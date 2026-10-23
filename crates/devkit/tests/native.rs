@@ -518,7 +518,7 @@ fn admitted_snapshot_rechecks_raw_manifests_and_optional_config_presence() {
 }
 
 #[test]
-fn cargo_inherited_dependency_can_reference_an_explicit_checkout_root_workspace() {
+fn cargo_virtual_workspace_context_does_not_change_component_lock_authority() {
     let f = TempDir::new().unwrap();
     let root = f.path();
     let mut state = state(&[("apps/api", "rust"), ("packages/common", "rust")]);
@@ -541,15 +541,20 @@ fn cargo_inherited_dependency_can_reference_an_explicit_checkout_root_workspace(
     );
     let inputs = collect_native_input_closure(root, &state).unwrap();
     assert!(inputs.files["Cargo.toml"].is_some());
-    assert_eq!(
-        derive_component_dependencies(root, &state).unwrap()["apps/api"],
-        Vec::<String>::new()
+    selected_cargo_lock(
+        root,
+        "apps/api",
+        json!([{"name":"api","version":"1.0.0","dependencies":["common"]},{"name":"common","version":"1.0.0"}]),
     );
-    state.version = "0.3.0".into();
-    assert_eq!(
-        derive_component_dependencies(root, &state).unwrap()["apps/api"],
-        vec!["packages/common"]
-    );
+    for version in ["0.2.1", "0.3.0"] {
+        state.version = version.into();
+        assert!(
+            derive_component_dependencies(root, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("component-root workspace/lock authority")
+        );
+    }
 }
 
 #[test]
@@ -1317,6 +1322,124 @@ fn unregistered_override_reaching_registered_component_uses_selected_graph() {
 }
 
 #[test]
+fn graph_authority_ordinary_direct_and_transitive_paths_follow_selected_edges() {
+    let mut wrong = Vec::new();
+    for role in [Role::App, Role::Library] {
+        for transitive in [false, true] {
+            let f = TempDir::new().unwrap();
+            let root = f.path();
+            let state = selected_cargo_fixture(root, role);
+            let target = if role == Role::App {
+                "apps/helper"
+            } else {
+                "packages/helper"
+            };
+            if transitive {
+                put(
+                    root,
+                    "apps/main/Cargo.toml",
+                    "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nvendor={path=\"../../vendor/provider\"}\n",
+                );
+                override_crate(root, "vendor/provider", "vendor");
+                put(
+                    root,
+                    "vendor/provider/Cargo.toml",
+                    &format!(
+                        "[package]\nname=\"vendor\"\nversion=\"1.0.0\"\n[dependencies]\nhelper={{path=\"../../{target}\"}}\n"
+                    ),
+                );
+                selected_cargo_lock(
+                    root,
+                    "apps/main",
+                    json!([{"name":"main","version":"1.0.0","dependencies":["vendor"]},{"name":"vendor","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+                );
+            } else {
+                put(
+                    root,
+                    "apps/main/Cargo.toml",
+                    &format!(
+                        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper={{path=\"../../{target}\"}}\n"
+                    ),
+                );
+            }
+            let result = derive_component_dependencies(root, &state);
+            if role == Role::App {
+                if !result.as_ref().is_err_and(|error| {
+                    error
+                        .to_string()
+                        .contains("Application dependency is forbidden")
+                }) {
+                    wrong.push(format!("app transitive={transitive}: {result:?}"));
+                }
+            } else if !result
+                .as_ref()
+                .is_ok_and(|map| map["apps/main"] == vec![target])
+            {
+                wrong.push(format!("library transitive={transitive}: {result:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("; "));
+}
+
+#[test]
+fn graph_authority_unused_workspace_path_is_input_not_modern_edge() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = selected_cargo_fixture(root, Role::Library);
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[workspace.dependencies]\nhelper={path=\"../../packages/helper\"}\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0"}]),
+    );
+    assert!(
+        collect_native_input_closure(root, &state).unwrap().files["packages/helper/Cargo.toml"]
+            .is_some()
+    );
+    assert!(
+        derive_component_dependencies(root, &state).unwrap()["apps/main"].is_empty(),
+        "unused workspace definition activated an effective edge"
+    );
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert!(admitted.effective_dependencies["apps/main"].is_empty());
+    state.version = "0.2.1".into();
+    state.components.get_mut("apps/main").unwrap().dependencies = vec!["packages/helper".into()];
+    profiles(root, &state);
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert_eq!(admitted.dependencies["apps/main"], vec!["packages/helper"]);
+    assert!(admitted.effective_dependencies["apps/main"].is_empty());
+}
+
+#[test]
+fn graph_authority_component_workspace_inheritance_uses_full_lock_records() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = selected_cargo_fixture(root, Role::Library);
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[workspace.dependencies]\nhelper={path=\"../../packages/helper\"}\n[dependencies]\nhelper={workspace=true}\n",
+    );
+    for version in ["0.2.1", "0.3.0"] {
+        state.version = version.into();
+        state.components.get_mut("apps/main").unwrap().dependencies =
+            vec!["packages/helper".into()];
+        profiles(root, &state);
+        let admitted = admit_native_components(root, &state).unwrap();
+        assert_eq!(admitted.dependencies["apps/main"], vec!["packages/helper"]);
+        assert_eq!(
+            admitted.effective_dependencies["apps/main"],
+            vec!["packages/helper"]
+        );
+    }
+}
+
+#[test]
 fn cargo_lock_reachable_edges_control_activity_source_and_ambiguity() {
     let f = TempDir::new().unwrap();
     let root = f.path();
@@ -1672,6 +1795,141 @@ fn full_runtime_rejects_patch_app_edge_and_synchronizes_modern_library_edge() {
             .effective_dependencies["apps/api"],
         vec!["packages/helper"]
     );
+}
+
+#[test]
+#[ignore = "requires Cargo inside the pinned Rust 1.99.1 validation container"]
+fn pinned_cargo_metadata_confirms_ordinary_graph_and_unused_patch_neutrality() {
+    fn metadata(root: &Path, component: &str) -> Value {
+        let version = std::process::Command::new("cargo")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&version.stdout).starts_with("cargo 1.99.1 "));
+        let output = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "Cargo.toml",
+            ])
+            .current_dir(root.join(component))
+            .env("CARGO_HOME", std::env::var_os("CARGO_HOME").unwrap())
+            .env("CARGO_TARGET_DIR", root.join(".metadata-target"))
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    let mut proof = Vec::new();
+    for (name, role, transitive, unused) in [
+        ("direct-app", Role::App, false, false),
+        ("direct-library", Role::Library, false, false),
+        ("transitive-app", Role::App, true, false),
+        ("transitive-library", Role::Library, true, false),
+        ("unused-workspace-library", Role::Library, false, true),
+    ] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let mut state = selected_cargo_fixture(root, role);
+        let target = if role == Role::App {
+            "apps/helper"
+        } else {
+            "packages/helper"
+        };
+        let mut manifest = "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n".to_owned();
+        if transitive {
+            manifest.push_str("[dependencies]\nvendor={path=\"../../vendor/provider\"}\n");
+            override_crate(root, "vendor/provider", "vendor");
+            put(
+                root,
+                "vendor/provider/Cargo.toml",
+                &format!(
+                    "[package]\nname=\"vendor\"\nversion=\"1.0.0\"\n[dependencies]\nhelper={{path=\"../../{target}\"}}\n"
+                ),
+            );
+        } else if unused {
+            manifest
+                .push_str("[workspace.dependencies]\nhelper={path=\"../../packages/helper\"}\n");
+        } else {
+            manifest.push_str(&format!(
+                "[dependencies]\nhelper={{path=\"../../{target}\"}}\n"
+            ));
+        }
+        put(root, "apps/main/Cargo.toml", &manifest);
+        put(root, "apps/main/src/main.rs", "fn main() {}\n");
+        put(root, "apps/main/src/lib.rs", "pub fn root() {}\n");
+        put(
+            root,
+            &format!("{target}/src/lib.rs"),
+            "pub fn helper() {}\n",
+        );
+        if role == Role::App {
+            put(root, &format!("{target}/src/main.rs"), "fn main() {}\n");
+        }
+        let before = metadata(root, "apps/main");
+        metadata(root, target);
+        let before_lock = fs::read(root.join("apps/main/Cargo.lock")).unwrap();
+        let expected = if unused {
+            vec![]
+        } else {
+            vec![target.to_owned()]
+        };
+        for with_unused_patch in [false, true] {
+            if with_unused_patch {
+                put(
+                    root,
+                    "apps/main/Cargo.toml",
+                    &format!("{manifest}\n[patch.crates-io]\nmain={{path=\".\"}}\n"),
+                );
+            }
+            let current = metadata(root, "apps/main");
+            assert_eq!(
+                before["resolve"]["nodes"], current["resolve"]["nodes"],
+                "unused self patch changed resolve for {name}"
+            );
+            if role == Role::App {
+                assert!(
+                    derive_component_dependencies(root, &state)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Application dependency is forbidden")
+                );
+            } else {
+                assert_eq!(
+                    derive_component_dependencies(root, &state).unwrap()["apps/main"],
+                    expected,
+                    "{name}"
+                );
+                state.components.get_mut("apps/main").unwrap().dependencies = expected.clone();
+                assert_eq!(
+                    admit_native_components(root, &state)
+                        .unwrap()
+                        .effective_dependencies["apps/main"],
+                    expected
+                );
+            }
+        }
+        assert!(
+            collect_native_input_closure(root, &state).unwrap().files
+                [&format!("{target}/Cargo.toml")]
+                .is_some()
+        );
+        proof.push(json!({"case":name,"beforeResolveNodes":before["resolve"]["nodes"],"unusedPatchResolveEqual":true,
+            "beforeLockSha256":devkit::files::digest(before_lock),"afterLockSha256":devkit::files::digest(fs::read(root.join("apps/main/Cargo.lock")).unwrap()),
+            "effectiveExpected":if role==Role::App {json!("app-target-refused")} else {json!(expected)}}));
+    }
+    if let Ok(directory) = std::env::var("DEVKIT_PROOF_DIR") {
+        write_json(&Path::new(&directory).join("cargo-path-authority-proof.json"),&json!({"toolchain":"1.99.1","offline":true,"cases":proof,
+            "authority":"Only selected Cargo.lock dependency/replacement edges activate modern/effective Rust component relationships; raw declarations remain inputs and exact legacy0.2 projection."})).unwrap();
+    }
 }
 
 #[test]

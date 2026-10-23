@@ -378,7 +378,6 @@ impl CargoLockGraph {
 #[derive(Default)]
 struct CargoLocalContext {
     paths: BTreeSet<String>,
-    overrides: BTreeSet<String>,
     config_paths: BTreeSet<String>,
 }
 struct DerivedDependencies {
@@ -822,11 +821,11 @@ impl<'a> ReadContext<'a> {
             let data = object(&raw, "Cargo lock")?;
             ensure!(
                 matches!(data.get("version").and_then(Value::as_u64), Some(3 | 4)),
-                "Effective Cargo override graph requires component Cargo.lock version 3 or 4"
+                "Selected Cargo component graph requires component Cargo.lock version 3 or 4"
             );
             let mut packages = Vec::new();
             let mut seen = BTreeSet::new();
-            for package in data.get("package").and_then(Value::as_array).context("Cargo.lock cannot prove selected overrides without package records; refresh it with pinned Cargo")? {
+            for package in data.get("package").and_then(Value::as_array).context("Cargo.lock cannot prove the selected component graph without package records; refresh it with pinned Cargo")? {
                 let package = object(package, "locked Cargo package")?;
                 let id = CargoPackageId {
                     name: text(package.get("name").context("Missing locked Cargo package name")?, "locked Cargo package name")?.to_owned(),
@@ -897,14 +896,14 @@ impl<'a> ReadContext<'a> {
         if !manifest.contains_key("workspace") {
             ensure!(
                 !dependency_table(&manifest, "package")?.contains_key("workspace"),
-                "Selected Cargo overrides require component-root workspace/lock authority; inherited workspace context does not change the accepted Cargo.lock location"
+                "Selected Cargo component graph requires component-root workspace/lock authority; inherited workspace context does not change the accepted Cargo.lock location"
             );
             let mut ancestor = parent_name(component);
             loop {
                 if exists(&input_path(self.root, prefixed(&ancestor, "Cargo.toml"))?)? {
                     ensure!(
                         !self.cargo_manifest(&ancestor)?.contains_key("workspace"),
-                        "Selected Cargo overrides require component-root workspace/lock authority; refresh the component layout explicitly"
+                        "Selected Cargo component graph requires component-root workspace/lock authority; refresh the component layout explicitly"
                     );
                 }
                 if ancestor.is_empty() {
@@ -922,11 +921,10 @@ impl<'a> ReadContext<'a> {
         local: &CargoLocalContext,
         deps: &mut BTreeSet<String>,
     ) -> Result<()> {
-        if local.overrides.is_empty()
-            || !local
-                .paths
-                .iter()
-                .any(|path| component_owner(state, path).is_some_and(|owner| owner != component))
+        if !local
+            .paths
+            .iter()
+            .any(|path| component_owner(state, path).is_some_and(|owner| owner != component))
         {
             return Ok(());
         }
@@ -1035,19 +1033,9 @@ impl<'a> ReadContext<'a> {
                 }
             } else {
                 let native = self.cargo_inputs(path)?;
-                for target in &native.dependencies {
-                    register_edge(state, path, target.clone(), &mut deps)?;
-                }
                 let mut files = BTreeMap::new();
                 let local =
                     self.cargo_local_context(VecDeque::from([path.clone()]), state, &mut files)?;
-                for member in self.cargo_workspace_member_paths(path)? {
-                    for target in self.cargo_inputs(&member)?.dependencies {
-                        if component_owner(state, &target) != Some(path.as_str()) {
-                            register_edge(state, path, target, &mut deps)?;
-                        }
-                    }
-                }
                 self.cargo_selected_edges(path, state, &local, &mut deps)?;
                 if matches!(state.version.as_str(), "0.2.0" | "0.2.1") {
                     let mut legacy = BTreeSet::new();
@@ -1167,8 +1155,6 @@ impl<'a> ReadContext<'a> {
                 result.config_paths.extend(config_paths);
             }
             result.paths.insert(path);
-            result.overrides.extend(native.overrides.iter().cloned());
-            result.overrides.extend(override_targets.iter().cloned());
             rust_queue.extend(native.dependencies);
             rust_queue.extend(native.members);
             rust_queue.extend(native.overrides);
