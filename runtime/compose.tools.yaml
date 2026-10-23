@@ -1,0 +1,107 @@
+# Explicit environment allowlist; project .env is never loaded by the launcher.
+x-task: &task
+  init: true
+  user: "${DEVKIT_UID:?}:${DEVKIT_GID:?}"
+  working_dir: "/workspace/apps/${DEVKIT_CURRENT_APP:?}"
+  stop_grace_period: 2s
+  network_mode: bridge
+  environment:
+    HOME: /tmp/devkit-home
+    CI: "true"
+  volumes:
+    - type: bind
+      source: "${DEVKIT_PROJECT_ROOT:?}"
+      target: /workspace
+      read_only: true
+      bind:
+        create_host_path: false
+        selinux: z
+    - type: bind
+      source: "${DEVKIT_APP_ROOT:?}"
+      target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}"
+      read_only: ${DEVKIT_SOURCE_READ_ONLY:-true}
+      bind:
+        create_host_path: false
+        selinux: z
+  labels:
+    io.docouno.devkit.checkout: "${DEVKIT_PROJECT_NAME:?}"
+    io.docouno.devkit.role: tool
+
+services:
+  control:
+    image: "${DEVKIT_NODE_IMAGE:?}"
+    init: true
+    user: "${DEVKIT_UID:?}:${DEVKIT_GID:?}"
+    working_dir: /workspace
+    network_mode: none
+    read_only: true
+    stop_grace_period: 2s
+    labels:
+      io.docouno.devkit.checkout: "${DEVKIT_PROJECT_NAME:?}"
+      io.docouno.devkit.role: control
+    volumes:
+      - type: bind
+        source: "${DEVKIT_PROJECT_ROOT:?}"
+        target: /workspace
+        read_only: true
+        bind: {create_host_path: false, selinux: z}
+  node:
+    <<: *task
+    image: "${DEVKIT_NODE_IMAGE:?}"
+    environment:
+      HOME: /tmp/devkit-home
+      CI: "true"
+      NPM_CONFIG_CACHE: /cache/npm
+      NPM_CONFIG_UPDATE_NOTIFIER: "false"
+    volumes:
+      - type: bind
+        source: "${DEVKIT_PROJECT_ROOT:?}"
+        target: /workspace
+        read_only: true
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_APP_ROOT:?}"
+        target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}"
+        read_only: ${DEVKIT_SOURCE_READ_ONLY:-true}
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_APP_ROOT:?}/node_modules"
+        target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}/node_modules"
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_APP_ROOT:?}/dist"
+        target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}/dist"
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_PROJECT_ROOT:?}/.devkit/cache/npm"
+        target: /cache/npm
+        bind: {create_host_path: false, selinux: z}
+  rust:
+    <<: *task
+    image: "${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"
+    environment:
+      HOME: /tmp/devkit-home
+      CI: "true"
+      CARGO_HOME: /cache/cargo
+      CARGO_TARGET_DIR: "/workspace/apps/${DEVKIT_CURRENT_APP:?}/target"
+      RUSTUP_AUTO_INSTALL: "0"
+      DEVKIT_RUST_VERSION: "${DEVKIT_RUST_VERSION:?}"
+    volumes:
+      - type: bind
+        source: "${DEVKIT_PROJECT_ROOT:?}"
+        target: /workspace
+        read_only: true
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_APP_ROOT:?}"
+        target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}"
+        read_only: ${DEVKIT_SOURCE_READ_ONLY:-true}
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_APP_ROOT:?}/target"
+        target: "/workspace/apps/${DEVKIT_CURRENT_APP:?}/target"
+        bind: {create_host_path: false, selinux: z}
+      - type: bind
+        source: "${DEVKIT_PROJECT_ROOT:?}/.devkit/cache/cargo"
+        target: /cache/cargo
+        bind: {create_host_path: false, selinux: z}

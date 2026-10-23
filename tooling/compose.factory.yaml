@@ -1,0 +1,26 @@
+services:
+  factory:
+    image: '${DEVKIT_NODE_IMAGE:?}'
+    init: true
+    user: '${DEVKIT_UID:?}:${DEVKIT_GID:?}'
+    working_dir: /release
+    read_only: true
+    network_mode: bridge
+    tmpfs:
+      - /tmp:mode=1777
+    environment:
+      HOME: /tmp/devkit-home
+      DEVKIT_EXPECTED_NODE_VERSION: '${DEVKIT_NODE_VERSION:?}'
+    labels:
+      io.docouno.devkit.invocation: '${DEVKIT_INVOCATION_TOKEN:?}'
+    volumes:
+      - type: bind
+        source: '${DEVKIT_RELEASE_ROOT:?}'
+        target: /release
+        read_only: true
+        bind: { create_host_path: false, selinux: z }
+      - type: bind
+        source: '${DEVKIT_FACTORY_PARENT:?}'
+        target: /workspace
+        bind: { create_host_path: false, selinux: z }
+    entrypoint: ['node', '/release/cli/cli.js']

@@ -3,6 +3,8 @@ dist/
 target/
 .artifacts/
 .tmp/
+__pycache__/
+*.pyc
 .devkit/cache/
 .devkit/state/
 .env

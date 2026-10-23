@@ -1,0 +1,63 @@
+{
+  "name": "@docouno/env",
+  "version": "0.1.0",
+  "description": "Shared, checked JavaScript and TypeScript configuration for Devkit projects",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": "^24.18.0"
+  },
+  "exports": {
+    "./eslint": {
+      "types": "./src/eslint.d.ts",
+      "default": "./src/eslint.js"
+    },
+    "./prettier": {
+      "types": "./src/prettier.d.ts",
+      "default": "./src/prettier.js"
+    },
+    "./node-test-reporter": {
+      "types": "./src/node-test-reporter.d.ts",
+      "default": "./src/node-test-reporter.js"
+    },
+    "./vitest-reporter": {
+      "types": "./src/vitest-reporter.d.ts",
+      "default": "./src/vitest-reporter.js"
+    },
+    "./tsconfig/node.json": "./tsconfig/node.json",
+    "./tsconfig/browser.json": "./tsconfig/browser.json"
+  },
+  "bin": {
+    "devkit-verify": "./bin/devkit-verify.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "tsconfig",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.7",
+    "globals": "17.13.0",
+    "typescript-eslint": "8.72.0"
+  },
+  "peerDependencies": {
+    "eslint": "^10.13.0",
+    "typescript": ">=6.0.3 <6.1.0",
+    "vitest": "5.0.5"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

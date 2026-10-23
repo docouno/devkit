@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "tooling",
+    "outDir": ".artifacts/cli"
+  },
+  "include": ["tooling/**/*.ts"],
+  "exclude": ["node_modules", ".artifacts", "templates", "test"]
+}
