@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+.artifacts/
+.tmp/
+.devkit/cache/
+.devkit/state/
+.env
+.env.*
+!.env.example
