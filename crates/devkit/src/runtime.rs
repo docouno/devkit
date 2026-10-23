@@ -875,6 +875,8 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             }
             let _ = path;
         }
+        full.recheck()?;
+        runner.check_cancelled()?;
         println!(
             "Devkit {}; Node {}; Rust {}; accepted components verified.",
             ctx.admission.pins.version,

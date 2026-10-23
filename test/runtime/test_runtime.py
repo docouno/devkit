@@ -187,6 +187,92 @@ def accept_runtime(root, native=False):
     seal_runtime(root)
 
 
+class DoctorSnapshotTests(unittest.TestCase):
+    def test_doctor_rechecks_admitted_snapshot_after_external_query(self):
+        # Real admission and CLI, with only Docker's read-only query boundary
+        # controlled. This regression needs neither a daemon nor prepared images.
+        with tempfile.TemporaryDirectory(prefix="devkit-doctor-snapshot-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            runtime = root / ".devkit/runtime"
+            shutil.copytree(RUNTIME_SOURCE, runtime)
+            recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
+            (runtime / "toolchains.env").write_text(
+                f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
+                f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
+                f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
+                f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+            (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
+            shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
+            accept_runtime(root, native=True)
+            (root / ".devkit/state").mkdir(exist_ok=True)
+            (root / ".devkit/state/rust-image").write_text("sha256:" + "a"*64 + "\n")
+            fake = base / "bin"
+            fake.mkdir()
+            docker = fake / "docker"
+            docker.write_text('''#!/usr/bin/python3
+import os, pathlib, sys, time
+argv = sys.argv[1:]
+base = pathlib.Path(os.environ['DOCTOR_SNAPSHOT_BASE'])
+if argv[:2] == ['compose', 'version']:
+    print('Docker Compose version snapshot-regression')
+elif argv[:2] == ['info', '--format']:
+    print('linux')
+elif argv[:2] == ['image', 'inspect']:
+    if (base/'armed').exists():
+        (base/'ready').write_text('admission finished before image query')
+        deadline = time.monotonic() + 5
+        while not (base/'go').exists():
+            if time.monotonic() > deadline:
+                sys.exit(89)
+            time.sleep(.01)
+    print(os.environ['DOCTOR_SNAPSHOT_RECIPE'])
+else:
+    print('unexpected Docker query: '+repr(argv), file=sys.stderr)
+    sys.exit(90)
+''')
+            docker.chmod(0o755)
+            environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
+                               DOCTOR_SNAPSHOT_BASE=str(base), DOCTOR_SNAPSHOT_RECIPE=recipe)
+            argv = [str(ENGINE), "task", "doctor", "--root", str(root)]
+            baseline = run(*argv, env=environment, timeout=12)
+            self.assertIn("accepted components verified", baseline.stdout)
+            evidence = {"engineSha256": hashlib.sha256(ENGINE.read_bytes()).hexdigest(),
+                        "baseline": {"code": baseline.returncode, "stdout": baseline.stdout}, "cases": []}
+            for mutation in ("native-lock", "manifest-generation"):
+                with self.subTest(mutation=mutation):
+                    for name in ("ready", "go"):
+                        (base / name).unlink(missing_ok=True)
+                    (base / "armed").touch()
+                    path = root / ("apps/api/Cargo.lock" if mutation == "native-lock" else ".devkit/manifest.json")
+                    original = path.read_bytes()
+                    child = subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    try:
+                        wait_until(lambda: (base / "ready").exists() or child.poll() is not None, timeout=5)
+                        self.assertTrue((base / "ready").exists(), "doctor exited before the query barrier")
+                        if mutation == "native-lock":
+                            path.write_bytes(original+b"\n")
+                        else:
+                            state = json.loads(original)
+                            state["generation"] = "11111111-1111-4111-8111-111111111111"
+                            path.write_text(json.dumps(state)+"\n")
+                        self.assertNotEqual(path.read_bytes(), original)
+                        (base / "go").touch()
+                        stdout, stderr = child.communicate(timeout=12)
+                        evidence["cases"].append({"mutation": mutation, "code": child.returncode,
+                                                  "stdout": stdout, "stderr": stderr})
+                        self.assertNotEqual(child.returncode, 0, "doctor reported stale success after admitted input changed")
+                        self.assertNotIn("accepted components verified", stdout)
+                        self.assertIn("changed", stderr.lower())
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate(timeout=5)
+                        path.write_bytes(original)
+                        (base / "armed").unlink(missing_ok=True)
+            print("Doctor snapshot evidence: " + json.dumps(evidence), flush=True)
+
+
 class RuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
