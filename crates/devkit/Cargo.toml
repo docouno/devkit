@@ -1,0 +1,19 @@
+[package]
+name = "devkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde-saphyr = "2"
+sha2 = "0.10"
+tempfile = "3"
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
