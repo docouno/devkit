@@ -285,8 +285,105 @@ pub fn local_dependency_map(
 #[derive(Default, Clone)]
 struct CargoInputs {
     dependencies: BTreeSet<String>,
+    legacy_dependencies: BTreeSet<String>,
     members: BTreeSet<String>,
     overrides: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CargoPackageId {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+#[derive(Clone)]
+struct LockedCargoPackage {
+    id: CargoPackageId,
+    dependencies: Vec<String>,
+    replacement: Option<String>,
+}
+#[derive(Clone)]
+struct CargoLockGraph {
+    packages: Vec<LockedCargoPackage>,
+}
+impl CargoLockGraph {
+    fn package_ref(&self, reference: &str, replacement: bool) -> Result<usize> {
+        let (identity, source) = if let Some((identity, source)) = reference.split_once(" (") {
+            (
+                identity,
+                Some(
+                    source
+                        .strip_suffix(')')
+                        .context("Invalid Cargo lock dependency source")?,
+                ),
+            )
+        } else {
+            (reference, None)
+        };
+        let parts: Vec<_> = identity.split_whitespace().collect();
+        ensure!(
+            (1..=2).contains(&parts.len()),
+            "Unsupported Cargo lock dependency reference: {reference}"
+        );
+        // Cargo's version-qualified reference without a source denotes an
+        // existing local lock record when one shares its name/version with a
+        // source-qualified registry/Git record. Do not infer this from a nearby
+        // manifest, and keep unversioned or remote-only ambiguity fail-closed.
+        let compact_local = source.is_none()
+            && parts.len() == 2
+            && self.packages.iter().any(|package| {
+                package.id.name == parts[0]
+                    && package.id.version == parts[1]
+                    && package.id.source.is_none()
+            });
+        let selected: Vec<_> = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| {
+                package.id.name == parts[0]
+                    && (parts.len() == 1 || package.id.version == parts[1])
+                    && source.is_none_or(|source| package.id.source.as_deref() == Some(source))
+                    && (!compact_local || package.id.source.is_none())
+                    // A compact replacement ref denotes the local target;
+                    // Cargo also retains the replaced registry record with
+                    // the same name/version and an explicit source.
+                    && (!replacement || source.is_some() || package.id.source.is_none())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        ensure!(
+            selected.len() == 1,
+            "Cargo lock dependency reference is missing or ambiguous: {reference}; refresh the component Cargo.lock with pinned Cargo"
+        );
+        Ok(selected[0])
+    }
+    fn local_id(&self, identity: &CargoPackageId) -> Result<usize> {
+        let selected: Vec<_> = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| &package.id == identity)
+            .map(|(index, _)| index)
+            .collect();
+        ensure!(
+            selected.len() == 1,
+            "Cargo.lock does not uniquely identify workspace package {} {}; refresh the component Cargo.lock with pinned Cargo",
+            identity.name,
+            identity.version
+        );
+        Ok(selected[0])
+    }
+}
+#[derive(Default)]
+struct CargoLocalContext {
+    paths: BTreeSet<String>,
+    overrides: BTreeSet<String>,
+    config_paths: BTreeSet<String>,
+}
+struct DerivedDependencies {
+    projected: BTreeMap<String, Vec<String>>,
+    effective: BTreeMap<String, Vec<String>>,
 }
 
 /// Raw facts which a saved admission must retain without reparsing native
@@ -395,6 +492,7 @@ struct ReadContext<'a> {
     manifests: BTreeMap<String, Fields>,
     cargo: BTreeMap<String, Fields>,
     cargo_configs: BTreeMap<String, Fields>,
+    cargo_locks: BTreeMap<String, CargoLockGraph>,
     read_identities: BTreeMap<String, FileIdentity>,
 }
 impl<'a> ReadContext<'a> {
@@ -405,6 +503,7 @@ impl<'a> ReadContext<'a> {
             manifests: BTreeMap::new(),
             cargo: BTreeMap::new(),
             cargo_configs: BTreeMap::new(),
+            cargo_locks: BTreeMap::new(),
             read_identities: BTreeMap::new(),
         }
     }
@@ -480,17 +579,19 @@ impl<'a> ReadContext<'a> {
                 };
                 reject_local_cargo_git(table)?;
                 if let Some(path) = table.get("path") {
-                    result.dependencies.insert(cargo_local_path(
-                        self.root,
-                        base,
-                        text(path, "Cargo dependency path")?,
-                    )?);
+                    let path =
+                        cargo_local_path(self.root, base, text(path, "Cargo dependency path")?)?;
+                    result.dependencies.insert(path.clone());
+                    result.legacy_dependencies.insert(path);
                 } else if inherited && table.get("workspace") == Some(&Value::Bool(true)) {
                     let (workspace_root, workspace) = self.find_cargo_workspace(base)?;
                     let dependencies = dependency_table(&workspace, "dependencies")?;
                     let inherited = dependencies
                         .get(&name)
                         .with_context(|| format!("Missing inherited Cargo dependency: {name}"))?;
+                    if let Some(declaration) = inherited.as_object() {
+                        reject_local_cargo_git(declaration)?;
+                    }
                     if let Some(path) = inherited.as_object().and_then(|d| d.get("path")) {
                         result.dependencies.insert(cargo_local_path(
                             self.root,
@@ -558,6 +659,7 @@ impl<'a> ReadContext<'a> {
         seen: &mut BTreeSet<String>,
         active: &mut BTreeSet<String>,
         targets: &mut BTreeSet<String>,
+        config_paths: &mut BTreeSet<String>,
     ) -> Result<()> {
         if seen.contains(name) {
             return Ok(());
@@ -611,7 +713,14 @@ impl<'a> ReadContext<'a> {
                 let target_name = relative_name(&project_root(self.root)?, &target)?;
                 record(self.root, files, &target_name, !optional)?;
                 if identity(&target)?.is_some() {
-                    self.cargo_config_inputs(&target_name, files, seen, active, targets)?;
+                    self.cargo_config_inputs(
+                        &target_name,
+                        files,
+                        seen,
+                        active,
+                        targets,
+                        config_paths,
+                    )?;
                 }
             }
         }
@@ -627,11 +736,10 @@ impl<'a> ReadContext<'a> {
                 .as_array()
                 .context("Cargo config paths must be an array")?
             {
-                targets.insert(cargo_local_path(
-                    self.root,
-                    base,
-                    text(value, "Cargo config override path")?,
-                )?);
+                let target =
+                    cargo_local_path(self.root, base, text(value, "Cargo config override path")?)?;
+                config_paths.insert(target.clone());
+                targets.insert(target);
             }
         }
         self.collect_cargo_overrides(base, &data, targets)?;
@@ -705,11 +813,215 @@ impl<'a> ReadContext<'a> {
         }
         bail!("Cargo workspace dependency has no project-local workspace: {base}")
     }
-    fn derive(&mut self, state: &ProjectState) -> Result<BTreeMap<String, Vec<String>>> {
+    fn cargo_lock_graph(&mut self, component: &str) -> Result<CargoLockGraph> {
+        if !self.cargo_locks.contains_key(component) {
+            let name = prefixed(component, "Cargo.lock");
+            let (bytes, identity) = stable_bytes(&input_path(self.root, &name)?)?;
+            let parsed: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)?;
+            let raw = serde_json::to_value(parsed)?;
+            let data = object(&raw, "Cargo lock")?;
+            ensure!(
+                matches!(data.get("version").and_then(Value::as_u64), Some(3 | 4)),
+                "Effective Cargo override graph requires component Cargo.lock version 3 or 4"
+            );
+            let mut packages = Vec::new();
+            let mut seen = BTreeSet::new();
+            for package in data.get("package").and_then(Value::as_array).context("Cargo.lock cannot prove selected overrides without package records; refresh it with pinned Cargo")? {
+                let package = object(package, "locked Cargo package")?;
+                let id = CargoPackageId {
+                    name: text(package.get("name").context("Missing locked Cargo package name")?, "locked Cargo package name")?.to_owned(),
+                    version: text(package.get("version").context("Missing locked Cargo version")?, "locked Cargo version")?.to_owned(),
+                    source: package.get("source").map(|value| text(value,"locked Cargo source").map(str::to_owned)).transpose()?,
+                };
+                ensure!(seen.insert(id.clone()), "Duplicate Cargo lock package identity: {} {}",id.name,id.version);
+                let dependencies = package.get("dependencies").map(|value| value.as_array().context("Cargo lock dependencies must be an array")).transpose()?.into_iter().flatten()
+                    .map(|value| text(value,"Cargo lock dependency").map(str::to_owned)).collect::<Result<Vec<_>>>()?;
+                let replacement = package.get("replace").map(|value| text(value,"Cargo lock replacement").map(str::to_owned)).transpose()?;
+                packages.push(LockedCargoPackage {id,dependencies,replacement});
+            }
+            self.cargo_locks
+                .insert(component.to_owned(), CargoLockGraph { packages });
+            self.read_identities.insert(name, identity);
+        }
+        Ok(self.cargo_locks[component].clone())
+    }
+    fn cargo_package_id(&mut self, path: &str) -> Result<Option<CargoPackageId>> {
+        let data = self.cargo_manifest(path)?;
+        let Some(package) = data.get("package") else {
+            return Ok(None);
+        };
+        let package = object(package, "Cargo package identity")?;
+        let name = text(
+            package.get("name").context("Missing Cargo package name")?,
+            "Cargo package name",
+        )?
+        .to_owned();
+        let version = match package.get("version") {
+            None => "0.0.0".to_owned(),
+            Some(Value::String(version)) if !version.is_empty() => version.clone(),
+            Some(value)
+                if value.as_object().and_then(|v| v.get("workspace"))
+                    == Some(&Value::Bool(true)) =>
+            {
+                let (_, workspace) = self.find_cargo_workspace(path)?;
+                let inherited = dependency_table(&workspace, "package")?;
+                text(
+                    inherited
+                        .get("version")
+                        .context("Missing workspace.package.version")?,
+                    "workspace package version",
+                )?
+                .to_owned()
+            }
+            _ => bail!("Unsupported Cargo package version declaration: {path}"),
+        };
+        Ok(Some(CargoPackageId {
+            name,
+            version,
+            source: None,
+        }))
+    }
+    fn cargo_workspace_member_paths(&mut self, component: &str) -> Result<BTreeSet<String>> {
+        let mut queue = VecDeque::from([component.to_owned()]);
+        let mut members = BTreeSet::new();
+        while let Some(path) = queue.pop_front() {
+            if !members.insert(path.clone()) {
+                continue;
+            }
+            queue.extend(self.cargo_inputs(&path)?.members);
+        }
+        Ok(members)
+    }
+    fn cargo_workspace_packages(&mut self, component: &str) -> Result<BTreeSet<String>> {
+        let manifest = self.cargo_manifest(component)?;
+        if !manifest.contains_key("workspace") {
+            ensure!(
+                !dependency_table(&manifest, "package")?.contains_key("workspace"),
+                "Selected Cargo overrides require component-root workspace/lock authority; inherited workspace context does not change the accepted Cargo.lock location"
+            );
+            let mut ancestor = parent_name(component);
+            loop {
+                if exists(&input_path(self.root, prefixed(&ancestor, "Cargo.toml"))?)? {
+                    ensure!(
+                        !self.cargo_manifest(&ancestor)?.contains_key("workspace"),
+                        "Selected Cargo overrides require component-root workspace/lock authority; refresh the component layout explicitly"
+                    );
+                }
+                if ancestor.is_empty() {
+                    break;
+                }
+                ancestor = parent_name(&ancestor);
+            }
+        }
+        self.cargo_workspace_member_paths(component)
+    }
+    fn cargo_selected_edges(
+        &mut self,
+        component: &str,
+        state: &ProjectState,
+        local: &CargoLocalContext,
+        deps: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if local.overrides.is_empty()
+            || !local
+                .paths
+                .iter()
+                .any(|path| component_owner(state, path).is_some_and(|owner| owner != component))
+        {
+            return Ok(());
+        }
+        let lock = self.cargo_lock_graph(component)?;
+        let workspace = self.cargo_workspace_packages(component)?;
+        let mut candidates: BTreeMap<CargoPackageId, BTreeSet<String>> = BTreeMap::new();
+        for path in &local.paths {
+            if let Some(id) = self.cargo_package_id(path)? {
+                candidates.entry(id).or_default().insert(path.clone());
+            }
+        }
+        let mut pinned = BTreeMap::new();
+        let mut queue = VecDeque::new();
+        for path in workspace {
+            if let Some(id) = self.cargo_package_id(&path)? {
+                let index = lock.local_id(&id)?;
+                ensure!(
+                    pinned.insert(index, path.clone()).is_none(),
+                    "Ambiguous local Cargo workspace package identity: {} {}",
+                    id.name,
+                    id.version
+                );
+                queue.push_back(index);
+            }
+        }
+        ensure!(
+            !queue.is_empty(),
+            "Component Cargo.lock has no identifiable workspace package roots: {component}"
+        );
+        let mut seen = BTreeSet::new();
+        while let Some(index) = queue.pop_front() {
+            if !seen.insert(index) {
+                continue;
+            }
+            let package = &lock.packages[index];
+            for (reference, replacement) in package
+                .dependencies
+                .iter()
+                .map(|reference| (reference, false))
+                .chain(
+                    package
+                        .replacement
+                        .iter()
+                        .map(|reference| (reference, true)),
+                )
+            {
+                let target = lock.package_ref(reference, replacement)?;
+                let id = &lock.packages[target].id;
+                // paths overrides can replace code while the lock preserves a
+                // registry source. Do not silently relabel such a record.
+                for path in &local.config_paths {
+                    if id.source.is_some()
+                        && component_owner(state, path).is_some()
+                        && self
+                            .cargo_package_id(path)?
+                            .as_ref()
+                            .is_some_and(|candidate| {
+                                candidate.name == id.name && candidate.version == id.version
+                            })
+                    {
+                        bail!(
+                            "Cannot prove registered Cargo paths override {path} from Cargo.lock; use an explicit path/patch dependency or remove that paths override"
+                        );
+                    }
+                }
+                if id.source.is_none() {
+                    let target_path = if let Some(path) = pinned.get(&target) {
+                        path.clone()
+                    } else {
+                        let paths=candidates.get(id).with_context(||format!("Cargo.lock selected a local package without an admitted manifest candidate: {} {}",id.name,id.version))?;
+                        ensure!(
+                            paths.len() == 1,
+                            "Ambiguous local Cargo target {} {}: multiple admitted paths; make the chosen local source explicit",
+                            id.name,
+                            id.version
+                        );
+                        paths.iter().next().expect("one local candidate").clone()
+                    };
+                    if let Some(owner) = component_owner(state, &target_path)
+                        && owner != component
+                    {
+                        register_edge(state, component, owner.to_owned(), deps)?;
+                    }
+                }
+                queue.push_back(target);
+            }
+        }
+        Ok(())
+    }
+    fn derive(&mut self, state: &ProjectState) -> Result<DerivedDependencies> {
         if !node_components(state).is_empty() {
             self.packages()?;
         }
-        let mut result = BTreeMap::new();
+        let mut projected = BTreeMap::new();
+        let mut effective = BTreeMap::new();
         for (path, component) in &state.components {
             let mut deps = BTreeSet::new();
             if component.toolchain == Toolchain::Node {
@@ -722,14 +1034,40 @@ impl<'a> ReadContext<'a> {
                     }
                 }
             } else {
-                for target in self.cargo_inputs(path)?.dependencies {
-                    register_edge(state, path, target, &mut deps)?;
+                let native = self.cargo_inputs(path)?;
+                for target in &native.dependencies {
+                    register_edge(state, path, target.clone(), &mut deps)?;
+                }
+                let mut files = BTreeMap::new();
+                let local =
+                    self.cargo_local_context(VecDeque::from([path.clone()]), state, &mut files)?;
+                for member in self.cargo_workspace_member_paths(path)? {
+                    for target in self.cargo_inputs(&member)?.dependencies {
+                        if component_owner(state, &target) != Some(path.as_str()) {
+                            register_edge(state, path, target, &mut deps)?;
+                        }
+                    }
+                }
+                self.cargo_selected_edges(path, state, &local, &mut deps)?;
+                if matches!(state.version.as_str(), "0.2.0" | "0.2.1") {
+                    let mut legacy = BTreeSet::new();
+                    for target in native.legacy_dependencies {
+                        register_edge(state, path, target, &mut legacy)?;
+                    }
+                    projected.insert(path.clone(), legacy.into_iter().collect());
                 }
             }
-            result.insert(path.clone(), deps.into_iter().collect());
+            let deps: Vec<_> = deps.into_iter().collect();
+            projected
+                .entry(path.clone())
+                .or_insert_with(|| deps.clone());
+            effective.insert(path.clone(), deps);
         }
-        assert_acyclic(&result)?;
-        Ok(result)
+        assert_acyclic(&effective)?;
+        Ok(DerivedDependencies {
+            projected,
+            effective,
+        })
     }
     fn assert_npm_targets(&mut self) -> Result<()> {
         let packages = self.packages()?.clone();
@@ -755,6 +1093,88 @@ impl<'a> ReadContext<'a> {
             }
         }
         Ok(())
+    }
+    fn cargo_local_context(
+        &mut self,
+        mut rust_queue: VecDeque<String>,
+        state: &ProjectState,
+        files: &mut BTreeMap<String, Option<FileIdentity>>,
+    ) -> Result<CargoLocalContext> {
+        let roots: BTreeSet<_> = rust_queue.iter().cloned().collect();
+        let mut result = CargoLocalContext::default();
+        let mut rust_seen = BTreeSet::new();
+        let mut seen_configs = BTreeSet::new();
+        let mut active_configs = BTreeSet::new();
+        while let Some(path) = rust_queue.pop_front() {
+            if !rust_seen.insert(path.clone()) {
+                continue;
+            }
+            record(self.root, files, &prefixed(&path, "Cargo.toml"), true)?;
+            for name in ["Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"] {
+                record(
+                    self.root,
+                    files,
+                    &prefixed(&path, name),
+                    state.components.contains_key(&path),
+                )?;
+            }
+            // Cargo discovers config in cwd ancestors. Include absence as well as
+            // presence, so adding a new config cannot reuse a previous receipt.
+            let mut directory = path.clone();
+            let mut override_targets = BTreeSet::new();
+            let mut config_paths = BTreeSet::new();
+            loop {
+                for name in [".cargo/config.toml", ".cargo/config", ".rustfmt.toml"] {
+                    record(self.root, files, &prefixed(&directory, name), false)?;
+                }
+                let legacy_config = prefixed(&directory, ".cargo/config");
+                let config = if files[&legacy_config].is_some() {
+                    legacy_config
+                } else {
+                    prefixed(&directory, ".cargo/config.toml")
+                };
+                if files[&config].is_some() {
+                    self.cargo_config_inputs(
+                        &config,
+                        files,
+                        &mut seen_configs,
+                        &mut active_configs,
+                        &mut override_targets,
+                        &mut config_paths,
+                    )?;
+                }
+                if directory != path {
+                    record(self.root, files, &prefixed(&directory, "Cargo.toml"), false)?;
+                    if files[&prefixed(&directory, "Cargo.toml")].is_some() {
+                        let ancestor = self.cargo_manifest(&directory)?;
+                        self.collect_cargo_overrides(&directory, &ancestor, &mut override_targets)?;
+                    }
+                    record(self.root, files, &prefixed(&directory, "Cargo.lock"), false)?;
+                    record(
+                        self.root,
+                        files,
+                        &prefixed(&directory, "rustfmt.toml"),
+                        false,
+                    )?;
+                }
+                if directory.is_empty() {
+                    break;
+                }
+                directory = parent_name(&directory);
+            }
+            let native = self.cargo_inputs(&path)?;
+            if roots.contains(&path) {
+                result.config_paths.extend(config_paths);
+            }
+            result.paths.insert(path);
+            result.overrides.extend(native.overrides.iter().cloned());
+            result.overrides.extend(override_targets.iter().cloned());
+            rust_queue.extend(native.dependencies);
+            rust_queue.extend(native.members);
+            rust_queue.extend(native.overrides);
+            rust_queue.extend(override_targets);
+        }
+        Ok(result)
     }
     fn closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
         let structure = NativeStructure::capture(self.root, state)?;
@@ -822,86 +1242,13 @@ impl<'a> ReadContext<'a> {
                 }
             }
         }
-        let mut rust_queue: VecDeque<String> = state
+        let rust_queue = state
             .components
             .iter()
-            .filter(|(_, c)| c.toolchain == Toolchain::Rust)
-            .map(|(p, _)| p.clone())
+            .filter(|(_, component)| component.toolchain == Toolchain::Rust)
+            .map(|(path, _)| path.clone())
             .collect();
-        let mut rust_seen = BTreeSet::new();
-        let mut seen_configs = BTreeSet::new();
-        let mut active_configs = BTreeSet::new();
-        while let Some(path) = rust_queue.pop_front() {
-            if !rust_seen.insert(path.clone()) {
-                continue;
-            }
-            record(self.root, &mut files, &prefixed(&path, "Cargo.toml"), true)?;
-            for name in ["Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"] {
-                record(
-                    self.root,
-                    &mut files,
-                    &prefixed(&path, name),
-                    state.components.contains_key(&path),
-                )?;
-            }
-            // Cargo discovers config in cwd ancestors. Include absence as well as
-            // presence, so adding a new config cannot reuse a previous receipt.
-            let mut directory = path.clone();
-            let mut override_targets = BTreeSet::new();
-            loop {
-                for name in [".cargo/config.toml", ".cargo/config", ".rustfmt.toml"] {
-                    record(self.root, &mut files, &prefixed(&directory, name), false)?;
-                }
-                let legacy_config = prefixed(&directory, ".cargo/config");
-                let config = if files[&legacy_config].is_some() {
-                    legacy_config
-                } else {
-                    prefixed(&directory, ".cargo/config.toml")
-                };
-                if files[&config].is_some() {
-                    self.cargo_config_inputs(
-                        &config,
-                        &mut files,
-                        &mut seen_configs,
-                        &mut active_configs,
-                        &mut override_targets,
-                    )?;
-                }
-                if directory != path {
-                    record(
-                        self.root,
-                        &mut files,
-                        &prefixed(&directory, "Cargo.toml"),
-                        false,
-                    )?;
-                    if files[&prefixed(&directory, "Cargo.toml")].is_some() {
-                        let ancestor = self.cargo_manifest(&directory)?;
-                        self.collect_cargo_overrides(&directory, &ancestor, &mut override_targets)?;
-                    }
-                    record(
-                        self.root,
-                        &mut files,
-                        &prefixed(&directory, "Cargo.lock"),
-                        false,
-                    )?;
-                    record(
-                        self.root,
-                        &mut files,
-                        &prefixed(&directory, "rustfmt.toml"),
-                        false,
-                    )?;
-                }
-                if directory.is_empty() {
-                    break;
-                }
-                directory = parent_name(&directory);
-            }
-            let native = self.cargo_inputs(&path)?;
-            rust_queue.extend(native.dependencies);
-            rust_queue.extend(native.members);
-            rust_queue.extend(native.overrides);
-            rust_queue.extend(override_targets);
-        }
+        self.cargo_local_context(rust_queue, state, &mut files)?;
         // Bind workspace parent manifests read to resolve inherited dependencies.
         for path in self.cargo.keys() {
             record(self.root, &mut files, &prefixed(path, "Cargo.toml"), true)?;
@@ -1025,6 +1372,13 @@ fn register_edge(
     }
     Ok(())
 }
+fn component_owner<'a>(state: &'a ProjectState, path: &str) -> Option<&'a str> {
+    state
+        .components
+        .keys()
+        .find(|component| path == component.as_str() || path.starts_with(&format!("{component}/")))
+        .map(String::as_str)
+}
 fn assert_acyclic(deps: &BTreeMap<String, Vec<String>>) -> Result<()> {
     fn visit(
         path: &str,
@@ -1057,7 +1411,7 @@ pub fn derive_component_dependencies(
     root: &Path,
     state: &ProjectState,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    ReadContext::new(root).derive(state)
+    Ok(ReadContext::new(root).derive(state)?.projected)
 }
 pub fn collect_native_input_closure(root: &Path, state: &ProjectState) -> Result<InputIdentitySet> {
     ReadContext::new(root).closure(state)
@@ -1108,6 +1462,9 @@ pub fn assert_tool_profiles(root: &Path, state: &ProjectState) -> Result<()> {
 pub struct NativeAdmission {
     pub inputs: InputIdentitySet,
     pub dependencies: BTreeMap<String, Vec<String>>,
+    /// Complete admitted graph. Public 0.2 projections retain their original
+    /// literal-path shape, while role/cycle safety always checks this graph.
+    pub effective_dependencies: BTreeMap<String, Vec<String>>,
     structure: NativeStructure,
 }
 impl NativeAdmission {
@@ -1236,7 +1593,7 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         );
     }
     let dependencies = context.derive(state)?;
-    for (path, actual) in &dependencies {
+    for (path, actual) in &dependencies.projected {
         ensure!(
             actual == &state.components[path].dependencies,
             "Native dependency projection is stale: {path}; run the accepted devkit update"
@@ -1250,7 +1607,8 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
     assert_input_identities(root, &inputs)?;
     Ok(NativeAdmission {
         inputs,
-        dependencies,
+        dependencies: dependencies.projected,
+        effective_dependencies: dependencies.effective,
         structure,
     })
 }

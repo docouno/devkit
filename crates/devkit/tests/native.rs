@@ -5,12 +5,17 @@ use devkit::{
         LockSeed, assert_product_graphs_preserved, capture_product_graph, read_native_graph,
         seed_workspace_lock,
     },
-    model::{ComponentState, Environment, PackageMode, ProjectState, Release},
+    model::{
+        ComponentState, Environment, PackageMode, ProjectState, Release, Role, ToolingProfile,
+    },
     native::{
         admit_native_components, assert_native_components, assert_npmrc_compatibility,
         collect_native_input_closure, derive_component_dependencies, package_lock, valid_integrity,
     },
-    project::{InitOptions, LockResolver, UpdateOptions, init_project, update_project},
+    project::{
+        ComponentSpec, InitOptions, LockResolver, UpdateOptions, init_project,
+        register_project_component, update_project,
+    },
     release::AdmittedRelease,
     state::{admit_runtime_project, source_signature},
 };
@@ -516,7 +521,7 @@ fn admitted_snapshot_rechecks_raw_manifests_and_optional_config_presence() {
 fn cargo_inherited_dependency_can_reference_an_explicit_checkout_root_workspace() {
     let f = TempDir::new().unwrap();
     let root = f.path();
-    let state = state(&[("apps/api", "rust"), ("packages/common", "rust")]);
+    let mut state = state(&[("apps/api", "rust"), ("packages/common", "rust")]);
     put(
         root,
         "Cargo.toml",
@@ -536,6 +541,11 @@ fn cargo_inherited_dependency_can_reference_an_explicit_checkout_root_workspace(
     );
     let inputs = collect_native_input_closure(root, &state).unwrap();
     assert!(inputs.files["Cargo.toml"].is_some());
+    assert_eq!(
+        derive_component_dependencies(root, &state).unwrap()["apps/api"],
+        Vec::<String>::new()
+    );
+    state.version = "0.3.0".into();
     assert_eq!(
         derive_component_dependencies(root, &state).unwrap()["apps/api"],
         vec!["packages/common"]
@@ -1123,6 +1133,784 @@ fn cargo_override_paths_reject_escape_symlink_and_unmodelled_local_stores() {
         "[build]\njobs=1\n[patch.crates-io]\nremote={git=\"https://example.invalid/repository\",rev=\"abc\"}\n",
     );
     admit_native_components(root, &state).unwrap();
+}
+
+fn selected_cargo_lock(root: &Path, path: &str, packages: Value) {
+    put(
+        root,
+        &format!("{path}/Cargo.lock"),
+        &toml::to_string(&json!({"version":4,"package":packages})).unwrap(),
+    );
+}
+fn selected_cargo_fixture(root: &Path, role: Role) -> ProjectState {
+    let target = if role == Role::App {
+        "apps/helper"
+    } else {
+        "packages/helper"
+    };
+    let mut state = state(&[("apps/main", "rust"), (target, "rust")]);
+    state.version = "0.3.0".into();
+    let relative = if role == Role::App {
+        "../helper"
+    } else {
+        "../../packages/helper"
+    };
+    rust(
+        root,
+        "apps/main",
+        &format!(
+            "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper=\"=1.0.0\"\n[patch.crates-io]\nhelper={{path=\"{relative}\"}}\n"
+        ),
+        true,
+    );
+    rust(
+        root,
+        target,
+        "[package]\nname=\"helper\"\nversion=\"1.0.0\"\n[workspace]\n",
+        true,
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+    );
+    selected_cargo_lock(root, target, json!([{"name":"helper","version":"1.0.0"}]));
+    profiles(root, &state);
+    state
+}
+
+#[test]
+fn inherited_virtual_workspace_source_guard_matches_direct_declaration() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = state(&[("apps/main", "rust")]);
+    put(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers=[\"apps/main\"]\n[workspace.dependencies]\nexternal={git=\"file:///outside\"}\n",
+    );
+    rust(
+        root,
+        "apps/main",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\nworkspace=\"../..\"\n[dependencies]\nexternal={workspace=true}\n",
+        true,
+    );
+    profiles(root, &state);
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unsupported local Cargo git source")
+    );
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[dependencies]\nexternal={git=\"file:///outside\"}\n",
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unsupported local Cargo git source")
+    );
+}
+
+#[test]
+fn selected_cargo_patch_role_and_legacy_projection_are_separate() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = selected_cargo_fixture(root, Role::Library);
+    state.components.get_mut("apps/main").unwrap().dependencies = vec!["packages/helper".into()];
+    let native = admit_native_components(root, &state).unwrap();
+    assert_eq!(native.dependencies["apps/main"], vec!["packages/helper"]);
+    assert_eq!(
+        native.effective_dependencies["apps/main"],
+        vec!["packages/helper"]
+    );
+    state.version = "0.2.1".into();
+    state
+        .components
+        .get_mut("apps/main")
+        .unwrap()
+        .dependencies
+        .clear();
+    profiles(root, &state);
+    let native = admit_native_components(root, &state).unwrap();
+    assert!(native.dependencies["apps/main"].is_empty());
+    assert_eq!(
+        native.effective_dependencies["apps/main"],
+        vec!["packages/helper"]
+    );
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = selected_cargo_fixture(root, Role::App);
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("Application dependency is forbidden")
+    );
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper={path=\"../helper\"}\n",
+    );
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("Application dependency is forbidden")
+    );
+}
+
+#[test]
+fn unregistered_override_reaching_registered_component_uses_selected_graph() {
+    for role in [Role::App, Role::Library] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let state = selected_cargo_fixture(root, role);
+        let target = if role == Role::App {
+            "apps/helper"
+        } else {
+            "packages/helper"
+        };
+        put(
+            root,
+            "apps/main/Cargo.toml",
+            "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nvendor=\"=1.0.0\"\n[patch.crates-io]\nvendor={path=\"../../vendor/provider\"}\n",
+        );
+        override_crate(root, "vendor/provider", "vendor");
+        put(
+            root,
+            "vendor/provider/Cargo.toml",
+            &format!(
+                "[package]\nname=\"vendor\"\nversion=\"1.0.0\"\n[dependencies]\nhelper={{path=\"../../{target}\"}}\n"
+            ),
+        );
+        selected_cargo_lock(
+            root,
+            "apps/main",
+            json!([
+                {"name":"main","version":"1.0.0","dependencies":["vendor"]},
+                {"name":"vendor","version":"1.0.0","dependencies":["helper"]},
+                {"name":"helper","version":"1.0.0"}
+            ]),
+        );
+        let result = derive_component_dependencies(root, &state);
+        if role == Role::App {
+            assert!(
+                result.is_err(),
+                "transitive selected override app edge was skipped"
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        } else {
+            assert_eq!(result.unwrap()["apps/main"], vec![target]);
+        }
+    }
+}
+
+#[test]
+fn cargo_lock_reachable_edges_control_activity_source_and_ambiguity() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = selected_cargo_fixture(root, Role::App);
+    // A local package record alone is not an active dependency edge.
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0"},{"name":"helper","version":"1.0.0"}]),
+    );
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/main"].is_empty());
+    // An equal name/version in a registry remains registry-selected.
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0","dependencies":["helper 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]},
+            {"name":"helper","version":"1.0.0"},
+            {"name":"helper","version":"1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"}
+        ]),
+    );
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/main"].is_empty());
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0","dependencies":["helper 2.0.0"]},
+            {"name":"helper","version":"2.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"}
+        ]),
+    );
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/main"].is_empty());
+    // Unused patch to the source root must not produce an app->self edge.
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[patch.crates-io]\nunrelated={path=\".\"}\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0"}]),
+    );
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/main"].is_empty());
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper=\"1.0.0\"\n[patch.crates-io]\nhelper={path=\"../helper\"}\n[patch.'https://example.invalid/other']\nhelper={path=\"../../vendor/helper\"}\n",
+    );
+    override_crate(root, "vendor/helper", "helper");
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+    );
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("Ambiguous local Cargo target")
+    );
+}
+
+#[test]
+fn compact_local_cargo_reference_uses_lock_source_without_manifest_guessing() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = selected_cargo_fixture(root, Role::Library);
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0","dependencies":["helper 1.0.0","helper 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]},
+            {"name":"helper","version":"1.0.0"},
+            {"name":"helper","version":"1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"}
+        ]),
+    );
+    assert_eq!(
+        derive_component_dependencies(root, &state).unwrap()["apps/main"],
+        vec!["packages/helper"]
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0","dependencies":["helper"]},
+            {"name":"helper","version":"1.0.0"},
+            {"name":"helper","version":"1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"}
+        ]),
+    );
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("missing or ambiguous")
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0","dependencies":["helper 1.0.0"]},
+            {"name":"helper","version":"1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"},
+            {"name":"helper","version":"1.0.0","source":"git+https://example.invalid/repository#0123456789abcdef"}
+        ]),
+    );
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("missing or ambiguous")
+    );
+}
+
+#[test]
+fn workspace_member_seeds_find_edges_without_creating_internal_app_edges() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = selected_cargo_fixture(root, Role::Library);
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\nmembers=[\"member\"]\n[workspace.package]\nversion=\"2.0.0\"\n[patch.crates-io]\nhelper={path=\"../../packages/helper\"}\n",
+    );
+    override_crate(root, "apps/main/member", "member");
+    put(
+        root,
+        "apps/main/member/Cargo.toml",
+        "[package]\nname=\"member\"\nversion.workspace=true\n[dependencies]\nhelper=\"1.0.0\"\nmain={path=\"..\"}\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([
+            {"name":"main","version":"1.0.0"},
+            {"name":"member","version":"2.0.0","dependencies":["main","helper"]},
+            {"name":"helper","version":"1.0.0"}
+        ]),
+    );
+    state.components.get_mut("apps/main").unwrap().dependencies = vec!["packages/helper".into()];
+    let native = admit_native_components(root, &state).unwrap();
+    assert_eq!(
+        native.effective_dependencies["apps/main"],
+        vec!["packages/helper"]
+    );
+}
+
+#[test]
+fn cargo_paths_registered_selection_is_actionably_uncertain_and_cycles_are_checked() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let first_state = selected_cargo_fixture(root, Role::Library);
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper=\"1.0.0\"\n",
+    );
+    put(
+        root,
+        "apps/main/.cargo/config.toml",
+        "paths=[\"../../packages/helper\"]\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{ "name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0","source":"registry+https://github.com/rust-lang/crates.io-index"}]),
+    );
+    assert!(
+        derive_component_dependencies(root, &first_state)
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot prove registered Cargo paths override")
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0"}]),
+    );
+    assert!(derive_component_dependencies(root, &first_state).unwrap()["apps/main"].is_empty());
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper={path=\"../../packages/helper\"}\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+    );
+    let lock_path = root.join("apps/main/Cargo.lock");
+    let lock = fs::read_to_string(&lock_path)
+        .unwrap()
+        .replace("version = 4", "version = 3");
+    put(root, "apps/main/Cargo.lock", &lock);
+    assert_eq!(
+        derive_component_dependencies(root, &first_state).unwrap()["apps/main"],
+        vec!["packages/helper"]
+    );
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = state(&[
+        ("apps/main", "rust"),
+        ("packages/a", "rust"),
+        ("packages/b", "rust"),
+    ]);
+    state.version = "0.3.0".into();
+    rust(
+        root,
+        "apps/main",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n",
+        true,
+    );
+    for (name, other) in [("a", "b"), ("b", "a")] {
+        rust(
+            root,
+            &format!("packages/{name}"),
+            &format!(
+                "[package]\nname=\"{name}\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\n{other}=\"1.0.0\"\n[patch.crates-io]\n{other}={{path=\"../{other}\"}}\n"
+            ),
+            true,
+        );
+        selected_cargo_lock(
+            root,
+            &format!("packages/{name}"),
+            json!([{"name":name,"version":"1.0.0","dependencies":[other]},{"name":other,"version":"1.0.0"}]),
+        );
+    }
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle")
+    );
+}
+
+#[test]
+fn full_runtime_rejects_patch_app_edge_and_synchronizes_modern_library_edge() {
+    let f = TempDir::new().unwrap();
+    let release = runtime_release(f.path());
+    let root = f.path().join("consumer");
+    let before = init_project(
+        &release,
+        &root,
+        &InitOptions {
+            apps: Some(vec![
+                ComponentSpec {
+                    name: "main".into(),
+                    template: "rust-api".into(),
+                    uses: vec![],
+                },
+                ComponentSpec {
+                    name: "helper".into(),
+                    template: "rust-api".into(),
+                    uses: vec![],
+                },
+            ]),
+            name: Some("native-fixture".into()),
+            ..Default::default()
+        },
+        &SeedFixtureResolver,
+    )
+    .unwrap();
+    put(
+        &root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper=\"=1.0.0\"\n[patch.crates-io]\nhelper={path=\"../helper\"}\n",
+    );
+    put(
+        &root,
+        "apps/helper/Cargo.toml",
+        "[package]\nname=\"helper\"\nversion=\"1.0.0\"\n[workspace]\n",
+    );
+    put(&root, "apps/helper/src/lib.rs", "pub fn helper() {}\n");
+    selected_cargo_lock(
+        &root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+    );
+    selected_cargo_lock(
+        &root,
+        "apps/helper",
+        json!([{"name":"helper","version":"1.0.0"}]),
+    );
+    assert!(
+        admit_runtime_project(&root, "0.3.0")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Application dependency is forbidden")
+    );
+    assert!(
+        update_project(&release, &root, &UpdateOptions::default(), &RefuseResolver)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Application dependency is forbidden")
+    );
+    assert_eq!(
+        devkit::state::read_project_state(&root).unwrap().generation,
+        before.generation
+    );
+    let f = TempDir::new().unwrap();
+    let (release, root, _) = runtime_project(f.path(), "rust");
+    rust(
+        &root,
+        "packages/helper",
+        "[package]\nname=\"helper\"\nversion=\"1.0.0\"\n[workspace]\n",
+        true,
+    );
+    put(&root, "packages/helper/src/lib.rs", "pub fn helper() {}\n");
+    selected_cargo_lock(
+        &root,
+        "packages/helper",
+        json!([{"name":"helper","version":"1.0.0"}]),
+    );
+    register_project_component(
+        &release,
+        &root,
+        Role::Library,
+        "helper".into(),
+        ToolingProfile::Rust,
+        &UpdateOptions::default(),
+        &RefuseResolver,
+    )
+    .unwrap();
+    put(
+        &root,
+        "apps/api/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nhelper=\"=1.0.0\"\n[patch.crates-io]\nhelper={path=\"../../packages/helper\"}\n",
+    );
+    selected_cargo_lock(
+        &root,
+        "apps/api",
+        json!([{"name":"main","version":"1.0.0","dependencies":["helper"]},{"name":"helper","version":"1.0.0"}]),
+    );
+    let before = devkit::state::read_project_state(&root).unwrap();
+    assert!(
+        admit_runtime_project(&root, "0.3.0")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("projection is stale")
+    );
+    let next = update_project(&release, &root, &UpdateOptions::default(), &RefuseResolver).unwrap();
+    assert!(!next.no_op);
+    assert_ne!(next.state.generation, before.generation);
+    assert_eq!(
+        next.state.components["apps/api"].dependencies,
+        vec!["packages/helper"]
+    );
+    assert_eq!(
+        admit_runtime_project(&root, "0.3.0")
+            .unwrap()
+            .native
+            .effective_dependencies["apps/api"],
+        vec!["packages/helper"]
+    );
+}
+
+#[test]
+#[ignore = "requires Cargo inside the pinned Rust 1.99.1 validation container"]
+fn pinned_cargo_metadata_proves_selected_component_edges_and_paths_uncertainty() {
+    fn metadata(root: &Path, component: &str, locked: bool) -> Value {
+        let version = std::process::Command::new("cargo")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&version.stdout).starts_with("cargo 1.99.1 "));
+        let mut command = std::process::Command::new("cargo");
+        command.args([
+            "metadata",
+            "--offline",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            "Cargo.toml",
+        ]);
+        if locked {
+            command.arg("--locked");
+        }
+        let output = command
+            .current_dir(root.join(component))
+            .env("CARGO_HOME", std::env::var_os("CARGO_HOME").unwrap())
+            .env("CARGO_TARGET_DIR", root.join(".metadata-target"))
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{component}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    let build_lock: toml::Value = toml::from_str(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))
+            .unwrap(),
+    )
+    .unwrap();
+    let anyhow_version = build_lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str() == Some("anyhow"))
+        .unwrap()["version"]
+        .as_str()
+        .unwrap();
+    let mut proof = Vec::new();
+    for form in [
+        "app-patch",
+        "transitive-vendor-app",
+        "library-patch",
+        "member-only-patch",
+        "unused-root-patch",
+        "registry-source-control",
+        "registered-replace",
+        "registered-paths",
+        "parallel-local-registry",
+    ] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let role = if ["app-patch", "transitive-vendor-app"].contains(&form) {
+            Role::App
+        } else {
+            Role::Library
+        };
+        let mut state = selected_cargo_fixture(root, role);
+        let target = if role == Role::App {
+            "apps/helper"
+        } else {
+            "packages/helper"
+        };
+        put(root, "apps/main/src/main.rs", "fn main() {}\n");
+        put(
+            root,
+            &format!("{target}/src/lib.rs"),
+            "pub fn helper() {}\n",
+        );
+        if role == Role::App {
+            put(root, &format!("{target}/src/main.rs"), "fn main() {}\n");
+        }
+        if form == "transitive-vendor-app" {
+            put(
+                root,
+                "apps/main/Cargo.toml",
+                "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nvendor=\"=1.0.0\"\n[patch.crates-io]\nvendor={path=\"../../vendor/provider\"}\n",
+            );
+            override_crate(root, "vendor/provider", "vendor");
+            put(
+                root,
+                "vendor/provider/Cargo.toml",
+                "[package]\nname=\"vendor\"\nversion=\"1.0.0\"\n[dependencies]\nhelper={path=\"../../apps/helper\"}\n",
+            );
+        } else if form == "member-only-patch" {
+            put(
+                root,
+                "apps/main/Cargo.toml",
+                "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\nmembers=[\"member\"]\n[patch.crates-io]\nhelper={path=\"../../packages/helper\"}\n",
+            );
+            override_crate(root, "apps/main/member", "member");
+            put(
+                root,
+                "apps/main/member/Cargo.toml",
+                "[package]\nname=\"member\"\nversion=\"1.0.0\"\n[dependencies]\nhelper=\"=1.0.0\"\nmain={path=\"..\"}\n",
+            );
+            put(root, "apps/main/src/lib.rs", "pub fn root() {}\n");
+        } else if form == "unused-root-patch" {
+            put(
+                root,
+                "apps/main/Cargo.toml",
+                "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[patch.crates-io]\nmain={path=\".\"}\n",
+            );
+            put(root, "apps/main/src/lib.rs", "pub fn root() {}\n");
+        } else if [
+            "registry-source-control",
+            "registered-replace",
+            "registered-paths",
+            "parallel-local-registry",
+        ]
+        .contains(&form)
+        {
+            let header = if form == "parallel-local-registry" {
+                format!(
+                    "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nlocal-anyhow={{package=\"anyhow\",path=\"../../packages/helper\"}}\nregistry-anyhow={{package=\"anyhow\",version=\"={anyhow_version}\"}}\n"
+                )
+            } else {
+                format!(
+                    "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[dependencies]\nanyhow=\"={anyhow_version}\"\n"
+                )
+            };
+            let manifest = if form == "registry-source-control" {
+                format!(
+                    "{header}[patch.'https://example.invalid/other']\nanyhow={{path=\"../../packages/helper\"}}\n"
+                )
+            } else if form == "registered-replace" {
+                format!(
+                    "{header}[replace]\n\"anyhow:{anyhow_version}\"={{path=\"../../packages/helper\"}}\n"
+                )
+            } else if form == "parallel-local-registry" {
+                put(root, "apps/main/src/lib.rs", "pub fn root() {}\n");
+                format!("{header}[patch.crates-io]\nmain={{path=\".\"}}\n")
+            } else {
+                header
+            };
+            put(root, "apps/main/Cargo.toml", &manifest);
+            put(
+                root,
+                "packages/helper/Cargo.toml",
+                &format!(
+                    "[package]\nname=\"anyhow\"\nversion=\"{anyhow_version}\"\n[workspace]\n[features]\ndefault=[\"std\"]\nstd=[]\nbacktrace=[]\n"
+                ),
+            );
+            if form == "registered-paths" {
+                put(
+                    root,
+                    "apps/main/.cargo/config.toml",
+                    "paths=[\"../../packages/helper\"]\n",
+                );
+            }
+        }
+        let selected = metadata(root, "apps/main", false);
+        metadata(root, target, false);
+        if let Ok(directory) = std::env::var("DEVKIT_PROOF_DIR") {
+            put(
+                Path::new(&directory),
+                &format!("selected-lock-{form}.toml"),
+                &fs::read_to_string(root.join("apps/main/Cargo.lock")).unwrap(),
+            );
+        }
+        let selected_edges = selected["resolve"]["nodes"].clone();
+        if ["app-patch", "transitive-vendor-app"].contains(&form) {
+            assert!(
+                derive_component_dependencies(root, &state)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        } else if form == "registered-paths" {
+            let lock: toml::Value =
+                toml::from_str(&fs::read_to_string(root.join("apps/main/Cargo.lock")).unwrap())
+                    .unwrap();
+            assert!(lock["package"].as_array().unwrap().iter().any(|package| {
+                package["name"].as_str() == Some("anyhow")
+                    && package
+                        .get("source")
+                        .and_then(toml::Value::as_str)
+                        .is_some()
+            }));
+            assert!(
+                derive_component_dependencies(root, &state)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Cannot prove registered Cargo paths override")
+            );
+        } else {
+            let expected = if ["unused-root-patch", "registry-source-control"].contains(&form) {
+                vec![]
+            } else {
+                vec!["packages/helper".to_owned()]
+            };
+            assert_eq!(
+                derive_component_dependencies(root, &state).unwrap()["apps/main"],
+                expected,
+                "{form}"
+            );
+            state.components.get_mut("apps/main").unwrap().dependencies = expected.clone();
+            assert_eq!(
+                admit_native_components(root, &state)
+                    .unwrap()
+                    .effective_dependencies["apps/main"],
+                expected
+            );
+            if form == "library-patch" {
+                let lock_path = root.join("apps/main/Cargo.lock");
+                let old = fs::read_to_string(&lock_path).unwrap();
+                put(
+                    root,
+                    "apps/main/Cargo.lock",
+                    &old.replace("version = 4", "version = 3"),
+                );
+                metadata(root, "apps/main", true);
+                assert_eq!(
+                    derive_component_dependencies(root, &state).unwrap()["apps/main"],
+                    vec!["packages/helper"]
+                );
+            }
+        }
+        proof.push(json!({"form":form,"nativeEdges":selected_edges,"lockSha256":devkit::files::digest(fs::read(root.join("apps/main/Cargo.lock")).unwrap())}));
+    }
+    if let Ok(directory) = std::env::var("DEVKIT_PROOF_DIR") {
+        write_json(&Path::new(&directory).join("cargo-selected-graph-proof.json"),&json!({
+            "toolchain":"1.99.1","offline":true,"cases":proof,
+            "sources":["https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#paths-overrides","https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field"],
+            "lockAuthority":"registered component Cargo.lock; exact IDs and dependency/replacement refs; all component-workspace package seeds"
+        })).unwrap();
+    }
 }
 
 #[test]

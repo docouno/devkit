@@ -14,7 +14,7 @@ use sha2::{Digest, Sha512};
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -859,6 +859,288 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
         status.success(),
         "Old public runtime rejected native-generated accepted-version projections"
     );
+}
+
+fn pinned_test_cargo(root: &Path, component: &str, args: &[&str]) -> std::process::Output {
+    let metadata = fs::metadata(root).unwrap();
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network",
+            "none",
+            "--cpus",
+            "1",
+            "--memory",
+            "768m",
+            "--user",
+            &format!("{}:{}", metadata.uid(), metadata.gid()),
+            "--volume",
+            &format!("{}:/workspace:Z", root.display()),
+            "--workdir",
+            &format!("/workspace/{component}"),
+            "--env",
+            "CARGO_HOME=/tmp/devkit-cargo",
+            "--env",
+            "CARGO_TARGET_DIR=/tmp/devkit-target",
+            "--env",
+            "CARGO_BUILD_JOBS=1",
+            "--env",
+            "RUSTUP_AUTO_INSTALL=0",
+            "sha256:40481709a28aa6af42101260ce6f0c1746fc3453caa953960c279728395d4c18",
+            "cargo",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Pinned Cargo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+fn old_runtime_metadata_oracle(root: &Path, version: &str) {
+    let pins = fs::read_to_string(root.join(".devkit/runtime/toolchains.env")).unwrap();
+    let image = pins
+        .lines()
+        .find_map(|line| line.strip_prefix("DEVKIT_NODE_IMAGE="))
+        .unwrap();
+    let metadata = fs::metadata(root).unwrap();
+    // This immutable old Node helper is a test oracle only. Production project
+    // management never calls it or the old factory/controller.
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network",
+            "none",
+            "--user",
+            &format!("{}:{}", metadata.uid(), metadata.gid()),
+            "--volume",
+            &format!("{}:/workspace:ro,Z", root.display()),
+            "--workdir",
+            "/workspace",
+            image,
+            "node",
+            "/workspace/.devkit/runtime/project.mjs",
+            "verify",
+            "/workspace",
+            version,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Immutable old runtime rejected native projection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires genuine public0.2.1 release/Rust consumer fixtures and Docker; old Node runtime is a compatibility oracle only"]
+fn legacy_library_patch_registration_add_and_modern_migration_preserve_native_ownership() {
+    let release = PathBuf::from(
+        std::env::var_os("DEVKIT_TEST_LEGACY_RELEASE").expect("legacy release fixture"),
+    );
+    let consumer = PathBuf::from(
+        std::env::var_os("DEVKIT_TEST_LEGACY_CONSUMER").expect("legacy Rust consumer fixture"),
+    );
+    let old = read_project_state(&consumer).unwrap();
+    assert_eq!(old.version, "0.2.1");
+    assert_eq!(old.components.len(), 1);
+    let component = old.components.keys().next().unwrap().clone();
+    assert_eq!(old.components[&component].toolchain, Toolchain::Rust);
+    let f = TempDir::new().unwrap();
+    let target = f.path().join("legacy effective graph");
+    copy_tree(
+        &consumer,
+        &target,
+        &|name| snapshot_excluded(&old, name),
+        true,
+    )
+    .unwrap();
+    put(&target,&format!("{component}/Cargo.toml"),b"[package]\nname = \"main\"\nversion = \"1.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nhelper = \"=1.0.0\"\n[patch.crates-io]\nhelper = { path = \"../../packages/helper\" }\n[package.metadata.owner]\nkeep = true\n");
+    put(
+        &target,
+        &format!("{component}/src/main.rs"),
+        b"fn main() { println!(\"{}\", helper::value()); }\n",
+    );
+    put(
+        &target,
+        &format!("{component}/src/lib.rs"),
+        b"pub const OWNER_MARKER: bool = true;\n",
+    );
+    put(&target,"packages/helper/Cargo.toml",b"[package]\nname = \"helper\"\nversion = \"1.0.0\"\nedition = \"2024\"\n[workspace]\n[package.metadata.owner]\nkeep = true\n");
+    put(
+        &target,
+        "packages/helper/src/lib.rs",
+        b"pub fn value() -> u32 { 42 }\n",
+    );
+    for name in ["rustfmt.toml", "rust-toolchain.toml"] {
+        write_atomic(
+            &target.join("packages/helper").join(name),
+            &fs::read(release.join("templates/rust-api").join(name)).unwrap(),
+            0o644,
+        )
+        .unwrap();
+    }
+    let selected: Value = serde_json::from_slice(
+        &pinned_test_cargo(
+            &target,
+            &component,
+            &["metadata", "--offline", "--format-version", "1"],
+        )
+        .stdout,
+    )
+    .unwrap();
+    let helper_id = selected["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "helper")
+        .unwrap()["id"]
+        .clone();
+    let main = selected["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == selected["resolve"]["root"])
+        .unwrap();
+    assert!(
+        main["dependencies"]
+            .as_array()
+            .unwrap()
+            .contains(&helper_id)
+    );
+    pinned_test_cargo(
+        &target,
+        "packages/helper",
+        &["metadata", "--offline", "--format-version", "1"],
+    );
+    pinned_test_cargo(
+        &target,
+        &component,
+        &["check", "--workspace", "--locked", "--offline"],
+    );
+    let names = vec![
+        format!("{component}/Cargo.toml"),
+        format!("{component}/Cargo.lock"),
+        format!("{component}/src/main.rs"),
+        format!("{component}/src/lib.rs"),
+        "packages/helper/Cargo.toml".to_string(),
+        "packages/helper/Cargo.lock".to_string(),
+        "packages/helper/src/lib.rs".to_string(),
+        "Makefile".to_string(),
+        ".gitignore".to_string(),
+        ".env".to_string(),
+    ];
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let owner_bytes = preserved(&target, &names);
+    let registered = register_project_component(
+        &release,
+        &target,
+        Role::Library,
+        "helper".to_string(),
+        ToolingProfile::Rust,
+        &UpdateOptions::default(),
+        &NoResolver,
+    )
+    .unwrap();
+    assert!(
+        registered.state.components[&component]
+            .dependencies
+            .is_empty()
+    );
+    assert_eq!(preserved(&target, &names), owner_bytes);
+    old_runtime_metadata_oracle(&target, "0.2.1");
+    let admission = admit_runtime_project(&target, "0.2.1").unwrap();
+    assert!(admission.native.dependencies[&component].is_empty());
+    assert_eq!(
+        admission.native.effective_dependencies[&component],
+        vec!["packages/helper"]
+    );
+    let before_noop = fs::read(target.join(MANIFEST_PATH)).unwrap();
+    let noop = update_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(noop.no_op);
+    assert_eq!(fs::read(target.join(MANIFEST_PATH)).unwrap(), before_noop);
+    let mut inventory = capture_compose_inputs(&target).unwrap();
+    inventory.services = registered
+        .state
+        .components
+        .values()
+        .filter_map(|c| c.development.as_ref()?.service.clone())
+        .collect();
+    let added = add_project_component(
+        &release,
+        &target,
+        Role::App,
+        ComponentSpec {
+            name: "worker".to_string(),
+            template: "rust-api".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap();
+    assert!(added.state.components[&component].dependencies.is_empty());
+    assert_eq!(preserved(&target, &names), owner_bytes);
+    old_runtime_metadata_oracle(&target, "0.2.1");
+    for command in ["setup", "doctor"] {
+        let status = Command::new("make")
+            .arg(command)
+            .env("CARGO_BUILD_JOBS", "1")
+            .current_dir(&target)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "Old make {command} failed after accepted native add/register"
+        );
+    }
+    let modern = fixture_release(f.path(), "0.3.0");
+    let migrated =
+        update_project(&modern, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert_eq!(
+        migrated.state.components[&component].dependencies,
+        vec!["packages/helper"]
+    );
+    assert_eq!(preserved(&target, &names), owner_bytes);
+    let accepted = admit_runtime_project(&target, "0.3.0").unwrap();
+    assert_eq!(
+        accepted.native.dependencies[&component],
+        vec!["packages/helper"]
+    );
+    assert_eq!(
+        accepted.native.effective_dependencies[&component],
+        vec!["packages/helper"]
+    );
+    for (key, value) in &old.extra {
+        assert_eq!(migrated.state.extra.get(key), Some(value));
+    }
+    assert_eq!(
+        migrated.state.components[&component].origin,
+        old.components[&component].origin
+    );
+    assert_eq!(
+        migrated.state.components[&component].extra,
+        old.components[&component].extra
+    );
+    assert_eq!(
+        migrated.state.components[&component].development,
+        old.components[&component].development
+    );
+    let make = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    assert!(make.contains("build/packages/helper"));
+    if let Some(directory) = std::env::var_os("DEVKIT_PROOF_DIR") {
+        write_json(&Path::new(&directory).join("legacy-effective-graph.json"),&json!({"legacyVersion":"0.2.1","legacyProjectedEdges":registered.state.components[&component].dependencies,"effectiveEdges":admission.native.effective_dependencies[&component],"modernVersion":"0.3.0","modernProjectedEdges":migrated.state.components[&component].dependencies,"cargoSelectedHelperId":helper_id,"oldMetadataOracle":true,"oldMakeSetupDoctor":true,"ownerNativeBytesPreserved":true,"modernTarget":"synthetic admitted core release fixture; no P2/runtime delivery claim"})).unwrap();
+    }
 }
 
 #[test]
