@@ -1,41 +1,67 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, posix } from 'node:path';
+import { templates, templateId, componentPath, nodeComponents, profiles } from './catalog.ts';
+import type { TemplateId } from './catalog.ts';
 import {
-  copyTree,
   digest,
   fail,
-  fileMap,
   identity,
   json,
   object,
   readRelease,
   safePath,
-  same,
   slug,
   text,
   writeAtomic,
   writeJson,
 } from './files.ts';
-import { npmEnvironment, run } from './process.ts';
+import { renderProjectMake, renderAppCompose } from './project-integration.ts';
+import { renderWorkspaceCompose } from './workspace-compose.ts';
 import { checksumPath, manifestPath, projectRoot } from './project-state.ts';
-import type { AppState, FileIdentity, PackageMode, ProjectState, Release } from './types.ts';
+import {
+  captureProductGraph,
+  assertProductGraphsPreserved,
+  readNativeGraph,
+  regenerateWorkspaceLock,
+  seedWorkspaceLock,
+} from './native-graph.ts';
+import type { LockSeed } from './native-graph.ts';
+import {
+  deriveComponentDependencies,
+  nativeManifest,
+  collectNativeInputClosure,
+  assertPackageLockMode,
+} from './native-workspace.ts';
+import type {
+  ComponentPath,
+  ComponentRole,
+  ComponentState,
+  FileIdentity,
+  PackageMode,
+  ProjectState,
+  Release,
+  ToolingProfile,
+} from './types.ts';
 
-export type Template = 'node' | 'react' | 'rust' | 'mixed';
+export type Template = TemplateId | 'node' | 'react' | 'rust' | 'mixed';
+export interface ComponentSpec {
+  name: string;
+  template: string;
+  uses?: string[];
+}
 export interface InitOptions {
-  template: Template;
+  template?: Template;
+  apps?: ComponentSpec[];
+  preset?: string;
   packageMode: PackageMode;
   name?: string;
   registry?: string;
 }
-export const templates: Record<Template, Record<string, string>> = {
-  node: { main: 'node-app' },
-  react: { web: 'react-app' },
-  rust: { api: 'rust-app' },
-  mixed: { web: 'react-app', api: 'rust-app' },
-};
-
-function releaseBytes(root: string, release: Release, name: string): Buffer {
+export function releaseIdentity(root: string): string {
+  return digest(readFileSync(join(root, 'release.json')));
+}
+export function releaseBytes(root: string, release: Release, name: string): Buffer {
   const expected = release.files[name];
   if (!expected) {
     fail(`Release is missing ${name}`);
@@ -46,63 +72,193 @@ function releaseBytes(root: string, release: Release, name: string): Buffer {
   }
   return bytes;
 }
-
-export function releaseIdentity(root: string): string {
-  return digest(readFileSync(join(root, 'release.json')));
+export function templateDirectory(id: TemplateId): string {
+  return id;
 }
 export function environmentSpec(release: Release, mode: PackageMode): string {
   return mode === 'registry'
     ? release.environment.version
     : `file:../../.devkit/npm/${basename(release.environment.archive)}`;
 }
-
+export function profileTools(
+  root: string,
+  release: Release,
+  profile: ToolingProfile,
+  mode: PackageMode,
+): Record<string, string> {
+  if (profile === 'rust') {
+    return {};
+  }
+  const directory = templateDirectory(profiles[profile].template);
+  const manifest = object(
+    JSON.parse(releaseBytes(root, release, `templates/${directory}/package.json`).toString()),
+    'template manifest',
+  );
+  const tools = Object.fromEntries(
+    Object.entries(object(manifest.devDependencies, 'template devDependencies'))
+      .filter(([name]) => !['react', 'react-dom'].includes(name))
+      .map(([name, value]) => [name, text(value, name)]),
+  );
+  if (!Object.hasOwn(tools, release.environment.name)) {
+    fail('Template is missing environment package');
+  }
+  tools[release.environment.name] = environmentSpec(release, mode);
+  return tools;
+}
 export function templateTools(
-  releaseRoot: string,
+  root: string,
   release: Release,
   template: string,
   mode: PackageMode,
 ): Record<string, string> {
-  if (template === 'rust-app') {
-    return {};
-  }
-  const manifest = object(
-    JSON.parse(
-      releaseBytes(releaseRoot, release, `templates/${template}/package.json`).toString('utf8'),
-    ) as unknown,
-    'template package manifest',
-  );
-  const dependencies: Record<string, string> = {};
-  for (const [name, spec] of Object.entries(
-    object(manifest.devDependencies, 'template devDependencies'),
-  )) {
-    dependencies[name] = text(spec, name);
-  }
-  if (!Object.hasOwn(dependencies, release.environment.name)) {
-    fail('Template is missing the environment package');
-  }
-  dependencies[release.environment.name] = environmentSpec(release, mode);
-  return dependencies;
+  return profileTools(root, release, templates[templateId(template)].toolingProfile, mode);
 }
-
+export function syncNodeWorkspace(root: string, state: ProjectState, name?: string): void {
+  const paths = nodeComponents(state).map(([path]) => path);
+  if (!paths.length) {
+    return;
+  }
+  assertPackageLockMode(root);
+  const file = join(root, 'package.json');
+  const manifest = existsSync(file)
+    ? object(json(file), 'root package')
+    : { name: name ?? 'devkit-project', private: true };
+  const names = new Set<string>();
+  for (const path of paths) {
+    const packageName = text(nativeManifest(root, path).name, `package name ${path}`);
+    if (names.has(packageName)) {
+      fail(`Duplicate npm workspace name: ${packageName}`);
+    }
+    names.add(packageName);
+  }
+  manifest.workspaces = paths;
+  writeJson(file, manifest);
+}
+export function renderComponent(
+  root: string,
+  release: Release,
+  destination: string,
+  projectName: string,
+  spec: ComponentSpec,
+  role: ComponentRole,
+  mode: PackageMode,
+  components: Record<ComponentPath, ComponentState>,
+): { path: ComponentPath; state: ComponentState; seed?: LockSeed } {
+  const id = templateId(spec.template),
+    definition = templates[id];
+  if (definition.role !== role) {
+    fail(`Template ${id} does not create a ${role}`);
+  }
+  const path = componentPath(role, spec.name),
+    directory = templateDirectory(id),
+    prefix = `templates/${directory}/`;
+  if (existsSync(join(destination, path))) {
+    fail(`Component path already exists: ${path}`);
+  }
+  const uses = spec.uses ?? [];
+  if (uses.length > 1 || (uses.length && !['react-web', 'electron-react'].includes(id))) {
+    fail('This template supports one shared client binding');
+  }
+  const client = uses.length ? componentPath('library', uses[0]!) : undefined;
+  if (client && components[client]?.toolingProfile !== 'react-library') {
+    fail(`Shared client is not a registered React library: ${client}`);
+  }
+  const clientName = client
+    ? text(nativeManifest(destination, client).name, 'client package name')
+    : '';
+  for (const [file, expected] of Object.entries(release.files)) {
+    if (!file.startsWith(prefix) || file.slice(prefix.length).startsWith('variants/')) {
+      continue;
+    }
+    writeAtomic(
+      safePath(destination, `${path}/${file.slice(prefix.length)}`),
+      releaseBytes(root, release, file),
+      expected.mode,
+    );
+  }
+  if (client) {
+    const variantPrefix = `${prefix}variants/shared/`;
+    const descriptor = object(
+      JSON.parse(releaseBytes(root, release, `${variantPrefix}variant.json`).toString()),
+      'shared variant',
+    );
+    if (!Array.isArray(descriptor.remove)) {
+      fail('Variant requires an explicit remove list');
+    }
+    for (const item of descriptor.remove) {
+      rmSync(safePath(destination, `${path}/${text(item, 'removed path')}`), {
+        recursive: true,
+        force: true,
+      });
+    }
+    for (const [file, expected] of Object.entries(release.files)) {
+      const filesPrefix = `${variantPrefix}files/`;
+      if (!file.startsWith(filesPrefix)) {
+        continue;
+      }
+      writeAtomic(
+        safePath(destination, `${path}/${file.slice(filesPrefix.length)}`),
+        releaseBytes(root, release, file)
+          .toString()
+          .replaceAll('__DEVKIT_CLIENT_PACKAGE__', clientName),
+        expected.mode,
+      );
+    }
+  }
+  const state: ComponentState = {
+    role,
+    toolchain: definition.toolchain,
+    toolingProfile: definition.toolingProfile,
+    origin: { template: id, version: release.version },
+    toolDependencies: profileTools(root, release, definition.toolingProfile, mode),
+    dependencies: [],
+  };
+  if (role === 'app') {
+    state.development = {
+      owner: 'managed',
+      kind: id === 'electron-react' ? 'desktop' : 'compose',
+      service: spec.name,
+    };
+  }
+  if (definition.toolchain === 'rust') {
+    return { path, state };
+  }
+  const packagePath = join(destination, path, 'package.json'),
+    manifest = object(json(packagePath), 'component package');
+  manifest.name = `@${projectName}/${role === 'app' ? 'app' : 'package'}-${spec.name}`;
+  manifest.devDependencies = {
+    ...object(manifest.devDependencies, 'dev dependencies'),
+    ...state.toolDependencies,
+  };
+  if (client) {
+    object(manifest.devDependencies, 'dev dependencies')[clientName] =
+      `file:${posix.relative(path, client)}`;
+  }
+  writeJson(packagePath, manifest);
+  const lockPath = join(destination, path, 'package-lock.json');
+  if (!existsSync(lockPath)) {
+    fail(`Template lacks canonical native lock: ${id}`);
+  }
+  const lock = object(json(lockPath), 'template lock');
+  const packages = object(lock.packages, 'template lock packages');
+  packages[''] = manifest;
+  lock.name = manifest.name;
+  return { path, state, seed: { prefix: path, lock } };
+}
 export function writeManaged(
-  releaseRoot: string,
+  root: string,
   release: Release,
   destination: string,
   mode: PackageMode,
-  apps: Record<string, AppState>,
+  state: ProjectState,
 ): Record<string, FileIdentity> {
   const managed: Record<string, FileIdentity> = {};
   for (const [name, expected] of Object.entries(release.files)) {
-    if (!name.startsWith('runtime/')) {
-      continue;
+    if (name.startsWith('runtime/')) {
+      const target = `.devkit/${name}`;
+      writeAtomic(safePath(destination, target), releaseBytes(root, release, name), expected.mode);
+      managed[target] = expected;
     }
-    const target = `.devkit/${name}`;
-    writeAtomic(
-      safePath(destination, target),
-      releaseBytes(releaseRoot, release, name),
-      expected.mode,
-    );
-    managed[target] = expected;
   }
   for (const required of [
     'devkit.mk',
@@ -111,228 +267,230 @@ export function writeManaged(
     'toolchains.env',
     'compose.tools.yaml',
   ]) {
-    if (!Object.hasOwn(managed, `.devkit/runtime/${required}`)) {
-      fail(`Release is missing required runtime/${required}`);
+    if (!managed[`.devkit/runtime/${required}`]) {
+      fail(`Missing release runtime/${required}`);
     }
   }
   if (mode === 'local') {
     const name = `.devkit/npm/${basename(release.environment.archive)}`;
     writeAtomic(
       safePath(destination, name),
-      releaseBytes(releaseRoot, release, release.environment.archive),
+      releaseBytes(root, release, release.environment.archive),
     );
     managed[name] = identity(safePath(destination, name))!;
   }
-  for (const [name, app] of Object.entries(apps)) {
-    if (app.kind !== 'rust') {
-      continue;
+  for (const [path, component] of Object.entries(state.components)) {
+    if (component.toolchain === 'rust') {
+      const source = `templates/${templateDirectory('rust-api')}/rust-toolchain.toml`,
+        target = `${path}/rust-toolchain.toml`;
+      writeAtomic(safePath(destination, target), releaseBytes(root, release, source));
+      managed[target] = identity(safePath(destination, target))!;
     }
-    const target = `apps/${name}/rust-toolchain.toml`;
-    const source = `templates/${app.template}/rust-toolchain.toml`;
-    const expected = release.files[source];
-    if (!expected) {
-      fail(`Release is missing ${source}`);
-    }
-    writeAtomic(
-      safePath(destination, target),
-      releaseBytes(releaseRoot, release, source),
-      expected.mode,
-    );
-    managed[target] = expected;
+  }
+  for (const [name, content] of [
+    [
+      '.devkit/tooling-profiles.json',
+      JSON.stringify(
+        {
+          schemaVersion: 1,
+          version: release.version,
+          packageMode: mode,
+          profiles: Object.fromEntries(
+            [
+              ...new Set(
+                Object.values(state.components).map((component) => component.toolingProfile),
+              ),
+            ]
+              .sort()
+              .map((profile) => [profile, profileTools(root, release, profile, mode)]),
+          ),
+        },
+        null,
+        2,
+      ) + '\n',
+    ],
+    ['.devkit/project.mk', renderProjectMake(state)],
+    ['.devkit/compose.apps.yaml', renderAppCompose(state)],
+    [
+      '.devkit/compose.workspace.json',
+      renderWorkspaceCompose(
+        state,
+        existsSync(join(destination, 'package-lock.json'))
+          ? collectNativeInputClosure(destination, state)
+          : {
+              schemaVersion: 1,
+              files: {},
+              directories: ['', ...nodeComponents(state).map(([path]) => path)],
+              digest: '',
+            },
+      ),
+    ],
+  ]) {
+    writeAtomic(safePath(destination, name!), content!);
+    managed[name!] = identity(safePath(destination, name!))!;
   }
   const checksums = Object.entries(managed)
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([name, expected]) => `${expected.sha256}  ${name}\n`)
+    .map(([name, entry]) => `${entry.sha256}  ${name}\n`)
     .join('');
   writeAtomic(safePath(destination, checksumPath), checksums);
   managed[checksumPath] = identity(safePath(destination, checksumPath))!;
   return managed;
 }
-
-export async function regenerateLock(root: string, app: string, registry?: string): Promise<void> {
-  const manifestPath = safePath(root, `apps/${app}/package.json`);
-  const before = identity(manifestPath);
-  await run(
-    'npm',
-    [
-      'install',
-      '--package-lock-only',
-      '--package-lock=true',
-      '--legacy-peer-deps=false',
-      '--force=false',
-      '--ignore-scripts',
-      '--include=dev',
-      '--strict-peer-deps',
-      '--workspaces=false',
-    ],
-    {
-      cwd: safePath(root, `apps/${app}`),
-      env: npmEnvironment(join(root, '.devkit/cache/npm'), registry),
-      quiet: true,
-    },
-  );
-  if (!same(identity(manifestPath), before)) {
-    fail(`npm changed the native manifest of ${app} during lock staging`);
+export async function finishNativeWorkspace(
+  root: string,
+  state: ProjectState,
+  seeds: LockSeed[],
+  registry?: string,
+): Promise<void> {
+  if (!nodeComponents(state).length) {
+    return;
   }
-  if (identity(safePath(root, `apps/${app}/package-lock.json`)) === null) {
-    fail(`npm did not produce a lockfile for ${app}`);
+  syncNodeWorkspace(root, state);
+  seedWorkspaceLock(root, state, seeds);
+  const before = captureProductGraph(root, state);
+  await regenerateWorkspaceLock(root, registry);
+  assertProductGraphsPreserved(before, readNativeGraph(root));
+  const deps = deriveComponentDependencies(root, state);
+  for (const [path, component] of Object.entries(state.components)) {
+    component.dependencies = deps[path as ComponentPath]!;
   }
+  for (const [path] of nodeComponents(state)) {
+    rmSync(join(root, path, 'package-lock.json'), { force: true });
+  }
+  collectNativeInputClosure(root, state);
 }
-
-function compose(apps: Record<string, AppState>, mixed: boolean): string {
-  let result =
-    '# Product-owned development services. Tool pins come from the accepted runtime.\nservices:\n';
-  for (const [name, app] of Object.entries(apps)) {
-    const rust = app.kind === 'rust';
-    const port = app.template === 'react-app' ? 5173 : 8080;
-    result += `  ${name}:\n    image: "\${${rust ? 'DEVKIT_RUST_IMAGE:?Run make setup' : 'DEVKIT_NODE_IMAGE:?'}}"\n    init: true\n    user: "\${DEVKIT_UID:?}:\${DEVKIT_GID:?}"\n    working_dir: /workspace/apps/${name}\n    command: ${rust ? '["cargo", "run", "--locked"]' : '["npm", "run", "dev"]'}\n    ports:\n      - "127.0.0.1::${port}"\n    environment:\n      HOME: /tmp/devkit-home\n`;
-    if (rust) {
-      result += `      CARGO_HOME: /cache/cargo\n      CARGO_TARGET_DIR: /workspace/apps/${name}/target\n      RUSTUP_AUTO_INSTALL: "0"\n`;
-    }
-    if (mixed && name === 'web') {
-      result += '      VITE_API_ENABLED: "true"\n      DEVKIT_API_TARGET: http://api:8080\n';
-    }
-    result += `    volumes:\n      - type: bind\n        source: "\${DEVKIT_PROJECT_ROOT:?}"\n        target: /workspace\n        read_only: true\n        bind: {create_host_path: false, selinux: z}\n`;
-    const mounts = rust
-      ? [
-          [`apps/${name}/target`, `/workspace/apps/${name}/target`],
-          ['.devkit/cache/cargo', '/cache/cargo'],
-        ]
-      : [
-          [`apps/${name}/node_modules`, `/workspace/apps/${name}/node_modules`],
-          [`apps/${name}/dist`, `/workspace/apps/${name}/dist`],
-        ];
-    for (const [source, target] of mounts) {
-      result += `      - type: bind\n        source: "\${DEVKIT_PROJECT_ROOT:?}/${source}"\n        target: ${target}\n        bind: {create_host_path: false, selinux: z}\n`;
-    }
-  }
-  return result;
-}
-
 function emptyTarget(target: string): void {
   if (existsSync(target) && readdirSync(target).some((entry) => entry !== '.git')) {
     fail('Target must be new or empty (existing .git metadata is preserved)');
   }
 }
-
 export async function initProject(
   releaseRoot: string,
   targetPath: string,
   options: InitOptions,
 ): Promise<ProjectState> {
-  const release = readRelease(releaseRoot);
-  const acceptedIdentity = releaseIdentity(releaseRoot);
-  if (!Object.hasOwn(templates, options.template)) {
-    fail(`Unknown template: ${options.template}`);
+  if (
+    [
+      options.apps !== undefined,
+      options.preset !== undefined,
+      options.template !== undefined,
+    ].filter(Boolean).length !== 1
+  ) {
+    fail('Choose exactly one of --app, --preset or --template');
   }
-  if (!['local', 'registry'].includes(options.packageMode)) {
-    fail(`Unknown package source: ${options.packageMode}`);
-  }
-  const target = projectRoot(targetPath);
-  const parent = dirname(target);
+  const release = readRelease(releaseRoot),
+    accepted = releaseIdentity(releaseRoot),
+    target = projectRoot(targetPath),
+    parent = dirname(target);
   if (!existsSync(parent)) {
     fail('Target parent directory must already exist');
   }
-  const suggested = basename(target)
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  const name = slug(options.name ?? suggested);
+  if (!['local', 'registry'].includes(options.packageMode)) {
+    fail('Invalid package source');
+  }
+  const name = slug(
+    options.name ??
+      basename(target)
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-+|-+$/g, ''),
+  );
   emptyTarget(target);
-  const stage = join(parent, `.devkit-init-${randomUUID()}`);
-  const apps: Record<string, AppState> = {};
+  const state: ProjectState = {
+    schemaVersion: 2,
+    version: release.version,
+    releaseIdentity: accepted,
+    generation: randomUUID(),
+    packageMode: options.packageMode,
+    managed: {},
+    components: {},
+  };
+  let specs: { role: ComponentRole; spec: ComponentSpec }[];
+  if (options.preset) {
+    if (options.preset !== 'fullstack-desktop' || options.apps || options.template) {
+      fail('Unknown or combined preset selection');
+    }
+    specs = [
+      { role: 'library', spec: { name: 'client', template: 'react-client' } },
+      { role: 'app', spec: { name: 'api', template: 'rust-api' } },
+      { role: 'app', spec: { name: 'web', template: 'react-web', uses: ['client'] } },
+      { role: 'app', spec: { name: 'desktop', template: 'electron-react', uses: ['client'] } },
+    ];
+  } else if (options.apps) {
+    specs = options.apps.map((spec) => ({ role: 'app', spec }));
+  } else if (options.template === 'mixed') {
+    specs = [
+      { role: 'app', spec: { name: 'api', template: 'rust-api' } },
+      { role: 'app', spec: { name: 'web', template: 'react-web' } },
+    ];
+  } else if (options.template) {
+    const id = templateId(options.template);
+    specs = [
+      {
+        role: 'app',
+        spec: {
+          name: id === 'node-api' ? 'main' : id === 'rust-api' ? 'api' : 'web',
+          template: id,
+        },
+      },
+    ];
+  } else {
+    fail('Init requires --app or --preset');
+  }
+  if (!specs.some((item) => item.role === 'app')) {
+    fail('Init requires an application');
+  }
+  const stage = join(parent, `.devkit-init-${randomUUID()}`),
+    seeds: LockSeed[] = [];
   try {
     mkdirSync(stage);
-    for (const [appName, template] of Object.entries(templates[options.template])) {
-      const source = safePath(releaseRoot, `templates/${template}`);
-      if (!existsSync(source)) {
-        fail(`Release is missing template ${template}`);
+    for (const item of specs) {
+      const rendered = renderComponent(
+        releaseRoot,
+        release,
+        stage,
+        name,
+        item.spec,
+        item.role,
+        options.packageMode,
+        state.components,
+      );
+      state.components[rendered.path] = rendered.state;
+      if (rendered.seed) {
+        seeds.push(rendered.seed);
       }
-      const destination = safePath(stage, `apps/${appName}`);
-      copyTree(source, destination);
-      const copied = fileMap(destination);
-      const expectedNames = Object.keys(release.files)
-        .filter((name) => name.startsWith(`templates/${template}/`))
-        .map((name) => name.slice(`templates/${template}/`.length))
-        .sort();
-      if (JSON.stringify(Object.keys(copied).sort()) !== JSON.stringify(expectedNames)) {
-        fail(`Template changed during generation: ${template}`);
-      }
-      for (const [name, actual] of Object.entries(copied)) {
-        if (!same(actual, release.files[`templates/${template}/${name}`] ?? null)) {
-          fail(`Template changed during generation: ${template}/${name}`);
-        }
-      }
-      if (options.template === 'mixed' && template === 'react-app') {
-        const entryPath = safePath(destination, 'src/main.tsx');
-        if (identity(entryPath) === null) {
-          fail('Mixed template contract changed: missing react-app/src/main.tsx');
-        }
-        const entry = readFileSync(entryPath, 'utf8');
-        const expected = '    <App />\n';
-        if (entry.split(expected).length !== 2) {
-          fail('Mixed template contract changed: expected exactly one standalone <App /> entry');
-        }
-        writeAtomic(entryPath, entry.replace(expected, '    <App apiEnabled />\n'));
-      }
-      const kind = template === 'rust-app' ? 'rust' : 'node';
-      const toolDependencies = templateTools(releaseRoot, release, template, options.packageMode);
-      apps[appName] = { kind, template, toolDependencies };
-      if (kind === 'node') {
-        const packagePath = join(destination, 'package.json');
-        const manifest = object(json(packagePath), 'package manifest');
-        manifest.name = `${name}-${appName}`;
-        manifest.devDependencies = toolDependencies;
-        writeJson(packagePath, manifest);
-        if (options.packageMode === 'registry') {
-          const lockPath = join(destination, 'package-lock.json');
-          const lock = object(json(lockPath), 'canonical package lock');
-          const packages = object(lock.packages, 'canonical lock packages');
-          const root = object(packages[''], 'canonical lock root');
-          lock.name = manifest.name;
-          root.name = manifest.name;
-          root.devDependencies = toolDependencies;
-          writeJson(lockPath, lock);
+    }
+    if (options.preset === 'fullstack-desktop' || options.template === 'mixed') {
+      for (const path of ['apps/web', 'apps/desktop'] as ComponentPath[]) {
+        if (state.components[path]?.development) {
+          state.components[path].development.api = 'apps/api';
         }
       }
     }
-    const managed = writeManaged(releaseRoot, release, stage, options.packageMode, apps);
-    for (const [appName, app] of Object.entries(apps)) {
-      if (app.kind === 'node' && options.packageMode === 'local') {
-        await regenerateLock(stage, appName, options.registry);
-      }
-    }
+    syncNodeWorkspace(stage, state, name);
+    state.managed = writeManaged(releaseRoot, release, stage, options.packageMode, state);
+    await finishNativeWorkspace(stage, state, seeds, options.registry);
+    state.managed = writeManaged(releaseRoot, release, stage, options.packageMode, state);
+    writeAtomic(join(stage, 'Makefile'), 'include .devkit/runtime/devkit.mk\n');
     writeAtomic(
-      join(stage, 'Makefile'),
-      `DEVKIT_APPS := ${Object.keys(apps).join(' ')}\ninclude .devkit/runtime/devkit.mk\n`,
+      join(stage, 'compose.yaml'),
+      '# Product-owned development overrides.\nservices: {}\n',
     );
-    writeAtomic(join(stage, 'compose.yaml'), compose(apps, options.template === 'mixed'));
     writeAtomic(
       join(stage, '.gitignore'),
-      '**/node_modules/\n**/dist/\n**/target/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n',
+      '**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n',
     );
     writeAtomic(
       join(stage, 'README.md'),
-      `# ${name}\n\nRun \`make setup\`, then \`make check build\`. Development: \`make dev\`, \`make status\`, \`make logs\`, \`make down\`.\n\nThe accepted toolkit identity and package source are recorded in \`.devkit/manifest.json\`; \`make doctor\` checks the prepared environment. Toolkit archives in local mode are part of this repository.\n\nApps are declared in the root Makefile. Register an added native app with the matching release's \`devkit register\` before adding it to DEVKIT_APPS. Root Makefile, Compose and app source belong to this project.\n`,
+      `# ${name}\n\nRun \`make setup\`, then \`make check build\`. Apps and packages use their native commands through the root Makefile. Use the accepted release's \`devkit add-app\` to add an app. Product source, root Make and Compose overrides belong to this project.\n`,
     );
-    const state: ProjectState = {
-      schemaVersion: 1,
-      version: release.version,
-      releaseIdentity: acceptedIdentity,
-      generation: randomUUID(),
-      packageMode: options.packageMode,
-      apps,
-      managed,
-    };
     writeJson(join(stage, manifestPath), state);
     rmSync(join(stage, '.devkit/cache'), { recursive: true, force: true });
-    // Revalidate an archive that could have changed while native locks were staged.
     readRelease(releaseRoot);
-    if (releaseIdentity(releaseRoot) !== acceptedIdentity) {
-      fail('Release changed while generating the project');
+    if (releaseIdentity(releaseRoot) !== accepted) {
+      fail('Release changed during generation');
     }
-    // The payload is complete and verified before the first target write.
-    fileMap(stage);
     emptyTarget(target);
     if (!existsSync(target)) {
       renameSync(stage, target);

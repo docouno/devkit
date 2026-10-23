@@ -92,6 +92,38 @@ export function safePath(root: string, name: string): string {
   return current;
 }
 
+/** Native input paths may contain spaces; they still cannot leave or redirect the checkout. */
+export function inputPath(root: string, name: string): string {
+  if (!name || name.includes('\0')) {
+    fail(`Invalid native input path: ${name}`);
+  }
+  const target = resolve(root, name);
+  const suffix = relative(root, target);
+  if (
+    !suffix ||
+    suffix.startsWith(`..${sep}`) ||
+    suffix === '..' ||
+    resolve(target) === resolve(root)
+  ) {
+    fail(`Native input escapes the project: ${name}`);
+  }
+  let current = root;
+  const parts = suffix.split(sep);
+  for (const [index, part] of parts.entries()) {
+    current = join(current, part);
+    if (existsSync(current) || isLink(current)) {
+      const info = lstatSync(current);
+      if (info.isSymbolicLink()) {
+        fail(`Symlink native input: ${name}`);
+      }
+      if (index < parts.length - 1 && !info.isDirectory()) {
+        fail(`Non-directory native input ancestor: ${name}`);
+      }
+    }
+  }
+  return target;
+}
+
 function isLink(path: string): boolean {
   try {
     return lstatSync(path).isSymbolicLink();

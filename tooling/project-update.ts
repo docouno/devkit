@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { componentPath, nodeComponents, profiles, templateId, templates } from './catalog.ts';
 import {
   copyTree,
   fail,
+  fileMap,
   identity,
   json,
   object,
@@ -11,7 +13,6 @@ import {
   relativePath,
   safePath,
   same,
-  slug,
   text,
   writeAtomic,
   writeJson,
@@ -19,22 +20,55 @@ import {
 import {
   assertManaged,
   assertNoPending,
-  excludedSnapshotPath,
   fileIdentity,
   managedPath,
   manifestPath,
   pendingPath,
   projectRoot,
-  projectState,
+  readProjectState,
+  snapshotExcluder,
   sourceSignature,
 } from './project-state.ts';
-import { regenerateLock, releaseIdentity, templateTools, writeManaged } from './project.ts';
+import {
+  profileTools,
+  releaseIdentity,
+  renderComponent,
+  syncNodeWorkspace,
+  writeManaged,
+} from './project.ts';
+import type { ComponentSpec } from './project.ts';
+import {
+  assertNpmrcCompatibility,
+  assertProductGraphsPreserved,
+  captureProductGraph,
+  readNativeGraph,
+  regenerateWorkspaceLock,
+  seedWorkspaceLock,
+} from './native-graph.ts';
+import type { LockSeed } from './native-graph.ts';
+import {
+  assertNativeComponents,
+  assertComponentManifests,
+  assertPackageLockMode,
+  assertToolProfiles,
+  collectNativeInputClosure,
+  deriveComponentDependencies,
+  nativeManifest,
+} from './native-workspace.ts';
+import { assertComposeInventory } from './compose-inputs.ts';
+import { renderWorkspaceCompose } from './workspace-compose.ts';
+import { normalizeLegacyLockIdentities } from './lock-identities.ts';
 import type {
-  AppState,
+  AnyProjectState,
+  ComponentPath,
+  ComponentRole,
+  ComponentState,
+  ComposeInventory,
   FileIdentity,
   PackageMode,
   PlannedFile,
   ProjectState,
+  ToolingProfile,
   UpdateJournal,
 } from './types.ts';
 
@@ -46,55 +80,89 @@ export interface UpdateOptions {
   packageMode?: PackageMode;
   registry?: string;
   hooks?: UpdateHooks;
+  composeInventory?: ComposeInventory;
 }
-
-function optionalIdentity(value: unknown, label: string): FileIdentity | null {
-  return value === null ? null : fileIdentity(value, label);
-}
-function transactionPath(name: string): string {
+function transactionPath(name: string, created: string[] = []): string {
   relativePath(name);
-  if (name === manifestPath || /^apps\/[a-z][a-z0-9-]*\/package(?:-lock)?\.json$/.test(name)) {
+  if (
+    name === manifestPath ||
+    ['package.json', 'package-lock.json'].includes(name) ||
+    /^(apps|packages)\/[a-z][a-z0-9-]*\/package(?:-lock)?\.json$/.test(name) ||
+    created.some((dir) => name.startsWith(`${dir}/`))
+  ) {
     return name;
   }
   return managedPath(name);
 }
-
+function optionalIdentity(value: unknown, label: string): FileIdentity | null {
+  return value === null ? null : fileIdentity(value, label);
+}
 function journal(root: string): UpdateJournal {
   const raw = object(json(safePath(root, pendingPath)), 'update journal');
-  if (raw.schemaVersion !== 1 || !Array.isArray(raw.files)) {
+  if (![1, 2].includes(Number(raw.schemaVersion)) || !Array.isArray(raw.files)) {
     fail('Unsupported update journal');
   }
   const stage = text(raw.stage, 'update stage');
   if (!/^\.devkit\/state\/update-[a-f0-9-]{36}$/.test(stage)) {
-    fail('Invalid update stage path');
+    fail('Invalid update stage');
   }
-  safePath(root, stage);
+  const created =
+    raw.createdDirectories === undefined
+      ? []
+      : Array.isArray(raw.createdDirectories)
+        ? raw.createdDirectories.map((item) => text(item, 'created directory'))
+        : fail('Invalid created directories');
+  for (const dir of created) {
+    if (!/^(apps|packages)\/[a-z][a-z0-9-]*$/.test(dir)) {
+      fail('Invalid created component directory');
+    }
+  }
   const names = new Set<string>();
+  const parents =
+    raw.createdParents === undefined
+      ? []
+      : Array.isArray(raw.createdParents)
+        ? raw.createdParents.map((value) => text(value, 'created parent'))
+        : fail('Invalid created parents');
+  if (
+    parents.some((name) => !['apps', 'packages'].includes(name)) ||
+    new Set(parents).size !== parents.length
+  ) {
+    fail('Invalid created parent directories');
+  }
   const files = raw.files.map((value, index): PlannedFile => {
-    const file = object(value, 'journal file');
-    const path = transactionPath(text(file.path, 'journal target'));
+    const file = object(value, 'journal file'),
+      path = transactionPath(text(file.path, 'target'), created);
     if (names.has(path)) {
       fail(`Duplicate journal target: ${path}`);
     }
     names.add(path);
-    const before = optionalIdentity(file.before, `before ${path}`);
-    const after = optionalIdentity(file.after, `after ${path}`);
+    const before = optionalIdentity(file.before, path),
+      after = optionalIdentity(file.after, path);
     if (same(before, after)) {
       fail(`Unchanged journal target: ${path}`);
     }
-    const backup = before === null ? null : `${stage}/backup/${index}`;
-    const staged = after === null ? null : `${stage}/staged/${index}`;
+    if (created.some((dir) => path.startsWith(`${dir}/`)) && before !== null) {
+      fail('New component journal overwrites existing source');
+    }
+    const backup = before === null ? null : `${stage}/backup/${index}`,
+      staged = after === null ? null : `${stage}/staged/${index}`;
     if (file.backup !== backup || file.staged !== staged) {
       fail(`Invalid saved path: ${path}`);
     }
     return { path, before, after, backup, staged };
   });
-  if (files.length === 0 || !names.has(manifestPath)) {
-    fail('Update journal is missing the accepted manifest');
+  if (!files.length || !names.has(manifestPath)) {
+    fail('Journal is missing accepted manifest');
   }
-  return { schemaVersion: 1, stage, files };
+  return {
+    schemaVersion: raw.schemaVersion as 1 | 2,
+    stage,
+    files,
+    createdDirectories: created,
+    createdParents: parents,
+  };
 }
-
 function verifySaved(root: string, file: PlannedFile): void {
   if (file.backup !== null && !same(identity(safePath(root, file.backup)), file.before)) {
     fail(`Update backup integrity mismatch: ${file.path}`);
@@ -103,8 +171,19 @@ function verifySaved(root: string, file: PlannedFile): void {
     fail(`Update staged integrity mismatch: ${file.path}`);
   }
 }
-
-/** A pending transaction is always recovered to its pre-update state. */
+function pruneEmpty(directory: string): void {
+  if (!existsSync(directory)) {
+    return;
+  }
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      pruneEmpty(join(directory, entry.name));
+    }
+  }
+  if (!readdirSync(directory).length) {
+    rmdirSync(directory);
+  }
+}
 export function recoverProject(target: string): boolean {
   const root = projectRoot(target);
   safePath(root, '.devkit/state/task.lock');
@@ -112,172 +191,122 @@ export function recoverProject(target: string): boolean {
   if (pending === null) {
     return false;
   }
-  const transaction = journal(root);
-  // Validate every file first: an editor's unknown bytes must never be overwritten.
-  for (const file of transaction.files) {
+  const tx = journal(root);
+  for (const dir of tx.createdDirectories ?? []) {
+    if (existsSync(safePath(root, dir))) {
+      for (const name of Object.keys(fileMap(safePath(root, dir)))) {
+        if (!tx.files.some((file) => file.path === `${dir}/${name}`)) {
+          fail(`Recovery conflict: unknown file ${dir}/${name}`);
+        }
+      }
+    }
+  }
+  for (const file of tx.files) {
     verifySaved(root, file);
     const actual = identity(safePath(root, file.path));
     if (!same(actual, file.before) && !same(actual, file.after)) {
-      fail(
-        `Recovery conflict: ${file.path}; preserve your edits and restore a known before/after state`,
-      );
+      fail(`Recovery conflict: ${file.path}; restore a known before/after state`);
     }
   }
   if (!same(identity(safePath(root, pendingPath)), pending)) {
     fail('Update journal changed during recovery');
   }
-  for (const file of [...transaction.files].reverse()) {
-    const path = safePath(root, file.path);
-    const actual = identity(path);
-    if (same(actual, file.before)) {
+  for (const file of [...tx.files].reverse()) {
+    if (same(identity(safePath(root, file.path)), file.before)) {
       continue;
-    }
-    if (!same(actual, file.after)) {
-      fail(`Recovery conflict: ${file.path}`);
     }
     if (file.backup === null) {
-      rmSync(path, { force: true });
+      rmSync(safePath(root, file.path), { force: true });
     } else {
-      writeAtomic(path, readFileSync(safePath(root, file.backup)), file.before!.mode);
-    }
-  }
-  rmSync(safePath(root, pendingPath));
-  rmSync(safePath(root, transaction.stage), { recursive: true });
-  return true;
-}
-
-function assertRegisteredApps(root: string, state: ProjectState): void {
-  const appsRoot = safePath(root, 'apps');
-  for (const entry of readdirSync(appsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
-      continue;
-    }
-    const native = ['package.json', 'Cargo.toml'].some((file) =>
-      existsSync(join(appsRoot, entry.name, file)),
-    );
-    if (native && !Object.hasOwn(state.apps, entry.name)) {
-      fail(
-        `Unregistered native app: apps/${entry.name}; run devkit register with the accepted release before updating`,
+      writeAtomic(
+        safePath(root, file.path),
+        readFileSync(safePath(root, file.backup)),
+        file.before!.mode,
       );
     }
   }
+  for (const dir of tx.createdDirectories ?? []) {
+    pruneEmpty(safePath(root, dir));
+  }
+  for (const parent of tx.createdParents ?? []) {
+    const path = safePath(root, parent);
+    if (existsSync(path) && readdirSync(path).length === 0) {
+      rmdirSync(path);
+    }
+  }
+  rmSync(safePath(root, pendingPath));
+  rmSync(safePath(root, tx.stage), { recursive: true });
+  return true;
 }
-
-function verifyAppOwnership(root: string, name: string, app: AppState): void {
-  const appRoot = safePath(root, `apps/${name}`);
-  if (!existsSync(appRoot)) {
-    fail(`Registered app is missing: ${name}`);
-  }
-  if (app.kind === 'rust') {
-    if (
-      identity(safePath(root, `apps/${name}/Cargo.toml`)) === null ||
-      identity(safePath(root, `apps/${name}/Cargo.lock`)) === null
-    ) {
-      fail(`Rust app ${name} requires native manifest and lock`);
-    }
-    if (existsSync(join(appRoot, 'package.json'))) {
-      fail(`Ambiguous native manifest: ${name}`);
-    }
-    return;
-  }
-  if (existsSync(join(appRoot, 'Cargo.toml'))) {
-    fail(`Ambiguous native manifest: ${name}`);
-  }
-  const manifest = object(json(safePath(root, `apps/${name}/package.json`)), `manifest of ${name}`);
-  const dependencies = object(manifest.devDependencies, `devDependencies of ${name}`);
-  for (const [dependency, expected] of Object.entries(app.toolDependencies)) {
-    if (dependencies[dependency] !== expected) {
-      fail(`Tool dependency conflict: apps/${name}/package.json devDependencies.${dependency}`);
-    }
-  }
-  if (identity(safePath(root, `apps/${name}/package-lock.json`)) === null) {
-    fail(`App ${name} is missing its package lock`);
-  }
-}
-
-function nativeManifestTools(root: string, name: string, old: AppState, next: AppState): void {
-  const path = safePath(root, `apps/${name}/package.json`);
-  const manifest = object(json(path), `manifest of ${name}`);
-  const dependencies = object(manifest.devDependencies, `devDependencies of ${name}`);
-  for (const dependency of Object.keys(old.toolDependencies)) {
-    delete dependencies[dependency];
-  }
-  for (const [dependency, spec] of Object.entries(next.toolDependencies)) {
-    if (manifest.dependencies !== undefined) {
-      const production = object(manifest.dependencies, `dependencies of ${name}`);
-      if (Object.hasOwn(production, dependency) && production[dependency] !== spec) {
-        fail(`Tool dependency conflicts with product dependency: ${name}/${dependency}`);
-      }
-    }
-    if (
-      !Object.hasOwn(old.toolDependencies, dependency) &&
-      Object.hasOwn(dependencies, dependency) &&
-      dependencies[dependency] !== spec
-    ) {
-      fail(`New tool dependency conflicts with project dependency: ${name}/${dependency}`);
-    }
-    dependencies[dependency] = spec;
-  }
-  writeJson(path, manifest);
-}
-
 function commitUpdate(
   root: string,
   stageName: string,
   stagedRoot: string,
   next: ProjectState,
-  old: ProjectState,
+  old: AnyProjectState,
   expectedSource: string,
-  hooks?: UpdateHooks,
+  created: string[],
+  options: UpdateOptions,
 ): void {
-  const allPaths = new Set([
+  const paths = new Set([
     ...Object.keys(old.managed),
     ...Object.keys(next.managed),
     manifestPath,
+    'package.json',
+    'package-lock.json',
   ]);
-  for (const [name, app] of Object.entries(next.apps)) {
-    if (app.kind === 'node') {
-      allPaths.add(`apps/${name}/package.json`);
-      allPaths.add(`apps/${name}/package-lock.json`);
+  for (const path of Object.keys(next.components)) {
+    if (next.components[path as ComponentPath]!.toolchain === 'node') {
+      paths.add(`${path}/package.json`);
+      paths.add(`${path}/package-lock.json`);
     }
   }
-  // Preserve unknown state metadata, as well as native package fields.
-  const oldRaw = object(json(safePath(root, manifestPath)), 'project manifest');
-  const oldApps = object(oldRaw.apps, 'registered apps');
-  writeJson(safePath(stagedRoot, manifestPath), {
-    ...oldRaw,
+  for (const dir of created) {
+    for (const file of Object.keys(fileMap(safePath(stagedRoot, dir)))) {
+      paths.add(`${dir}/${file}`);
+    }
+  }
+  const raw = object(json(safePath(root, manifestPath)), 'old manifest');
+  const previous = old.schemaVersion === 2 ? object(raw.components, 'old components') : {};
+  const merged: Record<string, unknown> = {
+    ...raw,
     ...next,
-    apps: Object.fromEntries(
-      Object.entries(next.apps).map(([name, app]) => [
-        name,
-        { ...(oldApps[name] === undefined ? {} : object(oldApps[name], name)), ...app },
+    components: Object.fromEntries(
+      Object.entries(next.components).map(([path, component]) => [
+        path,
+        { ...object(previous[path] ?? {}, path), ...component },
       ]),
     ),
-  });
+  };
+  delete merged.apps;
+  writeJson(safePath(stagedRoot, manifestPath), merged);
   const files: PlannedFile[] = [];
-  for (const name of [...allPaths].sort((a, b) =>
+  for (const name of [...paths].sort((a, b) =>
     a === manifestPath ? 1 : b === manifestPath ? -1 : a.localeCompare(b),
   )) {
-    transactionPath(name);
-    const before = identity(safePath(root, name));
-    const after = identity(safePath(stagedRoot, name));
+    transactionPath(name, created);
+    const before = identity(safePath(root, name)),
+      after = identity(safePath(stagedRoot, name));
     if (same(before, after)) {
       continue;
     }
-    const index = files.length;
-    const backup = before === null ? null : `${stageName}/backup/${index}`;
-    const staged = after === null ? null : `${stageName}/staged/${index}`;
-    if (backup !== null) {
+    const index = files.length,
+      backup = before === null ? null : `${stageName}/backup/${index}`,
+      staged = after === null ? null : `${stageName}/staged/${index}`;
+    if (backup) {
       writeAtomic(safePath(root, backup), readFileSync(safePath(root, name)), before!.mode);
     }
-    if (staged !== null) {
+    if (staged) {
       writeAtomic(safePath(root, staged), readFileSync(safePath(stagedRoot, name)), after!.mode);
     }
     files.push({ path: name, before, after, backup, staged });
   }
-  hooks?.afterStage?.();
-  if (sourceSignature(root) !== expectedSource) {
+  options.hooks?.afterStage?.();
+  if (sourceSignature(root, old) !== expectedSource) {
     fail('Project changed while staging the update; retry after reviewing concurrent edits');
+  }
+  if (options.composeInventory) {
+    assertComposeInventory(root, options.composeInventory);
   }
   for (const file of files) {
     if (!same(identity(safePath(root, file.path)), file.before)) {
@@ -285,121 +314,436 @@ function commitUpdate(
     }
   }
   assertNoPending(root);
-  const transaction: UpdateJournal = {
-    schemaVersion: 1,
+  const createdParents = [...new Set(created.map((path) => path.split('/')[0]!))].filter(
+    (path) => !existsSync(safePath(root, path)),
+  );
+  writeJson(safePath(root, pendingPath), {
+    schemaVersion: 2,
     stage: stageName,
     files,
-  };
-  writeJson(safePath(root, pendingPath), transaction);
+    createdDirectories: created,
+    createdParents,
+  });
   try {
     for (const [index, file] of files.entries()) {
-      const path = safePath(root, file.path);
-      if (!same(identity(path), file.before)) {
+      if (!same(identity(safePath(root, file.path)), file.before)) {
         fail(`Concurrent update conflict: ${file.path}`);
       }
       verifySaved(root, file);
       if (file.staged === null) {
-        rmSync(path, { force: true });
+        rmSync(safePath(root, file.path), { force: true });
       } else {
-        writeAtomic(path, readFileSync(safePath(root, file.staged)), file.after!.mode);
+        writeAtomic(
+          safePath(root, file.path),
+          readFileSync(safePath(root, file.staged)),
+          file.after!.mode,
+        );
       }
-      hooks?.afterWrite?.(index + 1);
+      options.hooks?.afterWrite?.(index + 1);
     }
     rmSync(safePath(root, pendingPath));
   } catch (error) {
     try {
       recoverProject(root);
-    } catch (recoveryError) {
+    } catch (rollback) {
       fail(
-        `${String(error)}; automatic rollback was blocked: ${String(recoveryError)}. Run devkit recover after resolving the conflict.`,
+        `${String(error)}; automatic rollback was blocked: ${String(rollback)}. Run devkit recover.`,
       );
     }
     throw error;
   }
 }
-
-export async function updateProject(
+function migrateState(old: AnyProjectState): ProjectState {
+  if (old.schemaVersion === 2) {
+    return structuredClone(old);
+  }
+  const components: ProjectState['components'] = {};
+  for (const [name, app] of Object.entries(old.apps)) {
+    const id = templateId(app.template),
+      definition = templates[id];
+    components[componentPath('app', name)] = {
+      role: 'app',
+      toolchain: app.kind,
+      toolingProfile: definition.toolingProfile,
+      origin: { template: app.template, version: old.version },
+      toolDependencies: app.toolDependencies,
+      dependencies: [],
+      development: { owner: 'project', kind: 'compose', service: name },
+    };
+  }
+  return {
+    schemaVersion: 2,
+    version: old.version,
+    releaseIdentity: old.releaseIdentity,
+    generation: old.generation,
+    packageMode: old.packageMode,
+    managed: old.managed,
+    components,
+  };
+}
+function verifyOldTools(root: string, state: ProjectState): void {
+  assertComponentManifests(root, state);
+  for (const [path, component] of Object.entries(state.components)) {
+    if (component.toolchain === 'rust') {
+      for (const file of ['Cargo.toml', 'Cargo.lock']) {
+        if (identity(safePath(root, `${path}/${file}`)) === null) {
+          fail(`Missing native ${path}/${file}`);
+        }
+      }
+      continue;
+    }
+    const manifest = nativeManifest(root, path),
+      deps = object(manifest.devDependencies, 'native devDependencies');
+    for (const [name, value] of Object.entries(component.toolDependencies)) {
+      if (deps[name] !== value) {
+        fail(`Tool dependency conflict: ${path}/package.json devDependencies.${name}`);
+      }
+    }
+  }
+}
+function updateTools(
+  root: string,
+  path: ComponentPath,
+  old: ComponentState,
+  next: ComponentState,
+): void {
+  const manifest = nativeManifest(root, path),
+    deps = object(manifest.devDependencies, 'native devDependencies');
+  for (const name of Object.keys(old.toolDependencies)) {
+    delete deps[name];
+  }
+  for (const [name, value] of Object.entries(next.toolDependencies)) {
+    if (
+      (Object.hasOwn(deps, name) && deps[name] !== value) ||
+      (object(manifest.dependencies ?? {}, 'dependencies')[name] !== undefined &&
+        object(manifest.dependencies, 'dependencies')[name] !== value)
+    ) {
+      fail(`New tool dependency conflicts with project dependency: ${path}/${name}`);
+    }
+    deps[name] = value;
+  }
+  writeJson(safePath(root, `${path}/package.json`), manifest);
+}
+type Change =
+  | { kind: 'add'; role: ComponentRole; spec: ComponentSpec }
+  | { kind: 'register'; role: ComponentRole; name: string; profile: ToolingProfile };
+async function mutate(
   releaseRoot: string,
   target: string,
-  options: UpdateOptions = {},
+  options: UpdateOptions,
+  change?: Change,
 ): Promise<ProjectState> {
-  const release = readRelease(releaseRoot);
-  const root = projectRoot(target);
+  const release = readRelease(releaseRoot),
+    root = projectRoot(target);
   safePath(root, '.devkit/state/task.lock');
   assertNoPending(root);
-  const old = projectState(root);
+  const old = readProjectState(root);
   assertManaged(root, old);
-  assertRegisteredApps(root, old);
-  for (const [name, app] of Object.entries(old.apps)) {
-    verifyAppOwnership(root, name, app);
+  if (options.composeInventory) {
+    assertComposeInventory(root, options.composeInventory);
   }
-  const nextIdentity = releaseIdentity(releaseRoot);
-  const mode = options.packageMode ?? old.packageMode;
-  if (mode !== 'local' && mode !== 'registry') {
-    fail('Invalid package source');
+  const next = migrateState(old);
+  if (old.schemaVersion === 1) {
+    for (const [path] of nodeComponents(next)) {
+      if (identity(safePath(root, `${path}/npm-shrinkwrap.json`)) !== null) {
+        fail(`Legacy npm-shrinkwrap.json conflicts with package-lock migration: ${path}`);
+      }
+    }
   }
-  if (old.version === release.version && old.releaseIdentity !== nextIdentity) {
+  if (
+    nodeComponents(next).length ||
+    (change?.kind === 'add' && templates[templateId(change.spec.template)].toolchain === 'node') ||
+    (change?.kind === 'register' && change.profile !== 'rust')
+  ) {
+    assertPackageLockMode(root);
+  }
+  if (old.schemaVersion === 2) {
+    assertToolProfiles(root, old);
+  }
+  verifyOldTools(root, next);
+  if (old.schemaVersion === 2 && nodeComponents(old).length) {
+    const actual = nativeManifest(root, '').workspaces;
+    const expected = nodeComponents(old).map(([path]) => path);
+    const adopting =
+      change?.kind === 'register' ? componentPath(change.role, change.name) : undefined;
+    if (
+      JSON.stringify(actual) !== JSON.stringify(expected) &&
+      (!adopting || JSON.stringify(actual) !== JSON.stringify([...expected, adopting].sort()))
+    ) {
+      fail('Root npm workspace membership conflicts with accepted registration');
+    }
+  }
+  if (change && releaseIdentity(releaseRoot) !== old.releaseIdentity) {
+    fail('Add/register requires the exact accepted release');
+  }
+  if (old.version === release.version && old.releaseIdentity !== releaseIdentity(releaseRoot)) {
     fail('A different release has the same version; use a distinctly versioned release');
   }
-  if (old.releaseIdentity === nextIdentity && mode === old.packageMode) {
-    return old;
+  const mode = options.packageMode ?? old.packageMode;
+  if (!['local', 'registry'].includes(mode)) {
+    fail('Invalid package source');
   }
-  const expectedSource = sourceSignature(root);
-  const stageName = `.devkit/state/update-${randomUUID()}`;
-  const stage = safePath(root, stageName);
-  const stagedRoot = join(stage, 'project');
+  if (
+    !change &&
+    old.schemaVersion === 2 &&
+    old.releaseIdentity === releaseIdentity(releaseRoot) &&
+    mode === old.packageMode
+  ) {
+    try {
+      assertNativeComponents(root, old);
+      if (
+        readFileSync(safePath(root, '.devkit/compose.workspace.json'), 'utf8') ===
+        renderWorkspaceCompose(old, collectNativeInputClosure(root, old))
+      ) {
+        return old;
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('projection is stale')) {
+        throw error;
+      }
+    }
+  }
+  const expectedSource = sourceSignature(root, old),
+    stageName = `.devkit/state/update-${randomUUID()}`,
+    stage = safePath(root, stageName),
+    stagedRoot = join(stage, 'project');
   mkdirSync(stage, { recursive: true });
   try {
-    copyTree(root, stagedRoot, {
-      ignore: excludedSnapshotPath,
-      preserveLinks: true,
-    });
-    const apps: Record<string, AppState> = {};
-    for (const [name, app] of Object.entries(old.apps)) {
-      apps[name] = {
-        ...app,
-        toolDependencies: templateTools(releaseRoot, release, app.template, mode),
+    copyTree(root, stagedRoot, { ignore: snapshotExcluder(old), preserveLinks: true });
+    let seeds: LockSeed[] = [];
+    const legacyLocks: Record<string, FileIdentity> = {};
+    if (old.schemaVersion === 1 && nodeComponents(next).length) {
+      if (existsSync(join(root, 'package-lock.json'))) {
+        fail('Unmanaged root package-lock.json conflicts with migration');
+      }
+      if (existsSync(join(root, 'package.json'))) {
+        const native = nativeManifest(root, '');
+        if (
+          native.workspaces !== undefined ||
+          ['dependencies', 'devDependencies', 'optionalDependencies'].some(
+            (field) => Object.keys(object(native[field] ?? {}, field)).length,
+          )
+        ) {
+          fail('Unmanaged root npm graph conflicts with migration');
+        }
+      }
+      assertNpmrcCompatibility(
+        stagedRoot,
+        nodeComponents(next).map(([path]) => path),
+      );
+      seeds = nodeComponents(next).map(([path]) => ({
+        prefix: path,
+        lock: json(safePath(stagedRoot, `${path}/package-lock.json`)),
+      }));
+      for (const [path] of nodeComponents(next)) {
+        legacyLocks[`${path}/package-lock.json`] = identity(
+          safePath(stagedRoot, `${path}/package-lock.json`),
+        )!;
+      }
+    } else if (nodeComponents(next).length) {
+      seeds.push({ prefix: '', lock: json(join(stagedRoot, 'package-lock.json')) });
+    }
+    const created: string[] = [];
+    if (change?.kind === 'add') {
+      const path = componentPath(change.role, change.spec.name);
+      if (Object.hasOwn(next.components, path) || existsSync(safePath(root, path))) {
+        fail(`Component path already exists: ${path}`);
+      }
+      if (change.role === 'app') {
+        if (!options.composeInventory) {
+          fail('Adding a managed service requires admitted Compose inventory');
+        }
+        if (options.composeInventory.services.includes(change.spec.name)) {
+          fail(`Compose service conflict: ${change.spec.name}`);
+        }
+      }
+      const name = existsSync(join(stagedRoot, 'package.json'))
+        ? String(nativeManifest(stagedRoot, '').name)
+            .replace(/^@/, '')
+            .replace(/[^a-z0-9-]+/g, '-')
+        : basename(root)
+            .toLowerCase()
+            .replace(/[^a-z0-9-]+/g, '-');
+      const rendered = renderComponent(
+        releaseRoot,
+        release,
+        stagedRoot,
+        name,
+        change.spec,
+        change.role,
+        mode,
+        next.components,
+      );
+      next.components[rendered.path] = rendered.state;
+      created.push(rendered.path);
+      if (rendered.seed) {
+        seeds.push(rendered.seed);
+      }
+    } else if (change?.kind === 'register') {
+      const path = componentPath(change.role, change.name);
+      if (Object.hasOwn(next.components, path)) {
+        fail(`Component is already registered: ${path}`);
+      }
+      const tools = profileTools(releaseRoot, release, change.profile, mode);
+      const toolchain = change.profile === 'rust' ? 'rust' : 'node';
+      next.components[path] = {
+        role: change.role,
+        toolchain,
+        toolingProfile: change.profile,
+        origin: { template: 'adopted', version: release.version },
+        toolDependencies: tools,
+        dependencies: [],
+        ...(change.role === 'app'
+          ? {
+              development: {
+                owner: 'project' as const,
+                kind: 'compose' as const,
+                service: change.name,
+              },
+            }
+          : {}),
+      };
+      verifyOldTools(stagedRoot, next);
+      if (toolchain === 'node') {
+        const lockPath = join(stagedRoot, path, 'package-lock.json');
+        if (existsSync(lockPath)) {
+          seeds.push({ prefix: path, lock: json(lockPath) });
+        } else if (
+          !existsSync(join(stagedRoot, 'package-lock.json')) ||
+          !Object.hasOwn(
+            object(
+              object(json(join(stagedRoot, 'package-lock.json')), 'root lock').packages,
+              'lock packages',
+            ),
+            path,
+          )
+        ) {
+          fail('Adopted Node component requires admitted native lock membership');
+        }
+      }
+    }
+    syncNodeWorkspace(stagedRoot, next);
+    if (nodeComponents(next).length) {
+      seedWorkspaceLock(stagedRoot, next, seeds);
+    }
+    if (old.schemaVersion === 1 && nodeComponents(next).length) {
+      const normalized = await normalizeLegacyLockIdentities(
+        json(join(stagedRoot, 'package-lock.json')),
+        {
+          projectRoot: stagedRoot,
+          cwd: stagedRoot,
+          cache: join(stagedRoot, '.devkit/cache/npm'),
+          ...(options.registry === undefined ? {} : { registry: options.registry }),
+        },
+      );
+      writeJson(join(stagedRoot, 'package-lock.json'), normalized.lock);
+      next.legacyIdentityNormalization = {
+        schemaVersion: 1,
+        basis: 'exact-version-registry-metadata-observed-at-update',
+        source: {
+          schemaVersion: 1,
+          version: old.version,
+          releaseIdentity: old.releaseIdentity,
+          locks: legacyLocks,
+        },
+        normalizedRegistryEntries: normalized.normalizedRegistryEntries,
+        localArchiveInputs: normalized.localArchives,
       };
     }
-    for (const name of Object.keys(old.managed)) {
-      rmSync(safePath(stagedRoot, name), { force: true });
+    const product = nodeComponents(next).length ? captureProductGraph(stagedRoot, next) : undefined;
+    const oldComponents = structuredClone(next.components);
+    for (const [path, component] of Object.entries(next.components) as [
+      ComponentPath,
+      ComponentState,
+    ][]) {
+      component.toolDependencies = profileTools(
+        releaseRoot,
+        release,
+        component.toolingProfile,
+        mode,
+      );
+      if (component.toolchain === 'node') {
+        updateTools(stagedRoot, path, oldComponents[path]!, component);
+      }
     }
-    const managed = writeManaged(releaseRoot, release, stagedRoot, mode, apps);
-    for (const name of Object.keys(managed)) {
-      if (!Object.hasOwn(old.managed, name) && identity(safePath(root, name)) !== null) {
+    next.packageMode = mode;
+    next.version = release.version;
+    next.releaseIdentity = releaseIdentity(releaseRoot);
+    next.generation = randomUUID();
+    next.managed = writeManaged(releaseRoot, release, stagedRoot, mode, next);
+    for (const name of Object.keys(old.managed)) {
+      if (!Object.hasOwn(next.managed, name)) {
+        rmSync(safePath(stagedRoot, name), { force: true });
+      }
+    }
+    if (product) {
+      await regenerateWorkspaceLock(stagedRoot, options.registry);
+      assertProductGraphsPreserved(product, readNativeGraph(stagedRoot));
+    }
+    for (const [path] of nodeComponents(next)) {
+      rmSync(safePath(stagedRoot, `${path}/package-lock.json`), { force: true });
+    }
+    const deps = deriveComponentDependencies(stagedRoot, next);
+    for (const [path, component] of Object.entries(next.components)) {
+      component.dependencies = deps[path as ComponentPath]!;
+    }
+    next.managed = writeManaged(releaseRoot, release, stagedRoot, mode, next);
+    for (const name of Object.keys(next.managed)) {
+      if (
+        !Object.hasOwn(old.managed, name) &&
+        identity(safePath(root, name)) !== null &&
+        !(
+          change?.kind === 'register' &&
+          name === `${componentPath(change.role, change.name)}/rust-toolchain.toml` &&
+          same(identity(safePath(root, name)), next.managed[name]!)
+        )
+      ) {
         fail(`New managed file conflicts with project content: ${name}`);
       }
     }
-    for (const [name, app] of Object.entries(apps)) {
-      if (app.kind === 'node') {
-        nativeManifestTools(stagedRoot, name, old.apps[name]!, app);
-        await regenerateLock(stagedRoot, name, options.registry);
-      }
-    }
-    const next: ProjectState = {
-      schemaVersion: 1,
-      version: release.version,
-      releaseIdentity: nextIdentity,
-      generation: randomUUID(),
-      packageMode: mode,
-      managed,
-      apps,
-    };
+    assertNativeComponents(stagedRoot, next);
+    collectNativeInputClosure(stagedRoot, next);
     readRelease(releaseRoot);
-    if (releaseIdentity(releaseRoot) !== nextIdentity) {
-      fail('Release changed while staging the update');
+    if (releaseIdentity(releaseRoot) !== next.releaseIdentity) {
+      fail('Release changed while staging');
     }
-    commitUpdate(root, stageName, stagedRoot, next, old, expectedSource, options.hooks);
+    commitUpdate(root, stageName, stagedRoot, next, old, expectedSource, created, options);
     return next;
   } finally {
-    // On process interruption this block does not run; pending state retains its backups.
     if (!existsSync(safePath(root, pendingPath))) {
       rmSync(stage, { recursive: true, force: true });
     }
   }
 }
-
-/** Adopt an existing native app; adding it to DEVKIT_APPS remains a project Make edit. */
+export async function updateProject(
+  releaseRoot: string,
+  target: string,
+  options: UpdateOptions = {},
+): Promise<ProjectState> {
+  return mutate(releaseRoot, target, options);
+}
+export async function addProjectComponent(
+  releaseRoot: string,
+  target: string,
+  role: ComponentRole,
+  spec: ComponentSpec,
+  options: UpdateOptions = {},
+): Promise<ProjectState> {
+  return mutate(releaseRoot, target, options, { kind: 'add', role, spec });
+}
+export async function registerProjectComponent(
+  releaseRoot: string,
+  target: string,
+  role: ComponentRole,
+  name: string,
+  profile: ToolingProfile,
+  options: UpdateOptions = {},
+): Promise<ProjectState> {
+  if (!profiles[profile] || !profiles[profile].roles.includes(role)) {
+    fail(`Tooling profile ${profile} cannot register a ${role}`);
+  }
+  return mutate(releaseRoot, target, options, { kind: 'register', role, name, profile });
+}
 export async function registerProjectApp(
   releaseRoot: string,
   target: string,
@@ -407,80 +751,12 @@ export async function registerProjectApp(
   template: 'node' | 'react' | 'rust',
   options: UpdateOptions = {},
 ): Promise<ProjectState> {
-  slug(name);
-  if (!['node', 'react', 'rust'].includes(template)) {
-    fail(`Unknown app template: ${template}`);
-  }
-  const release = readRelease(releaseRoot);
-  const root = projectRoot(target);
-  safePath(root, '.devkit/state/task.lock');
-  assertNoPending(root);
-  const old = projectState(root);
-  assertManaged(root, old);
-  if (old.releaseIdentity !== releaseIdentity(releaseRoot)) {
-    fail("Register apps using the project's exact accepted release");
-  }
-  if (Object.hasOwn(old.apps, name)) {
-    fail(`App is already registered: ${name}`);
-  }
-  for (const [appName, app] of Object.entries(old.apps)) {
-    verifyAppOwnership(root, appName, app);
-  }
-  const templateName = `${template === 'react' ? 'react' : template === 'rust' ? 'rust' : 'node'}-app`;
-  const app: AppState = {
-    kind: template === 'rust' ? 'rust' : 'node',
-    template: templateName,
-    toolDependencies: templateTools(releaseRoot, release, templateName, old.packageMode),
-  };
-  verifyAppOwnership(root, name, app);
-  if (app.kind === 'node') {
-    const manifest = object(
-      json(safePath(root, `apps/${name}/package.json`)),
-      `manifest of ${name}`,
-    );
-    const scripts = object(manifest.scripts, `scripts of ${name}`);
-    for (const script of ['check', 'fix', 'test', 'build', 'dev']) {
-      text(scripts[script], `native script ${script}`);
-    }
-  } else {
-    const expected = release.files[`templates/${templateName}/rust-toolchain.toml`];
-    if (
-      !expected ||
-      !same(identity(safePath(root, `apps/${name}/rust-toolchain.toml`)), expected)
-    ) {
-      fail(`App ${name} must use the accepted Rust toolchain pin`);
-    }
-  }
-  const expectedSource = sourceSignature(root);
-  const stageName = `.devkit/state/update-${randomUUID()}`;
-  const stage = safePath(root, stageName);
-  const stagedRoot = join(stage, 'project');
-  mkdirSync(stage, { recursive: true });
-  try {
-    copyTree(root, stagedRoot, {
-      ignore: excludedSnapshotPath,
-      preserveLinks: true,
-    });
-    const apps = { ...old.apps, [name]: app };
-    const managed = writeManaged(releaseRoot, release, stagedRoot, old.packageMode, apps);
-    if (app.kind === 'node') {
-      await regenerateLock(stagedRoot, name, options.registry);
-    }
-    readRelease(releaseRoot);
-    if (releaseIdentity(releaseRoot) !== old.releaseIdentity) {
-      fail('Release changed while registering the app');
-    }
-    const next: ProjectState = {
-      ...old,
-      generation: randomUUID(),
-      apps,
-      managed,
-    };
-    commitUpdate(root, stageName, stagedRoot, next, old, expectedSource, options.hooks);
-    return next;
-  } finally {
-    if (!existsSync(safePath(root, pendingPath))) {
-      rmSync(stage, { recursive: true, force: true });
-    }
-  }
+  return registerProjectComponent(
+    releaseRoot,
+    target,
+    'app',
+    name,
+    templates[templateId(template)].toolingProfile,
+    options,
+  );
 }

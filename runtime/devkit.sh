@@ -5,24 +5,23 @@ fail() { printf 'devkit: %s\n' "$*" >&2; exit 1; }
 root=$(realpath -ms -- "$(dirname -- "${BASH_SOURCE[0]}")/../..")
 runtime="$root/.devkit/runtime"
 command=${1:-help}
-[[ $# -le 1 ]] || fail 'expected one command; use app=<registered-name>'
+[[ $# -le 1 ]] || fail 'expected one command; select app=<name> or package=<name>'
 case "$command" in
   help)
-    printf '%s\n' 'make setup|check|fix|test|build [app=<name>]' \
-      'make <command>-<name>  (ordinary Make dependency edges are supported)' \
-      'make dev|up [app=<name>]   detached product services' \
+    printf '%s\n' \
+      'make setup|check|fix|test|build [app=<name> | package=<name>]' \
+      'make dev|up [app=<name>] [headless=1]  start development services' \
+      'make package [app=<desktop>]         build a Linux desktop archive' \
       'make status|logs [app=<name>] [tail=100] [follow=1]' \
-      'make down                 stop this checkout; preserve named volumes' \
-      'make doctor               check host prerequisites and accepted tools'
+      'make down                           stop this checkout; preserve data' \
+      'make doctor                         verify accepted and prepared tools'
     exit 0 ;;
-  doctor|setup|check|fix|test|build|dev|up|down|logs|status|snapshot) ;;
+  doctor|setup|setup-node|check|fix|test|build|package|dev|up|down|logs|status|snapshot|package-snapshot) ;;
   *) fail "unknown command: $command" ;;
 esac
 
-for tool in docker flock sha256sum realpath; do command -v "$tool" >/dev/null || fail "missing host prerequisite: $tool"; done
+for executable in docker flock sha256sum realpath; do command -v "$executable" >/dev/null || fail "missing prerequisite: $executable"; done
 [[ -d $root && $(realpath -e -- "$root") == "$root" ]] || fail 'checkout path must not contain symlinks'
-# Validate every existing prefix before mkdir, lock open, bind or SELinux relabel.
-# This prevents accidental path redirection, not concurrent malicious rewrites.
 safe_path() {
   local path=$1 kind=$2 relative current=$root part i
   [[ $path == "$root/"* ]] || fail "path is outside this checkout: $path"
@@ -36,238 +35,259 @@ safe_path() {
     [[ ! -L $current ]] || fail "refusing symlink runtime path: $current"
     if [[ -e $current ]]; then
       if [[ $i -lt $((${#parts[@]} - 1)) || $kind == directory ]]; then
-        [[ -d $current ]] || fail "expected runtime directory: $current"
+        [[ -d $current ]] || fail "expected directory: $current"
       else
-        [[ -f $current ]] || fail "expected regular runtime file: $current"
+        [[ -f $current ]] || fail "expected regular file: $current"
       fi
     fi
   done
 }
-for path in "$root/.devkit/state" "$root/.devkit/cache/npm" "$root/.devkit/cache/cargo" "$runtime"; do safe_path "$path" directory; done
-for path in "$root/.devkit/state/task.lock" "$root/.devkit/state/rust-image" "$root/.devkit/runtime.sha256" "$root/.devkit/manifest.json" "$runtime/toolchains.env"; do safe_path "$path" file; done
-[[ ! -e $root/.devkit/update-pending.json && ! -L $root/.devkit/update-pending.json ]] || fail 'an update is incomplete or its pending state is malformed; run the release updater recovery before ordinary commands'
-[[ ${DEVKIT_APPS:-} != *$'\n'* ]] || fail 'DEVKIT_APPS must be a single whitespace-separated list'
-read -r -a apps <<< "${DEVKIT_APPS:-}"
-[[ ${#apps[@]} -gt 0 ]] || fail 'DEVKIT_APPS must register at least one app'
-declare -A app_names=()
-for app in "${apps[@]}"; do
-  [[ $app =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ && ${#app} -le 63 ]] || fail "invalid app identifier: $app"
-  [[ ! -v app_names[$app] ]] || fail "duplicate app registration: $app"
-  app_names[$app]=1
-  for path in "$root/apps/$app/node_modules" "$root/apps/$app/dist" "$root/apps/$app/target"; do safe_path "$path" directory; done
-  for path in "$root/.devkit/state/node-$app.lock" "$root/.devkit/state/node-$app.lock.tmp" "$root/apps/$app/package.json" "$root/apps/$app/package-lock.json" "$root/apps/$app/Cargo.toml" "$root/apps/$app/Cargo.lock"; do safe_path "$path" file; done
-done
+for directory in .devkit/state .devkit/cache/npm .devkit/cache/cargo .devkit/cache/electron .devkit/runtime; do safe_path "$root/$directory" directory; done
+for file in .devkit/manifest.json .devkit/runtime.sha256 .devkit/project.mk .devkit/compose.apps.yaml .devkit/compose.workspace.json .devkit/state/task.lock .devkit/state/node-workspace.lock .devkit/state/rust-image .devkit/state/desktop-image; do safe_path "$root/$file" file; done
+[[ ! -e $root/.devkit/update-pending.json && ! -L $root/.devkit/update-pending.json ]] || fail 'an update is incomplete; run the selected release updater recovery'
 mkdir -p -- "$root/.devkit/state"
 exec 9>>"$root/.devkit/state/task.lock"
 flock -n 9 || fail 'another devkit operation is active in this checkout'
-[[ ! -e $root/.devkit/update-pending.json && ! -L $root/.devkit/update-pending.json ]] || fail 'an update is incomplete or its pending state is malformed; run the release updater recovery before ordinary commands'
-[[ ${DEVKIT_EXPECTED_MANIFEST:-} =~ ^[a-f0-9]{64}$ ]] || fail 'missing accepted-toolkit snapshot; invoke the root Makefile'
-[[ -f $root/.devkit/manifest.json ]] || fail 'missing accepted release manifest'
-manifest_hash=$(sha256sum "$root/.devkit/manifest.json")
-[[ ${manifest_hash%% *} == "$DEVKIT_EXPECTED_MANIFEST" ]] || fail 'accepted toolkit changed during this Make invocation; rerun the command'
-[[ -f $root/.devkit/runtime.sha256 ]] || fail 'missing managed runtime.sha256'
-(cd -- "$root"; sha256sum --check --status .devkit/runtime.sha256) || fail 'managed runtime differs from the accepted release; restore it or resolve the update conflict'
-[[ -f $runtime/toolchains.env ]] || fail 'missing managed toolchains.env'
+[[ ! -e $root/.devkit/update-pending.json && ! -L $root/.devkit/update-pending.json ]] || fail 'an update is incomplete; run the selected release updater recovery'
+[[ ${DEVKIT_EXPECTED_MANIFEST:-} =~ ^[a-f0-9]{64}$ ]] || fail 'invoke the root Makefile to capture the accepted version'
+actual=$(sha256sum "$root/.devkit/manifest.json")
+[[ ${actual%% *} == "$DEVKIT_EXPECTED_MANIFEST" ]] || fail 'accepted toolkit changed during this Make invocation; rerun the command'
+(cd -- "$root"; sha256sum --check --status .devkit/runtime.sha256) || fail 'managed toolkit files differ from the accepted release'
 
-# This is a data file, not executable shell configuration.
-declare -A toolchain_keys=()
-unset DEVKIT_VERSION DEVKIT_NODE_IMAGE DEVKIT_NODE_VERSION DEVKIT_RUST_VERSION DEVKIT_RUST_RECIPE_HASH
+declare -A pins=()
+unset DEVKIT_VERSION DEVKIT_NODE_IMAGE DEVKIT_NODE_VERSION DEVKIT_RUST_VERSION DEVKIT_RUST_RECIPE_HASH DEVKIT_DESKTOP_RECIPE_HASH
 while IFS= read -r line || [[ -n $line ]]; do
   [[ -z $line || $line == \#* ]] && continue
   [[ $line == *=* ]] || fail 'invalid toolchains.env record'
   key=${line%%=*} value=${line#*=}
   case "$key" in
-    DEVKIT_VERSION|DEVKIT_NODE_IMAGE|DEVKIT_NODE_VERSION|DEVKIT_RUST_VERSION|DEVKIT_RUST_RECIPE_HASH) ;;
+    DEVKIT_VERSION|DEVKIT_NODE_IMAGE|DEVKIT_NODE_VERSION|DEVKIT_RUST_VERSION|DEVKIT_RUST_RECIPE_HASH|DEVKIT_DESKTOP_RECIPE_HASH) ;;
     *) fail "unknown toolchain key: $key" ;;
   esac
-  [[ ! -v toolchain_keys[$key] ]] || fail "duplicate toolchain key: $key"
-  toolchain_keys[$key]=1
+  [[ ! -v pins[$key] ]] || fail "duplicate toolchain key: $key"
   [[ -n $value && $value != *[[:space:]]* && $value != *\'* && $value != *\"* ]] || fail "invalid toolchain value: $key"
+  pins[$key]=1
   printf -v "$key" '%s' "$value"
   export "$key"
 done < "$runtime/toolchains.env"
-for key in DEVKIT_VERSION DEVKIT_NODE_IMAGE DEVKIT_NODE_VERSION DEVKIT_RUST_VERSION DEVKIT_RUST_RECIPE_HASH; do
-  [[ -n ${!key:-} ]] || fail "missing toolchain key: $key"
-done
-[[ $DEVKIT_NODE_IMAGE == *@sha256:* && $DEVKIT_RUST_RECIPE_HASH =~ ^[a-f0-9]{64}$ ]] || fail 'toolchain pins must be immutable'
+for key in DEVKIT_VERSION DEVKIT_NODE_IMAGE DEVKIT_NODE_VERSION DEVKIT_RUST_VERSION DEVKIT_RUST_RECIPE_HASH DEVKIT_DESKTOP_RECIPE_HASH; do [[ -n ${!key:-} ]] || fail "missing toolchain key: $key"; done
+[[ $DEVKIT_NODE_IMAGE =~ ^[a-z0-9./:-]+@sha256:[a-f0-9]{64}$ && $DEVKIT_RUST_RECIPE_HASH =~ ^[a-f0-9]{64}$ && $DEVKIT_DESKTOP_RECIPE_HASH =~ ^[a-f0-9]{64}$ ]] || fail 'invalid immutable tool pins'
 
-declare -A languages=()
-for app in "${apps[@]}"; do
-  [[ $app =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] || fail "invalid app identifier: $app"
-  [[ ! -v languages[$app] ]] || fail "duplicate app registration: $app"
-  path="$root/apps/$app"
-  [[ -d $path && $(realpath -e -- "$path") == "$path" ]] || fail "missing or symlinked app directory: apps/$app"
-  if [[ -f $path/package.json && ! -f $path/Cargo.toml ]]; then
-    [[ -f $path/package-lock.json ]] || fail "apps/$app requires package-lock.json"
-    languages[$app]=node
-  elif [[ -f $path/Cargo.toml && ! -f $path/package.json ]]; then
-    [[ -f $path/Cargo.lock ]] || fail "apps/$app requires Cargo.lock"
-    languages[$app]=rust
-  else
-    fail "apps/$app must have exactly one supported native manifest (package.json or Cargo.toml)"
-  fi
-done
-selector=${DEVKIT_APP:-}
-[[ -z $selector || $selector =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] || fail "invalid app selector: $selector"
-[[ -z $selector || -v languages[$selector] ]] || fail "unregistered app: $selector"
-target=${DEVKIT_TARGET_APP:-}
-[[ -z $target || $target =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]] || fail "invalid target app: $target"
-[[ -z $target || -v languages[$target] ]] || fail "unregistered target app: $target"
-selected=("${apps[@]}")
-if [[ -n $target ]]; then selected=("$target"); elif [[ -n $selector ]]; then selected=("$selector"); fi
-
-export DEVKIT_PROJECT_ROOT=$root
+export DEVKIT_PROJECT_ROOT=$root DEVKIT_UID=$(id -u) DEVKIT_GID=$(id -g)
 export DEVKIT_PROJECT_NAME="devkit-$(printf '%s' "$root" | sha256sum | cut -c1-16)"
-export DEVKIT_UID=$(id -u) DEVKIT_GID=$(id -g)
-# Disregard ambient Compose routing/configuration. .env is explicitly disabled.
+export DEVKIT_CURRENT_COMPONENT=. DEVKIT_COMPONENT_ROOT=$root DEVKIT_WORKDIR=/workspace DEVKIT_SOURCE_READ_ONLY=true DEVKIT_TASK_NETWORK=none
+export VITE_API_ENABLED=false
+export DEVKIT_RUST_IMAGE=devkit-unprepared-rust DEVKIT_DESKTOP_IMAGE=devkit-unprepared-desktop
 unset COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR
 compose=(docker compose --project-directory "$root" --project-name "$DEVKIT_PROJECT_NAME" --env-file /dev/null)
-active_pid=
-launching=0
-cancel_status=0
+tool_compose=("${compose[@]}" --file "$runtime/compose.tools.yaml" --file "$root/.devkit/compose.workspace.json")
+app_compose=("${compose[@]}" --file "$root/.devkit/compose.apps.yaml")
+[[ ! -f $root/compose.yaml ]] || app_compose+=(--file "$root/compose.yaml")
+temporary_files=()
+cleanup() { for file in "${temporary_files[@]}"; do rm -f -- "$file"; done; }
+trap cleanup EXIT
+active_pid= launching=0 cancel_status=0
 set -m
 cancel() {
   local status=$1
   trap '' INT TERM
-  if [[ -n $active_pid ]]; then
-    kill -TERM -- "-$active_pid" 2>/dev/null || true
-    wait "$active_pid" 2>/dev/null || true
-  fi
+  if [[ -n $active_pid ]]; then kill -TERM -- "-$active_pid" 2>/dev/null || true; wait "$active_pid" 2>/dev/null || true; fi
   exit "$status"
 }
-request_cancel() {
-  cancel_status=$1
-  if [[ $launching == 0 ]]; then cancel "$cancel_status"; fi
-}
+request_cancel() { cancel_status=$1; [[ $launching != 0 ]] || cancel "$cancel_status"; }
 trap 'request_cancel 130' INT
 trap 'request_cancel 143' TERM
 run_child() {
-  local result=0
+  local status=0
   launching=1
   "$@" &
   active_pid=$!
   launching=0
   [[ $cancel_status == 0 ]] || cancel "$cancel_status"
-  wait "$active_pid" || result=$?
+  wait "$active_pid" || status=$?
   active_pid=
-  return "$result"
+  return "$status"
 }
-
 node_image() {
   if ! docker image inspect "$DEVKIT_NODE_IMAGE" >/dev/null 2>&1; then
-    [[ $command == setup ]] || fail 'accepted Node image is absent; run make setup'
+    [[ $command == setup || $command == setup-node ]] || fail 'accepted Node image is absent; run make setup'
     run_child docker pull "$DEVKIT_NODE_IMAGE"
   fi
 }
-rust_image() {
-  local actual recorded label iid tmp
-  actual=$(sha256sum "$runtime/rust.Dockerfile")
-  [[ ${actual%% *} == "$DEVKIT_RUST_RECIPE_HASH" ]] || fail 'Rust Dockerfile differs from the accepted recipe'
-  recorded=
-  if [[ -f $root/.devkit/state/rust-image ]]; then recorded=$(<"$root/.devkit/state/rust-image"); fi
-  if [[ $recorded =~ ^sha256:[a-f0-9]{64}$ ]]; then
-    label=$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "$recorded" 2>/dev/null || true)
-    if [[ $label == "$DEVKIT_RUST_RECIPE_HASH" ]]; then export DEVKIT_RUST_IMAGE=$recorded; return; fi
+derived_image() {
+  local kind=$1 recipe pin label state key recorded= actual tmp iid
+  if [[ $kind == rust ]]; then
+    recipe=rust.Dockerfile pin=$DEVKIT_RUST_RECIPE_HASH label=io.docouno.devkit.rust-recipe state=rust-image key=DEVKIT_RUST_IMAGE
+  else
+    recipe=desktop.Dockerfile pin=$DEVKIT_DESKTOP_RECIPE_HASH label=io.docouno.devkit.desktop-recipe state=desktop-image key=DEVKIT_DESKTOP_IMAGE
   fi
-  [[ $command == setup ]] || fail 'accepted derived Rust image is absent/stale; run make setup'
-  tmp=$(mktemp "$root/.devkit/state/rust-image.XXXXXX")
-  if ! run_child docker build --pull=false --build-arg "DEVKIT_RECIPE_SHA=$DEVKIT_RUST_RECIPE_HASH" \
-    --label "io.docouno.devkit.rust-recipe=$DEVKIT_RUST_RECIPE_HASH" --iidfile "$tmp" \
-    --file "$runtime/rust.Dockerfile" "$runtime"; then
-    rm -f -- "$tmp"
-    fail 'Rust tool image preparation failed'
+  actual=$(sha256sum "$runtime/$recipe")
+  [[ ${actual%% *} == "$pin" ]] || fail "$recipe differs from the accepted recipe"
+  if [[ -f $root/.devkit/state/$state ]]; then recorded=$(<"$root/.devkit/state/$state"); fi
+  if [[ $recorded =~ ^sha256:[a-f0-9]{64}$ ]] && [[ $(docker image inspect --format "{{index .Config.Labels \"$label\"}}" "$recorded" 2>/dev/null || true) == "$pin" ]]; then
+    printf -v "$key" '%s' "$recorded"; export "$key"; return
   fi
+  [[ $command == setup || $command == setup-node ]] || fail "accepted $kind image is absent/stale; run make setup"
+  tmp=$(mktemp "$root/.devkit/state/$state.XXXXXXXX")
+  temporary_files+=("$tmp")
+  run_child docker build --pull=false --build-arg "DEVKIT_RECIPE_SHA=$pin" --label "$label=$pin" --iidfile "$tmp" --file "$runtime/$recipe" "$runtime" || fail "$kind image preparation failed"
   iid=$(<"$tmp")
-  [[ $iid =~ ^sha256:[a-f0-9]{64}$ ]] || { rm -f -- "$tmp"; fail 'build did not return an immutable Rust image ID'; }
-  label=$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "$iid")
-  [[ $label == "$DEVKIT_RUST_RECIPE_HASH" ]] || { rm -f -- "$tmp"; fail 'derived Rust image recipe label mismatch'; }
+  [[ $iid =~ ^sha256:[a-f0-9]{64}$ && $(docker image inspect --format "{{index .Config.Labels \"$label\"}}" "$iid") == "$pin" ]] || fail "invalid $kind image identity"
   printf '%s\n' "$iid" > "$tmp"
-  mv -f -- "$tmp" "$root/.devkit/state/rust-image"
-  export DEVKIT_RUST_IMAGE=$iid
+  mv -f -- "$tmp" "$root/.devkit/state/$state"
+  printf -v "$key" '%s' "$iid"; export "$key"
 }
-node_lock_hash() { (cd -- "$1"; sha256sum package.json package-lock.json | sha256sum | cut -d' ' -f1); }
-tool_task() {
-  local app=$1 language=${languages[$1]} token name fingerprint state receipt
-  export DEVKIT_CURRENT_APP=$app DEVKIT_APP_ROOT="$root/apps/$app" DEVKIT_SOURCE_READ_ONLY=true
-  [[ $command != fix ]] || DEVKIT_SOURCE_READ_ONLY=false
-  mkdir -p -- "$root/.devkit/cache/npm" "$root/.devkit/cache/cargo"
-  if [[ $language == node ]]; then
-    node_image
-    fingerprint=$(node_lock_hash "$DEVKIT_APP_ROOT")
-    state="$root/.devkit/state/node-$app.lock"
-    if [[ $command == setup ]]; then
-      # npm ci mutates the existing dependency tree. An old receipt cannot attest
-      # that tree after a failed or interrupted repeat install with equal inputs.
-      rm -f -- "$state"
-    else
-      [[ -d $DEVKIT_APP_ROOT/node_modules && -f $state && $(<"$state") == "$fingerprint" ]] || fail "apps/$app dependencies are absent/stale; run make setup app=$app"
-    fi
-    mkdir -p -- "$DEVKIT_APP_ROOT/node_modules" "$DEVKIT_APP_ROOT/dist"
-  else
-    rust_image
-    mkdir -p -- "$DEVKIT_APP_ROOT/target"
-  fi
+control() {
+  local action=$1 output=$2 token name
+  shift 2
   token=$(cat /proc/sys/kernel/random/uuid)
-  name="$DEVKIT_PROJECT_NAME-task-$token"
-  local argv=("${compose[@]}" --file "$runtime/compose.tools.yaml" run --pull never --rm -T --no-deps \
-    --name "$name" --label "io.docouno.devkit.invocation=$token" "$language")
-  if [[ $language == node ]]; then
-    argv+=(sh -ec 'mkdir -p "$HOME"; node -e '\''const fs=require("node:fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));for(const name of ["check","fix","test","build","dev"]){if(typeof p.scripts?.[name]!=="string"||!p.scripts[name].trim())throw Error("Missing native npm script: "+name)}if(process.versions.node!==process.argv[1])throw Error("Unexpected Node version: "+process.versions.node)'\'' "$1"; shift; exec "$@"' sh "$DEVKIT_NODE_VERSION")
-    if [[ $command == setup ]]; then argv+=(npm ci --include=dev --strict-peer-deps); else argv+=(npm run "$command"); fi
-  else
-    argv+=(bash /workspace/.devkit/runtime/rust-check.sh "$command")
-  fi
-  run_child bash "$runtime/guard.sh" "$name" "$token" -- "${argv[@]}"
-  if [[ $language == node && $command == setup ]]; then
-    [[ $(node_lock_hash "$DEVKIT_APP_ROOT") == "$fingerprint" ]] || fail 'native manifest/lock changed during setup'
-    receipt=$(mktemp "$root/.devkit/state/node-$app.XXXXXX")
-    printf '%s\n' "$fingerprint" > "$receipt"
-    mv -f -- "$receipt" "$state"
-  fi
+  name="$DEVKIT_PROJECT_NAME-control-$token"
+  run_child bash "$runtime/guard.sh" "$name" "$token" -- \
+    "${compose[@]}" --file "$runtime/compose.tools.yaml" run --pull never --rm -T --no-deps --name "$name" --label "io.docouno.devkit.invocation=$token" \
+    control node /workspace/.devkit/runtime/project.mjs "$action" /workspace "$DEVKIT_VERSION" "$@" > "$output"
+}
+docker compose version >/dev/null || fail 'Docker Compose is unavailable'
+docker info --format '{{.OSType}}' | { read -r type; [[ $type == linux ]]; } || fail 'a Linux Docker daemon is required'
+node_image
+metadata=$(mktemp "$root/.devkit/state/metadata.XXXXXXXX")
+temporary_files+=("$metadata")
+control describe "$metadata"
+declare -A languages=() profiles=() roles=() kinds=() services=() apis=()
+node_fingerprint=
+while IFS=$'\t' read -r record first second third fourth fifth sixth seventh; do
+  case "$record" in
+    node-fingerprint) node_fingerprint=$first ;;
+    component) languages["$first"]=$second; profiles["$first"]=$third; roles["$first"]=$fourth; kinds["$first"]=$fifth; services["$first"]=$sixth; apis["$first"]=$seventh ;;
+    directory) safe_path "$root/$first" directory; mkdir -p -- "$root/$first" ;;
+    *) fail 'invalid metadata response' ;;
+  esac
+done < "$metadata"
+[[ $node_fingerprint =~ ^[a-f0-9]{64}$ ]] || fail 'missing workspace fingerprint'
+rm -f -- "$metadata"
+for directory in .devkit/cache/npm .devkit/cache/cargo .devkit/cache/electron; do mkdir -p -- "$root/$directory"; done
+target=${DEVKIT_TARGET_COMPONENT:-}
+app=${DEVKIT_APP:-} package=${DEVKIT_PACKAGE:-}
+[[ -z $app || -z $package ]] || fail 'app and package selectors are mutually exclusive'
+if [[ -n $app ]]; then [[ $app =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ && -v languages[apps/$app] ]] || fail "unregistered app: $app"; fi
+if [[ -n $package ]]; then [[ $package =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ && -v languages[packages/$package] ]] || fail "unregistered package: $package"; fi
+[[ -z $target || -v languages[$target] ]] || fail "unregistered target component: $target"
+if [[ -z $target && -n $app ]]; then target="apps/$app"; elif [[ -z $target && -n $package ]]; then target="packages/$package"; fi
+node_ready() {
+  [[ -f $root/.devkit/state/node-workspace.lock && $(<"$root/.devkit/state/node-workspace.lock") == "$node_fingerprint" && -d $root/node_modules ]] || fail 'workspace dependencies are absent/stale; run make setup'
+}
+run_node() {
+  local token name service=$1; shift
+  token=$(cat /proc/sys/kernel/random/uuid); name="$DEVKIT_PROJECT_NAME-task-$token"
+  run_child bash "$runtime/guard.sh" "$name" "$token" -- "${tool_compose[@]}" run --pull never --rm -T --no-deps --name "$name" --label "io.docouno.devkit.invocation=$token" "$service" \
+    sh -ec 'mkdir -p "$HOME"; node -e '\''if(process.versions.node!==process.argv[1])throw Error("Unexpected Node version")'\'' "$1"; shift; exec "$@"' sh "$DEVKIT_NODE_VERSION" "$@"
+}
+run_rust() {
+  local token name
+  token=$(cat /proc/sys/kernel/random/uuid); name="$DEVKIT_PROJECT_NAME-task-$token"
+  run_child bash "$runtime/guard.sh" "$name" "$token" -- "${tool_compose[@]}" run --pull never --rm -T --no-deps --name "$name" --label "io.docouno.devkit.invocation=$token" rust \
+    bash /workspace/.devkit/runtime/rust-check.sh "$command"
 }
 
-docker compose version >/dev/null || fail 'Docker Compose is unavailable'
-docker info --format '{{.OSType}}' | { read -r type; [[ $type == linux ]]; } || fail 'a working Linux Docker daemon is required'
-# Control metadata validation has no dependency/cache/output mounts or network.
-# Setup prepares this pinned base even for a Rust-only checkout.
-node_image
-export DEVKIT_CURRENT_APP=${selected[0]} DEVKIT_APP_ROOT="$root/apps/${selected[0]}" DEVKIT_SOURCE_READ_ONLY=true
-token=$(cat /proc/sys/kernel/random/uuid)
-name="$DEVKIT_PROJECT_NAME-control-$token"
-run_child bash "$runtime/guard.sh" "$name" "$token" -- "${compose[@]}" --file "$runtime/compose.tools.yaml" \
-  run --pull never --rm -T --no-deps --name "$name" --label "io.docouno.devkit.invocation=$token" \
-  control node /workspace/.devkit/runtime/verify-manifest.mjs /workspace "$DEVKIT_VERSION" "${apps[@]}"
-[[ $command != snapshot ]] || exit 0
 case "$command" in
-  setup|check|fix|test|build)
-    for app in "${selected[@]}"; do tool_task "$app"; done ;;
-  doctor)
-    printf 'devkit %s\ncheckout %s\nproject %s\n' "$DEVKIT_VERSION" "$root" "$DEVKIT_PROJECT_NAME"
-    docker compose version
-    for app in "${selected[@]}"; do
-      if [[ ${languages[$app]} == node ]]; then node_image; else rust_image; fi
-      printf 'app %s: %s tool image present\n' "$app" "${languages[$app]}"
-    done ;;
-  dev|up|down|logs|status)
-    [[ -f $root/compose.yaml ]] || fail 'this project has no compose.yaml for development services'
-    # All variables are explicit; product-owned Compose controls app runtime env.
-    export DEVKIT_RUST_IMAGE=devkit-unprepared-rust
-    if [[ -f $root/.devkit/state/rust-image ]]; then export DEVKIT_RUST_IMAGE=$(<"$root/.devkit/state/rust-image"); fi
-    if [[ $command == dev || $command == up ]]; then
-      for app in "${selected[@]}"; do
-        if [[ ${languages[$app]} == node ]]; then node_image; else rust_image; fi
-      done
-      run_child "${compose[@]}" --file "$root/compose.yaml" up --detach --no-build --pull never --wait --wait-timeout 30 "${selected[@]}"
-    elif [[ $command == down ]]; then
-      run_child "${compose[@]}" --file "$root/compose.yaml" down --timeout 5
-    elif [[ $command == status ]]; then
-      run_child "${compose[@]}" --file "$root/compose.yaml" ps --all "${selected[@]}"
+  snapshot) exit 0 ;;
+  package-snapshot)
+    [[ -z $package ]] || fail 'package selects a desktop app, not a library'
+    found=0
+    for id in "${!profiles[@]}"; do [[ ${profiles[$id]} != electron ]] || found=1; done
+    [[ $found == 1 ]] || fail 'no desktop component is registered'
+    exit 0 ;;
+  setup-node)
+    export DEVKIT_WORKDIR=/workspace DEVKIT_COMPONENT_ROOT=$root DEVKIT_CURRENT_COMPONENT=. DEVKIT_TASK_NETWORK=bridge
+    rm -f -- "$root/.devkit/state/node-workspace.lock"
+    run_node node npm ci --include=dev --strict-peer-deps
+    for id in "${!profiles[@]}"; do
+      if [[ ${profiles[$id]} == electron ]]; then
+        run_node node npm exec --offline --workspace="$id" -- install-electron
+      fi
+    done
+    after=$(mktemp "$root/.devkit/state/fingerprint.XXXXXXXX"); temporary_files+=("$after")
+    control fingerprint "$after"
+    [[ $(<"$after") == "$node_fingerprint" ]] || fail 'native inputs changed during setup'
+    receipt=$(mktemp "$root/.devkit/state/node-workspace.XXXXXXXX"); temporary_files+=("$receipt")
+    printf '%s\n' "$node_fingerprint" > "$receipt"
+    mv -f -- "$receipt" "$root/.devkit/state/node-workspace.lock"
+    exit 0 ;;
+  setup|check|fix|test|build|package)
+    [[ -n $target ]] || fail 'finite task must select a registered component through Make'
+    export DEVKIT_CURRENT_COMPONENT=$target DEVKIT_COMPONENT_ROOT="$root/$target" DEVKIT_WORKDIR="/workspace/$target"
+    if [[ ${languages[$target]} == rust ]]; then
+      [[ $command != package ]] || fail 'package is defined for desktop applications'
+      derived_image rust
+      [[ $command != setup ]] || export DEVKIT_TASK_NETWORK=bridge
+      run_rust
     else
-      tail=${DEVKIT_TAIL:-100} follow=${DEVKIT_FOLLOW:-0}
-      [[ $tail =~ ^[0-9]+$ && ${#tail} -le 5 && $tail -le 10000 ]] || fail 'tail must be an integer from 0 through 10000'
-      [[ $follow == 0 || $follow == 1 ]] || fail 'follow must be 0 or 1'
-      args=(logs --tail "$tail")
-      [[ $follow == 0 ]] || args+=(--follow)
-      run_child "${compose[@]}" --file "$root/compose.yaml" "${args[@]}" "${selected[@]}"
-    fi ;;
+      node_ready
+      service=node
+      if [[ ${profiles[$target]} == web && ${apis[$target]} != - ]]; then export VITE_API_ENABLED=true; fi
+      if [[ ${profiles[$target]} == electron ]]; then derived_image desktop; service=desktop; fi
+      if [[ $command == setup ]]; then exit 0; fi
+      [[ $command != package || ${profiles[$target]} == electron ]] || fail 'package is defined for desktop applications'
+      [[ $command != fix ]] || export DEVKIT_SOURCE_READ_ONLY=false
+      run_node "$service" npm run "$command"
+    fi
+    exit 0 ;;
+  doctor)
+    have_node=0
+    for id in "${!languages[@]}"; do
+      if [[ ${languages[$id]} == rust ]]; then derived_image rust; else have_node=1; fi
+      [[ ${profiles[$id]} != electron ]] || derived_image desktop
+    done
+    [[ $have_node == 0 ]] || node_ready
+    printf 'Devkit %s; Node %s; Rust %s; accepted components verified.\n' "$DEVKIT_VERSION" "$DEVKIT_NODE_VERSION" "$DEVKIT_RUST_VERSION"
+    exit 0 ;;
+esac
+
+# Status/down need no prepared images. Development exports only admitted IDs.
+service_args=()
+if [[ -n $target ]]; then
+  [[ ${roles[$target]} == app ]] || fail 'development services require an app selector'
+  name=${services[$target]}; [[ $name != - ]] || name=${target#apps/}
+  service_args+=("$name")
+fi
+case "$command" in
+  dev|up)
+    [[ -z $package && -n $target ]] || fail 'development must select an app through Make'
+    model=$(mktemp "$root/.devkit/state/compose.XXXXXXXX.json"); temporary_files+=("$model")
+    reached=$(mktemp "$root/.devkit/state/development.XXXXXXXX"); temporary_files+=("$reached")
+    # Inspect all profiles so an explicitly selected profiled service is present.
+    # Actual up below retains normal selection; the helper filters inactive deps.
+    run_child "${app_compose[@]}" --profile '*' config --no-env-resolution --format json > "$model"
+    control development "$reached" ".devkit/state/${model##*/}" "${service_args[0]}"
+    mapfile -t started_components < "$reached"
+    [[ ${#started_components[@]} -gt 0 ]] || fail 'selected Compose service has no registered application'
+    for id in "${started_components[@]}"; do
+      [[ -v languages[$id] && ${roles[$id]} == app ]] || fail 'invalid development component response'
+      if [[ ${languages[$id]} == node ]]; then node_ready; else derived_image rust; fi
+      if [[ ${profiles[$id]} == electron ]]; then derived_image desktop; fi
+    done
+    for id in "${started_components[@]}"; do
+      if [[ ${profiles[$id]} != electron ]]; then continue; fi
+      desktop_service=${services[$id]}; [[ $desktop_service != - ]] || desktop_service=${id#apps/}
+      display=${DISPLAY:-} authority=${XAUTHORITY:-${HOME:-}/.Xauthority} headless=${DEVKIT_HEADLESS:-0}
+      [[ $headless == 0 || $headless == 1 ]] || fail 'headless must be 0 or 1'
+      if [[ $headless == 0 ]]; then
+        [[ $display =~ ^:[0-9]+(\.[0-9]+)?$ && -d /tmp/.X11-unix && -f $authority && -r $authority ]] || fail 'desktop requires local DISPLAY and readable XAUTHORITY; use headless=1 for a virtual display'
+        authority=$(realpath -e -- "$authority")
+      fi
+      overlay=$(mktemp "$root/.devkit/state/display.XXXXXXXX"); temporary_files+=("$overlay")
+      token=$(cat /proc/sys/kernel/random/uuid); name="$DEVKIT_PROJECT_NAME-display-$token"
+      run_child bash "$runtime/guard.sh" "$name" "$token" -- "${compose[@]}" --file "$runtime/compose.tools.yaml" run --pull never --rm -T --no-deps --name "$name" --label "io.docouno.devkit.invocation=$token" control \
+        node -e 'const [name,headless,display,authority]=process.argv.slice(1);const service={environment:{DEVKIT_HEADLESS:headless}};if(headless==="0"){service.environment.DISPLAY=display;service.environment.XAUTHORITY="/run/devkit-xauthority";service.volumes=[{type:"bind",source:"/tmp/.X11-unix",target:"/tmp/.X11-unix",read_only:true,bind:{create_host_path:false}},{type:"bind",source:authority,target:"/run/devkit-xauthority",read_only:true,bind:{create_host_path:false}}]};process.stdout.write(JSON.stringify({services:{[name]:service}}))' \
+        "$desktop_service" "$headless" "$display" "$authority" > "$overlay"
+      app_compose+=(--file "$overlay")
+    done
+    run_child "${app_compose[@]}" up -d --wait --pull never "${service_args[@]}" ;;
+  down) run_child "${app_compose[@]}" --profile '*' down ;;
+  status) run_child "${app_compose[@]}" ps --all "${service_args[@]}" ;;
+  logs)
+    tail=${DEVKIT_TAIL:-100} follow=${DEVKIT_FOLLOW:-0}
+    [[ $tail =~ ^[0-9]+$ && $follow =~ ^[01]$ ]] || fail 'invalid logs options'
+    args=(logs --tail "$tail")
+    [[ $follow == 0 ]] || args+=(--follow)
+    run_child "${app_compose[@]}" --profile '*' "${args[@]}" "${service_args[@]}" ;;
 esac

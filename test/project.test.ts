@@ -1,156 +1,17 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import {
-  copyTree,
-  digest,
-  fileMap,
-  identity,
-  json,
-  object,
-  safePath,
-  writeJson,
-} from '../tooling/files.ts';
+import { copyTree, digest, identity, json, object, safePath, writeJson } from '../tooling/files.ts';
 import { initProject } from '../tooling/project.ts';
+import { regenerateWorkspaceLock } from '../tooling/native-graph.ts';
 import { projectState, sourceSignature } from '../tooling/project-state.ts';
 import { recoverProject, registerProjectApp, updateProject } from '../tooling/project-update.ts';
-import type { Release, UpdateJournal } from '../tooling/types.ts';
+import type { UpdateJournal } from '../tooling/types.ts';
 
-const toolchain =
-  'DEVKIT_NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d\nDEVKIT_NODE_VERSION=24.18.0\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH=' +
-  '0'.repeat(64) +
-  '\n';
-
-function fixture(): { root: string; close: () => void } {
-  const root = mkdtempSync(join(tmpdir(), 'devkit project tests '));
-  return { root, close: () => rmSync(root, { recursive: true, force: true }) };
-}
-
-function put(root: string, path: string, bytes: string): void {
-  const target = join(root, path);
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, bytes);
-}
-
-function release(root: string, version: string, options: { runtime?: string } = {}): string {
-  const destination = join(root, `release-${version}-${options.runtime ?? 'normal'}`);
-  mkdirSync(destination);
-  for (const name of ['devkit.mk', 'devkit.sh', 'guard.sh', 'compose.tools.yaml']) {
-    put(destination, `runtime/${name}`, `${options.runtime ?? 'runtime'} ${version} ${name}\n`);
-  }
-  put(destination, 'runtime/toolchains.env', `DEVKIT_VERSION=${version}\n${toolchain}`);
-  const packageRoot = join(destination, 'packing');
-  put(
-    packageRoot,
-    'package/package.json',
-    JSON.stringify({
-      name: '@docouno/env',
-      version,
-      type: 'module',
-      exports: './index.js',
-    }),
-  );
-  put(packageRoot, 'package/index.js', 'export const fixture = true;\n');
-  mkdirSync(join(destination, 'npm'));
-  const archive = `npm/docouno-env-${version}.tgz`;
-  execFileSync('tar', ['-czf', join(destination, archive), '-C', packageRoot, 'package']);
-  rmSync(packageRoot, { recursive: true });
-  for (const template of ['node-app', 'react-app']) {
-    const manifest = {
-      name: `fixture-${template}`,
-      version: '1.0.0',
-      private: true,
-      type: 'module',
-      scripts: Object.fromEntries(
-        ['check', 'fix', 'test', 'build', 'dev'].map((key) => [key, 'node --version']),
-      ),
-      devDependencies: { '@docouno/env': version },
-    };
-    put(
-      destination,
-      `templates/${template}/package.json`,
-      `${JSON.stringify(manifest, null, 2)}\n`,
-    );
-    const integrity = `sha512-${createHash('sha512')
-      .update(readFileSync(join(destination, archive)))
-      .digest('base64')}`;
-    put(
-      destination,
-      `templates/${template}/package-lock.json`,
-      JSON.stringify({
-        name: manifest.name,
-        version: manifest.version,
-        lockfileVersion: 3,
-        requires: true,
-        packages: {
-          '': {
-            name: manifest.name,
-            version: manifest.version,
-            devDependencies: manifest.devDependencies,
-          },
-          'node_modules/@docouno/env': {
-            version,
-            resolved: `https://registry.npmjs.org/@docouno/env/-/env-${version}.tgz`,
-            integrity,
-            dev: true,
-          },
-        },
-      }),
-    );
-    put(destination, `templates/${template}/src/index.ts`, 'export const answer = 42;\n');
-  }
-  put(
-    destination,
-    'templates/react-app/src/main.tsx',
-    readFileSync(new URL('../templates/react-app/src/main.tsx', import.meta.url), 'utf8'),
-  );
-  put(
-    destination,
-    'templates/rust-app/Cargo.toml',
-    '[package]\nname = "fixture-api"\nversion = "1.0.0"\nedition = "2024"\n',
-  );
-  put(destination, 'templates/rust-app/Cargo.lock', '# fixture native lock\nversion = 4\n');
-  put(destination, 'templates/rust-app/rust-toolchain.toml', '[toolchain]\nchannel = "1.99.1"\n');
-  put(destination, 'templates/rust-app/src/main.rs', 'fn main() {}\n');
-  seal(destination, version, archive);
-  return destination;
-}
-
-function seal(
-  destination: string,
-  version: string,
-  archive = `npm/docouno-env-${version}.tgz`,
-): void {
-  rmSync(join(destination, 'release.json'), { force: true });
-  const manifest: Release = {
-    schemaVersion: 1,
-    version,
-    rustVersion: '1.99.1',
-    files: fileMap(destination),
-    environment: {
-      name: '@docouno/env',
-      version,
-      archive,
-      integrity: `sha512-${createHash('sha512')
-        .update(readFileSync(join(destination, archive)))
-        .digest('base64')}`,
-    },
-  };
-  writeJson(join(destination, 'release.json'), manifest);
-}
+import { fixture, put, release, seal } from './helpers/project-fixture.ts';
 
 await test('init validates before target writes and preserves existing Git metadata', async () => {
   const f = fixture();
@@ -228,6 +89,7 @@ await test('local Node update preserves native/product edits and resolves full s
     stateNative.productMetadata = { keep: true };
     writeJson(join(target, '.devkit/manifest.json'), stateNative);
     const before = readFileSync(join(target, 'Makefile'));
+    await regenerateWorkspaceLock(target);
     const result = await updateProject(r2, target);
     assert.equal(result.version, '0.2.0');
     assert.equal(result.packageMode, 'local');
@@ -250,7 +112,7 @@ await test('local Node update preserves native/product edits and resolves full s
     });
     assert.equal(existsSync(join(target, 'apps/main/scripts-ran')), false);
     assert.equal(existsSync(join(target, '.devkit/npm/docouno-env-0.1.0.tgz')), false);
-    const lock = JSON.stringify(json(join(target, 'apps/main/package-lock.json')));
+    const lock = JSON.stringify(json(join(target, 'package-lock.json')));
     assert.ok(lock.includes('shared/my package'));
     assert.ok(!lock.includes(r1) && !lock.includes(r2) && !lock.includes('localhost'));
     execFileSync('sha256sum', ['--check', '--status', '.devkit/runtime.sha256'], { cwd: target });
@@ -270,22 +132,22 @@ await test('registry init keeps canonical locks and only rewrites root metadata'
   try {
     const r = release(f.root, '0.1.0');
     const target = join(f.root, 'registry');
-    const original = object(json(join(r, 'templates/node-app/package-lock.json')), 'lock');
+    const original = object(json(join(r, 'templates/node-api/package-lock.json')), 'lock');
     await initProject(r, target, {
       template: 'node',
       packageMode: 'registry',
       name: 'renamed',
     });
-    const updated = object(json(join(target, 'apps/main/package-lock.json')), 'lock');
-    assert.equal(updated.name, 'renamed-main');
+    const updated = object(json(join(target, 'package-lock.json')), 'lock');
+    assert.equal(updated.name, 'renamed');
     assert.deepEqual(
-      object(updated.packages, 'packages')['node_modules/@docouno/env'],
+      object(updated.packages, 'packages')['apps/main/node_modules/@docouno/env'],
       object(original.packages, 'packages')['node_modules/@docouno/env'],
     );
     assert.equal(existsSync(join(target, '.devkit/npm')), false);
     assert.equal(
       object(json(join(target, 'apps/main/package.json')), 'package').name,
-      'renamed-main',
+      '@renamed/app-main',
     );
   } finally {
     f.close();
@@ -432,16 +294,16 @@ await test('added apps need explicit registration with exact accepted native too
     const r2 = release(f.root, '0.2.0');
     const target = join(f.root, 'registration');
     await initProject(r1, target, { template: 'rust', packageMode: 'local' });
-    copyTree(join(r1, 'templates/rust-app'), join(target, 'apps/extra'));
+    copyTree(join(r1, 'templates/rust-api'), join(target, 'apps/extra'));
     const makefile = readFileSync(join(target, 'Makefile'));
-    await assert.rejects(updateProject(r2, target), /Unregistered native app/);
+    await assert.rejects(updateProject(r2, target), /Unregistered native component/);
     await assert.rejects(registerProjectApp(r2, target, 'extra', 'rust'), /exact accepted release/);
     const registered = await registerProjectApp(r1, target, 'extra', 'rust');
-    assert.ok(registered.apps.extra);
+    assert.ok(registered.components['apps/extra']);
     assert.ok(registered.managed['apps/extra/rust-toolchain.toml']);
     assert.deepEqual(readFileSync(join(target, 'Makefile')), makefile);
     const updated = await updateProject(r2, target);
-    assert.ok(updated.apps.extra);
+    assert.ok(updated.components['apps/extra']);
     await assert.rejects(registerProjectApp(r2, target, 'extra', 'rust'), /already registered/);
     assert.ok(/^[a-f0-9]{64}$/.test(digest(readFileSync(join(target, '.devkit/runtime.sha256')))));
   } finally {
@@ -468,7 +330,7 @@ await test('new runtime ownership conflicts and native resolution failure leave 
     native.dependencies = { 'missing-native-input': 'file:../../shared/absent-package.tgz' };
     writeJson(nativePath, native);
     const beforeResolution = sourceSignature(target);
-    await assert.rejects(updateProject(r2, target), /npm failed/);
+    await assert.rejects(updateProject(r2, target), /native|dependency|ENOENT/);
     assert.equal(sourceSignature(target), beforeResolution);
     assert.equal(existsSync(join(target, '.devkit/update-pending.json')), false);
   } finally {
@@ -476,40 +338,21 @@ await test('new runtime ownership conflicts and native resolution failure leave 
   }
 });
 
-await test('mixed init enables the API in its owned starter entry and fails closed on template contract changes', async () => {
+await test('mixed composes independent apps without editing their source', async () => {
   const f = fixture();
   try {
-    const r1 = release(f.root, '0.1.0');
-    const r2 = release(f.root, '0.2.0');
-    const mixed = join(f.root, 'mixed');
-    const standalone = join(f.root, 'standalone');
-    const original = readFileSync(join(r1, 'templates/react-app/src/main.tsx'), 'utf8');
-    await initProject(r1, mixed, { template: 'mixed', packageMode: 'local' });
-    await initProject(r1, standalone, { template: 'react', packageMode: 'local' });
-    const mixedEntry = join(mixed, 'apps/web/src/main.tsx');
-    assert.equal(
-      readFileSync(mixedEntry, 'utf8'),
-      original.replace('    <App />\n', '    <App apiEnabled />\n'),
-    );
-    assert.equal(readFileSync(join(standalone, 'apps/web/src/main.tsx'), 'utf8'), original);
-    assert.equal(Object.hasOwn(projectState(mixed).managed, 'apps/web/src/main.tsx'), false);
-    const edited = `// Product-owned entry\n${readFileSync(mixedEntry, 'utf8')}`;
-    writeFileSync(mixedEntry, edited);
-    await updateProject(r2, mixed);
-    assert.equal(readFileSync(mixedEntry, 'utf8'), edited);
-    const rejected = join(f.root, 'changed-template');
-    for (const changed of [
-      original.replace('    <App />\n', '    <App changed />\n'),
-      original.replace('    <App />\n', '    <App />\n    <App />\n'),
-    ]) {
-      put(r2, 'templates/react-app/src/main.tsx', changed);
-      seal(r2, '0.2.0');
-      await assert.rejects(
-        initProject(r2, rejected, { template: 'mixed', packageMode: 'local' }),
-        /Mixed template contract changed/,
-      );
-      assert.equal(existsSync(rejected), false);
-    }
+    const r1 = release(f.root, '0.1.0'),
+      r2 = release(f.root, '0.2.0');
+    const target = join(f.root, 'mixed');
+    const state = await initProject(r1, target, { template: 'mixed', packageMode: 'local' });
+    assert.deepEqual(Object.keys(state.components).sort(), ['apps/api', 'apps/web']);
+    assert.equal(state.components['apps/web']?.development?.api, 'apps/api');
+    const file = join(target, 'apps/web/src/main.tsx');
+    const original = readFileSync(file, 'utf8');
+    const edited = `// Product-owned entry\n${original}`;
+    writeFileSync(file, edited);
+    await updateProject(r2, target);
+    assert.equal(readFileSync(file, 'utf8'), edited);
   } finally {
     f.close();
   }

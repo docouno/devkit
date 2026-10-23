@@ -20,6 +20,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -55,8 +56,8 @@ def source_snapshot(root):
     for directory, names, files in os.walk(root, followlinks=False):
         relative = Path(directory).relative_to(root)
         names[:] = sorted(name for name in names if name not in (".git", "node_modules")
-                          and not (len(relative.parts) == 2 and relative.parts[0] == "apps"
-                                   and name in ("dist", "target"))
+                          and not (len(relative.parts) == 2 and relative.parts[0] in ("apps", "packages")
+                                   and name in ("dist", "target", "release"))
                           and not (relative == Path(".devkit") and name in ("state", "cache")))
         for name in sorted(files + [name for name in names if (Path(directory) / name).is_symlink()]):
             path = Path(directory) / name
@@ -81,15 +82,19 @@ def changed_files(changes):
 
 
 class Verification:
-    def __init__(self, release, next_release=None):
+    def __init__(self, release, next_release=None, legacy_release=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
         self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-"))
         self.release = self.copy_release(release, "release")
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
+        self.legacy_release = self.copy_release(legacy_release, "legacy-release") if legacy_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
         self.results = []
+        self.harness_identity = {path.name: sha256(path.read_bytes())
+                                 for path in Path(__file__).parent.iterdir()
+                                 if path.is_file()}
         self.projects = []
         self.containers = []
         self.forbidden_log = self.scratch / "host-sdk-attempts"
@@ -108,9 +113,21 @@ class Verification:
                 self.environment.pop(key)
         self.environment["PATH"] = str(blockers) + os.pathsep + os.environ["PATH"]
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
+        print(f"Receipt directory: {self.receipt}", flush=True)
+        print(f"Consumer scratch: {self.scratch}", flush=True)
 
     def copy_release(self, source, name):
         source = Path(source).resolve()
+        if source.is_file():
+            unpacked = self.scratch / (name + "-archive")
+            unpacked.mkdir()
+            with tarfile.open(source) as archive:
+                for entry in archive.getmembers():
+                    require(not entry.name.startswith("/") and ".." not in Path(entry.name).parts, "Unsafe release archive")
+                archive.extractall(unpacked, filter="data")
+            candidates = [unpacked] if (unpacked / "release.json").is_file() else list(unpacked.glob("*/release.json"))
+            require(len(candidates) == 1, "Release archive must contain one release root")
+            source = candidates[0] if candidates[0].is_dir() else candidates[0].parent
         require((source / "release.json").is_file(), f"Not a built release: {source}")
         destination = self.scratch / name
         shutil.copytree(source, destination)
@@ -210,22 +227,39 @@ class Verification:
                 time.sleep(0.2)
         raise RuntimeError(f"HTTP readiness failed at port {port}, {path}: {failure}")
 
-    def create(self, kind, parent):
+    def create(self, kind, parent, release=None):
         root = self.scratch / "work trees" / parent / "product"
         root.parent.mkdir(parents=True)
-        output = self.run(f"{kind}-init", [self.release / "devkit", "init", root, "--template", kind,
+        release = release or self.release
+        selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
+                      "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"]}
+        output = self.run(f"{kind}-init", [release / "devkit", "init", root, *selections[kind],
                           "--package-source", "local", "--name", f"verification-{kind}"])
         verify_creation_hint(output)
         self.projects.append(root)
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        require(state["version"] == self.version and state["packageMode"] == "local", "Wrong accepted release")
-        for name, app in state["apps"].items():
-            if app["kind"] == "node":
-                package = json.loads((root / "apps" / name / "package.json").read_text())
-                require(package["devDependencies"]["@docouno/env"].startswith("file:../../.devkit/npm/"),
-                        "Local init did not consume the copied package archive")
-                (root / "apps" / name / "src/consumer-marker.ts").write_text(
-                    "export const consumerMarker = 'untracked source input';\n")
+        require(state["schemaVersion"] == 2 and state["version"] == self.version and state["packageMode"] == "local", "Wrong accepted v2 release")
+        components = state["components"]
+        require(all(path.startswith(("apps/", "packages/")) for path in components), "Invalid component paths")
+        node_paths = [path for path, component in components.items() if component["toolchain"] == "node"]
+        if node_paths:
+            workspace = json.loads((root / "package.json").read_text())
+            require(set(workspace["workspaces"]) == set(node_paths), "Root workspace registration mismatch")
+            require((root / "package-lock.json").is_file(), "Missing root lock")
+        for path in node_paths:
+            package = json.loads((root / path / "package.json").read_text())
+            require(package["devDependencies"]["@docouno/env"].startswith("file:../../.devkit/npm/"), "Init did not use the release's local env archive")
+            require(not (root / path / "package-lock.json").exists(), "Leaf npm lock survived workspace creation")
+            (root / path / "src/consumer-marker.ts").write_text("export const consumerMarker = 'untracked source input';\n")
+        if kind == "react":
+            require(set(components) == {"apps/web"}, "React selection implicitly created a backend")
+        if kind == "fullstack":
+            require(set(components) == {"apps/api", "apps/web", "apps/desktop", "packages/client"}, "Wrong preset composition")
+            ui = [path for path in root.rglob("ClientApp.tsx") if "node_modules" not in path.parts]
+            require(ui == [root / "packages/client/src/ClientApp.tsx"], "Shared preset contains duplicate UI")
+            require(not any((root / path / "variants").exists() for path in node_paths), "Template overlays leaked into consumer")
+            for path in ("apps/web", "apps/desktop"):
+                require(components[path]["dependencies"] == ["packages/client"], "Shared dependency not derived")
         (root / ".env").write_text("PRODUCT_SECRET=consumer-owned-fixture-value\n")
         return root
 
@@ -237,6 +271,30 @@ class Verification:
         require(source_snapshot(root) == before, f"{kind}: setup/check/test/build mutated source inputs")
         self.results.append({"label": f"{kind}-source-purity", "passed": True,
                              "inputFileCount": len(before), "snapshot": before})
+
+    def readonly_mounts(self, root, kind):
+        if kind == "node":
+            probe = root / "apps/main/src/readonly-mount.test.ts"
+            code = ("import assert from 'node:assert/strict';\n"
+                    "import { closeSync, openSync } from 'node:fs';\n"
+                    "import test from 'node:test';\n\n"
+                    "test('source and native lock mounts reject writable opens', () => {\n"
+                    "  for (const file of [new URL(import.meta.url), new URL('../../../package-lock.json', import.meta.url)]) {\n"
+                    "    assert.throws(() => { const fd = openSync(file, 'r+'); closeSync(fd); }, { code: 'EROFS' });\n"
+                    "  }\n"
+                    "});\n")
+        else:
+            probe = root / "apps/api/tests/readonly_mount.rs"
+            code = ('#[test]\nfn source_and_lock_mounts_reject_writable_opens() {\n'
+                    '    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));\n'
+                    '    for file in [root.join("Cargo.lock"), root.join("tests/readonly_mount.rs")] {\n'
+                    '        let error = std::fs::OpenOptions::new().write(true).open(file).err();\n'
+                    '        assert_eq!(error.and_then(|error| error.raw_os_error()), Some(30));\n'
+                    '    }\n}\n')
+        with changed_files({probe: code}):
+            before = source_snapshot(root)
+            self.make(root, "test", label=f"{kind}-source-lock-readonly")
+            require(source_snapshot(root) == before, "Readonly mount probe changed project bytes")
 
     def node_negative(self, root):
         source = root / "apps/main/src"
@@ -269,7 +327,7 @@ class Verification:
         tests = list((root / "apps/web/src").glob("*.test.*"))
         require(len(tests) > 0, "React template has no native tests")
         with changed_files({path: "import { test } from 'vitest';\ntest.skip('skipped', () => {});\n" for path in tests}):
-            self.make(root, "test", expected="No runnable Vitest", label="react-skipped-tests-rejected")
+            self.make(root, "test", "app=web", expected="No runnable Vitest", label="react-skipped-tests-rejected")
 
     def rust_negative(self, root):
         source = root / "apps/api/src/lib.rs"
@@ -315,37 +373,160 @@ class Verification:
         require(found and found["State"]["ExitCode"] == 0, f"{kind}: emitted app did not shut down cleanly")
         self.run(f"{kind}-emitted-remove", ["docker", "rm", name])
 
-    def mixed_development(self, mixed, node):
-        require(mixed.name == node.name and self.project_name(mixed) != self.project_name(node), "Invalid same-name isolation fixture")
-        started = time.time()
+    def electron_runtime(self, root):
+        """Resolve the installed binary from the consuming workspace, never infer hoisting."""
+        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        name = f"devkit-packaged-{self.token}-electron-resolve"
+        self.containers.append(name)
+        output = self.run("consumer-electron-runtime", ["docker", "run", "--rm", "--pull", "never", "--name", name,
+                          "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
+                          "--network", "none", "--read-only", "--volume", f"{root}:/workspace:ro,z",
+                          "--workdir", "/workspace/apps/desktop", image, "node", "-p", "require('electron')"]).strip()
+        require(output.startswith("/workspace/") and ".." not in Path(output).parts,
+                f"Electron resolved outside the consumer: {output}")
+        binary = root / output.removeprefix("/workspace/")
+        require(binary.is_file() and os.access(binary, os.X_OK), "Prepared Electron binary is absent")
+        return binary.parent
+
+    def helper(self, root, mode, network_container, heading, label, *, hmr=None, packaged=None):
+        output = self.receipt / label
+        output.mkdir()
+        name = f"devkit-packaged-{self.token}-{label}"
+        self.containers.append(name)
+        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        argv = ["docker", "run", "--detach", "--pull", "never", "--name", name,
+                "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
+                "--network", f"container:{network_container}", "--read-only", "--tmpfs", "/tmp:mode=1777",
+                "--env", "HOME=/tmp/devkit-browser-home", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges:true", "--security-opt", f"seccomp={root}/.devkit/runtime/desktop-seccomp.json",
+                "--shm-size", "256m", "--volume", f"{Path(__file__).parent}:/harness:ro,z",
+                "--volume", f"{output}:/evidence:z", "--env", f"PROBE_MODE={mode}",
+                "--env", f"PROBE_HEADING={heading}", "--env", f"PROBE_NAME={label}"]
+        if hmr:
+            argv += ["--env", f"PROBE_HMR_HEADING={hmr}"]
+        if mode == "packaged-desktop":
+            argv += ["--volume", f"{packaged}:/app:ro,z", "--env", "PROBE_API_TARGET=http://127.0.0.1:8080"]
+        elif mode != "development-desktop":
+            argv += ["--volume", f"{self.electron_runtime(root)}:/electron:ro,z"]
+            if mode == "production-web":
+                argv += ["--volume", f"{root}/apps/web/dist:/web:ro,z", "--env", "PROBE_API_TARGET=http://127.0.0.1:8080"]
+        argv += [image, "timeout", "65s", "node", "/harness/browser.mjs"]
+        self.run(label + "-start", argv)
+        return name, output
+
+    def helper_ready(self, helper):
+        name, output = helper
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if (output / "ready.json").is_file():
+                return json.loads((output / "ready.json").read_text())
+            found = self.inspect("container", name)
+            if found and not found["State"]["Running"]:
+                break
+            time.sleep(0.1)
+        log = self.run(name[-25:] + "-logs", ["docker", "logs", name])
+        raise RuntimeError(f"Browser helper did not become ready: {name}: {log[-4000:]}")
+
+    def helper_finish(self, helper, label):
+        name, output = helper
+        status = self.run(label + "-wait", ["docker", "wait", name], timeout=70).strip()
+        self.run(label + "-logs", ["docker", "logs", name])
+        require(status == "0", f"{label} failed with container exit {status}")
+        result = json.loads((output / "result.json").read_text())
+        require((output / "screenshot.png").is_file(), "Browser did not capture a screenshot")
+        self.results.append({"label": label + "-browser-result", "passed": True, "result": result})
+        self.run(label + "-remove", ["docker", "rm", name])
+        return result
+
+    def library_negative(self, root):
+        source = root / "packages/client/src"
+        probe = source / "quality-probe.ts"
+        with changed_files({probe: "export const invalid: string = 42;\n"}):
+            self.make(root, "check", "package=client", expected="TS2322", label="library-type-rejected")
+        with changed_files({probe: "export const unsafe: string = JSON.parse('42');\n"}):
+            self.make(root, "check", "package=client", expected="no-unsafe-assignment", label="library-typed-lint-rejected")
+        tests = list(source.rglob("*.test.*"))
+        require(tests, "Shared library has no native tests")
+        with changed_files({path: "import { test } from 'vitest';\ntest.skip('skipped', () => {});\n" for path in tests}):
+            self.make(root, "test", "package=client", expected="No runnable Vitest", label="library-skipped-tests-rejected")
+        with changed_files({path: "" for path in tests}):
+            self.make(root, "test", "package=client", expected="No test suite found", label="library-empty-tests-rejected")
+
+    def fullstack(self, root, node):
+        require(root.name == node.name and self.project_name(root) != self.project_name(node), "Same-name isolation fixture invalid")
+        # Product-owned Compose override exposes no inspector on the host; the
+        # helper joins only this service's network namespace.
+        (root / "compose.yaml").write_text('services:\n  desktop:\n    environment:\n      REMOTE_DEBUGGING_PORT: "9222"\n')
         self.make(node, "dev", label="node-development-start")
-        self.make(mixed, "dev", label="mixed-development-start")
-        web = self.service(mixed, "web")
-        api = self.service(mixed, "api")
-        node_container = self.service(node, "main")
-        web_port, api_port, node_port = self.port(web, 5173), self.port(api, 8080), self.port(node_container, 8080)
-        require(len({web_port, api_port, node_port}) == 3, "Development stands share a port")
-        self.http(web_port, "/", '<div id="root"></div>')
-        self.http(web_port, "/src/main.tsx", "apiEnabled")
-        self.http(api_port, "/health", {"status": "ok"})
-        self.http(web_port, "/api/greeting?name=%E4%B8%96%E7%95%8C", {"message": "Hello, 世界!"})
-        self.http(node_port, "/health", {"status": "ok"})
-        self.make(mixed, "status", label="mixed-status")
-        self.make(mixed, "logs", "tail=10", label="mixed-finite-logs", timeout=30)
+        self.make(root, "dev", "headless=1", label="fullstack-development-start")
+        web, api, desktop = (self.service(root, name) for name in ("web", "api", "desktop"))
+        main = self.service(node, "main")
+        self.http(self.port(api, 8080), "/health", {"status": "ok"})
+        self.http(self.port(web, 5173), "/api/greeting?name=shared", {"message": "Hello, shared!"})
+        self.http(self.port(main, 8080), "/health", {"status": "ok"})
+        initial = "A small app, ready to change."
+        marker = "Packaged harness shared UI"
+        helpers = [self.helper(root, "development-web", web, initial, "dev-web", hmr=marker),
+                   self.helper(root, "development-desktop", desktop, initial, "dev-desktop", hmr=marker)]
+        for helper in helpers:
+            self.helper_ready(helper)
+        source = root / "packages/client/src/ClientApp.tsx"
+        original = source.read_text()
+        require(initial in original, "Shared UI template heading changed; update the named fixture")
+        library_before = {str(path.relative_to(root)): sha256(path.read_bytes()) for path in (root / "packages/client/dist").rglob("*") if path.is_file()}
+        with changed_files({source: original.replace(initial, marker)}):
+            for helper, label in zip(helpers, ("dev-web", "dev-desktop")):
+                self.helper_finish(helper, label)
+            library_after = {str(path.relative_to(root)): sha256(path.read_bytes()) for path in (root / "packages/client/dist").rglob("*") if path.is_file()}
+            require(library_before == library_after, "Dev HMR unexpectedly rebuilt the library")
+            self.results.append({"label": "native-shared-hmr", "passed": True, "libraryDistUnchanged": True})
+            self.make(root, "build", label="changed-shared-production-build")
+            web_js = "\n".join(path.read_text() for path in (root / "apps/web/dist").rglob("*.js"))
+            require(marker in web_js, "Shared change missing from production web bundle")
+            self.make(root, "package", "app=desktop", label="changed-shared-desktop-package")
+            archive = root / "apps/desktop/release/app-linux.tar.gz"
+            require(archive.is_file(), "Missing packaged desktop archive")
+            extracted = self.scratch / "extracted-desktop"
+            extracted.mkdir()
+            with tarfile.open(archive) as tar:
+                for entry in tar.getmembers():
+                    require(not entry.name.startswith("/") and ".." not in Path(entry.name).parts, "Unsafe archive member")
+                tar.extractall(extracted, filter="data")
+            require((extracted / "app").read_bytes()[:4] == b"\x7fELF", "Packaged app is not an ELF executable")
+            asar = extracted / "resources/app.asar"
+            require(asar.is_file(), "Packaged app has no ASAR payload")
+            require(not (extracted / "src").exists(), "Raw application source leaked outside ASAR")
+            self.results.append({"label": "desktop-archive", "passed": True, "sha256": sha256(archive.read_bytes()), "bytes": archive.stat().st_size,
+                                 "asarSha256": sha256(asar.read_bytes()), "executableType": "ELF"})
+            for mode, label in (("production-web", "production-web"), ("packaged-desktop", "packaged-desktop")):
+                helper = self.helper(root, mode, api, marker, label, packaged=extracted)
+                self.helper_finish(helper, label)
+        self.make(root, "status", label="fullstack-status")
+        self.make(root, "logs", "tail=10", label="fullstack-finite-logs", timeout=30)
         self.make(node, "down", label="node-development-down")
-        require(self.inspect("container", node_container) is None, "Down left this checkout's service")
-        self.http(web_port, "/api/greeting?name=isolated", {"message": "Hello, isolated!"})
-        require(self.inspect("container", api)["State"]["Running"], "Other checkout stopped")
-        self.make(mixed, "down", label="mixed-development-down")
-        require(self.inspect("container", web) is None and self.inspect("container", api) is None, "Mixed services survived down")
-        events = self.run("mixed-rust-stop-events", ["docker", "events", "--since", f"{started:.9f}",
-                          "--until", f"{time.time():.9f}", "--filter", f"container={api}",
-                          "--filter", "event=die", "--format", "{{json .}}"], timeout=10)
-        exits = [json.loads(line)["Actor"]["Attributes"]["exitCode"] for line in events.splitlines()]
-        require(len(exits) == 1 and exits[0] != "137", "Rust development service required a forced kill or has unknown stop status")
-        self.results.append({"label": "mixed-http-and-same-name-isolation", "passed": True,
-                             "ports": {"web": web_port, "rustApi": api_port, "nodeApi": node_port},
-                             "rustDevelopmentExitCode": int(exits[0])})
+        require(self.inspect("container", main) is None, "Node service survived down")
+        self.http(self.port(api, 8080), "/api/greeting?name=isolated", {"message": "Hello, isolated!"})
+        self.make(root, "down", label="fullstack-development-down")
+        require(all(self.inspect("container", item) is None for item in (web, api, desktop)), "Fullstack services survived down")
+        self.results.append({"label": "same-name-checkout-isolation", "passed": True})
+
+    def add_app(self, root):
+        source = root / "apps/main/src/consumer-marker.ts"
+        source.write_text("export const consumerMarker = 'preserve edited app during add';\n")
+        make = root / "Makefile"
+        make.write_text(make.read_text() + "\nconsumer-note:\n\t@printf 'consumer-owned\\n'\n")
+        compose = root / "compose.yaml"
+        settings = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if line and not line.startswith("#"))
+        compose.write_text(json.dumps({"services": {"manual": {"image": settings["DEVKIT_NODE_IMAGE"], "profiles": ["manual"], "command": ["node", "--version"]}}}, indent=2) + "\n")
+        preserved = {path: path.read_bytes() for path in (source, make, compose, root / ".env")}
+        self.run("add-react-app", [self.release / "devkit", "add-app", root, "--name", "console", "--template", "react-web"])
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(state["components"]["apps/console"]["toolingProfile"] == "web", "Added app not registered")
+        for path, content in preserved.items(): require(path.read_bytes() == content, f"Add-app overwrote {path}")
+        before = source_snapshot(root)
+        self.run("add-existing-app-refused", [self.release / "devkit", "add-app", root, "--name", "console", "--template", "react-web"], expected="already exists")
+        require(source_snapshot(root) == before, "Duplicate add-app wrote source")
+        self.healthy(root, "added-react-app")
 
     def upgrade(self, root):
         if self.next_release is None:
@@ -383,6 +564,63 @@ class Verification:
         self.run("upgrade-identical-noop", [self.next_release / "devkit", "update", root])
         require(source_snapshot(root) == before, "Identical release update rewrote source or generation")
         self.run("recover-without-pending", [self.next_release / "devkit", "recover", root])
+
+    def recovery(self, root):
+        # A synthetic interrupted journal exercises the released recovery command.
+        # It does not claim to reproduce the timing of a killed live transaction.
+        before = source_snapshot(root)
+        stage = ".devkit/state/update-" + str(uuid.uuid4())
+        entries = []
+        for index, relative in enumerate((".devkit/runtime/devkit.mk", ".devkit/manifest.json")):
+            path = root / relative
+            old = path.read_bytes()
+            new = old + b"\n" if index == 0 else (json.dumps({**json.loads(old), "generation": str(uuid.uuid4())}, indent=2) + "\n").encode()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            backup, staged = f"{stage}/backup/{index}", f"{stage}/staged/{index}"
+            for saved, content in ((backup, old), (staged, new)):
+                dest = root / saved
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content)
+                dest.chmod(mode)
+            entries.append({"path": relative, "before": {"sha256": sha256(old), "mode": mode},
+                            "after": {"sha256": sha256(new), "mode": mode}, "backup": backup, "staged": staged})
+            if index == 0: path.write_bytes(new)
+        pending = root / ".devkit/update-pending.json"
+        pending.write_text(json.dumps({"schemaVersion": 2, "stage": stage, "files": entries, "createdDirectories": []}, indent=2) + "\n")
+        self.make(root, "check", expected="update is incomplete", label="pending-state-rejected")
+        runtime = root / entries[0]["path"]
+        known_after = runtime.read_bytes()
+        runtime.write_bytes(known_after + b"# concurrent unknown edit\n")
+        conflict = source_snapshot(root)
+        self.run("recovery-conflict", [self.next_release / "devkit" if self.next_release else self.release / "devkit", "recover", root], expected="Recovery conflict")
+        require(source_snapshot(root) == conflict, "Recovery conflict discarded an edit")
+        runtime.write_bytes(known_after)
+        self.run("synthetic-journal-recovery", [self.next_release / "devkit" if self.next_release else self.release / "devkit", "recover", root])
+        require(source_snapshot(root) == before, "Recovery did not restore known bytes")
+        self.results.append({"label": "synthetic-interrupted-journal", "passed": True, "liveCrashReproduced": False})
+
+    def legacy_migration(self):
+        if not self.legacy_release: return
+        root = self.scratch / "work trees/legacy-v1/product"
+        root.parent.mkdir(parents=True)
+        self.run("legacy-init", [self.legacy_release / "devkit", "init", root, "--template", "node", "--package-source", "local"])
+        self.projects.append(root)
+        old = json.loads((root / ".devkit/manifest.json").read_text())
+        require(old["schemaVersion"] == 1 and old["version"].startswith("0.1."), "Legacy artifact does not create schema1")
+        self.make(root, "setup", "check", "build", label="legacy-healthy-before-migration")
+        (root / ".env").write_text("LEGACY_SETTING=preserve-me\n")
+        source = root / "apps/main/src/legacy-product.ts"
+        source.write_text("export const legacyProduct = 'keep legacy product source';\n")
+        make = root / "Makefile"
+        make.write_text(make.read_text() + "\nlegacy-note:\n\t@printf 'retained\\n'\n")
+        keep = {path: path.read_bytes() for path in (source, make, root / "compose.yaml", root / ".env")}
+        self.run("legacy-upgrade-v2", [self.release / "devkit", "update", root])
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(state["schemaVersion"] == 2 and state["version"] == self.version, "Legacy schema migration failed")
+        require((root / "package-lock.json").exists() and not (root / "apps/main/package-lock.json").exists(), "Legacy lock migration failed")
+        for path, contents in keep.items(): require(path.read_bytes() == contents, f"Legacy update changed {path}")
+        self.healthy(root, "legacy-migrated")
+        self.results.append({"label": "legacy-schema1-to-schema2", "passed": True, "fromVersion": old["version"]})
 
     def cleanup(self):
         errors = []
@@ -425,6 +663,7 @@ class Verification:
             node = self.create("node", "a-node-Проект")
             self.make(node, "check", expected="dependencies are absent/stale", label="node-setup-required")
             self.healthy(node, "node")
+            self.readonly_mounts(node, "node")
             self.node_negative(node)
             self.emitted(node, "node")
             react = self.create("react", "b-react")
@@ -432,18 +671,17 @@ class Verification:
             self.react_negative(react)
             rust = self.create("rust", "c-rust")
             self.healthy(rust, "rust")
+            self.readonly_mounts(rust, "rust")
             self.rust_negative(rust)
             self.emitted(rust, "rust")
-            mixed = self.create("mixed", "d-mixed")
-            # An ordinary Make edge must build the web output before the Rust API.
-            with (mixed / "Makefile").open("a") as target:
-                target.write("\nbuild-api: build-web\n")
-            self.healthy(mixed, "mixed")
-            edge = self.make(mixed, "build", "app=api", label="mixed-explicit-build-edge")
-            require("vite v" in edge and "Finished" in edge and edge.index("vite v") < edge.index("Finished"),
-                    "Explicit Make edge did not build web before the selected Rust API")
-            self.mixed_development(mixed, node)
+            fullstack = self.create("fullstack", "d-fullstack")
+            self.healthy(fullstack, "fullstack")
+            self.library_negative(fullstack)
+            self.fullstack(fullstack, node)
+            self.add_app(node)
             self.upgrade(node)
+            self.recovery(node)
+            self.legacy_migration()
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error
@@ -452,12 +690,16 @@ class Verification:
                 self.cleanup()
             except BaseException as error:
                 failure = RuntimeError(f"{failure or ''}\nCleanup: {error}")
-            summary = {"schemaVersion": 1, "version": self.version, "token": self.token,
+            summary = {"schemaVersion": 2, "version": self.version, "token": self.token,
                        "standaloneRelease": str(self.release), "scratch": str(self.scratch),
+                       "releaseIdentity": sha256((self.release / "release.json").read_bytes()),
+                       "nextReleaseIdentity": sha256((self.next_release / "release.json").read_bytes()) if self.next_release else None,
+                       "harnessIdentity": self.harness_identity,
                        "passed": failure is None, "error": str(failure) if failure else None,
                        "hostLanguageSDKAttempted": self.forbidden_log.exists(),
-                       "nextVersionTested": bool(self.next_release), "results": self.results,
-                       "limits": ["HTTP smoke does not execute a real browser", "Registry consumption and crash recovery are separate proofs"]}
+                       "nextVersionTested": bool(self.next_release), "legacyMigrationTested": bool(self.legacy_release),
+                       "results": self.results,
+                       "limits": ["Registry and remote bootstrap are separate suites", "Recovery journal is synthetic; live crash timing is covered by core tests"]}
             (self.receipt / "receipt.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
             print(f"Receipt: {self.receipt / 'receipt.json'}", flush=True)
             if failure is None and os.environ.get("DEVKIT_VERIFY_KEEP") != "1":
@@ -477,8 +719,13 @@ def main():
     parser.add_argument("release", type=Path)
     parser.add_argument("--next-release", type=Path,
                         default=os.environ.get("DEVKIT_VERIFY_NEXT_RELEASE"))
+    default_legacy = REPO / ".artifacts/releases/0.1.0"
+    parser.add_argument("--legacy-release", type=Path,
+                        default=os.environ.get("DEVKIT_VERIFY_LEGACY_RELEASE") or (default_legacy if default_legacy.is_dir() else None))
+    parser.add_argument("--skip-legacy", action="store_true",
+                        help="Explicitly omit the legacy migration in a bounded preflight")
     args = parser.parse_args()
-    Verification(args.release, args.next_release).verify()
+    Verification(args.release, args.next_release, None if args.skip_legacy else args.legacy_release).verify()
 
 
 if __name__ == "__main__":

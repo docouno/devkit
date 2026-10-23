@@ -104,7 +104,7 @@ class RustCheckTests(unittest.TestCase):
 
     @classmethod
     def write_receipt(cls):
-        paths = [HELPER, RECIPE, Path(__file__), REPO / "templates/rust-app/README.md"]
+        paths = [HELPER, RECIPE, Path(__file__), REPO / "templates/rust-api/README.md"]
         receipt = {"imageId": cls.image, "recipeSha256": cls.recipe_sha,
                    "sourceSha256": {str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                     for path in paths}, "commands": cls.commands}
@@ -119,7 +119,8 @@ class RustCheckTests(unittest.TestCase):
         (fixture / "target").mkdir(exist_ok=True)
         before = source_hashes(fixture)
         args = ["docker", "run", "--rm", "--name", name, "--label", LABEL + "=" + cls.token,
-                "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+                "--network", "none", "--read-only", "--tmpfs", "/tmp:mode=1777,exec",
+                "--user", f"{os.getuid()}:{os.getgid()}",
                 "--env", "DEVKIT_RUST_VERSION=" + VERSION, "--env", "RUSTUP_AUTO_INSTALL=0",
                 "--env", "CARGO_HOME=/cache/cargo", "--env", "HOME=/tmp/devkit-home",
                 "--env", "CARGO_BUILD_JOBS=2", "--volume",

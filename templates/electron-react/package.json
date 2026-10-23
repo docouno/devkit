@@ -1,0 +1,57 @@
+{
+  "name": "devkit-electron-react",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^24.22.1"
+  },
+  "scripts": {
+    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck && npm test",
+    "format:check": "prettier --check src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
+    "lint": "eslint --no-ignore --max-warnings 0 src eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run --config vitest.config.mjs",
+    "fix": "prettier --write src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs && eslint --no-ignore --max-warnings 0 --fix src eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs && prettier --write src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
+    "build": "npm run typecheck && electron-vite build",
+    "dev": "electron-vite dev",
+    "package": "electron-builder --config electron-builder.config.cjs --linux dir --publish never && tar -czf release/app-linux.tar.gz -C release/linux-unpacked ."
+  },
+  "devDependencies": {
+    "@docouno/env": "0.2.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "eslint": "10.13.0",
+    "jsdom": "30.1.3",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "vite": "8.3.5",
+    "vitest": "5.0.5",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "electron": "45.0.0",
+    "electron-vite": "6.0.0",
+    "electron-builder": "26.15.3"
+  },
+  "devkit": {
+    "sourceDirectories": [
+      "src"
+    ],
+    "typecheckConfigs": [
+      "tsconfig.json",
+      "tsconfig.node.json",
+      "tsconfig.test.json"
+    ],
+    "boundaries": {
+      "forbidCrossAppImports": true
+    }
+  },
+  "main": "dist/main/index.js",
+  "description": "A React desktop application",
+  "author": "Application authors",
+  "license": "MIT"
+}

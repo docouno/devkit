@@ -1,0 +1,68 @@
+{
+  "name": "devkit-react-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^24.22.1"
+  },
+  "scripts": {
+    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck && npm test",
+    "format:check": "prettier --check src tsconfig.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs tsconfig.build.json",
+    "lint": "eslint --no-ignore --max-warnings 0 src eslint.config.mjs prettier.config.mjs vitest.config.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run --config vitest.config.mjs",
+    "fix": "prettier --write src tsconfig.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs tsconfig.build.json && eslint --no-ignore --max-warnings 0 --fix src eslint.config.mjs prettier.config.mjs vitest.config.mjs && prettier --write src tsconfig.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && cp src/style.css dist/style.css"
+  },
+  "devDependencies": {
+    "@docouno/env": "0.2.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "eslint": "10.13.0",
+    "jsdom": "30.1.3",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "vite": "8.3.5",
+    "vitest": "5.0.5",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devkit": {
+    "sourceDirectories": [
+      "src"
+    ],
+    "typecheckConfigs": [
+      "tsconfig.json",
+      "tsconfig.test.json"
+    ],
+    "boundaries": {
+      "forbidCrossAppImports": true
+    }
+  },
+  "peerDependencies": {
+    "react": "^19.3.1"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./style.css": {
+      "development": "./src/style.css",
+      "default": "./dist/style.css"
+    }
+  },
+  "sideEffects": [
+    "**/*.css"
+  ]
+}

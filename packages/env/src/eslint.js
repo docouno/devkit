@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { builtinModules } from 'node:module';
 import js from '@eslint/js';
 import { defineConfig } from 'eslint/config';
 import reactHooks from 'eslint-plugin-react-hooks';
@@ -85,3 +86,89 @@ function config(appRoot, browser) {
 
 export const nodeConfig = (appRoot) => config(appRoot, false);
 export const browserConfig = (appRoot) => config(appRoot, true);
+
+/** Electron's renderer uses browser globals even though its main process uses Node. */
+export const desktopConfig = (appRoot) => {
+  const definitions = config(appRoot, false);
+  const browser = config(appRoot, true);
+  const renderer = ['src/renderer/**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}'];
+  const forbidden = [
+    ...new Set([
+      ...builtinModules,
+      ...builtinModules.map((name) => (name.startsWith('node:') ? name : `node:${name}`)),
+      'electron',
+    ]),
+  ];
+  const nativeModules = new Set(forbidden);
+  const desktopPlugin = {
+    rules: {
+      'no-native-dynamic-import': {
+        meta: {
+          type: 'problem',
+          schema: [],
+          messages: { native: 'Renderer code cannot import native module {{name}}.' },
+        },
+        create(context) {
+          return {
+            ImportExpression(node) {
+              const source = node.source;
+              const name =
+                source.type === 'Literal'
+                  ? source.value
+                  : source.type === 'TemplateLiteral' && source.expressions.length === 0
+                    ? source.quasis[0].value.cooked
+                    : undefined;
+              if (
+                typeof name === 'string' &&
+                (nativeModules.has(name) || name.startsWith('electron/'))
+              ) {
+                context.report({ node, messageId: 'native', data: { name } });
+              }
+            },
+          };
+        },
+      },
+    },
+  };
+  definitions.push({
+    name: 'devkit/electron-renderer',
+    files: renderer,
+    plugins: { 'devkit-desktop': desktopPlugin },
+    languageOptions: {
+      globals: {
+        ...Object.fromEntries(Object.keys(globals.node).map((name) => [name, 'off'])),
+        ...globals.browser,
+      },
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        'process',
+        'Buffer',
+        'require',
+        '__dirname',
+        '__filename',
+        'global',
+        'module',
+        'exports',
+      ],
+      'no-restricted-imports': ['error', { paths: forbidden, patterns: ['electron/*'] }],
+      'no-restricted-modules': ['error', { paths: forbidden, patterns: ['electron/*'] }],
+      'devkit-desktop/no-native-dynamic-import': 'error',
+    },
+  });
+  for (const definition of browser.filter((entry) =>
+    ['devkit/react', 'devkit/react-tests'].includes(entry.name),
+  )) {
+    definitions.push({
+      ...definition,
+      name: `${definition.name}-electron-renderer`,
+      files:
+        definition.name === 'devkit/react'
+          ? ['src/renderer/**/*.{tsx,jsx}']
+          : ['src/renderer/**/*.{test,spec}.{tsx,jsx}'],
+    });
+  }
+  return defineConfig(definitions);
+};

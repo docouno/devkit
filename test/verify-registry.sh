@@ -13,6 +13,6 @@ bash "$root/runtime/guard.sh" "$name" "$token" -- docker run --rm --init --pull 
   --name "$name" --label "io.docouno.devkit.invocation=$token" \
   --user "$(id -u):$(id -g)" --env HOME=/tmp/devkit-home --env CI=true \
   --volume "$first:/release-v1:ro,z" --volume "$second:/release-v2:ro,z" \
-  --volume "$root/.artifacts/cli:/fixture:ro,z" \
+  --volume "$root/.artifacts/cli-author:/fixture:ro,z" \
   --volume "$root/test/registry-consumer.mjs:/registry-consumer.mjs:ro,z" \
   "$image" node /registry-consumer.mjs 2>&1 | tee "$root/.artifacts/registry/latest.log"

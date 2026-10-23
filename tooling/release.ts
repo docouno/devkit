@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -26,9 +27,16 @@ import {
 } from './files.ts';
 import { npmEnvironment, run } from './process.ts';
 import { canonicalizeLock, withRegistry } from './registry.ts';
+import { assertCompleteLockIdentities, hydrateLockIdentities } from './lock-identities.ts';
 import type { Release } from './types.ts';
 
-const templateNames = ['node-app', 'react-app', 'rust-app'] as const;
+const templateNames = [
+  'node-api',
+  'react-web',
+  'rust-api',
+  'electron-react',
+  'react-client',
+] as const;
 const requiredRuntime = [
   'devkit.mk',
   'devkit.sh',
@@ -36,8 +44,19 @@ const requiredRuntime = [
   'compose.tools.yaml',
   'rust.Dockerfile',
   'rust-check.sh',
-  'verify-manifest.mjs',
+  'desktop.Dockerfile',
+  'desktop-seccomp.json',
+  'desktop-dev.sh',
 ];
+
+export function assertRuntimeNotices(runtimeRoot: string): void {
+  for (const name of ['Apache-2.0.txt', 'moby-profiles.NOTICE', 'yaml.txt', 'smol-toml.txt']) {
+    const path = join(runtimeRoot, 'licenses', name);
+    if (!existsSync(path) || !lstatSync(path).isFile() || readFileSync(path).length === 0) {
+      fail(`Missing or empty runtime notice: ${name}`);
+    }
+  }
+}
 
 function isBuildOutput(name: string): boolean {
   return (
@@ -91,7 +110,7 @@ async function canonicalTemplateLock(
     if (top.devDependencies !== undefined) {
       object(top.devDependencies, 'lock root devDependencies')['@docouno/env'] = packageVersion;
     }
-    writeJson(lockPath, lock);
+    writeJson(lockPath, await hydrateLockIdentities(lock, { cwd: appRoot, cache, registry }));
   }
   await run(
     'npm',
@@ -99,6 +118,7 @@ async function canonicalTemplateLock(
     { cwd: appRoot, env: npmEnvironment(cache, registry) },
   );
   const canonical = canonicalizeLock(json(lockPath), registry);
+  assertCompleteLockIdentities(canonical);
   const encoded = JSON.stringify(canonical);
   if (encoded.includes('"link":true') || /file:|\/workspace\/|\.artifacts\//.test(encoded)) {
     fail('A source/local link remains in a default template lock');
@@ -124,6 +144,9 @@ export async function buildRelease(
     if (!existsSync(join(root, '.artifacts', 'cli', file))) {
       fail(`Build the factory first: missing ${file}`);
     }
+  }
+  if (!existsSync(join(root, '.artifacts', 'runtime-project.mjs'))) {
+    fail('Build the runtime metadata helper first');
   }
   const artifacts = join(root, '.artifacts');
   mkdirSync(artifacts, { recursive: true });
@@ -165,10 +188,25 @@ export async function buildRelease(
     }
 
     copyTree(join(root, 'runtime'), join(payload, 'runtime'), { ignore: isBuildOutput });
+    writeAtomic(
+      join(payload, 'runtime', 'project.mjs'),
+      readFileSync(join(root, '.artifacts', 'runtime-project.mjs')),
+    );
     writeAtomic(join(payload, 'runtime', 'LICENSE'), readFileSync(join(root, 'LICENSE')));
+    for (const dependency of ['yaml', 'smol-toml']) {
+      writeAtomic(
+        join(payload, 'runtime', 'licenses', `${dependency}.txt`),
+        readFileSync(join(root, 'node_modules', dependency, 'LICENSE')),
+      );
+    }
+    assertRuntimeNotices(join(payload, 'runtime'));
     const recipe = digest(readFileSync(join(payload, 'runtime', 'rust.Dockerfile')));
     settings.set('DEVKIT_VERSION', releaseVersion);
     settings.set('DEVKIT_RUST_RECIPE_HASH', recipe);
+    settings.set(
+      'DEVKIT_DESKTOP_RECIPE_HASH',
+      digest(readFileSync(join(payload, 'runtime', 'desktop.Dockerfile'))),
+    );
     writeAtomic(
       join(payload, 'runtime', 'toolchains.env'),
       [...settings].map(([key, value]) => `${key}=${value}`).join('\n') + '\n',
@@ -195,7 +233,7 @@ export async function buildRelease(
       );
     }
     await withRegistry([{ manifest: envManifest, archive: npmArchive }], async (registry) => {
-      for (const template of ['node-app', 'react-app']) {
+      for (const template of ['node-api', 'react-web', 'electron-react', 'react-client']) {
         await canonicalTemplateLock(
           join(payload, 'templates', template),
           releaseVersion,
@@ -206,7 +244,7 @@ export async function buildRelease(
     });
 
     const rustPin = readFileSync(
-      join(payload, 'templates', 'rust-app', 'rust-toolchain.toml'),
+      join(payload, 'templates', 'rust-api', 'rust-toolchain.toml'),
       'utf8',
     );
     if (!rustPin.includes(`channel = "${settings.get('DEVKIT_RUST_VERSION')}"`)) {
@@ -229,6 +267,25 @@ export async function buildRelease(
     };
     writeJson(join(payload, 'release.json'), manifest);
     readRelease(payload);
+
+    let bootstrap = readFileSync(join(root, 'tooling', 'bootstrap.sh'), 'utf8');
+    const replacements: Record<string, string> = {
+      '@@BOOTSTRAP_VERSION@@': releaseVersion,
+      '@@NODE_IMAGE@@': settings.get('DEVKIT_NODE_IMAGE')!,
+      '@@NODE_VERSION@@': settings.get('DEVKIT_NODE_VERSION')!,
+      '@@GUARD@@': readFileSync(join(root, 'runtime', 'guard.sh'), 'utf8'),
+    };
+    for (const [token, value] of Object.entries(replacements)) {
+      if (bootstrap.split(token).length !== 2) {
+        fail(`Bootstrap must contain exactly one ${token}`);
+      }
+      bootstrap = bootstrap.replace(token, () => value);
+    }
+    if (/@@[A-Z_]+@@/u.test(bootstrap)) {
+      fail('Unresolved bootstrap placeholder');
+    }
+    const stagedBootstrap = join(stage, `devkit-${releaseVersion}.sh`);
+    writeAtomic(stagedBootstrap, bootstrap, 0o755);
 
     const stagedArchive = join(stage, `devkit-${releaseVersion}.tar.gz`);
     await run(
@@ -267,6 +324,12 @@ export async function buildRelease(
     const archive = join(artifacts, `devkit-${releaseVersion}.tar.gz`);
     renameSync(stagedArchive, archive);
     writeAtomic(`${archive}.sha256`, `${digest(readFileSync(archive))}  ${basename(archive)}\n`);
+    const bootstrapPath = join(artifacts, `devkit-${releaseVersion}.sh`);
+    renameSync(stagedBootstrap, bootstrapPath);
+    writeAtomic(
+      `${bootstrapPath}.sha256`,
+      `${digest(readFileSync(bootstrapPath))}  ${basename(bootstrapPath)}\n`,
+    );
     process.stdout.write(`Release ${releaseVersion}: ${output}\nArchive: ${archive}\n`);
     return output;
   } finally {

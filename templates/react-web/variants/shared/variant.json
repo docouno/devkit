@@ -1,0 +1,3 @@
+{
+  "remove": ["src/ClientApp.tsx", "src/ClientApp.test.tsx", "src/style.css"]
+}

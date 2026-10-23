@@ -2,7 +2,7 @@
 
 Reusable ESM configuration and source verification for Devkit applications. Standard tools remain native application dependencies; this package does not locate or dispatch their binaries.
 
-The supported initial suite is Node 24.18, ESLint 10.13, TypeScript 6.0 and Prettier 3.9. The exact accepted versions and application lockfiles belong to a Devkit release. TypeScript 7 is outside this package's peer range.
+The supported suite is Node 24.22, ESLint 10.13, TypeScript 6.0 and Prettier 3.9. The exact accepted versions and application lockfiles belong to a Devkit release. TypeScript 7 is outside this package's peer range.
 
 ## Configuration
 
@@ -13,7 +13,9 @@ import { nodeConfig } from '@docouno/env/eslint';
 export default nodeConfig(import.meta.dirname);
 ```
 
-Use `browserConfig` for React/browser code. Both factories require the absolute application root. They enable typed linting and reject inline ESLint disable directives. Source-specific exceptions therefore remain visible configuration changes rather than local comments.
+Use `browserConfig` for React/browser code and `desktopConfig` for Electron's main/preload/renderer layout. Each factory requires the absolute component root. They enable typed linting and reject inline ESLint disable directives. Source-specific exceptions therefore remain visible configuration changes rather than local comments.
+
+The desktop factory applies Node rules to main/preload and browser rules to `src/renderer`. Renderer source cannot directly use Node/Electron imports or native globals. Literal dynamic imports are checked too; arbitrary computed runtime imports are outside this static contract. The native capabilities of an application still need a deliberately designed preload interface.
 
 An application TSConfig extends `@docouno/env/tsconfig/node.json` or `@docouno/env/tsconfig/browser.json`. These configs contain compiler settings and no application source/output paths. Set `include`, `exclude`, `rootDir`, `outDir` and any runtime-specific types in the application. The Node config includes Node types; the browser config keeps DOM types separate.
 
@@ -47,6 +49,8 @@ These values are the defaults. Unknown options, parent traversal, source symlink
 Typechecking must remain strict and cannot use `noCheck` or a leading `ts-nocheck` directive. Coverage follows the compiler's actual import graph, not only its initial root file list. Authored declaration files are not claimed checked when `skipLibCheck` skips them. Every declared TS file must have the typed parser, project context and mandatory type-aware error rules. An ignored file is rejected even when the compiler could accept its code. Multiple `typecheckConfigs` select explicit rooted lint projects; a single ordinary `tsconfig.json` uses the TypeScript project service. List leaf configs rather than only an empty solution config.
 
 Cross-app checking rejects static relative import, re-export, dynamic-import and `require` literals into a sibling under `apps/`. It is not a runtime dependency graph or a proof about computed module paths. The policy can be disabled explicitly. Directory bans are opt-in basenames; no private naming scheme or legacy `spec` link is embedded.
+
+In a schema-2 Devkit consumer, workspace checking also uses the registered component graph and actual native manifests. A local shared library must be a declared native dependency, and imports must resolve through its public `exports`. Hoisted visibility alone is not a dependency declaration. Cross-app imports, library-to-app imports and private library paths fail. The verifier checks TypeScript's real import mode and resolution conditions, including aliases and asset imports, without changing source files. Dependencies outside the registered component graph retain ordinary native resolution.
 
 Use `eslint --no-ignore --max-warnings 0` on the declared source roots, a separate `tsc --noEmit`, and `prettier --check`. Formatting and lint autofix belong to a separate explicit command. Template checks also require real tests; empty test suites are not accepted.
 

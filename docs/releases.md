@@ -2,46 +2,66 @@
 
 ## Prepare locally
 
-`make pack` builds `.artifacts/releases/0.1.0`, `.artifacts/devkit-0.1.0.tar.gz` and its `.sha256` sidecar. `make pack version=X.Y.Z` builds a different preview version without modifying source manifests. The archive includes:
+`make pack` builds `.artifacts/releases/0.2.0`, `.artifacts/devkit-0.2.0.tar.gz`, `.artifacts/devkit-0.2.0.sh` and checksum sidecars. `make pack version=X.Y.Z` builds another preview without changing source versions. `make pack-next` also prepares the next test version. The unpacked archive contains:
 
 ```text
 devkit                       # host Bash launcher
 compose.factory.yaml
-cli/                         # compiled, dependency-free Node factory
-runtime/                     # Make/Compose helpers, pins, Rust recipe, license
-templates/                   # native Node, React and Rust starters, with MIT notices
+cli/                         # compiled Node factory, with bundled parser dependencies
+runtime/                     # Make/Compose/native helpers, recipes and notices
+templates/                   # app/library starters and shared-client variants
 npm/docouno-env-X.Y.Z.tgz
-release.json                 # version, package integrity and full payload identities
+release.json                 # version, package integrity, payload hashes and modes
 LICENSE
 ```
 
-The package archive contains public exports, executable verifier, compiler baselines, README and MIT license. Source tests, caches, scratch fixtures, private instructions and release-builder/test-registry helpers are excluded. Template npm locks contain public registry URLs and exact release dependency identities. The archive checksum detects accidental corruption; it is not a signature or a substitute for trusted release distribution.
+The npm archive contains public exports, the verifier, compiler baselines, README and license. It excludes tests, caches, fixtures and private instructions. The CLI bundles its YAML/TOML parser dependencies; it does not look for an author's `node_modules`. Release-only registry/hydration tools are not consumer entrypoints.
 
-The builder stages output, creates a real `npm pack` archive, generates template locks using that archive, validates every payload identity and then replaces the local preview. Preview replacement is allowed for author iteration. An existing consumer rejects different bytes bearing the same version; accepted releases must be immutable. Publish a new version after any accepted content change.
+The builder stages output, creates a real npm archive and resolves template locks against that archive. Incomplete historical locks acquire exact-version registry identities; selected product versions are preserved. Native npm then normalizes the result, and all registry entries must have explicit resolved URLs and integrity. The builder also requires all named runtime notices to be nonempty regular files and verifies payload identities before replacing the local preview. Different bytes with the same accepted version are rejected by consumers: published releases must be immutable.
 
-## Local and registry package sources
+## Remote protocol
 
-Local mode copies a real environment archive into `.devkit/npm` and records an explicit relative file dependency under each Node app. The archive is part of the consumer repository; it is independent of the author checkout.
+The operator supplies a trusted release base, using HTTPS. For version `X.Y.Z`, the bootstrap requests:
 
-Registry mode records the exact environment version and canonical npm lock identities. Default init is registry mode; source-checkout `make init` explicitly chooses local mode. Updating preserves the mode, including for Rust-only projects, unless the operator asks to change it. Changing modes is a reviewable native manifest/lock change.
+```text
+<base>/vX.Y.Z/devkit-X.Y.Z.tar.gz.sha256
+<base>/vX.Y.Z/devkit-X.Y.Z.tar.gz
+```
 
-The registry verification fixture serves real archive metadata/bytes only for supplied `@docouno` packages and redirects public dependency requests to npm. It supports no publish/auth API. Both versions are installed with fresh caches and canonical locks; wrong integrity and absent versions must fail. The fixture is author-test-only and is never shipped as a runtime dependency.
+Serve the rendered `.sh` as `<base>/vX.Y.Z/bootstrap.sh`. A versioned GitHub Releases `download` base is one possible layout, but no public endpoint is provisioned by this task. The wrapper can also consume `--release-archive /path/devkit-X.Y.Z.tar.gz` with an adjacent checksum sidecar.
 
-## Ownership and recovery
+Init, update and recovery require `--version X.Y.Z`. Add-app, add-package and register read the project's accepted version; an explicit different version is refused. There is no implicit `latest`. The same native CLI is available from an unpacked release.
 
-`.devkit/manifest.json` records the accepted release identity, fresh generation ID, registered apps, owned tooling dependency fields and managed file identities. Root Makefile, Compose, app source, ordinary app config, product dependencies/scripts and environment values remain project-owned. Registration checks the app's native tool set against the accepted release.
+The bootstrap checks the download and validates bounded archive contents before invoking the release. Temporary acquisition files are removed. Redirects must remain HTTPS; explicit localhost HTTP is available for the test fixture. Checksums protect against corruption, not a compromised distribution source. The script itself and the release source must be trusted.
 
-The new release's updater validates old managed bytes and tooling values, stages native lock regeneration against a source snapshot, checks for concurrent edits and only then applies changes. It shares the runtime admission lock. Native install/peer failures and ownership conflicts happen before applying the payload. An incomplete apply writes a journal and saved before/after files; ordinary commands then refuse to run.
+## Package sources
 
-`devkit recover TARGET` restores the known pre-update state. It validates all saved and current identities before touching files and refuses unknown edits. Preserve conflicting edits separately and restore a known state before retrying recovery. The updater does not stash, reset, commit, push or create a PR. The product's normal Git review process supplies the final acceptance step.
+Local mode copies the real environment archive into `.devkit/npm` and records relative `file:` dependencies in Node components. Commit the archive and root native lock with the runtime. The consumer remains independent of the author checkout and test registry.
+
+Registry mode uses the exact environment version and canonical npm lock identities. It is the default for released CLI init. Until publication, use `--package-source local`. Update retains the mode unless explicitly changed. Mode changes are reviewable manifest/lock changes.
+
+The author registry fixture serves real package metadata/bytes for the tested environment versions and redirects public dependency requests to npm. It supports no publish or authentication API. Fresh-cache installs, export loading, native gates, bad integrity and missing versions are tested separately from local mode.
+
+## Ownership and transactions
+
+Schema 2 records an accepted release, generation, components, tooling profiles, native dependency edges and managed file identities. Template origin is provenance; current tooling profile controls future tool updates. The CLI never reapplies a template over existing product source.
+
+Managed files are the runtime, tool profile table, generated Make/Compose integration, local environment archives and Rust toolchain pins. Named tooling dependency fields and the root npm workspace list are field-owned. Application scripts, configuration, product dependencies, root Make/Compose additions and environment values remain project-owned.
+
+Init creates selected apps or a preset. Add creates one new component and updates the shared integration. Register adopts an existing component only when its native tooling meets the selected profile. Component paths are distinct from npm package names. Libraries expose native public interfaces; application dependencies on another registered application are refused.
+
+Each mutation validates the old accepted state, stages the change, runs native lock resolution and compares the product-rooted dependency graph. An unrelated runtime dependency must not silently change because tooling changed. The complete native input closure is rechecked before commit. The root `npm-shrinkwrap.json` conflicts with this package-lock-based mode and is rejected rather than ignored.
+
+The common checkout lock serializes runtime tasks and lifecycle operations. Managed edits, incompatible peers, missing inputs or conflicting Compose service names fail before applying. A write interruption leaves a journal with saved before/after identities; ordinary tasks refuse pending state. `devkit recover TARGET` restores known prior bytes and refuses unknown concurrent edits. It does not stash, reset, commit or create a PR.
+
+## Migrating schema 1
+
+Updating a 0.1.0 consumer converts registration to schema 2 and imports existing per-app npm locks into a native root workspace lock. Product dependency identities, application source and user root Make/Compose are preserved. Existing development services remain project-owned, so migration does not introduce a second generated service beneath them. Review this diff and run setup and all project gates before merging.
+
+Some historical schema-1 locks omitted registry URLs or integrity. That transition fills only missing identities for the already selected exact versions, preserves existing identities and dependency topology, and hashes local archives from the staged input. The manifest records this normalization and its original lock/archive hashes. These are identities established during migration, not proof of which bytes an earlier installation used. A conflicting existing identity stops the update. Normal schema-2 operations retain strict identity checks and do not perform this legacy repair.
+
+Template improvements are not automatic source migrations. Explicit future migrations may change managed integration; product-code refactors require a separate task.
 
 ## Publication boundary
 
-No public publication is performed by this repository's current validation workflow. Before an authorized first publication:
-
-1. Review the final named source tree, version, MIT notices, package contents and verification evidence.
-2. Confirm `docouno` repository ownership and the npm scope/account's permission to publish `@docouno/env` publicly.
-3. Publish the already-verified npm archive without rebuilding different bytes; distribute the matching standalone archive/checksum.
-4. Verify the actual public installation and record the immutable release identities.
-
-These are release-operator steps, not a request to install a private registry or add user credentials to Devkit. No publish credential, token or private Doco endpoint is needed for local creation or the test matrix. Release automation/signing, hosted CI and public provenance policy can be added when the publishing destination is established.
+The current workflow prepares local artifacts. It does not publish, push, provision a public URL, sign installers or configure hosted release automation. An authorized release should publish the verified npm archive and matching standalone archive/checksum without rebuilding different bytes, then verify installation from the real public endpoint. Account ownership and registry permissions must be established for that separate operation.

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { ESLint } from 'eslint';
 import ts from 'typescript';
 import { relativeList, within } from './paths.js';
+import { workspaceContext, workspaceImportErrors } from './workspace.js';
 
 const semanticExtension = /\.(?:[cm]?[jt]s|[jt]sx)$/i;
 const typescriptExtension = /\.(?:[cm]?ts|tsx)$/i;
@@ -120,6 +121,7 @@ export async function verifyProject(directory = process.cwd()) {
   const errors = [];
   let root;
   let options;
+  let workspace;
   let parsedConfigs = 0;
   const files = new Set();
   const add = (file, rule, message) =>
@@ -144,6 +146,10 @@ export async function verifyProject(directory = process.cwd()) {
       throw new Error('package.json must be a real application-owned file.');
     }
     options = metadata(JSON.parse(fs.readFileSync(packagePath, 'utf8')));
+    workspace = workspaceContext(root);
+    if (workspace && options.boundaries.forbidCrossAppImports === false) {
+      throw new Error('Registered workspace components must preserve their import boundaries.');
+    }
   } catch (error) {
     add(
       'package.json',
@@ -211,6 +217,7 @@ export async function verifyProject(directory = process.cwd()) {
   }
 
   const checked = new Set();
+  const resolutionOptions = new Map();
   for (const relative of options.typecheckConfigs) {
     const full = path.resolve(root, relative);
     try {
@@ -268,6 +275,9 @@ export async function verifyProject(directory = process.cwd()) {
         }
         if (typescriptExtension.test(file.fileName) || config.options.checkJs === true) {
           checked.add(path.resolve(file.fileName));
+          if (!resolutionOptions.has(path.resolve(file.fileName))) {
+            resolutionOptions.set(path.resolve(file.fileName), config.options);
+          }
         }
       }
     } catch (error) {
@@ -299,6 +309,14 @@ export async function verifyProject(directory = process.cwd()) {
     }
     try {
       const text = fs.readFileSync(file, 'utf8');
+      for (const message of workspaceImportErrors(
+        workspace,
+        file,
+        text,
+        resolutionOptions.get(file) ?? {},
+      )) {
+        add(file, 'workspace-import', message);
+      }
       if (uncheckedHeader(text)) {
         add(file, 'unchecked-source', 'Declared source must not disable checking with ts-nocheck.');
       }

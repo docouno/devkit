@@ -1,9 +1,19 @@
-import type { Reporter, TestModule, TestRunEndReason } from 'vitest/node';
+interface RunnableTestCase {
+  result(): { readonly state: string };
+}
 
-export default class RunnableTestsReporter implements Reporter {
+interface RunnableTestModule {
+  readonly children: {
+    allTests(): Iterable<RunnableTestCase>;
+  };
+}
+
+type RunEndReason = 'passed' | 'interrupted' | 'failed';
+
+export default class RunnableTestsReporter {
   onTestRunEnd(
-    modules: ReadonlyArray<TestModule>,
+    modules: ReadonlyArray<RunnableTestModule>,
     errors: ReadonlyArray<unknown>,
-    reason: TestRunEndReason,
+    reason: RunEndReason,
   ): void;
 }
