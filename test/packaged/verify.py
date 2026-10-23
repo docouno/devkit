@@ -254,8 +254,10 @@ class Verification:
         selected_version = json.loads((release / "release.json").read_text())["version"]
         selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
                       "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"]}
-        output = self.run(f"{kind}-init", self.cli(release, "init", root, *selections[kind],
-                          "--package-source", self.package_source, "--name", f"verification-{kind}"))
+        arguments = [*selections[kind], "--name", f"verification-{kind}"]
+        if not self.public_bootstrap or self.package_source != "registry":
+            arguments += ["--package-source", self.package_source]
+        output = self.run(f"{kind}-init", self.cli(release, "init", root, *arguments))
         verify_creation_hint(output)
         self.projects.append(root)
         state = json.loads((root / ".devkit/manifest.json").read_text())
@@ -272,7 +274,11 @@ class Verification:
             require((root / "package-lock.json").is_file(), "Missing root lock")
         for path in node_paths:
             package = json.loads((root / path / "package.json").read_text())
-            require(package["devDependencies"]["@docouno/env"].startswith("file:../../.devkit/npm/"), "Init did not use the release's local env archive")
+            environment_spec = package["devDependencies"]["@docouno/env"]
+            if self.package_source == "local":
+                require(environment_spec.startswith("file:../../.devkit/npm/"), "Init did not use the release's local env archive")
+            else:
+                require(environment_spec == selected_version, "Registry consumer did not pin the published environment version")
             require(not (root / path / "package-lock.json").exists(), "Leaf npm lock survived workspace creation")
             (root / path / "src/consumer-marker.ts").write_text("export const consumerMarker = 'untracked source input';\n")
         if kind == "react":
@@ -702,6 +708,14 @@ class Verification:
     def verify(self):
         failure = None
         try:
+            if self.public_bootstrap:
+                absent = self.scratch / "absent public release"
+                command = ["bash", self.public_bootstrap, "init", absent, "--version", "99.99.99",
+                           "--app", "main=node-api"]
+                if self.release_base_url:
+                    command += ["--release-base-url", self.release_base_url]
+                self.run("public-missing-release-refused", command, expected="404")
+                require(not absent.exists(), "Missing public release created a target")
             node = self.create("node", "a-node-Проект")
             self.make(node, "check", expected="dependencies are absent/stale", label="node-setup-required")
             self.healthy(node, "node")
