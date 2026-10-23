@@ -2,7 +2,7 @@
 
 ## Prepare locally
 
-`make pack` builds `.artifacts/releases/0.2.0`, `.artifacts/devkit-0.2.0.tar.gz`, `.artifacts/devkit-0.2.0.sh` and checksum sidecars. `make pack version=X.Y.Z` builds another preview without changing source versions. `make pack-next` also prepares the next test version. The unpacked archive contains:
+`make pack` builds `.artifacts/releases/0.2.1`, `.artifacts/devkit-0.2.1.tar.gz`, `.artifacts/devkit-0.2.1.sh` and checksum sidecars. `make pack version=X.Y.Z` builds another preview without changing source versions. `make pack-next` also prepares the next test version. The unpacked archive contains:
 
 ```text
 devkit                       # host Bash launcher
@@ -21,14 +21,14 @@ The builder stages output, creates a real npm archive and resolves template lock
 
 ## Remote protocol
 
-The operator supplies a trusted release base, using HTTPS. For version `X.Y.Z`, the bootstrap requests:
+The published bootstrap defaults to `https://github.com/docouno/devkit/releases/download`. An operator can explicitly override that trusted HTTPS release base for another distribution endpoint. For version `X.Y.Z`, the bootstrap requests:
 
 ```text
 <base>/vX.Y.Z/devkit-X.Y.Z.tar.gz.sha256
 <base>/vX.Y.Z/devkit-X.Y.Z.tar.gz
 ```
 
-Serve the rendered `.sh` as `<base>/vX.Y.Z/bootstrap.sh`. A versioned GitHub Releases `download` base is one possible layout, but no public endpoint is provisioned by this task. The wrapper can also consume `--release-archive /path/devkit-X.Y.Z.tar.gz` with an adjacent checksum sidecar.
+Each GitHub release serves the rendered `.sh` both under its versioned filename and as `<base>/vX.Y.Z/bootstrap.sh`; the two files have identical bytes. Published versions and their assets are immutable. The wrapper can also consume `--release-archive /path/devkit-X.Y.Z.tar.gz` with an adjacent checksum sidecar.
 
 Init, update and recovery require `--version X.Y.Z`. Add-app, add-package and register read the project's accepted version; an explicit different version is refused. There is no implicit `latest`. The same native CLI is available from an unpacked release.
 
@@ -38,7 +38,7 @@ The bootstrap checks the download and validates bounded archive contents before 
 
 Local mode copies the real environment archive into `.devkit/npm` and records relative `file:` dependencies in Node components. Commit the archive and root native lock with the runtime. The consumer remains independent of the author checkout and test registry.
 
-Registry mode uses the exact environment version and canonical npm lock identities. It is the default for released CLI init. Until publication, use `--package-source local`. Update retains the mode unless explicitly changed. Mode changes are reviewable manifest/lock changes.
+Registry mode uses the exact environment version and canonical npm lock identities. It is the default for released CLI init. The public npm package and its release carry matching integrity. Use `--package-source local` only when an explicit bundled-archive workflow is desired. Update retains the mode unless explicitly changed. Mode changes are reviewable manifest/lock changes.
 
 The author registry fixture serves real package metadata/bytes for the tested environment versions and redirects public dependency requests to npm. It supports no publish or authentication API. Fresh-cache installs, export loading, native gates, bad integrity and missing versions are tested separately from local mode.
 
@@ -62,6 +62,12 @@ Some historical schema-1 locks omitted registry URLs or integrity. That transiti
 
 Template improvements are not automatic source migrations. Explicit future migrations may change managed integration; product-code refactors require a separate task.
 
-## Publication boundary
+## Publication procedure
 
-The current workflow prepares local artifacts. It does not publish, push, provision a public URL, sign installers or configure hosted release automation. An authorized release should publish the verified npm archive and matching standalone archive/checksum without rebuilding different bytes, then verify installation from the real public endpoint. Account ownership and registry permissions must be established for that separate operation.
+Prepare and verify a release before assigning its public version. Publish the verified npm archive with public access, then expose the matching GitHub assets and checksums. Publishing requires the account’s npm authorization/2FA; these credentials belong outside the checkout and must not be passed into consumer tests. The repository does not install publisher credentials or publish during normal build/check commands.
+
+The release includes the standalone tar/checksum, versioned bootstrap/checksum, `bootstrap.sh` alias/checksum, npm archive and `release.json`. Do not rebuild different bytes under an already published version. A correction requires a new patch release.
+
+After publication, `make verify-public from_version=X.Y.Z version=A.B.C` downloads both actual releases over HTTPS, compares the npm distribution integrity with each release, then creates and updates real registry consumers through the public bootstrap. The canonical endpoint is exercised without a URL override. No local archive or temporary registry fallback is used. This verification is separate from archive-failure fixtures and publication authentication.
+
+Installer signing, hosted publishing automation and support for additional operating systems remain separate work.

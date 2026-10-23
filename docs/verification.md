@@ -14,7 +14,7 @@ Use the root Make interface. Implementation checks run in the pinned Node contai
 
 The author environment suite installs the exact Vitest peer into a temporary nested layout to test its public declaration against native types; this integration case can access npm. Consumer check/test/build commands use their installed locked dependencies without acquisition.
 
-The default pair is 0.2.0 and 0.2.1. Override with `version=X.Y.Z next_version=A.B.C`. These are local previews, not public releases. Preserved 0.1.0/0.1.1 archives provide separate legacy migration inputs; the harnesses record whether those optional inputs were exercised.
+The local preview pair follows the source version (currently 0.2.1 and 0.2.2). Override with `version=X.Y.Z next_version=A.B.C`. These are local previews, not public releases. Preserved 0.1.0/0.1.1 archives provide separate legacy migration inputs; the harnesses record whether those optional inputs were exercised.
 
 Evidence lives under ignored `.artifacts/`. Tests record source/artifact identities and exact commands. Repeating a green test against identical inputs is unnecessary; changed implementation requires affected proofs to be refreshed. Consumers are outside the author tree and cannot rely on its dependencies. Resources are identified by exact names/labels; cleanup does not prune Docker or install host SDKs. Toolchain images/build cache remain available.
 
@@ -32,19 +32,49 @@ These suites establish the recorded scenarios on Linux/Docker Compose. They do n
 
 Static source/configuration guards cover declared semantic roots and supported native runners. Computed imports, custom test harnesses and application test completeness remain outside that claim. Container cleanup cannot guarantee recovery from SIGKILL, daemon failure, reboot or detached unowned processes. See [architecture](architecture.md) and the [environment package](../packages/env/README.md) for the exact contract.
 
-## Local release evidence — 23 October 2026
+## Public releases
 
-The final source checks passed types, lint, formatting and shell syntax, plus **38 core tests and 48 environment tests**. The final native runtime suite passed **24/24** in 157.240 seconds, with its original time limits. The separate native Rust helper suite passed **9/9** on unchanged helper/recipe bytes. Runtime evidence is `.artifacts/v2-runtime-final-clean.log`; source evidence is `.artifacts/v2-final-check.log`.
+```sh
+make verify-public from_version=0.2.0 version=0.2.1
+```
 
-Version 0.2.0 is prepared locally; 0.2.1 is the upgrade test version. Neither was published. Each standalone payload contains 126 hash/mode-bound files; each environment npm archive contains 18 entries. Archive inventories, package exports, required notices and source/build parity were independently checked.
+This command downloads the actual GitHub assets and public npm package bytes,
+compares their identities, and runs the consumer matrix through the published
+bootstrap in registry mode. It uses no publisher credentials, local archive
+fallback or temporary registry. The canonical bootstrap URL is exercised without
+an override. Standalone consumers begin at the first version, the fullstack
+product uses the successor, and an edited project explicitly updates to it.
+See [the public harness](../test/public/README.md).
 
-The full packaged matrix passed **109/109 results**: 92 commands (including 19 expected failures) and 17 additional assertions, in 414.670 seconds. It covered standalone Node, web and Rust, shared web/Electron UI, state-preserving HMR, production web, extracted packaged Electron ELF/ASAR, real Rust HTTP replies, add-app after product edits, 0.2.0 → 0.2.1 adoption, real 0.1.0 migration and conflict/recovery behavior. Source purity and read-only assertions passed; no host language SDK ran. All five checkout container/network scopes were cleaned. Receipt: `.artifacts/packaged/3be05b0ca6514279b3913e81d5cdac98/receipt.json`.
+The public matrix covers native gates and expected failures, source purity,
+shared HMR, production web and extracted packaged Electron with real Rust HTTP,
+all component operations, conflicts, no-op and synthetic journal recovery.
+It does not claim a live crash from that synthetic recovery case; real
+transaction interruption has separate core tests.
 
-The final standalone payload differs from that tested candidate only in the launcher's help text. The execution body, compiled CLI, environment package, runtime and templates remain byte-identical; the final help and archive identities were checked separately. The recovery matrix uses an explicitly synthetic interrupted journal; real interruption points have independent core tests.
+## Foundation acceptance baseline
 
-The remote transport matrix passed 73 assertions: 35 current, 33 legacy and 5 migration. Seventeen transport safety regressions also passed on the same rendered script. After the help-only packaging change, all 35 current transport cases were repeated against the exact final archives listed below; receipt `.artifacts/bootstrap/c2187178baf643b3a1e93c58daee4df0/receipt.json` confirms their hashes and clean resource removal. The earlier legacy/safety results are evidence for the unchanged transport implementation, not a claim that those older archive bytes are the final release. Fresh-cache registry tests installed both actual environment archives, ran checks/builds before and after update, and rejected wrong integrity and an absent version; the fixture recorded 640 requests.
+The pre-publication 0.2.0 foundation passed 38 core and 48 environment tests,
+24 native runtime tests and 9 native Rust helper tests. Its packaged matrix
+passed 109 results: 92 commands (19 expected failures) and 17 additional
+assertions. Web and Electron shared state-preserving HMR and both production
+clients received real Rust HTTP replies. The original 0.1.0 migration was also
+exercised. Full matrix wall time was 414.670 seconds.
 
-| Version      | Standalone archive SHA256                                          | Release manifest SHA256                                            |
-| ------------ | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| 0.2.0        | `6b2d31c35bbc3c7961e59790491e8aa00e0e39e18c1a927a01a573f6782008cc` | `39b085a22605e99e457c8c945866dc8f987afa4ef493dbe188d4dd2b59f21092` |
-| 0.2.1 (test) | `4c76a3563aa2015f6b19038f8c26022bd46fa8a1760fd8bf65ae63ee304d1e19` | `6e882963ca60051616ed53a13d3546a4f213a20cbd2ad4a10d4f42f929fc2c61` |
+Transport preparation covered 73 current/legacy/migration assertions and 17
+safety regressions. Thirty-five current transport cases were repeated on the
+final 0.2.0 archives. Fresh-cache registry checks installed the real npm tarballs,
+ran native checks/builds and rejected wrong integrity and missing versions.
+
+The first public 0.2.0 release reuses those exact verified package/runtime/template
+bytes. Only launcher help was corrected after the full matrix; its execution
+body stayed identical and the final artifact delta was independently audited.
+
+| Version | Standalone archive SHA256                                          | Release manifest SHA256                                            |
+| ------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| 0.2.0   | `6b2d31c35bbc3c7961e59790491e8aa00e0e39e18c1a927a01a573f6782008cc` | `39b085a22605e99e457c8c945866dc8f987afa4ef493dbe188d4dd2b59f21092` |
+
+Public verification receipts are recorded under `.artifacts/public/<run-id>` and
+the linked consumer receipt. Release checksums and `release.json` are served with
+each GitHub release. Evidence is tied to exact bytes; an unpublished local
+preview is not a published version identity.

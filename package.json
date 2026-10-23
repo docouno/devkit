@@ -1,6 +1,6 @@
 {
   "name": "@docouno/devkit-workspace",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "check:types": "tsc --project tsconfig.json --noEmit",
     "check:format": "prettier --check .",
     "check:lint": "eslint tooling test/*.test.ts test/*.mjs 'packages/env/{src,bin}/*.js' 'packages/env/test/*.mjs' --no-ignore --max-warnings=0",
-    "check:shell": "bash -n tooling/node.sh tooling/launcher.sh tooling/bootstrap.sh runtime/devkit.sh runtime/desktop-dev.sh runtime/guard.sh runtime/rust-check.sh test/verify-consumers.sh test/verify-registry.sh test/verify-bootstrap.sh",
+    "check:shell": "bash -n tooling/node.sh tooling/launcher.sh tooling/bootstrap.sh runtime/devkit.sh runtime/desktop-dev.sh runtime/guard.sh runtime/rust-check.sh test/verify-consumers.sh test/verify-registry.sh test/verify-bootstrap.sh test/verify-public.sh",
     "fix:format": "prettier --write .",
     "test:core": "node --test --test-reporter=@docouno/env/node-test-reporter --test-concurrency=1 test/*.test.ts",
     "test:env": "npm test --workspace=@docouno/env",

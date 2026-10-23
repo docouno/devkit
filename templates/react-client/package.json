@@ -16,7 +16,7 @@
     "build": "tsc -p tsconfig.build.json && cp src/style.css dist/style.css"
   },
   "devDependencies": {
-    "@docouno/env": "0.2.0",
+    "@docouno/env": "0.2.1",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "24.19.2",

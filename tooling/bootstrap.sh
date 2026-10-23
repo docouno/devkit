@@ -16,14 +16,14 @@ devkit_bootstrap_main() {
       'Commands: init, add-app, add-package, register, update, recover' \
       'Init, update and recover require an exact --version.' \
       'Add-app, add-package and register use the project accepted version.' \
-      'Set --release-base-url or DEVKIT_RELEASE_BASE_URL for remote releases; local archives need their .sha256 sidecar.'
+      'Defaults to GitHub docouno/devkit; override with --release-base-url or DEVKIT_RELEASE_BASE_URL.'
     return 0
   fi
   [[ $# -ge 2 ]] || fail 'expected COMMAND TARGET [--version X.Y.Z] [--release-base-url URL | --release-archive FILE]'
   operation=$1 requested=$2
   shift 2
   case "$operation" in init|update|recover|register|add-app|add-package) ;; *) fail "unknown command: $operation" ;; esac
-  selected= archive= base=${DEVKIT_RELEASE_BASE_URL:-} child= stage= child_deadline=0 child_label= launching=0 cancel_status=0
+  selected= archive= base=${DEVKIT_RELEASE_BASE_URL:-https://github.com/docouno/devkit/releases/download} child= stage= child_deadline=0 child_label= launching=0 cancel_status=0
   factory_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in

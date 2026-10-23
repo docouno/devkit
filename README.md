@@ -4,7 +4,7 @@ Devkit creates standalone TypeScript and Rust repositories with pinned container
 
 The supported platform is **Linux with a local Docker daemon and Docker Compose**. The host needs Bash, GNU Make, coreutils, `flock`, curl and GNU tar. Node and Rust run in containers. Setup downloads dependencies; ordinary checks and builds use the accepted tools offline. Desktop development additionally needs an X11 display and authorization, or explicit headless mode.
 
-Version **0.2.0 is a local publication candidate**. Nothing has been published. The examples below use a release base supplied by the operator; it serves `vX.Y.Z/bootstrap.sh`, `devkit-X.Y.Z.tar.gz` and its `.sha256` sidecar. Use `--package-source local` until the matching npm package is published.
+Versioned CLI releases are available from [GitHub Releases](https://github.com/docouno/devkit/releases), and the environment package is published as [`@docouno/env`](https://www.npmjs.com/package/@docouno/env). The commands below use **0.2.1**. Its bootstrap defaults to this repository’s public release endpoint; no clone or registry credentials are needed.
 
 ## Create without cloning Devkit
 
@@ -12,12 +12,12 @@ Download the bootstrap from your trusted release location and pass an exact vers
 
 ```sh
 bootstrap=$(mktemp)
-curl --fail --silent --show-error --location --proto =https --proto-redir =https \
-  "$RELEASE_BASE/v0.2.0/bootstrap.sh" \
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://github.com/docouno/devkit/releases/download/v0.2.1/bootstrap.sh \
   -o "$bootstrap"
 bash "$bootstrap" init /absolute/path/to/product \
-  --version 0.2.0 --release-base-url "$RELEASE_BASE" \
-  --app api=rust-api --app web=react-web --package-source local
+  --version 0.2.1 \
+  --app api=rust-api --app web=react-web
 cd /absolute/path/to/product
 make setup
 make check build
@@ -26,7 +26,7 @@ make status
 make down
 ```
 
-The script also supports `curl … | bash -s -- init …`. It downloads and checks the selected archive, runs its self-contained CLI in the pinned Node container and removes temporary acquisition files. No author checkout or host language SDK is needed. HTTPS is required except for explicit loopback HTTP test servers. Checksums detect corruption; the bootstrap and release location must be trusted.
+The script also supports `curl … | bash -s -- init …`. Override `--release-base-url` or `DEVKIT_RELEASE_BASE_URL` only when using a different distribution endpoint. Registry mode is the default; `--package-source local` instead commits the release’s bundled npm archive for an explicit offline distribution workflow. It downloads and checks the selected archive, runs its self-contained CLI in the pinned Node container and removes temporary acquisition files. No author checkout or host language SDK is needed. HTTPS is required except for explicit loopback HTTP test servers. Checksums detect corruption; the bootstrap and release location must be trusted.
 
 The target must be new or empty, with an existing parent. Existing `.git` metadata is retained. Project/app names are lower-case slugs; pass `--name product` when the directory name is unsuitable.
 
@@ -46,9 +46,9 @@ Use the same bootstrap; add/register selects the version already accepted by the
 
 ```sh
 bash "$bootstrap" add-package "$PWD" \
-  --release-base-url "$RELEASE_BASE" --name client --template react-client
+  --name client --template react-client
 bash "$bootstrap" add-app "$PWD" \
-  --release-base-url "$RELEASE_BASE" --name desktop \
+  --name desktop \
   --template electron-react --use client
 ```
 
@@ -110,7 +110,7 @@ Electron uses a sandboxed, isolated renderer and a narrow preload bridge. GUI de
 ```sh
 git switch -c chore/devkit-0.2.1
 bash "$bootstrap" update "$PWD" \
-  --version 0.2.1 --release-base-url "$RELEASE_BASE"
+  --version 0.2.1
 git diff
 make setup
 make check build
@@ -125,12 +125,13 @@ An interrupted apply blocks normal commands. `recover "$PWD" --version X.Y.Z` th
 ```sh
 make setup
 make check
-make pack-next                # local 0.2.0 and 0.2.1 previews, no publication
+make pack-next                # local 0.2.1 and 0.2.2 previews, no publication
 make verify-runtime
 make verify-rust
 make verify-bootstrap
 make verify-packaged
 make verify-registry
+make verify-public from_version=0.2.0 version=0.2.1
 ```
 
 `make verify` runs the complete set. The author black-box harnesses also require Python 3. They create isolated consumers and retain evidence under ignored `.artifacts/`; no host SDK, global npm configuration or public registry is installed. `make init template=mixed target=/path/to/product` is a source-author convenience, not the consumer distribution path.

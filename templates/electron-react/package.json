@@ -18,7 +18,7 @@
     "package": "electron-builder --config electron-builder.config.cjs --linux dir --publish never && tar -czf release/app-linux.tar.gz -C release/linux-unpacked ."
   },
   "devDependencies": {
-    "@docouno/env": "0.2.0",
+    "@docouno/env": "0.2.1",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "24.19.2",

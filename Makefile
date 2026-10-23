@@ -3,11 +3,11 @@ SHELL := /bin/bash
 VERSION := $(strip $(file <VERSION))
 release_version := $(if $(version),$(version),$(VERSION))
 export DEVKIT_RELEASE_VERSION := $(release_version)
-export DEVKIT_NEXT_VERSION := $(or $(next_version),0.2.1)
+export DEVKIT_NEXT_VERSION := $(or $(next_version),0.2.2)
 export DEVKIT_INIT_TARGET := $(target)
 export DEVKIT_INIT_TEMPLATE := $(or $(template),node)
 
-.PHONY: help setup check test build pack pack-next verify verify-runtime verify-rust verify-bootstrap verify-packaged verify-registry init
+.PHONY: help setup check test build pack pack-next verify verify-runtime verify-rust verify-bootstrap verify-packaged verify-registry verify-public init
 help:
 	@printf '%s\n' 'Devkit author workspace (Linux + Docker Compose)' \
 	  'make setup                    Install the pinned author dependencies' \
@@ -15,6 +15,7 @@ help:
 	  'make build                    Build the factory helper' \
 	  'make pack [version=X.Y.Z]      Build a versioned local release and npm archives' \
 	  'make verify                   Verify packaged consumers and release invariants' \
+	  'make verify-public from_version=0.2.0 version=0.2.1  Verify public GitHub/npm flows' \
 	  'make init template=node target=/path/to/project  Create an unpublished local consumer'
 setup:
 	@bash tooling/node.sh --setup npm ci --include=dev --strict-peer-deps
@@ -39,6 +40,8 @@ verify-packaged: pack-next
 	@DEVKIT_VERIFY_NEXT_RELEASE=".artifacts/releases/$$DEVKIT_NEXT_VERSION" bash test/verify-consumers.sh ".artifacts/releases/$$DEVKIT_RELEASE_VERSION"
 verify-registry: pack-next
 	@bash test/verify-registry.sh ".artifacts/releases/$$DEVKIT_RELEASE_VERSION" ".artifacts/releases/$$DEVKIT_NEXT_VERSION"
+verify-public:
+	@bash test/verify-public.sh --version "$(or $(from_version),0.2.0)" --next-version "$$DEVKIT_RELEASE_VERSION"
 verify: check pack-next
 	@$(MAKE) --no-print-directory verify-runtime verify-rust
 	@bash test/verify-bootstrap.sh --release ".artifacts/devkit-$$DEVKIT_RELEASE_VERSION.tar.gz" --next-release ".artifacts/devkit-$$DEVKIT_NEXT_VERSION.tar.gz"

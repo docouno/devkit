@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box verification of independent, unpublished Devkit release consumers.
+"""Black-box verification of independent Devkit release consumers.
 
 Only Python's standard library is used on the host. All language tooling runs in
 the release's containers. The disposable release and consumers live outside the
@@ -82,7 +82,8 @@ def changed_files(changes):
 
 
 class Verification:
-    def __init__(self, release, next_release=None, legacy_release=None):
+    def __init__(self, release, next_release=None, legacy_release=None, *, package_source="local",
+                 public_bootstrap=None, release_base_url=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
@@ -91,7 +92,15 @@ class Verification:
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
         self.legacy_release = self.copy_release(legacy_release, "legacy-release") if legacy_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
+        require(package_source in ("local", "registry"), "Unknown package source")
+        self.package_source = package_source
+        self.public_bootstrap = None
+        self.release_base_url = release_base_url
+        if public_bootstrap:
+            self.public_bootstrap = self.scratch / "public-bootstrap.sh"
+            shutil.copy2(public_bootstrap, self.public_bootstrap)
         self.results = []
+        self.created_versions = {}
         self.harness_identity = {path.name: sha256(path.read_bytes())
                                  for path in Path(__file__).parent.iterdir()
                                  if path.is_file()}
@@ -115,6 +124,17 @@ class Verification:
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
         print(f"Receipt directory: {self.receipt}", flush=True)
         print(f"Consumer scratch: {self.scratch}", flush=True)
+
+    def cli(self, release, operation, root, *arguments):
+        if self.public_bootstrap:
+            command = ["bash", self.public_bootstrap, operation, root]
+            if operation in ("init", "update", "recover"):
+                version = json.loads((release / "release.json").read_text())["version"]
+                command += ["--version", version]
+            if self.release_base_url:
+                command += ["--release-base-url", self.release_base_url]
+            return command + list(arguments)
+        return [release / "devkit", operation, root, *arguments]
 
     def copy_release(self, source, name):
         source = Path(source).resolve()
@@ -231,14 +251,18 @@ class Verification:
         root = self.scratch / "work trees" / parent / "product"
         root.parent.mkdir(parents=True)
         release = release or self.release
+        selected_version = json.loads((release / "release.json").read_text())["version"]
         selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
                       "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"]}
-        output = self.run(f"{kind}-init", [release / "devkit", "init", root, *selections[kind],
-                          "--package-source", "local", "--name", f"verification-{kind}"])
+        output = self.run(f"{kind}-init", self.cli(release, "init", root, *selections[kind],
+                          "--package-source", self.package_source, "--name", f"verification-{kind}"))
         verify_creation_hint(output)
         self.projects.append(root)
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        require(state["schemaVersion"] == 2 and state["version"] == self.version and state["packageMode"] == "local", "Wrong accepted v2 release")
+        require(state["schemaVersion"] == 2 and state["version"] == selected_version and state["packageMode"] == self.package_source, "Wrong accepted v2 release")
+        self.created_versions[kind] = state["version"]
+        if self.package_source == "registry":
+            require(not (root / ".devkit/npm").exists(), "Registry consumer copied a local environment archive")
         components = state["components"]
         require(all(path.startswith(("apps/", "packages/")) for path in components), "Invalid component paths")
         node_paths = [path for path, component in components.items() if component["toolchain"] == "node"]
@@ -519,13 +543,31 @@ class Verification:
         settings = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if line and not line.startswith("#"))
         compose.write_text(json.dumps({"services": {"manual": {"image": settings["DEVKIT_NODE_IMAGE"], "profiles": ["manual"], "command": ["node", "--version"]}}}, indent=2) + "\n")
         preserved = {path: path.read_bytes() for path in (source, make, compose, root / ".env")}
-        self.run("add-react-app", [self.release / "devkit", "add-app", root, "--name", "console", "--template", "react-web"])
+        self.run("add-react-app", self.cli(self.release, "add-app", root, "--name", "console", "--template", "react-web"))
         state = json.loads((root / ".devkit/manifest.json").read_text())
         require(state["components"]["apps/console"]["toolingProfile"] == "web", "Added app not registered")
         for path, content in preserved.items(): require(path.read_bytes() == content, f"Add-app overwrote {path}")
         before = source_snapshot(root)
-        self.run("add-existing-app-refused", [self.release / "devkit", "add-app", root, "--name", "console", "--template", "react-web"], expected="already exists")
+        self.run("add-existing-app-refused", self.cli(self.release, "add-app", root, "--name", "console", "--template", "react-web"), expected="already exists")
         require(source_snapshot(root) == before, "Duplicate add-app wrote source")
+        if self.public_bootstrap:
+            self.run("public-add-package", self.cli(self.release, "add-package", root,
+                     "--name", "shared", "--template", "react-client"))
+            before = source_snapshot(root)
+            self.run("public-duplicate-package-refused", self.cli(self.release, "add-package", root,
+                     "--name", "shared", "--template", "react-client"), expected="already exists")
+            require(source_snapshot(root) == before, "Duplicate add-package wrote source")
+            shutil.copytree(self.release / "templates/rust-api", root / "apps/worker")
+            self.run("public-register-existing-rust", self.cli(self.release, "register", root,
+                     "--app", "worker", "--profile", "rust"))
+            state = json.loads((root / ".devkit/manifest.json").read_text())
+            require(state["components"]["packages/shared"]["role"] == "library" and
+                    state["components"]["apps/worker"]["toolchain"] == "rust", "Public component operations registered wrong profiles")
+            workspace = json.loads((root / "package.json").read_text())["workspaces"]
+            require("packages/shared" in workspace and "apps/worker" not in workspace,
+                    "Public native workspace membership is wrong")
+            for path, content in preserved.items():
+                require(path.read_bytes() == content, f"Public component operation overwrote {path}")
         self.healthy(root, "added-react-app")
 
     def upgrade(self, root):
@@ -545,12 +587,12 @@ class Verification:
         runtime = root / ".devkit/runtime/devkit.mk"
         with changed_files({runtime: runtime.read_text() + "# consumer-conflict\n"}):
             before = source_snapshot(root)
-            self.run("upgrade-managed-conflict", [self.next_release / "devkit", "update", root],
+            self.run("upgrade-managed-conflict", self.cli(self.next_release, "update", root),
                      expected="Managed file conflict")
             require(source_snapshot(root) == before, "Conflicting update wrote project files")
-        self.run("node-upgrade", [self.next_release / "devkit", "update", root])
+        self.run("node-upgrade", self.cli(self.next_release, "update", root))
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        require(state["version"] == next_version and state["packageMode"] == "local", "Update changed package mode or wrong version")
+        require(state["version"] == next_version and state["packageMode"] == self.package_source, "Update changed package mode or wrong version")
         require((root / ".devkit/manifest.json").read_bytes() != old_state, "Update retained old accepted state")
         for path, contents in preserved.items():
             require(path.read_bytes() == contents, f"Update overwrote {path}")
@@ -561,9 +603,9 @@ class Verification:
         self.make(root, "check", expected="dependencies are absent/stale", label="upgrade-requires-setup")
         self.healthy(root, "upgraded-node")
         before = source_snapshot(root)
-        self.run("upgrade-identical-noop", [self.next_release / "devkit", "update", root])
+        self.run("upgrade-identical-noop", self.cli(self.next_release, "update", root))
         require(source_snapshot(root) == before, "Identical release update rewrote source or generation")
-        self.run("recover-without-pending", [self.next_release / "devkit", "recover", root])
+        self.run("recover-without-pending", self.cli(self.next_release, "recover", root))
 
     def recovery(self, root):
         # A synthetic interrupted journal exercises the released recovery command.
@@ -592,10 +634,10 @@ class Verification:
         known_after = runtime.read_bytes()
         runtime.write_bytes(known_after + b"# concurrent unknown edit\n")
         conflict = source_snapshot(root)
-        self.run("recovery-conflict", [self.next_release / "devkit" if self.next_release else self.release / "devkit", "recover", root], expected="Recovery conflict")
+        self.run("recovery-conflict", self.cli(self.next_release or self.release, "recover", root), expected="Recovery conflict")
         require(source_snapshot(root) == conflict, "Recovery conflict discarded an edit")
         runtime.write_bytes(known_after)
-        self.run("synthetic-journal-recovery", [self.next_release / "devkit" if self.next_release else self.release / "devkit", "recover", root])
+        self.run("synthetic-journal-recovery", self.cli(self.next_release or self.release, "recover", root))
         require(source_snapshot(root) == before, "Recovery did not restore known bytes")
         self.results.append({"label": "synthetic-interrupted-journal", "passed": True, "liveCrashReproduced": False})
 
@@ -674,7 +716,8 @@ class Verification:
             self.readonly_mounts(rust, "rust")
             self.rust_negative(rust)
             self.emitted(rust, "rust")
-            fullstack = self.create("fullstack", "d-fullstack")
+            fullstack = self.create("fullstack", "d-fullstack",
+                                    self.next_release if self.public_bootstrap and self.next_release else None)
             self.healthy(fullstack, "fullstack")
             self.library_negative(fullstack)
             self.fullstack(fullstack, node)
@@ -694,12 +737,17 @@ class Verification:
                        "standaloneRelease": str(self.release), "scratch": str(self.scratch),
                        "releaseIdentity": sha256((self.release / "release.json").read_bytes()),
                        "nextReleaseIdentity": sha256((self.next_release / "release.json").read_bytes()) if self.next_release else None,
+                       "packageSource": self.package_source,
+                       "createdVersions": self.created_versions,
+                       "publicBootstrapSha256": sha256(self.public_bootstrap.read_bytes()) if self.public_bootstrap else None,
+                       "releaseBaseOverride": self.release_base_url,
                        "harnessIdentity": self.harness_identity,
                        "passed": failure is None, "error": str(failure) if failure else None,
                        "hostLanguageSDKAttempted": self.forbidden_log.exists(),
                        "nextVersionTested": bool(self.next_release), "legacyMigrationTested": bool(self.legacy_release),
                        "results": self.results,
-                       "limits": ["Registry and remote bootstrap are separate suites", "Recovery journal is synthetic; live crash timing is covered by core tests"]}
+                       "limits": (["Transport archive-failure cases are a separate suite"] if self.public_bootstrap else ["Registry and remote bootstrap are separate suites"]) +
+                                 ["Recovery journal is synthetic; live crash timing is covered by core tests"]}
             (self.receipt / "receipt.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
             print(f"Receipt: {self.receipt / 'receipt.json'}", flush=True)
             if failure is None and os.environ.get("DEVKIT_VERIFY_KEEP") != "1":
@@ -724,8 +772,14 @@ def main():
                         default=os.environ.get("DEVKIT_VERIFY_LEGACY_RELEASE") or (default_legacy if default_legacy.is_dir() else None))
     parser.add_argument("--skip-legacy", action="store_true",
                         help="Explicitly omit the legacy migration in a bounded preflight")
+    parser.add_argument("--package-source", choices=("local", "registry"), default="local")
+    parser.add_argument("--public-bootstrap", type=Path,
+                        help="Run lifecycle operations through this downloaded public bootstrap")
+    parser.add_argument("--release-base-url", help="Override the public bootstrap's default release endpoint")
     args = parser.parse_args()
-    Verification(args.release, args.next_release, None if args.skip_legacy else args.legacy_release).verify()
+    Verification(args.release, args.next_release, None if args.skip_legacy else args.legacy_release,
+                 package_source=args.package_source, public_bootstrap=args.public_bootstrap,
+                 release_base_url=args.release_base_url).verify()
 
 
 if __name__ == "__main__":
