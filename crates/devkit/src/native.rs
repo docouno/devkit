@@ -492,6 +492,7 @@ struct ReadContext<'a> {
     cargo: BTreeMap<String, Fields>,
     cargo_configs: BTreeMap<String, Fields>,
     cargo_locks: BTreeMap<String, CargoLockGraph>,
+    node_inputs: Option<InputIdentitySet>,
     read_identities: BTreeMap<String, FileIdentity>,
 }
 impl<'a> ReadContext<'a> {
@@ -503,6 +504,7 @@ impl<'a> ReadContext<'a> {
             cargo: BTreeMap::new(),
             cargo_configs: BTreeMap::new(),
             cargo_locks: BTreeMap::new(),
+            node_inputs: None,
             read_identities: BTreeMap::new(),
         }
     }
@@ -1166,12 +1168,8 @@ impl<'a> ReadContext<'a> {
         let structure = NativeStructure::capture(self.root, state)?;
         self.closure_with_structure(state, &structure)
     }
-    fn closure_with_structure(
-        &mut self,
-        state: &ProjectState,
-        structure: &NativeStructure,
-    ) -> Result<InputIdentitySet> {
-        let mut files = structure.manifests.clone();
+    fn node_closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
+        let mut files = BTreeMap::new();
         let mut directories = BTreeSet::new();
         let mut queue: VecDeque<String> = node_components(state)
             .into_iter()
@@ -1228,6 +1226,27 @@ impl<'a> ReadContext<'a> {
                 }
             }
         }
+        let directories: Vec<_> = directories.into_iter().collect();
+        let digest = digest(serde_json::to_vec(&json!({
+            "domain": "devkit-node-inputs-v1", "files": files, "directories": directories
+        }))?);
+        Ok(InputIdentitySet {
+            schema_version: 1,
+            files,
+            directories,
+            digest,
+        })
+    }
+    fn closure_with_structure(
+        &mut self,
+        state: &ProjectState,
+        structure: &NativeStructure,
+    ) -> Result<InputIdentitySet> {
+        let node = self.node_closure(state)?;
+        let mut files = structure.manifests.clone();
+        files.extend(node.files.clone());
+        let directories = node.directories.clone();
+        self.node_inputs = Some(node);
         let rust_queue = state
             .components
             .iter()
@@ -1239,7 +1258,6 @@ impl<'a> ReadContext<'a> {
         for path in self.cargo.keys() {
             record(self.root, &mut files, &prefixed(path, "Cargo.toml"), true)?;
         }
-        let directories: Vec<_> = directories.into_iter().collect();
         // Parsed data and raw identities must describe the same input stage.
         // In particular, do not pair a cached old manifest with a newly read
         // identity if a user edits it during admission.
@@ -1447,6 +1465,9 @@ pub fn assert_tool_profiles(root: &Path, state: &ProjectState) -> Result<()> {
 
 pub struct NativeAdmission {
     pub inputs: InputIdentitySet,
+    /// Exact Node subset produced by the same parsed context, before Cargo and
+    /// namespace identities are combined into the full safety snapshot.
+    pub node_inputs: InputIdentitySet,
     pub dependencies: BTreeMap<String, Vec<String>>,
     /// Complete admitted graph. Public 0.2 projections retain their original
     /// literal-path shape, while role/cycle safety always checks this graph.
@@ -1569,7 +1590,9 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             .chain((component.role == Role::App).then_some("dev"))
         {
             text(
-                scripts.get(command).context("Missing native script")?,
+                scripts
+                    .get(command)
+                    .with_context(|| format!("Missing native script {path}:{command}"))?,
                 &format!("native script {path}:{command}"),
             )?;
         }
@@ -1591,8 +1614,13 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
     let inputs = context.closure_with_structure(state, &structure)?;
     assert_npmrc_compatibility(root, &inputs.directories)?;
     assert_input_identities(root, &inputs)?;
+    let node_inputs = context
+        .node_inputs
+        .take()
+        .context("Missing Node input snapshot")?;
     Ok(NativeAdmission {
         inputs,
+        node_inputs,
         dependencies: dependencies.projected,
         effective_dependencies: dependencies.effective,
         structure,

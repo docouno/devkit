@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -296,6 +296,14 @@ pub fn admit_runtime_project(root: &Path, expected_version: &str) -> Result<Runt
         s.version == expected_version,
         "Manifest version differs from accepted toolchains.env"
     );
+    admit_runtime_snapshot(root, s, manifest_identity)
+}
+/// Upgrade a parsed minimal tool/service snapshot without reparsing manifests.
+pub fn admit_runtime_snapshot(
+    root: &Path,
+    s: ProjectState,
+    manifest_identity: FileIdentity,
+) -> Result<RuntimeAdmission> {
     assert_managed(root, &s)?;
     verify_managed_set(root, &s)?;
     let native = crate::native::admit_native_components(root, &s)?;
@@ -323,12 +331,26 @@ impl CheckoutLock {
         let root = project_root(root)?;
         let p = safe_path(&root, ".devkit/state/task.lock")?;
         create_dir_all_durable(p.parent().context("Lock parent")?)?;
+        // Never open a FIFO/device or follow a replacement symlink as a lock.
+        // O_NONBLOCK also makes an unexpected FIFO replacement fail promptly.
+        if let Ok(metadata) = fs::symlink_metadata(&p) {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "Expected a regular file for checkout lock: {}",
+                p.display()
+            );
+        }
         let f = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(p)?;
+        ensure!(
+            f.metadata()?.is_file(),
+            "Expected a regular file for checkout lock"
+        );
         f.try_lock()
             .context("Another devkit operation owns this checkout")?;
         Ok(Self { _file: f, root })

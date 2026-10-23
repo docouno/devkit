@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
+signal-hook = "0.3"
+shell-words = "1"
 base64 = "0.22"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

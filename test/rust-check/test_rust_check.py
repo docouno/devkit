@@ -13,7 +13,7 @@ import unittest
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
-HELPER = REPO / "runtime/rust-check.sh"
+HELPER = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
 RECIPE = REPO / "runtime/rust.Dockerfile"
 LABEL = "io.docouno.devkit.invocation"
 RECIPE_LABEL = "io.docouno.devkit.rust-recipe"
@@ -125,7 +125,7 @@ class RustCheckTests(unittest.TestCase):
                 "--env", "CARGO_HOME=/cache/cargo", "--env", "HOME=/tmp/devkit-home",
                 "--env", "CARGO_BUILD_JOBS=2", "--volume",
                 f"{fixture}:/app:" + ("rw,z" if write else "ro,z"),
-                "--volume", f"{HELPER}:/runtime/rust-check.sh:ro,z",
+                "--volume", f"{HELPER}:/runtime/devkit:ro,z",
                 "--volume", f"{cache}:/cache/cargo:rw,z",
                 "--volume", f"{fixture / 'target'}:/app/target:rw,z", "--workdir", cwd]
         for key, value in (extra_env or {}).items():
@@ -176,7 +176,7 @@ class RustCheckTests(unittest.TestCase):
         shutil.copytree(self.baseline, self.app, ignore=shutil.ignore_patterns("target"))
 
     def helper(self, command="test", **kwargs):
-        return self.native(self.app, ["bash", "/runtime/rust-check.sh", command], **kwargs)
+        return self.native(self.app, ["/runtime/devkit", "internal", "rust", command], **kwargs)
 
     def source(self, text):
         (self.app / "src/lib.rs").write_text(text)
@@ -243,6 +243,18 @@ class RustCheckTests(unittest.TestCase):
         self.assert_failure(self.helper("check", extra_env={"RUSTUP_TOOLCHAIN": VERSION}), "masks rust-toolchain.toml")
         (self.app / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.0.0"\n')
         self.assert_failure(self.helper("check"), "the app toolchain is unavailable")
+
+    def test_outer_workspace_cannot_hide_the_accepted_component_lock(self):
+        member = self.app / "member"
+        (member / "src").mkdir(parents=True)
+        (member / "Cargo.toml").write_text('[package]\nname="workspace-member"\nversion="0.1.0"\nedition="2024"\n')
+        (member / "src/lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
+        for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"):
+            shutil.copy2(self.app / name, member / name)
+        with (self.app / "Cargo.toml").open("a") as manifest:
+            manifest.write('\n[workspace]\nmembers=["member"]\n')
+        result = self.helper("build", cwd="/app/member")
+        self.assert_failure(result, "Unsupported outer Cargo workspace/lock authority")
 
     def test_clippy_checks_test_targets(self):
         self.source("""#[cfg(test)]

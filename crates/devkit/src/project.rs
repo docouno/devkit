@@ -1,16 +1,26 @@
 use crate::{
-    Result, catalog::*, compose::assert_compose_inventory, files::*, graph::*, model::*, native::*,
-    projections::*, release::*, state::*, transaction::*,
+    Result,
+    catalog::*,
+    compose::assert_compose_inventory,
+    files::*,
+    graph::*,
+    model::*,
+    native::*,
+    processes::{OutputMode, OwnedContainer, ProcessRunner},
+    projections::*,
+    release::*,
+    state::*,
+    transaction::*,
 };
 use anyhow::{Context, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 const LEGACY_GITIGNORE:&[u8]=b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
@@ -139,35 +149,21 @@ impl LockResolver for DockerNpmResolver {
         if let Some(registry) = registry {
             command.args(["--env", &format!("npm_config_registry={registry}")]);
         }
-        command
-            .arg(image)
-            .args([
-                "npm",
-                "install",
-                "--package-lock-only",
-                "--package-lock=true",
-                "--ignore-scripts",
-                "--include=dev",
-                "--strict-peer-deps",
-                "--legacy-peer-deps=false",
-                "--force=false",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = command
-            .spawn()
-            .context("Cannot start pinned native npm resolver")?;
-        let copied = io::copy(
-            &mut child.stdout.take().context("Missing npm output")?,
-            &mut io::stderr(),
-        );
-        let status = child.wait()?;
-        copied?;
-        ensure!(
-            status.success(),
-            "Pinned native npm resolver failed: {status}"
-        );
+        command.arg(image).args([
+            "npm",
+            "install",
+            "--package-lock-only",
+            "--package-lock=true",
+            "--ignore-scripts",
+            "--include=dev",
+            "--strict-peer-deps",
+            "--legacy-peer-deps=false",
+            "--force=false",
+        ]);
+        let runner = ProcessRunner::new()?;
+        let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
+        owned.label = "org.docouno.devkit.operation".into();
+        runner.run_owned(&mut command, OutputMode::Stderr, &owned)?;
         Ok(())
     }
 }

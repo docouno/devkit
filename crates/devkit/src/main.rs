@@ -1,9 +1,15 @@
 fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args == ["--version"] || args == ["version"] {
-        println!("devkit {}", env!("CARGO_PKG_VERSION"));
-        return std::process::ExitCode::SUCCESS;
+    let result = (|| -> devkit::Result<()> {
+        let runner = devkit::processes::ProcessRunner::new()?;
+        devkit::processes::watch_parent()?;
+        devkit::cli::main(std::env::args_os().skip(1).collect(), &runner)?;
+        runner.check_cancelled()
+    })();
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("devkit: {error:#}");
+            std::process::ExitCode::from(devkit::processes::exit_code(&error))
+        }
     }
-    eprintln!("devkit: the native command facade has not been integrated");
-    std::process::ExitCode::FAILURE
 }
