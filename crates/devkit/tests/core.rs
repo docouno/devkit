@@ -949,3 +949,647 @@ fn component_named_target_is_source_while_its_rust_target_output_is_excluded() {
     );
     assert!(target.join("apps/target/target/build-output").is_file());
 }
+
+#[test]
+fn rust_add_ignores_numeric_unicode_and_renamed_checkout_basenames() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    for basename in ["123", "Проект", "renamed Ω"] {
+        let original = f.path().join(format!("initial-{basename}"));
+        init_project(
+            &release,
+            &original,
+            &InitOptions {
+                template: Some("rust".to_string()),
+                name: Some("product".to_string()),
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap();
+        let target = f.path().join(basename);
+        fs::rename(original, &target).unwrap();
+        // Rust composition must not parse unrelated root npm metadata either.
+        put_json(
+            &target,
+            "package.json",
+            &json!({"productMetadata":{"keep":true}}),
+        );
+        let inventory = capture_compose_inputs(&target).unwrap();
+        let out = add_project_component(
+            &release,
+            &target,
+            Role::App,
+            ComponentSpec {
+                name: "worker".to_string(),
+                template: "rust-api".to_string(),
+                uses: vec![],
+            },
+            &UpdateOptions {
+                compose_inventory: Some(&inventory),
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap();
+        assert!(out.state.components.contains_key("apps/worker"));
+        assert_eq!(
+            read_json::<Value>(&target.join("package.json")).unwrap(),
+            json!({"productMetadata":{"keep":true}})
+        );
+    }
+}
+
+#[test]
+fn node_add_preserves_declared_scoped_namespace_after_checkout_move() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let original = f.path().join("123");
+    init_project(
+        &release,
+        &original,
+        &InitOptions {
+            template: Some("node".to_string()),
+            name: Some("product".to_string()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let target = f.path().join("Ω renamed");
+    fs::rename(original, &target).unwrap();
+    let mut root: Value = read_json(&target.join("package.json")).unwrap();
+    root["name"] = json!("@team/product");
+    root["futureRoot"] = json!({"keep":true});
+    put_json(&target, "package.json", &root);
+    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    lock["name"] = root["name"].clone();
+    lock["packages"][""] = root.clone();
+    put_json(&target, "package-lock.json", &lock);
+    let existing = fs::read(target.join("apps/main/package.json")).unwrap();
+    let inventory = capture_compose_inputs(&target).unwrap();
+    add_project_component(
+        &release,
+        &target,
+        Role::App,
+        ComponentSpec {
+            name: "worker".to_string(),
+            template: "node-api".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let next: Value = read_json(&target.join("package.json")).unwrap();
+    assert_eq!(next["name"], "@team/product");
+    assert_eq!(next["futureRoot"], root["futureRoot"]);
+    assert_eq!(
+        fs::read(target.join("apps/main/package.json")).unwrap(),
+        existing
+    );
+    assert_eq!(
+        read_json::<Value>(&target.join("apps/worker/package.json")).unwrap()["name"],
+        "@team/product-app-worker"
+    );
+}
+
+#[test]
+fn first_node_member_in_rust_project_establishes_a_stable_private_namespace() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let target = f.path().join("123");
+    init_project(
+        &release,
+        &target,
+        &InitOptions {
+            template: Some("rust".to_string()),
+            name: Some("product".to_string()),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap();
+    add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "client".to_string(),
+            template: "react-client".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        read_json::<Value>(&target.join("package.json")).unwrap()["name"],
+        "devkit-project"
+    );
+    assert_eq!(
+        read_json::<Value>(&target.join("packages/client/package.json")).unwrap()["name"],
+        "@devkit-project/package-client"
+    );
+    let moved = f.path().join("renamed λ");
+    fs::rename(target, &moved).unwrap();
+    let inventory = capture_compose_inputs(&moved).unwrap();
+    add_project_component(
+        &release,
+        &moved,
+        Role::App,
+        ComponentSpec {
+            name: "web".to_string(),
+            template: "react-web".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        read_json::<Value>(&moved.join("apps/web/package.json")).unwrap()["name"],
+        "@devkit-project/app-web"
+    );
+}
+
+#[test]
+fn node_add_keeps_an_existing_private_root_manifest_without_a_name() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let target = f.path().join("123");
+    init_project(
+        &release,
+        &target,
+        &InitOptions {
+            template: Some("rust".to_string()),
+            name: Some("product".to_string()),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap();
+    put_json(
+        &target,
+        "package.json",
+        &json!({"private":true,"futureRoot":{"keep":true}}),
+    );
+    add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "client".to_string(),
+            template: "react-client".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap();
+    let root: Value = read_json(&target.join("package.json")).unwrap();
+    assert!(root.get("name").is_none());
+    assert_eq!(root["futureRoot"], json!({"keep":true}));
+    assert_eq!(
+        read_json::<Value>(&target.join("packages/client/package.json")).unwrap()["name"],
+        "@devkit-project/package-client"
+    );
+}
+
+#[test]
+fn accepted_legacy_default_ignore_blocks_only_unsafe_new_sources_without_writes() {
+    let legacy=b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
+    assert_eq!(
+        digest(legacy),
+        "348c45ac15b10cd537bea277b83411de9885329b6aa53570b04c42590c2e4a92"
+    );
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.2.1");
+    let target = f.path().join("legacy");
+    let initial = init(&release, &target, "rust", PackageMode::Registry);
+    put(&target, ".gitignore", legacy);
+    for (role, name, template) in [
+        (Role::App, "target", "rust-api"),
+        (Role::App, "dist", "node-api"),
+        (Role::Library, "release", "react-client"),
+    ] {
+        let before = source_signature(&target, Some(&initial)).unwrap();
+        let manifest = fs::read(target.join(MANIFEST_PATH)).unwrap();
+        let inventory = capture_compose_inputs(&target).unwrap();
+        let error = add_project_component(
+            &release,
+            &target,
+            role,
+            ComponentSpec {
+                name: name.to_string(),
+                template: template.to_string(),
+                uses: vec![],
+            },
+            &UpdateOptions {
+                compose_inventory: Some(&inventory),
+                ..Default::default()
+            },
+            &FixtureResolver,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("adjust your project-owned .gitignore"),
+            "{error}"
+        );
+        assert_eq!(source_signature(&target, Some(&initial)).unwrap(), before);
+        assert_eq!(fs::read(target.join(MANIFEST_PATH)).unwrap(), manifest);
+        assert_eq!(fs::read(target.join(".gitignore")).unwrap(), legacy);
+        assert!(!target.join(PENDING_PATH).exists());
+    }
+    // An ordinary add and explicit update never take ownership of this file.
+    let inventory = capture_compose_inputs(&target).unwrap();
+    add_project_component(
+        &release,
+        &target,
+        Role::App,
+        ComponentSpec {
+            name: "worker".to_string(),
+            template: "rust-api".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap();
+    update_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert_eq!(fs::read(target.join(".gitignore")).unwrap(), legacy);
+    // A custom owner file is not interpreted by an embedded Git parser.
+    let custom = b"# Product-owned policy\n/scratch/\n";
+    put(&target, ".gitignore", custom);
+    let inventory = capture_compose_inputs(&target).unwrap();
+    add_project_component(
+        &release,
+        &target,
+        Role::App,
+        ComponentSpec {
+            name: "target".to_string(),
+            template: "rust-api".to_string(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap();
+    assert_eq!(fs::read(target.join(".gitignore")).unwrap(), custom);
+}
+
+fn isolated_git(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_TEMPLATE_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+fn git_ignored(root: &Path, path: &str) -> bool {
+    let status = isolated_git(root)
+        .args(["check-ignore", "--quiet", "--no-index", path])
+        .status()
+        .expect("Git is required for this explicit gate");
+    match status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => panic!("git check-ignore failed for {path}: {status}"),
+    }
+}
+#[test]
+#[ignore = "requires Git; run the compiled native test executable on the Linux host"]
+fn git_tracks_output_named_component_sources_and_ignores_scoped_outputs() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    for (name, component, source) in [
+        ("target", "apps/target", "Cargo.toml"),
+        ("dist", "apps/dist", "package.json"),
+        ("release", "packages/release", "package.json"),
+    ] {
+        let target = f.path().join(format!("component-{name}"));
+        if name == "release" {
+            init(&release, &target, "rust", PackageMode::Registry);
+            add_project_component(
+                &release,
+                &target,
+                Role::Library,
+                ComponentSpec {
+                    name: name.to_string(),
+                    template: "react-client".to_string(),
+                    uses: vec![],
+                },
+                &UpdateOptions::default(),
+                &FixtureResolver,
+            )
+            .unwrap();
+        } else {
+            init_project(
+                &release,
+                &target,
+                &InitOptions {
+                    apps: Some(vec![ComponentSpec {
+                        name: name.to_string(),
+                        template: if name == "target" {
+                            "rust-api".to_string()
+                        } else {
+                            "node-api".to_string()
+                        },
+                        uses: vec![],
+                    }]),
+                    ..Default::default()
+                },
+                &FixtureResolver,
+            )
+            .unwrap();
+        }
+        assert!(
+            isolated_git(&target)
+                .args([
+                    "-c",
+                    "init.defaultBranch=main",
+                    "init",
+                    "--quiet",
+                    "--template="
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !git_ignored(&target, &format!("{component}/{source}")),
+            "A component source must be eligible for commit: {component}/{source}"
+        );
+        for output in ["target", "dist", "release"] {
+            let file = format!("{component}/{output}/build-output");
+            put(&target, &file, b"generated output");
+            assert!(
+                git_ignored(&target, &file),
+                "A scoped generated output must be ignored: {file}"
+            );
+        }
+    }
+}
+
+struct RetainRecoveryStage {
+    root: PathBuf,
+}
+impl MutationHooks for RetainRecoveryStage {
+    fn after_write(&self, count: usize, _: &str) -> Result<()> {
+        if count == 1 {
+            put(
+                &self.root,
+                ".devkit/runtime/devkit.mk",
+                b"unknown user bytes",
+            );
+            bail!("retain stage for explicit recovery");
+        }
+        Ok(())
+    }
+}
+#[test]
+#[ignore = "test-only worker invoked by the Linux strace ordering test"]
+fn durability_order_worker() {
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.2.1");
+    let new = fixture_release(f.path(), "0.3.0");
+    put(&new, "runtime/nested/helper", b"new managed helper");
+    seal(&new, "0.3.0");
+    let committed = f.path().join("committed");
+    init(&old, &committed, "rust", PackageMode::Registry);
+    update_project(&new, &committed, &UpdateOptions::default(), &NoResolver).unwrap();
+    let recovered = f.path().join("recovered");
+    init(&old, &recovered, "rust", PackageMode::Registry);
+    let hooks = RetainRecoveryStage {
+        root: recovered.clone(),
+    };
+    assert!(
+        update_project(
+            &new,
+            &recovered,
+            &UpdateOptions {
+                hooks: Some(&hooks),
+                ..Default::default()
+            },
+            &NoResolver
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("automatic rollback was blocked")
+    );
+    let journal = read_journal(&recovered).unwrap();
+    let file = journal
+        .files
+        .iter()
+        .find(|f| f.path == ".devkit/runtime/devkit.mk")
+        .unwrap();
+    write_atomic(
+        &recovered.join(&file.path),
+        &fs::read(recovered.join(file.backup.as_ref().unwrap())).unwrap(),
+        file.before.as_ref().unwrap().mode,
+    )
+    .unwrap();
+    assert!(recover_project(&recovered).unwrap());
+}
+
+fn successful_sync(line: &str, path: &str) -> bool {
+    line.contains("fsync(")
+        && line.contains(&format!("<{path}>)"))
+        && line.trim_end().ends_with("= 0")
+}
+fn assert_durable_transaction_trace(trace: &str) {
+    let lines = trace.lines().collect::<Vec<_>>();
+    let rename = regex::Regex::new(r#"rename\("([^"]+)", "([^"]+)"\)\s+= 0"#).unwrap();
+    let mkdir = regex::Regex::new(r#"mkdir\("([^"]+)", [0-7]+\)\s+= 0"#).unwrap();
+    let publications = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let c = rename.captures(line)?;
+            let path = c.get(2)?.as_str();
+            path.ends_with("/.devkit/update-pending.json")
+                .then(|| (i, path.to_string()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        publications.len(),
+        2,
+        "Expected actual successful commit and explicit recovery transactions"
+    );
+    for (published, pending) in publications {
+        let devkit = Path::new(&pending).parent().unwrap().to_str().unwrap();
+        let stage_prefix = format!("{devkit}/state/update-");
+        let (created, stage) = lines[..published]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let c = mkdir.captures(line)?;
+                let path = c.get(1)?.as_str();
+                (path.starts_with(&stage_prefix) && !path[stage_prefix.len()..].contains('/'))
+                    .then(|| (i, path.to_string()))
+            })
+            .next_back()
+            .expect("A new durable recovery stage must precede publication");
+        for directory in [
+            format!("{devkit}/state"),
+            stage.clone(),
+            format!("{stage}/backup"),
+            format!("{stage}/staged"),
+        ] {
+            let created_at = lines[..published]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    mkdir
+                        .captures(line)
+                        .and_then(|c| (c.get(1)?.as_str() == directory).then_some(i))
+                })
+                .next_back();
+            if let Some(created_at) = created_at {
+                let parent = Path::new(&directory).parent().unwrap().to_str().unwrap();
+                assert!(
+                    lines[created_at + 1..published]
+                        .iter()
+                        .any(|line| successful_sync(line, parent)),
+                    "New saved-data directory entry was not durable before pending: {directory}"
+                );
+            } else {
+                assert!(
+                    directory.ends_with("/state"),
+                    "Saved stage directory creation missing: {directory}"
+                );
+            }
+        }
+        assert!(created < published);
+        let unlinked = lines
+            .iter()
+            .enumerate()
+            .skip(published + 1)
+            .find(|(_, line)| {
+                line.contains(&format!("unlink(\"{pending}\")")) && line.trim_end().ends_with("= 0")
+            })
+            .map(|(i, _)| i)
+            .expect("Pending marker was not removed");
+        let discarded = lines
+            .iter()
+            .enumerate()
+            .skip(unlinked + 1)
+            .find(|(_, line)| {
+                line.contains(&stage)
+                    && (line.contains("unlink(")
+                        || line.contains("unlinkat(")
+                        || line.contains("rmdir("))
+                    && line.trim_end().ends_with("= 0")
+            })
+            .map(|(i, _)| i)
+            .expect("Recovery data was not discarded");
+        assert!(
+            lines[unlinked + 1..discarded]
+                .iter()
+                .any(|line| successful_sync(line, devkit)),
+            "Pending removal was not durable before saved stage cleanup"
+        );
+        if let Some(manifest) = lines
+            .iter()
+            .enumerate()
+            .take(unlinked)
+            .skip(published + 1)
+            .find_map(|(i, line)| {
+                rename.captures(line).and_then(|c| {
+                    (c.get(2)?.as_str() == format!("{devkit}/manifest.json")).then_some(i)
+                })
+            })
+        {
+            let deleted = format!("{devkit}/runtime/project.mjs");
+            let deletion = lines[published + 1..manifest]
+                .iter()
+                .position(|line| {
+                    line.contains(&format!("unlink(\"{deleted}\")"))
+                        && line.trim_end().ends_with("= 0")
+                })
+                .map(|i| i + published + 1)
+                .expect("Expected managed deletion before manifest");
+            assert!(
+                lines[deletion + 1..manifest]
+                    .iter()
+                    .any(|line| successful_sync(line, &format!("{devkit}/runtime"))),
+                "Payload deletion must be durable before final manifest"
+            );
+            let new_parent = format!("{devkit}/runtime/nested");
+            let creation = lines[published + 1..manifest]
+                .iter()
+                .position(|line| {
+                    mkdir
+                        .captures(line)
+                        .is_some_and(|c| c.get(1).unwrap().as_str() == new_parent)
+                })
+                .map(|i| i + published + 1)
+                .expect("Expected new payload parent before manifest");
+            assert!(
+                lines[creation + 1..manifest]
+                    .iter()
+                    .any(|line| successful_sync(line, &format!("{devkit}/runtime"))),
+                "New payload parent must be durable before final manifest"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Linux strace; explicitly run in the pinned strace image"]
+fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
+    let f = TempDir::new().unwrap();
+    let trace = f.path().join("durability.trace");
+    let status = Command::new("strace")
+        .args([
+            "-f",
+            "-yy",
+            "-s",
+            "4096",
+            "-e",
+            "trace=mkdir,mkdirat,rename,renameat,renameat2,fsync,fdatasync,unlink,unlinkat,rmdir",
+            "-o",
+        ])
+        .arg(&trace)
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durability_order_worker",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .status()
+        .expect("Linux strace must be available for this explicit gate");
+    assert!(status.success(), "Traced transaction worker failed");
+    let bytes = fs::read(&trace).unwrap();
+    if let Some(output) = std::env::var_os("DEVKIT_TEST_TRACE_OUTPUT") {
+        fs::write(output, &bytes).unwrap();
+    }
+    assert_durable_transaction_trace(std::str::from_utf8(&bytes).unwrap());
+}

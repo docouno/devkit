@@ -234,12 +234,40 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
     for dir in dirs {
         let p = safe_path(root, &dir)?;
         if exists(&p)? && sorted_entries(&p)?.is_empty() {
-            fs::remove_dir(p)?;
+            remove_empty_dir_durable(&p)?;
         }
     }
     remove_file(&safe_path(root, PENDING_PATH)?)?;
-    fs::remove_dir_all(safe_path(root, &tx.stage)?)?;
+    remove_tree_durable(&safe_path(root, &tx.stage)?)?;
     Ok(true)
+}
+/// An unlink that returned an fsync error must not make saved data disposable.
+pub(crate) fn cleanup_unpublished_stage(root: &Path, stage: &Path) -> Result<()> {
+    let pending = safe_path(root, PENDING_PATH)?;
+    ensure!(
+        identity(&pending)?.is_none(),
+        "Cannot discard a pending recovery stage"
+    );
+    sync_directory(pending.parent().context("Pending marker parent")?)?;
+    remove_tree_durable(stage)
+}
+fn sync_stage_ancestry(root: &Path, stage: &str) -> Result<()> {
+    let mut directory = safe_path(root, stage)?;
+    loop {
+        sync_directory(&directory)?;
+        if directory == root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .context("Recovery stage parent")?
+            .to_path_buf();
+        ensure!(
+            directory.starts_with(root),
+            "Recovery stage escaped checkout"
+        );
+    }
+    Ok(())
 }
 pub struct PreparedTransaction {
     pub journal: UpdateJournal,
@@ -345,6 +373,9 @@ impl PreparedTransaction {
             verify_saved(root, file)?;
         }
         assert_no_pending(root)?;
+        // Also bind already-existing ancestry up to the admitted checkout.
+        // It may have been created by an older engine without directory fsync.
+        sync_stage_ancestry(root, &self.journal.stage)?;
         write_json(&safe_path(root, PENDING_PATH)?, &self.journal)?;
         let result = (|| {
             for (i, file) in self.journal.files.iter().enumerate() {

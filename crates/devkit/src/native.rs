@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -163,8 +164,14 @@ pub fn local_path(root: &Path, base: &str, value: &str) -> Result<String> {
         !value.is_empty() && !value.contains('\0'),
         "Invalid native local dependency path"
     );
-    let target = input_path(root, Path::new(base).join(value))?;
-    relative_name(&project_root(root)?, &target)
+    let root = project_root(root)?;
+    let target = crate::files::lexical(&root.join(base).join(value))?;
+    ensure!(
+        target != root,
+        "Unsupported checkout-root local package location: registered package sources must live below the checkout (for example apps/ or packages/)"
+    );
+    let target = input_path(&root, target)?;
+    relative_name(&root, &target)
 }
 
 pub fn resolve_lock_node(packages: &Packages, location: &str) -> Result<String> {
@@ -218,6 +225,36 @@ pub fn locked_dependency(packages: &Packages, from: &str, name: &str) -> Result<
     }
 }
 
+/// npm permits a missing optional dependency or optional peer. An
+/// optionalDependencies entry also overrides the same key in dependencies.
+/// Other direct, development and peer edges must have a physical lock target.
+pub fn admitted_dependency_target(
+    packages: &Packages,
+    from: &str,
+    manifest: &Fields,
+    field: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let target = locked_dependency(packages, from, name)?;
+    let optional = field == "optionalDependencies"
+        || (field == "dependencies"
+            && dependency_table(manifest, "optionalDependencies")?.contains_key(name))
+        || (field == "peerDependencies" && {
+            let metadata = dependency_table(manifest, "peerDependenciesMeta")?;
+            match metadata.get(name) {
+                None | Some(Value::Null) => false,
+                Some(value) => {
+                    object(value, "peer metadata")?.get("optional") == Some(&Value::Bool(true))
+                }
+            }
+        });
+    ensure!(
+        target.is_some() || optional,
+        "Native lock omits dependency {from}:{name}"
+    );
+    Ok(target)
+}
+
 pub fn local_dependency_map(
     root: &Path,
     state: &ProjectState,
@@ -249,6 +286,105 @@ pub fn local_dependency_map(
 struct CargoInputs {
     dependencies: BTreeSet<String>,
     members: BTreeSet<String>,
+    overrides: BTreeSet<String>,
+}
+
+/// Raw facts which a saved admission must retain without reparsing native
+/// manifests. Namespace inventory detects new directories; the negative
+/// manifest identities detect native manifests added to an existing directory.
+#[derive(Clone, Serialize)]
+struct NativeStructure {
+    namespaces: BTreeMap<String, Option<BTreeMap<String, String>>>,
+    manifests: BTreeMap<String, Option<FileIdentity>>,
+}
+impl NativeStructure {
+    fn namespace_inventory(
+        root: &Path,
+    ) -> Result<BTreeMap<String, Option<BTreeMap<String, String>>>> {
+        let mut result = BTreeMap::new();
+        for area in ["apps", "packages"] {
+            let directory = input_path(root, area)?;
+            let entries = if exists(&directory)? {
+                let mut entries = BTreeMap::new();
+                for entry in sorted_entries(&directory)? {
+                    let name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("Non-UTF8 component name"))?;
+                    let metadata = fs::symlink_metadata(entry.path())?;
+                    let kind = if metadata.file_type().is_symlink() {
+                        "symlink"
+                    } else if metadata.is_dir() {
+                        "directory"
+                    } else if metadata.is_file() {
+                        "file"
+                    } else {
+                        "other"
+                    };
+                    entries.insert(name, kind.to_owned());
+                }
+                Some(entries)
+            } else {
+                None
+            };
+            result.insert(area.to_owned(), entries);
+        }
+        Ok(result)
+    }
+    fn capture(root: &Path, state: &ProjectState) -> Result<Self> {
+        let namespaces = Self::namespace_inventory(root)?;
+        let mut candidates: BTreeSet<String> = state.components.keys().cloned().collect();
+        for (area, entries) in &namespaces {
+            if let Some(entries) = entries {
+                for (name, kind) in entries {
+                    if kind == "directory" || kind == "symlink" {
+                        candidates.insert(format!("{area}/{name}"));
+                    }
+                }
+            }
+        }
+        let mut manifests = BTreeMap::new();
+        for path in candidates {
+            for name in ["package.json", "Cargo.toml"] {
+                let name = format!("{path}/{name}");
+                manifests.insert(name.clone(), identity(&input_path(root, name)?)?);
+            }
+        }
+        Ok(Self {
+            namespaces,
+            manifests,
+        })
+    }
+    fn assert_registered(&self, state: &ProjectState) -> Result<()> {
+        for (path, component) in &state.components {
+            let node = self.manifests[&format!("{path}/package.json")].is_some();
+            let rust = self.manifests[&format!("{path}/Cargo.toml")].is_some();
+            ensure!(!(node && rust), "Ambiguous native manifests: {path}");
+            ensure!(
+                (component.toolchain == Toolchain::Node && node)
+                    || (component.toolchain == Toolchain::Rust && rust),
+                "Missing expected native {} manifest: {path}",
+                component.toolchain
+            );
+        }
+        for (name, identity) in &self.manifests {
+            if identity.is_some() {
+                let path = name.rsplit_once('/').context("Native manifest parent")?.0;
+                ensure!(
+                    state.components.contains_key(path),
+                    "Unregistered native component: {path}"
+                );
+            }
+        }
+        Ok(())
+    }
+    fn recheck(&self, root: &Path) -> Result<()> {
+        ensure!(
+            Self::namespace_inventory(root)? == self.namespaces,
+            "Native component namespace changed during admission"
+        );
+        Ok(())
+    }
 }
 
 /// One admission owns this cache. Derivation and input closure share parsed
@@ -258,6 +394,7 @@ struct ReadContext<'a> {
     packages: Option<Packages>,
     manifests: BTreeMap<String, Fields>,
     cargo: BTreeMap<String, Fields>,
+    cargo_configs: BTreeMap<String, Fields>,
     read_identities: BTreeMap<String, FileIdentity>,
 }
 impl<'a> ReadContext<'a> {
@@ -267,6 +404,7 @@ impl<'a> ReadContext<'a> {
             packages: None,
             manifests: BTreeMap::new(),
             cargo: BTreeMap::new(),
+            cargo_configs: BTreeMap::new(),
             read_identities: BTreeMap::new(),
         }
     }
@@ -310,6 +448,7 @@ impl<'a> ReadContext<'a> {
         }
         let workspace = dependency_table(&manifest, "workspace")?;
         self.collect_cargo_tables(path, &workspace, &mut result, false)?;
+        self.collect_cargo_overrides(path, &manifest, &mut result.overrides)?;
         if let Some(members) = workspace.get("members") {
             for member in members
                 .as_array()
@@ -320,7 +459,9 @@ impl<'a> ReadContext<'a> {
                     !value.contains(['?', '*', '[', ']']),
                     "Cargo workspace member globs require explicit registration"
                 );
-                result.members.insert(local_path(self.root, path, value)?);
+                result
+                    .members
+                    .insert(cargo_local_path(self.root, path, value)?);
             }
         }
         Ok(result)
@@ -337,8 +478,9 @@ impl<'a> ReadContext<'a> {
                 let Some(table) = dependency.as_object() else {
                     continue;
                 };
+                reject_local_cargo_git(table)?;
                 if let Some(path) = table.get("path") {
-                    result.dependencies.insert(local_path(
+                    result.dependencies.insert(cargo_local_path(
                         self.root,
                         base,
                         text(path, "Cargo dependency path")?,
@@ -350,7 +492,7 @@ impl<'a> ReadContext<'a> {
                         .get(&name)
                         .with_context(|| format!("Missing inherited Cargo dependency: {name}"))?;
                     if let Some(path) = inherited.as_object().and_then(|d| d.get("path")) {
-                        result.dependencies.insert(local_path(
+                        result.dependencies.insert(cargo_local_path(
                             self.root,
                             &workspace_root,
                             text(path, "inherited Cargo path")?,
@@ -359,6 +501,173 @@ impl<'a> ReadContext<'a> {
                 }
             }
         }
+        Ok(())
+    }
+    fn collect_cargo_overrides(
+        &self,
+        base: &str,
+        data: &Fields,
+        targets: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for source in dependency_table(data, "patch")?.values() {
+            self.collect_cargo_override_entries(
+                base,
+                object(source, "Cargo patch source")?,
+                targets,
+            )?;
+        }
+        self.collect_cargo_override_entries(base, &dependency_table(data, "replace")?, targets)
+    }
+    fn collect_cargo_override_entries(
+        &self,
+        base: &str,
+        entries: &Fields,
+        targets: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for value in entries.values() {
+            let Some(dependency) = value.as_object() else {
+                continue;
+            };
+            reject_local_cargo_git(dependency)?;
+            if let Some(path) = dependency.get("path") {
+                targets.insert(cargo_local_path(
+                    self.root,
+                    base,
+                    text(path, "Cargo override path")?,
+                )?);
+            }
+        }
+        Ok(())
+    }
+    fn cargo_config(&mut self, name: &str) -> Result<Fields> {
+        if !self.cargo_configs.contains_key(name) {
+            let (bytes, identity) = stable_bytes(&input_path(self.root, name)?)?;
+            let parsed: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
+                .with_context(|| format!("Invalid Cargo config: {name}"))?;
+            let value = serde_json::to_value(parsed)?;
+            self.cargo_configs
+                .insert(name.to_owned(), object(&value, "Cargo config")?.clone());
+            self.read_identities.insert(name.to_owned(), identity);
+        }
+        Ok(self.cargo_configs[name].clone())
+    }
+    fn cargo_config_inputs(
+        &mut self,
+        name: &str,
+        files: &mut BTreeMap<String, Option<FileIdentity>>,
+        seen: &mut BTreeSet<String>,
+        active: &mut BTreeSet<String>,
+        targets: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if seen.contains(name) {
+            return Ok(());
+        }
+        ensure!(
+            active.insert(name.to_owned()),
+            "Cargo config include cycle: {name}"
+        );
+        record(self.root, files, name, true)?;
+        let data = self.cargo_config(name)?;
+        let path = input_path(self.root, name)?;
+        let directory = path.parent().context("Cargo config parent")?;
+        if let Some(includes) = data.get("include") {
+            for include in includes
+                .as_array()
+                .context("Cargo config include must be an array")?
+            {
+                let (reference, optional) = if let Some(value) = include.as_str() {
+                    (value, false)
+                } else {
+                    let include = object(include, "Cargo config include")?;
+                    ensure!(
+                        include
+                            .keys()
+                            .all(|key| ["path", "optional"].contains(&key.as_str())),
+                        "Unsupported Cargo config include fields: {name}"
+                    );
+                    let optional = include
+                        .get("optional")
+                        .map(|v| {
+                            v.as_bool()
+                                .context("Cargo include optional must be boolean")
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    (
+                        text(
+                            include
+                                .get("path")
+                                .context("Missing Cargo config include path")?,
+                            "Cargo config include path",
+                        )?,
+                        optional,
+                    )
+                };
+                ensure!(
+                    reference.ends_with(".toml"),
+                    "Cargo config include must name a .toml file: {reference}"
+                );
+                let target = input_path(self.root, directory.join(reference))?;
+                let target_name = relative_name(&project_root(self.root)?, &target)?;
+                record(self.root, files, &target_name, !optional)?;
+                if identity(&target)?.is_some() {
+                    self.cargo_config_inputs(&target_name, files, seen, active, targets)?;
+                }
+            }
+        }
+        // Cargo resolves file-defined values relative to two levels above the
+        // defining config file, including --config/include files.
+        let base = directory
+            .parent()
+            .context("Cargo config value base")?
+            .to_str()
+            .context("Non-UTF8 Cargo config base")?;
+        if let Some(paths) = data.get("paths") {
+            for value in paths
+                .as_array()
+                .context("Cargo config paths must be an array")?
+            {
+                targets.insert(cargo_local_path(
+                    self.root,
+                    base,
+                    text(value, "Cargo config override path")?,
+                )?);
+            }
+        }
+        self.collect_cargo_overrides(base, &data, targets)?;
+        for source in dependency_table(&data, "source")?.values() {
+            let source = object(source, "Cargo source")?;
+            for field in ["directory", "local-registry"] {
+                ensure!(
+                    !source.contains_key(field),
+                    "Unsupported local Cargo source store: source.{field}; use a confined path or patch dependency"
+                );
+            }
+            reject_local_cargo_git(source)?;
+            ensure!(
+                !source
+                    .get("registry")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.starts_with("file:")),
+                "Unsupported local Cargo registry source: source.registry"
+            );
+        }
+        for registry in dependency_table(&data, "registries")?.values() {
+            let registry = object(registry, "Cargo registry")?;
+            ensure!(
+                !registry
+                    .get("index")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.starts_with("file:")),
+                "Unsupported local Cargo registry source: registries.index"
+            );
+        }
+        ensure!(
+            !dependency_table(&data, "resolver")?.contains_key("lockfile-path"),
+            "Unsupported Cargo resolver.lockfile-path: the accepted native lock is Cargo.lock"
+        );
+        active.remove(name);
+        seen.insert(name.to_owned());
         Ok(())
     }
     fn find_cargo_workspace(&mut self, base: &str) -> Result<(String, Fields)> {
@@ -422,8 +731,41 @@ impl<'a> ReadContext<'a> {
         assert_acyclic(&result)?;
         Ok(result)
     }
+    fn assert_npm_targets(&mut self) -> Result<()> {
+        let packages = self.packages()?.clone();
+        for (location, record) in &packages {
+            if record.get("link") == Some(&Value::Bool(true)) {
+                resolve_lock_node(&packages, location)?;
+                continue;
+            }
+            let data = if !location.contains("node_modules/")
+                && exists(&input_path(
+                    self.root,
+                    Path::new(location).join("package.json"),
+                )?)? {
+                self.manifest(location)?
+            } else {
+                record.clone()
+            };
+            for field in DEPENDENCY_FIELDS {
+                for (name, spec) in dependency_table(&data, field)? {
+                    text(&spec, &format!("{location}:{name}"))?;
+                    admitted_dependency_target(&packages, location, &data, field, &name)?;
+                }
+            }
+        }
+        Ok(())
+    }
     fn closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
-        let mut files = BTreeMap::new();
+        let structure = NativeStructure::capture(self.root, state)?;
+        self.closure_with_structure(state, &structure)
+    }
+    fn closure_with_structure(
+        &mut self,
+        state: &ProjectState,
+        structure: &NativeStructure,
+    ) -> Result<InputIdentitySet> {
+        let mut files = structure.manifests.clone();
         let mut directories = BTreeSet::new();
         let mut queue: VecDeque<String> = node_components(state)
             .into_iter()
@@ -433,7 +775,13 @@ impl<'a> ReadContext<'a> {
             queue.push_front(String::new());
             record(self.root, &mut files, "package-lock.json", true)?;
             let root = self.root;
-            for item in self.packages()?.values() {
+            for (location, item) in self.packages()? {
+                if !location.is_empty()
+                    && !location.contains("node_modules/")
+                    && exists(&input_path(root, Path::new(location).join("package.json"))?)?
+                {
+                    queue.push_back(location.clone());
+                }
                 if item.get("link") == Some(&Value::Bool(true)) {
                     queue.push_back(local_path(
                         root,
@@ -481,6 +829,8 @@ impl<'a> ReadContext<'a> {
             .map(|(p, _)| p.clone())
             .collect();
         let mut rust_seen = BTreeSet::new();
+        let mut seen_configs = BTreeSet::new();
+        let mut active_configs = BTreeSet::new();
         while let Some(path) = rust_queue.pop_front() {
             if !rust_seen.insert(path.clone()) {
                 continue;
@@ -497,9 +847,25 @@ impl<'a> ReadContext<'a> {
             // Cargo discovers config in cwd ancestors. Include absence as well as
             // presence, so adding a new config cannot reuse a previous receipt.
             let mut directory = path.clone();
+            let mut override_targets = BTreeSet::new();
             loop {
                 for name in [".cargo/config.toml", ".cargo/config", ".rustfmt.toml"] {
                     record(self.root, &mut files, &prefixed(&directory, name), false)?;
+                }
+                let legacy_config = prefixed(&directory, ".cargo/config");
+                let config = if files[&legacy_config].is_some() {
+                    legacy_config
+                } else {
+                    prefixed(&directory, ".cargo/config.toml")
+                };
+                if files[&config].is_some() {
+                    self.cargo_config_inputs(
+                        &config,
+                        &mut files,
+                        &mut seen_configs,
+                        &mut active_configs,
+                        &mut override_targets,
+                    )?;
                 }
                 if directory != path {
                     record(
@@ -508,6 +874,10 @@ impl<'a> ReadContext<'a> {
                         &prefixed(&directory, "Cargo.toml"),
                         false,
                     )?;
+                    if files[&prefixed(&directory, "Cargo.toml")].is_some() {
+                        let ancestor = self.cargo_manifest(&directory)?;
+                        self.collect_cargo_overrides(&directory, &ancestor, &mut override_targets)?;
+                    }
                     record(
                         self.root,
                         &mut files,
@@ -529,6 +899,8 @@ impl<'a> ReadContext<'a> {
             let native = self.cargo_inputs(&path)?;
             rust_queue.extend(native.dependencies);
             rust_queue.extend(native.members);
+            rust_queue.extend(native.overrides);
+            rust_queue.extend(override_targets);
         }
         // Bind workspace parent manifests read to resolve inherited dependencies.
         for path in self.cargo.keys() {
@@ -545,8 +917,16 @@ impl<'a> ReadContext<'a> {
                 "Native input changed during admission: {name}"
             );
         }
+        for (name, expected) in &structure.manifests {
+            ensure!(
+                files.get(name) == Some(expected)
+                    && &identity(&input_path(self.root, name)?)? == expected,
+                "Native structural input changed during admission: {name}"
+            );
+        }
+        structure.recheck(self.root)?;
         let digest = digest(serde_json::to_vec(
-            &json!({"domain":"devkit-native-inputs-v3", "files":files, "directories":directories}),
+            &json!({"domain":"devkit-native-inputs-v3-structural", "files":files, "directories":directories, "namespaces":structure.namespaces}),
         )?);
         Ok(InputIdentitySet {
             schema_version: 1,
@@ -563,6 +943,32 @@ fn prefixed(directory: &str, name: &str) -> String {
     } else {
         format!("{directory}/{name}")
     }
+}
+fn cargo_local_path(root: &Path, base: &str, value: &str) -> Result<String> {
+    ensure!(
+        !value.is_empty() && !value.contains('\0'),
+        "Invalid Cargo local path"
+    );
+    let root = project_root(root)?;
+    let manifest = input_path(&root, Path::new(base).join(value).join("Cargo.toml"))?;
+    ensure!(
+        manifest.parent() != Some(root.as_path()),
+        "Unsupported checkout-root local package location: registered package sources must live below the checkout (for example apps/ or packages/)"
+    );
+    relative_name(
+        &root,
+        manifest.parent().context("Cargo local manifest parent")?,
+    )
+}
+fn reject_local_cargo_git(dependency: &Fields) -> Result<()> {
+    ensure!(
+        !dependency
+            .get("git")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("file:")),
+        "Unsupported local Cargo git source: use a confined path dependency or patch"
+    );
+    Ok(())
 }
 fn parent_name(path: &str) -> String {
     path.rsplit_once('/')
@@ -702,10 +1108,12 @@ pub fn assert_tool_profiles(root: &Path, state: &ProjectState) -> Result<()> {
 pub struct NativeAdmission {
     pub inputs: InputIdentitySet,
     pub dependencies: BTreeMap<String, Vec<String>>,
+    structure: NativeStructure,
 }
 impl NativeAdmission {
     pub fn recheck(&self, root: &Path) -> Result<()> {
-        assert_input_identities(root, &self.inputs)
+        assert_input_identities(root, &self.inputs)?;
+        self.structure.recheck(root)
     }
 }
 pub fn assert_input_identities(root: &Path, inputs: &InputIdentitySet) -> Result<()> {
@@ -725,37 +1133,9 @@ pub fn assert_native_components(root: &Path, state: &ProjectState) -> Result<()>
     admit_native_components(root, state).map(|_| ())
 }
 pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<NativeAdmission> {
-    assert_component_manifests(root, state)?;
+    let structure = NativeStructure::capture(root, state)?;
+    structure.assert_registered(state)?;
     assert_tool_profiles(root, state)?;
-    for area in ["apps", "packages"] {
-        let directory = input_path(root, area)?;
-        if !exists(&directory)? {
-            continue;
-        }
-        for entry in sorted_entries(&directory)? {
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if !metadata.is_dir() && !metadata.file_type().is_symlink() {
-                continue;
-            }
-            let path = format!(
-                "{area}/{}",
-                entry
-                    .file_name()
-                    .to_str()
-                    .context("Non-UTF8 component name")?
-            );
-            let native = ["package.json", "Cargo.toml"].into_iter().try_fold(
-                false,
-                |found, file| -> Result<bool> {
-                    Ok(found || exists(&input_path(root, format!("{path}/{file}"))?)?)
-                },
-            )?;
-            ensure!(
-                !native || state.components.contains_key(&path),
-                "Unregistered native component: {path}"
-            );
-        }
-    }
     let mut context = ReadContext::new(root);
     let nodes = node_components(state);
     if !nodes.is_empty() {
@@ -862,12 +1242,16 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             "Native dependency projection is stale: {path}; run the accepted devkit update"
         );
     }
-    let inputs = context.closure(state)?;
+    if !nodes.is_empty() {
+        context.assert_npm_targets()?;
+    }
+    let inputs = context.closure_with_structure(state, &structure)?;
     assert_npmrc_compatibility(root, &inputs.directories)?;
     assert_input_identities(root, &inputs)?;
     Ok(NativeAdmission {
         inputs,
         dependencies,
+        structure,
     })
 }
 

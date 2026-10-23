@@ -322,7 +322,7 @@ impl CheckoutLock {
     pub fn acquire(root: &Path) -> Result<Self> {
         let root = project_root(root)?;
         let p = safe_path(&root, ".devkit/state/task.lock")?;
-        fs::create_dir_all(p.parent().context("Lock parent")?)?;
+        create_dir_all_durable(p.parent().context("Lock parent")?)?;
         let f = OpenOptions::new()
             .read(true)
             .write(true)

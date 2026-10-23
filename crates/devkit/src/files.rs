@@ -184,9 +184,71 @@ pub fn validate_identity(value: &FileIdentity) -> Result<()> {
     );
     Ok(())
 }
+pub fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("Cannot open directory for durability: {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("Cannot synchronize directory: {}", path.display()))
+}
+/// Install each new directory entry durably, not only the final file's parent.
+/// A journal may be published from a different directory than its saved data.
+pub fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = if path.as_os_str().is_empty() {
+        Path::new(".").to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "Expected a regular directory: {}",
+                    current.display()
+                );
+                break;
+            }
+            Err(error) if absent(&error) => {
+                missing.push(current.clone());
+                current = current
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory)?;
+                ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "Concurrent non-directory creation: {}",
+                    directory.display()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_directory(&directory)?;
+        sync_directory(
+            directory
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+    }
+    Ok(())
+}
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let parent = path.parent().context("Missing parent")?;
-    fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_dir_all_durable(parent)?;
     let temp = parent.join(format!(".devkit-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut f = OpenOptions::new()
@@ -197,7 +259,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         f.set_permissions(fs::Permissions::from_mode(mode))?;
         f.sync_all()?;
         fs::rename(&temp, path)?;
-        File::open(parent)?.sync_all()?;
+        sync_directory(parent)?;
         Ok(())
     })();
     let _ = fs::remove_file(&temp);
@@ -205,10 +267,41 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 }
 pub fn remove_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if absent(&e) => Ok(()),
-        Err(e) => Err(e.into()),
+        Ok(()) => (),
+        Err(e) if absent(&e) => (),
+        Err(e) => return Err(e.into()),
     }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if exists(parent)? {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+pub fn remove_empty_dir_durable(path: &Path) -> Result<()> {
+    fs::remove_dir(path)?;
+    sync_directory(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+}
+pub fn remove_tree_durable(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => (),
+        Err(error) if absent(&error) => (),
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if exists(parent)? {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 pub fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
     let mut v = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;

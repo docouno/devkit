@@ -4,8 +4,8 @@ use crate::{
     files::{exists, input_path, object, text, write_json},
     model::{ProjectState, Toolchain},
     native::{
-        DEPENDENCY_FIELDS, Fields, Packages, dependency_table, locked_dependency, native_manifest,
-        package_lock, resolve_lock_node, root_workspace_link,
+        DEPENDENCY_FIELDS, Fields, Packages, admitted_dependency_target, dependency_table,
+        native_manifest, package_lock, resolve_lock_node, root_workspace_link,
     },
 };
 use anyhow::{Context, ensure};
@@ -137,21 +137,7 @@ pub fn read_native_graph(root: &Path) -> Result<NativeGraph> {
                             .any(|prefix| spec.starts_with(prefix)),
                     "Unsupported dependency for preserved graph: {location}:{name}"
                 );
-                let to = locked_dependency(&packages, location, &name)?;
-                let optional = field == "optionalDependencies"
-                    || (field == "peerDependencies" && {
-                        let metadata = dependency_table(&data, "peerDependenciesMeta")?;
-                        metadata
-                            .get(&name)
-                            .map(|v| object(v, "peer metadata"))
-                            .transpose()?
-                            .and_then(|m| m.get("optional"))
-                            == Some(&Value::Bool(true))
-                    });
-                ensure!(
-                    to.is_some() || optional,
-                    "Native lock omits dependency {location}:{name}"
-                );
+                let to = admitted_dependency_target(&packages, location, &data, field, &name)?;
                 edges.push(Edge {
                     field: field.to_owned(),
                     name,

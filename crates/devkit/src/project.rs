@@ -13,6 +13,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+const LEGACY_GITIGNORE:&[u8]=b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
+const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/apps/*/dist/\n/packages/*/dist/\n/apps/*/target/\n/packages/*/target/\n/apps/*/release/\n/packages/*/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
+
 #[derive(Clone, Debug)]
 pub struct ComponentSpec {
     pub name: String,
@@ -387,11 +390,7 @@ pub fn render_component(
         return Ok((path, state, None));
     }
     let mut manifest = native_value(destination, &path)?;
-    manifest["name"] = json!(format!(
-        "@{project_name}/{}-{}",
-        if role == Role::App { "app" } else { "package" },
-        spec.name
-    ));
+    manifest["name"] = json!(component_package_name(project_name, role, &spec.name)?);
     let deps = manifest
         .get_mut("devDependencies")
         .and_then(Value::as_object_mut)
@@ -577,6 +576,32 @@ fn derived_name(target: &Path) -> Result<String> {
     }
     Ok(slug(result.trim_matches('-'))?.to_string())
 }
+fn component_package_name(project_name: &str, role: Role, name: &str) -> Result<String> {
+    let kind = if role == Role::App { "app" } else { "package" };
+    if let Some(scoped) = project_name.strip_prefix('@') {
+        let (scope, project) = scoped
+            .split_once('/')
+            .context("Invalid scoped root package identity")?;
+        ensure!(
+            !scope.is_empty() && !project.is_empty() && !project.contains('/'),
+            "Invalid scoped root package identity"
+        );
+        Ok(format!("@{scope}/{project}-{kind}-{name}"))
+    } else {
+        Ok(format!("@{project_name}/{kind}-{name}"))
+    }
+}
+fn existing_project_namespace(root: &Path) -> Result<String> {
+    if identity(&safe_path(root, "package.json")?)?.is_some() {
+        let manifest = native_manifest(root, "")?;
+        if let Some(name) = manifest.get("name") {
+            return Ok(text(name, "root package name")?.to_string());
+        }
+    }
+    // Published Rust-only schema2 projects do not retain an npm namespace.
+    // Their first Node member establishes a stable private fallback.
+    Ok("devkit-project".to_string())
+}
 pub fn init_project(
     release_root: &Path,
     target: &Path,
@@ -729,7 +754,7 @@ pub fn init_project(
         b"# Product-owned development overrides.\nservices: {}\n",
         0o644,
     )?;
-    write_atomic(&stage.path().join(".gitignore"),b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n",0o644)?;
+    write_atomic(&stage.path().join(".gitignore"), PROJECT_GITIGNORE, 0o644)?;
     let readme = format!(
         "# {name}\n\nRun `make setup`, then `make check build`. Apps and packages use their native commands through the root Makefile. Use the accepted release's `devkit add-app` to add an app. Product source, root Make and Compose overrides belong to this project.\n"
     );
@@ -754,7 +779,9 @@ pub fn init_project(
             );
             fs::rename(entry.path(), dest)?;
         }
+        sync_directory(&target)?;
     }
+    sync_directory(parent)?;
     Ok(state)
 }
 
@@ -868,6 +895,24 @@ fn update_tools(
     }
     write_native(root, path, &m)
 }
+fn assert_legacy_ignore_allows_component(root: &Path, path: &str, name: &str) -> Result<()> {
+    if !["target", "dist", "release"].contains(&name) {
+        return Ok(());
+    }
+    let ignore = root.join(".gitignore");
+    match fs::symlink_metadata(&ignore) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            ensure!(
+                fs::read(&ignore)? != LEGACY_GITIGNORE,
+                "The accepted legacy .gitignore default would ignore {path} source files; adjust your project-owned .gitignore to namespace-scoped output rules before adding this component"
+            );
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
 fn mutate(
     release_root: &Path,
     target: &Path,
@@ -922,6 +967,13 @@ fn mutate(
         "A different release has the same version; use a distinctly versioned release"
     );
     let mode = options.package_mode.unwrap_or(old.package_mode);
+    if let Some(Change::Add { role, spec }) = &change {
+        assert_legacy_ignore_allows_component(
+            root,
+            &component_path(*role, &spec.name)?,
+            &spec.name,
+        )?;
+    }
     if change.is_none() && old.release_identity == release.identity && mode == old.package_mode {
         match assert_native_components(root, old)
             .and_then(|()| assert_projections(root, old, &snapshot.inputs))
@@ -942,7 +994,7 @@ fn mutate(
     }
     let stage_name = format!(".devkit/state/update-{}", uuid::Uuid::new_v4());
     let stage = safe_path(root, &stage_name)?;
-    fs::create_dir_all(&stage)?;
+    create_dir_all_durable(&stage)?;
     let staged_root = stage.join("project");
     let result = (|| {
         copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
@@ -970,7 +1022,11 @@ fn mutate(
                     spec.name
                 );
             }
-            let name = derived_name(root)?;
+            let name = if template(&spec.template)?.toolchain == Toolchain::Node {
+                existing_project_namespace(&staged_root)?
+            } else {
+                String::new()
+            };
             let (path, c, seed) = render_component(
                 &release,
                 &staged_root,
@@ -1142,8 +1198,15 @@ fn mutate(
             no_op: false,
         })
     })();
-    if !exists(&safe_path(root, PENDING_PATH)?)? {
-        let _ = fs::remove_dir_all(stage);
+    if !exists(&safe_path(root, PENDING_PATH)?)?
+        && let Err(cleanup) = cleanup_unpublished_stage(root, &stage)
+    {
+        return match result {
+            Ok(_) => {
+                Err(cleanup.context("Operation completed but recovery stage cleanup was blocked"))
+            }
+            Err(error) => Err(error.context(format!("Recovery stage retained: {cleanup}"))),
+        };
     }
     result
 }
