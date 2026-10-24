@@ -1331,7 +1331,40 @@ fn read_proof(remote: &Fake) -> Proof {
 }
 
 fn npx_receipt(c: &Contract, mode: &str) -> Value {
-    json!({"schemaVersion":1,"success":true,"error":null,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256,"selectorMode":mode,"ignoreScripts":true,"authenticationUsed":false,"umasks":["022","077"],"durationSeconds":4.944376594999994,"harnessSha256":"d".repeat(64),"diagnostics":"/home/runner/work/project/project/.artifacts/release-proof/npx-public-diagnostics","cases":["022","077"].map(|mask| json!({"umask":mask,"registrySpec":if mode == "latest" {CLI.to_owned()} else {format!("{CLI}@{}",c.version)},"files":310,"engineSha256":"e".repeat(64),"sameVersionRequests":0,"canonicalReleaseIdentity":"f".repeat(64),"bareCiDiagnostic":true,"nativeImportNetwork":"none"}))})
+    let registry_spec = if mode == "latest" {
+        CLI.to_owned()
+    } else {
+        format!("{CLI}@{}", c.version)
+    };
+    let cases = ["022", "077"].map(|mask| {
+        json!({
+            "umask": mask,
+            "registrySpec": registry_spec,
+            "files": 310,
+            "engineSha256": "e".repeat(64),
+            "sameVersionRequests": 0,
+            "canonicalReleaseIdentity": "f".repeat(64),
+            "bareCiDiagnostic": true,
+            "nativeImportNetwork": "none"
+        })
+    });
+    json!({
+        "schemaVersion": 1,
+        "success": true,
+        "error": null,
+        "version": c.version,
+        "sourceCommit": c.source_commit,
+        "sourceTree": c.source_tree,
+        "indexSha256": c.index_sha256,
+        "selectorMode": mode,
+        "ignoreScripts": true,
+        "authenticationUsed": false,
+        "umasks": ["022", "077"],
+        "durationSeconds": 4.944376594999994,
+        "harnessSha256": "d".repeat(64),
+        "diagnostics": "/home/runner/work/project/project/.artifacts/release-proof/npx-public-diagnostics",
+        "cases": cases
+    })
 }
 
 fn assert_trace_facts(original: &Value, compact: &Value) {
@@ -1568,26 +1601,72 @@ fn varied_performance(c: &Contract) -> Value {
         }
     }
     raw["comparisons"] = json!((0..14).map(|i| {
-        let mut comparison = json!({"shape":format!("component-shape-{i}"),"operation":"describe-vs-doctor","nativeToBaselineMedianRatio":0.123_456_789_012_345_66,"nativeFaster":true});
+        let mut comparison = json!({
+            "shape": format!("component-shape-{i}"),
+            "operation": "describe-vs-doctor",
+            "nativeToBaselineMedianRatio": 0.123_456_789_012_345_66,
+            "nativeFaster": true
+        });
         if i % 4 == 0 {
             comparison["scopeDifference"] = json!("Native describe admits the full graph without SDK readiness; baseline doctor includes Docker and image readiness.");
         }
         comparison
     }).collect::<Vec<_>>());
     raw["definitions"] = json!(["warm","latency","hostProcesses","containers","tooling","cold","inputs","fixture"].map(|key| (key.to_owned(), format!("{key}: Plain warm measurements alternate old and new release factories with two warmups. Instrumented tracing is a separate diagnostic run; source, mode and product identities are unchanged. Raw samples and complete diagnostics remain in the original receipt."))).into_iter().collect::<BTreeMap<_,_>>());
-    raw["limits"] = json!({"minimumSamples":30,"warmups":2,"p95":"nearest-rank ceil(0.95*n)","requireNativeControlContainers":0,"requireNativeDescribeDockerCalls":0,"requireBuildToolContainersPerComponent":1,"support":"Linux x86_64 with local Docker Compose; host language SDK excluded","setupAndLockResolution":"Prepared outside measurement; required ecosystem checks remain enabled"});
-    raw["host"] = json!({"system":"Linux","machine":"x86_64","kernel":"6.17.0-generic","cpuCount":4,"cpuModel":"Synthetic server processor with extended descriptive model metadata ".repeat(4)});
-    raw["tools"] = json!({"traceImageId":format!("sha256:{}", "a".repeat(64)),"traceRecipeSha256":"b".repeat(64),"straceVersion":"strace -- version 6.1","straceFiles":["strace","libc.so.6","liblzma.so.5","libunwind.so.8","libunwind-ptrace.so.0","libunwind-x86_64.so.8","ld-linux-x86-64.so.2"].map(|key| (key.to_owned(),"c".repeat(64))).into_iter().collect::<BTreeMap<_,_>>()});
+    raw["limits"] = json!({
+        "minimumSamples": 30,
+        "warmups": 2,
+        "p95": "nearest-rank ceil(0.95*n)",
+        "requireNativeControlContainers": 0,
+        "requireNativeDescribeDockerCalls": 0,
+        "requireBuildToolContainersPerComponent": 1,
+        "support": "Linux x86_64 with local Docker Compose; host language SDK excluded",
+        "setupAndLockResolution": "Prepared outside measurement; required ecosystem checks remain enabled"
+    });
+    raw["host"] = json!({
+        "system": "Linux",
+        "machine": "x86_64",
+        "kernel": "6.17.0-generic",
+        "cpuCount": 4,
+        "cpuModel": "Synthetic server processor with extended descriptive model metadata ".repeat(4)
+    });
+    let strace_files = [
+        "strace",
+        "libc.so.6",
+        "liblzma.so.5",
+        "libunwind.so.8",
+        "libunwind-ptrace.so.0",
+        "libunwind-x86_64.so.8",
+        "ld-linux-x86-64.so.2",
+    ]
+    .map(|key| (key.to_owned(), "c".repeat(64)))
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    raw["tools"] = json!({
+        "traceImageId": format!("sha256:{}", "a".repeat(64)),
+        "traceRecipeSha256": "b".repeat(64),
+        "straceVersion": "strace -- version 6.1",
+        "straceFiles": strace_files
+    });
     raw["harness"] = json!(
         ["verify.py", "test_harness.py", "measure.py"]
             .map(|key| (key.to_owned(), "d".repeat(64)))
             .into_iter()
             .collect::<BTreeMap<_, _>>()
     );
-    raw["admissionChecks"] = json!([{"case":"refuse-source-edits","exitCode":1,"sourceUnchanged":true},{"case":"refuse-missing-cache","exitCode":1,"sourceUnchanged":true}]);
+    raw["admissionChecks"] = json!([
+        {"case": "refuse-source-edits", "exitCode": 1, "sourceUnchanged": true},
+        {"case": "refuse-missing-cache", "exitCode": 1, "sourceUnchanged": true}
+    ]);
     raw["buildRun"] = json!(c.build_run);
     raw["releaseIdentity"] = json!("e".repeat(64));
-    raw["baseline"] = json!({"version":"0.2.1","source":"/home/runner/work/project/project/.artifacts/legacy/devkit-0.2.1","publicArchiveUrl":"https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz","archiveSha256":"f".repeat(64),"releaseIdentity":"a".repeat(64)});
+    raw["baseline"] = json!({
+        "version": "0.2.1",
+        "source": "/home/runner/work/project/project/.artifacts/legacy/devkit-0.2.1",
+        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz",
+        "archiveSha256": "f".repeat(64),
+        "releaseIdentity": "a".repeat(64)
+    });
     raw
 }
 
