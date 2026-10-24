@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import stat
 
 
 def require(condition, message):
@@ -93,6 +94,8 @@ def verify(helper, module, index, from_version, environment, products):
 
     for name in (".env", "Makefile", "compose.yaml"):
         path = root / name
+        if name == ".env" and not path.exists():
+            path.touch(mode=0o600)
         path.write_bytes(path.read_bytes() + b"\n# Retained native-upgrade owner configuration.\n")
     web_source = root / "apps/web/src/ClientApp.tsx"
     source = web_source.read_text()
@@ -121,6 +124,7 @@ def verify(helper, module, index, from_version, environment, products):
     product_package = {key: value for key, value in package.items() if key != "devDependencies"}
     old_product_tools = {key: value for key, value in package["devDependencies"].items()
                          if key not in state["components"]["apps/web"]["toolDependencies"]}
+    product_modes = {path: stat.S_IMODE(path.stat().st_mode) for path in product_files}
     loader_before_add = (root / ".devkit/runtime/devkit.sh").read_bytes()
 
     def cli(label, *arguments):
@@ -155,7 +159,8 @@ def verify(helper, module, index, from_version, environment, products):
                 "Native upgrade lost component/origin owner metadata")
     require(set(after["components"]) == set(after_add["components"]), "Native upgrade changed the product graph")
     for path, content in product_files.items():
-        require(path.read_bytes() == content, "Native upgrade overwrote product input " + str(path.relative_to(root)))
+        require(path.read_bytes() == content and stat.S_IMODE(path.stat().st_mode) == product_modes[path],
+                "Native upgrade overwrote product input bytes/mode " + str(path.relative_to(root)))
     current = read_json(web_package)
     require({key: value for key, value in current.items() if key != "devDependencies"} == product_package,
             "Native upgrade changed product package fields/dependencies/scripts")

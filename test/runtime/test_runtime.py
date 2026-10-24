@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -19,7 +20,6 @@ PINS = dict(line.split("=", 1) for line in (REPO / "toolchains.env").read_text()
             if line and not line.startswith("#"))
 IMAGE = PINS["DEVKIT_NODE_IMAGE"]
 NODE_VERSION = PINS["DEVKIT_NODE_VERSION"]
-VERSION = "0.3.0"
 LABEL = "io.docouno.devkit.invocation"
 RUNTIME_SOURCE = REPO / "runtime"
 ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
@@ -41,6 +41,23 @@ def run(*args, check=True, timeout=35, **kwargs):
     if check and result.returncode:
         raise AssertionError(f"{args!r}: {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result
+
+
+def selected_engine_version():
+    metadata = json.loads(run(str(ENGINE), "version", "--json", timeout=10).stdout)
+    result = metadata.get("result") if isinstance(metadata, dict) else None
+    version = result.get("version") if isinstance(result, dict) else None
+    if not (isinstance(metadata, dict)
+            and type(metadata.get("schemaVersion")) is int and metadata["schemaVersion"] == 1
+            and metadata.get("ok") is True and metadata.get("command") == "version"
+            and isinstance(version, str) and len(version) <= 128
+            and re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", version)
+            and not any(re.fullmatch(r"0\d+", part) for part in version.split("+", 1)[0].partition("-")[2].split("."))):
+        raise AssertionError("Selected runtime engine returned invalid version metadata")
+    return version
+
+
+VERSION = selected_engine_version()
 
 
 def container(name):
@@ -215,6 +232,35 @@ def write_rust_fixture(root):
     shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
     accept_runtime(root, native=True)
     return recipe
+
+
+class EngineVersionAdmissionTests(unittest.TestCase):
+    def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            write_rust_fixture(root)
+            wrong = "9.9.9" if VERSION != "9.9.9" else "9.9.8"
+            manifest = root / ".devkit/manifest.json"
+            state = json.loads(manifest.read_text())
+            state["version"] = wrong
+            manifest.write_text(json.dumps(state) + "\n")
+            pins = root / ".devkit/runtime/toolchains.env"
+            pins.write_text(pins.read_text().replace("DEVKIT_VERSION=" + VERSION, "DEVKIT_VERSION=" + wrong))
+            seal_runtime(root)
+            fake = base / "bin"
+            fake.mkdir()
+            log = base / "docker-called"
+            docker = fake / "docker"
+            docker.write_text("#!/bin/sh\nprintf called >> \"$ENGINE_VERSION_DOCKER_LOG\"\nexit 91\n")
+            docker.chmod(0o755)
+            environment = dict(env(), PATH=str(fake) + os.pathsep + os.environ["PATH"],
+                               ENGINE_VERSION_DOCKER_LOG=str(log))
+            result = run(str(ENGINE), "task", "doctor", "--root", str(root),
+                         env=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Accepted engine version differs from its build", result.stderr)
+            self.assertFalse(log.exists(), "Version mismatch reached Docker")
 
 
 class ComposeCompatibilityTests(unittest.TestCase):
