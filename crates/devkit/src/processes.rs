@@ -184,6 +184,16 @@ impl ProcessRunner {
     pub fn run(&self, command: &mut Command, mode: OutputMode) -> Result<ProcessOutput> {
         self.run_inner(command, mode, false, None)
     }
+    /// Bound provider reads without treating an expected nonzero status (such
+    /// as a registry 404) as transport success or discarding captured output.
+    pub fn run_with_timeout(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_inner(command, mode, false, Some(timeout))
+    }
     pub fn checked(&self, command: &mut Command, mode: OutputMode) -> Result<ProcessOutput> {
         self.run(command, mode)?
             .success(&command.get_program().to_string_lossy())

@@ -1,0 +1,311 @@
+name: Release frozen native artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact stable version already coordinated in reviewed main
+        required: true
+        type: string
+      source_commit:
+        description: Exact dispatch event commit; retry historical releases through their original run
+        required: true
+        type: string
+      previous_env:
+        description: Expected previous @docouno/env latest (or none)
+        required: true
+        type: string
+      previous_cli:
+        description: Expected previous @docouno/devkit latest (initially 0.0.0-stage)
+        required: true
+        type: string
+      previous_github:
+        description: Expected previous GitHub latest tag (or none)
+        required: true
+        type: string
+
+# Every publish and promotion shares this queue, including reruns and versions.
+# No PR workflow receives OIDC or write authority.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: devkit-publication-and-promotion
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  SOURCE_COMMIT: ${{ inputs.source_commit }}
+  PREVIOUS_ENV: ${{ inputs.previous_env }}
+  PREVIOUS_CLI: ${{ inputs.previous_cli }}
+  PREVIOUS_GITHUB: ${{ inputs.previous_github }}
+  BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+
+jobs:
+  prepare:
+    if: github.repository == 'docouno/devkit' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    outputs:
+      source_tree: ${{ steps.freeze.outputs.source_tree }}
+      index_sha256: ${{ steps.freeze.outputs.index_sha256 }}
+      artifact_suffix: ${{ steps.freeze.outputs.artifact_suffix }}
+    steps:
+      - name: Admit reviewed main source before executing checkout code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          sha = os.environ['SOURCE_COMMIT']
+          assert re.fullmatch('[a-f0-9]{40}', sha), 'Exact lowercase source SHA required'
+          assert os.environ.get('GITHUB_SHA') == sha, 'SOURCE_COMMIT must equal the authentic event GITHUB_SHA for npm provenance. Retry a historical release using gh run rerun ORIGINAL_RUN_ID --failed; do not dispatch it at a newer commit.'
+          assert re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', os.environ['VERSION']), 'Exact stable version required'
+          def api(path):
+              return json.loads(subprocess.run(['gh', 'api', path], check=True, capture_output=True, text=True, timeout=90).stdout)
+          assert api('repos/docouno/devkit')['default_branch'] == 'main', 'Reviewed release branch must be main'
+          comparison = api(f'repos/docouno/devkit/compare/{sha}...main')
+          assert comparison['status'] in ('identical', 'ahead'), 'Source must be reviewed main or its ancestor'
+          PY
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify source admission and performance failure guards
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
+      - name: Prepare pinned author SDKs
+        run: make setup
+      - name: Build the author-only controller
+        run: |
+          set -euo pipefail
+          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
+          # Only the controller may be rebuilt when resuming. A partially
+          # published consumer artifact set is always restored from GitHub.
+          docker run --pull never --rm --init --user "$(id -u):$(id -g)" --memory 2g --cpus 2 \
+            --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,exec,mode=1777 --volume "$PWD:/workspace:ro" \
+            --volume "$PWD/.artifacts/author/cargo-home:/cargo" \
+            --volume "$PWD/.artifacts/author/target:/target" --workdir /workspace \
+            --env HOME=/tmp/home --env CARGO_HOME=/cargo --env CARGO_TARGET_DIR=/target \
+            --env CARGO_BUILD_JOBS=1 --env RUSTUP_AUTO_INSTALL=0 \
+            "devkit-author-rust:$recipe_sha" cargo build --locked --offline --target x86_64-unknown-linux-musl --bin devkit-release
+          mkdir -p .artifacts/release-ops
+          cp .artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit-release .artifacts/release-ops/devkit-release
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Inspect original durable bytes before any candidate build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_tree=$(env -i PATH="$PATH" git rev-parse 'HEAD^{tree}')
+          .artifacts/release-ops/devkit-release inspect --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$source_tree" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --output "$PWD/.artifacts/frozen" > .artifacts/release-ops/inspection.json
+          state=$(python3 -c 'import json; print(json.load(open(".artifacts/release-ops/inspection.json"))["state"])')
+          if test "$state" = incomplete; then
+            original_run=$(python3 -c 'import json; print(json.load(open(".artifacts/release-ops/inspection.json"))["originalRunId"])')
+            original_attempt=$(python3 -c 'import json; print(json.load(open(".artifacts/release-ops/inspection.json"))["originalAttempt"])')
+            rm -rf "$PWD/.artifacts/frozen"
+            gh run download "$original_run" --repo docouno/devkit --name "devkit-frozen-set-$original_attempt" --dir "$PWD/.artifacts/frozen"
+          elif test "$state" = fresh; then
+            make pack output="$PWD/.artifacts/frozen" build_id=release build_run="$BUILD_RUN"
+          fi
+          .artifacts/release-ops/devkit-release hydrate --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$source_tree" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --build-set "$PWD/.artifacts/frozen"
+      - name: Preserve the genuine public baseline
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/legacy
+          curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
+          printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
+          (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
+          tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy
+      - name: Verify exactly the frozen bytes
+        run: make verify build_set="$PWD/.artifacts/frozen" release="$PWD/.artifacts/frozen/payload" previous="$PWD/.artifacts/legacy/devkit-0.2.1" legacy_archive="$PWD/.artifacts/legacy/devkit-0.2.1.tar.gz"
+      - name: Measure frozen native artifacts
+        run: |
+          set -euo pipefail
+          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
+          export DEVKIT_PERFORMANCE_TRACE_IMAGE
+          DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
+          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/legacy/devkit-0.2.1" --output "$PWD/.artifacts/release-ops/performance.json"
+      - name: Freeze handoff identities
+        id: freeze
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          raw = Path('.artifacts/frozen/release-index.json').read_bytes()
+          index = json.loads(raw)
+          assert index['version'] == os.environ['VERSION'] and index['sourceCommit'] == os.environ['SOURCE_COMMIT'] and index['publicationEligible'] is True
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('source_tree=' + index['sourceTree'] + '\nindex_sha256=' + hashlib.sha256(raw).hexdigest() + '\n')
+              output.write('artifact_suffix=' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
+          PY
+      - name: Preserve every frozen distribution file before publishing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devkit-frozen-set-${{ github.run_attempt }}
+          path: |
+            .artifacts/frozen/*.json
+            .artifacts/frozen/*.tgz
+            .artifacts/frozen/*.tar.gz
+            .artifacts/frozen/*.sh
+            .artifacts/frozen/*.txt
+            .artifacts/frozen/devkit-x86_64-unknown-linux-musl
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devkit-release-controller-${{ github.run_attempt }}
+          path: .artifacts/release-ops/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Preserve pre-public diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-pre-public-diagnostics-${{ github.run_attempt }}
+          path: |
+            .artifacts/**/receipt.json
+            .artifacts/**/*.log
+            .artifacts/author/*notice-producer.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+      INDEX_SHA256: ${{ needs.prepare.outputs.index_sha256 }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: devkit-frozen-set-${{ needs.prepare.outputs.artifact_suffix }}
+          path: .artifacts/frozen
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: devkit-release-controller-${{ needs.prepare.outputs.artifact_suffix }}
+          path: .artifacts/release-ops
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Install the exact publisher into this runner's temporary prefix
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/npm-publisher" --ignore-scripts --no-audit --no-fund npm@11.21.1
+          printf '%s\n' "$RUNNER_TEMP/npm-publisher/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Verify frozen handoff and stage all bytes in GitHub draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(sha256sum .artifacts/frozen/release-index.json | cut -d ' ' -f 1)" = "$INDEX_SHA256"
+          chmod 755 .artifacts/release-ops/devkit-release
+          args=(--root "$PWD" --version "$VERSION" --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" --build-set "$PWD/.artifacts/frozen")
+          .artifacts/release-ops/devkit-release hydrate "${args[@]}"
+          .artifacts/release-ops/devkit-release stage "${args[@]}"
+      - name: Publish exact npm archives with OIDC and complete immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .artifacts/release-ops/devkit-release publish --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --build-set "$PWD/.artifacts/frozen"
+      - name: Prepare only the public consumer Node image
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          pins = dict(line.split('=', 1) for line in Path('toolchains.env').read_text().splitlines() if line and not line.startswith('#'))
+          subprocess.run(['docker', 'pull', pins['DEVKIT_NODE_IMAGE']], check=True, timeout=180)
+          PY
+      - name: Anonymous public 0.2.0 and 0.2.1 full migration matrices
+        run: |
+          python3 - <<'PY'
+          import json, os, shutil, subprocess, tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          proof = root / '.artifacts/release-proof'
+          proof.mkdir(parents=True, exist_ok=True)
+          # No Actions/npm credentials enter the actual public consumer process.
+          environment = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL') if key in os.environ}
+          environment.update(HOME=tempfile.mkdtemp(prefix='devkit-anonymous-'), CI='true')
+          for previous in ('0.2.0', '0.2.1'):
+              before = set((root / '.artifacts/public').glob('*/receipt.json'))
+              subprocess.run(['python3', 'test/public/verify.py', '--version', previous, '--next-version', os.environ['VERSION'], '--expected-index-sha256', os.environ['INDEX_SHA256']], check=True, env=environment, timeout=3600)
+              created = set((root / '.artifacts/public').glob('*/receipt.json')) - before
+              assert len(created) == 1, 'Expected the actual public matrix receipt'
+              shutil.copyfile(created.pop(), proof / ('public-' + previous + '.json'))
+          PY
+      - name: Anonymous public pinned npx and README entry checks
+        run: python3 test/public/npx.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/npx-pinned.json" --transport-output "$PWD/.artifacts/release-proof/transport-cold.json"
+      - name: Execute the actual principal README project flow
+        run: python3 test/public/readme.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/readme.json"
+      - name: Persist compact public proof before changing selectors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .artifacts/release-ops/devkit-release record-proof --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --build-set "$PWD/.artifacts/frozen" --publication-run "$BUILD_RUN" \
+            --public-020 "$PWD/.artifacts/release-proof/public-0.2.0.json" \
+            --public-021 "$PWD/.artifacts/release-proof/public-0.2.1.json" \
+            --npx "$PWD/.artifacts/release-proof/npx-pinned.json" \
+            --performance "$PWD/.artifacts/release-ops/performance.json" \
+            --transport "$PWD/.artifacts/release-proof/transport-cold.json" \
+            --readme "$PWD/.artifacts/release-proof/readme.json" \
+            --output "$PWD/.artifacts/release-proof/compact.json"
+      - name: Promote only after all actual public gates pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .artifacts/release-ops/devkit-release promote --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --build-set "$PWD/.artifacts/frozen"
+      - name: Verify the newly promoted unqualified public npx selector
+        run: python3 test/public/npx.py --build-set "$PWD/.artifacts/frozen" --selector-mode latest --output "$PWD/.artifacts/release-proof/npx-latest.json"
+      - name: Persist the actual unqualified selector result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .artifacts/release-ops/devkit-release record-latest --root "$PWD" --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
+            --build-set "$PWD/.artifacts/frozen" --npx "$PWD/.artifacts/release-proof/npx-latest.json"
+      - name: Preserve full public receipts and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-public-verification-${{ github.run_attempt }}
+          path: |
+            .artifacts/release-proof/
+            .artifacts/public/
+            .artifacts/packaged/
+            .artifacts/release-ops/*.json
+          retention-days: 90
+          if-no-files-found: warn
