@@ -40,6 +40,11 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def native_release(release):
+    with (release / "devkit").open("rb") as stream:
+        return stream.read(4) == b"\x7fELF"
+
+
 def verify_creation_hint(output):
     hints = [line for line in output.splitlines()
              if re.search(r"\bmake\b", line) and re.search(r"\bsetup\b", line)]
@@ -82,23 +87,24 @@ def changed_files(changes):
 
 
 class Verification:
-    def __init__(self, release, next_release=None, legacy_release=None, *, package_source="local",
-                 public_bootstrap=None, release_base_url=None):
+    def __init__(self, release, next_release=None, *, package_source="local",
+                 public_bootstrap=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
         self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-"))
         self.release = self.copy_release(release, "release")
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
-        self.legacy_release = self.copy_release(legacy_release, "legacy-release") if legacy_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
         require(package_source in ("local", "registry"), "Unknown package source")
         self.package_source = package_source
         self.public_bootstrap = None
-        self.release_base_url = release_base_url
         if public_bootstrap:
             self.public_bootstrap = self.scratch / "public-bootstrap.sh"
             shutil.copy2(public_bootstrap, self.public_bootstrap)
+        self.manager = self.next_release or self.release
+        require(native_release(self.manager),
+                "The target release must contain the native CLI")
         self.results = []
         self.created_versions = {}
         self.harness_identity = {path.name: sha256(path.read_bytes())
@@ -122,19 +128,26 @@ class Verification:
                 self.environment.pop(key)
         self.environment["PATH"] = str(blockers) + os.pathsep + os.environ["PATH"]
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
+        self.environment["DEVKIT_CACHE_DIR"] = str(self.scratch / "native cache")
+        self.environment["CI"] = "true"
         print(f"Receipt directory: {self.receipt}", flush=True)
         print(f"Consumer scratch: {self.scratch}", flush=True)
 
     def cli(self, release, operation, root, *arguments):
-        if self.public_bootstrap:
-            command = ["bash", self.public_bootstrap, operation, root]
-            if operation in ("init", "update", "recover"):
-                version = json.loads((release / "release.json").read_text())["version"]
-                command += ["--version", version]
-            if self.release_base_url:
-                command += ["--release-base-url", self.release_base_url]
-            return command + list(arguments)
-        return [release / "devkit", operation, root, *arguments]
+        version = json.loads((release / "release.json").read_text())["version"]
+        legacy_input = not native_release(release)
+        # A genuine old project must be created by its actual released factory.
+        # All subsequent lifecycle operations use the new Rust management core.
+        if operation == "init" and legacy_input:
+            return [release / "devkit", operation, root, *arguments]
+        command = (["sh", self.public_bootstrap] if self.public_bootstrap
+                   else [self.manager / "devkit"])
+        command += ["--non-interactive", operation, root]
+        if operation in ("init", "update"):
+            command += ["--to", version]
+        if not self.public_bootstrap and operation != "recover":
+            command += ["--release-root", release]
+        return command + list(arguments)
 
     def copy_release(self, source, name):
         source = Path(source).resolve()
@@ -208,7 +221,18 @@ class Verification:
     def inspect(self, kind, name):
         result = subprocess.run(["docker", kind, "inspect", name], env=self.environment,
                                 capture_output=True, text=True, timeout=20)
-        return json.loads(result.stdout)[0] if result.returncode == 0 else None
+        if result.returncode == 0:
+            objects = json.loads(result.stdout)
+            require(isinstance(objects, list) and len(objects) == 1,
+                    f"Unexpected Docker inspect result: {kind} {name}")
+            return objects[0]
+        escaped = re.escape(str(name))
+        absent = (re.search(rf"no such (?:object|container|network|image):\s*{escaped}(?:\s|$)",
+                            result.stderr, re.I)
+                  or re.search(rf"\b{re.escape(kind)}\s+{escaped}\s+not found\b", result.stderr, re.I))
+        if absent:
+            return None
+        raise RuntimeError(f"Docker inspection failed: {kind} {name}: {result.stderr}")
 
     def project_name(self, root):
         return "devkit-" + sha256(str(root.resolve()).encode())[:16]
@@ -647,29 +671,6 @@ class Verification:
         require(source_snapshot(root) == before, "Recovery did not restore known bytes")
         self.results.append({"label": "synthetic-interrupted-journal", "passed": True, "liveCrashReproduced": False})
 
-    def legacy_migration(self):
-        if not self.legacy_release: return
-        root = self.scratch / "work trees/legacy-v1/product"
-        root.parent.mkdir(parents=True)
-        self.run("legacy-init", [self.legacy_release / "devkit", "init", root, "--template", "node", "--package-source", "local"])
-        self.projects.append(root)
-        old = json.loads((root / ".devkit/manifest.json").read_text())
-        require(old["schemaVersion"] == 1 and old["version"].startswith("0.1."), "Legacy artifact does not create schema1")
-        self.make(root, "setup", "check", "build", label="legacy-healthy-before-migration")
-        (root / ".env").write_text("LEGACY_SETTING=preserve-me\n")
-        source = root / "apps/main/src/legacy-product.ts"
-        source.write_text("export const legacyProduct = 'keep legacy product source';\n")
-        make = root / "Makefile"
-        make.write_text(make.read_text() + "\nlegacy-note:\n\t@printf 'retained\\n'\n")
-        keep = {path: path.read_bytes() for path in (source, make, root / "compose.yaml", root / ".env")}
-        self.run("legacy-upgrade-v2", [self.release / "devkit", "update", root])
-        state = json.loads((root / ".devkit/manifest.json").read_text())
-        require(state["schemaVersion"] == 2 and state["version"] == self.version, "Legacy schema migration failed")
-        require((root / "package-lock.json").exists() and not (root / "apps/main/package-lock.json").exists(), "Legacy lock migration failed")
-        for path, contents in keep.items(): require(path.read_bytes() == contents, f"Legacy update changed {path}")
-        self.healthy(root, "legacy-migrated")
-        self.results.append({"label": "legacy-schema1-to-schema2", "passed": True, "fromVersion": old["version"]})
-
     def cleanup(self):
         errors = []
         for root in reversed(self.projects):
@@ -710,10 +711,8 @@ class Verification:
         try:
             if self.public_bootstrap:
                 absent = self.scratch / "absent public release"
-                command = ["bash", self.public_bootstrap, "init", absent, "--version", "99.99.99",
-                           "--app", "main=node-api"]
-                if self.release_base_url:
-                    command += ["--release-base-url", self.release_base_url]
+                command = ["sh", self.public_bootstrap, "--non-interactive", "init", absent,
+                           "--to", "99.99.99", "--app", "main=node-api"]
                 self.run("public-missing-release-refused", command, expected="404")
                 require(not absent.exists(), "Missing public release created a target")
             node = self.create("node", "a-node-Проект")
@@ -738,7 +737,6 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
-            self.legacy_migration()
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error
@@ -754,11 +752,14 @@ class Verification:
                        "packageSource": self.package_source,
                        "createdVersions": self.created_versions,
                        "publicBootstrapSha256": sha256(self.public_bootstrap.read_bytes()) if self.public_bootstrap else None,
-                       "releaseBaseOverride": self.release_base_url,
+                       "nativeManagerVersion": json.loads((self.manager / "release.json").read_text())["version"],
+                       "nativeManagerSha256": sha256((self.manager / "devkit").read_bytes()),
+                       "nativeCacheIsolated": True,
                        "harnessIdentity": self.harness_identity,
                        "passed": failure is None, "error": str(failure) if failure else None,
                        "hostLanguageSDKAttempted": self.forbidden_log.exists(),
-                       "nextVersionTested": bool(self.next_release), "legacyMigrationTested": bool(self.legacy_release),
+                       "nextVersionTested": bool(self.next_release),
+                       "baselineUsesGenuineReleasedFactory": not native_release(self.release),
                        "results": self.results,
                        "limits": (["Transport archive-failure cases are a separate suite"] if self.public_bootstrap else ["Registry and remote bootstrap are separate suites"]) +
                                  ["Recovery journal is synthetic; live crash timing is covered by core tests"]}
@@ -781,19 +782,12 @@ def main():
     parser.add_argument("release", type=Path)
     parser.add_argument("--next-release", type=Path,
                         default=os.environ.get("DEVKIT_VERIFY_NEXT_RELEASE"))
-    default_legacy = REPO / ".artifacts/releases/0.1.0"
-    parser.add_argument("--legacy-release", type=Path,
-                        default=os.environ.get("DEVKIT_VERIFY_LEGACY_RELEASE") or (default_legacy if default_legacy.is_dir() else None))
-    parser.add_argument("--skip-legacy", action="store_true",
-                        help="Explicitly omit the legacy migration in a bounded preflight")
     parser.add_argument("--package-source", choices=("local", "registry"), default="local")
     parser.add_argument("--public-bootstrap", type=Path,
                         help="Run lifecycle operations through this downloaded public bootstrap")
-    parser.add_argument("--release-base-url", help="Override the public bootstrap's default release endpoint")
     args = parser.parse_args()
-    Verification(args.release, args.next_release, None if args.skip_legacy else args.legacy_release,
-                 package_source=args.package_source, public_bootstrap=args.public_bootstrap,
-                 release_base_url=args.release_base_url).verify()
+    Verification(args.release, args.next_release, package_source=args.package_source,
+                 public_bootstrap=args.public_bootstrap).verify()
 
 
 if __name__ == "__main__":
