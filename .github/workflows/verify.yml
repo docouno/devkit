@@ -72,6 +72,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: verify-${{ matrix.group }}-${{ github.run_attempt }}
           path: |
             .artifacts/**/receipt.json
@@ -110,6 +111,7 @@ jobs:
       - name: Preserve the exact successful performance receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: devkit-performance-${{ github.run_attempt }}
           path: .artifacts/release-ops/performance.json
           if-no-files-found: error
@@ -121,6 +123,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: verify-performance-diagnostics-${{ github.run_attempt }}
           path: |
             .artifacts/**/receipt.json

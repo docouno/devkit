@@ -125,6 +125,7 @@ jobs:
       - name: Preserve every frozen distribution file before publishing
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: devkit-frozen-set-${{ github.run_attempt }}
           path: |
             .artifacts/frozen/*.json
@@ -137,6 +138,7 @@ jobs:
           retention-days: 90
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: devkit-release-controller-${{ github.run_attempt }}
           path: .artifacts/release-ops/
           if-no-files-found: error
@@ -145,6 +147,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: release-pre-public-diagnostics-${{ github.run_attempt }}
           path: |
             .artifacts/**/receipt.json
@@ -287,6 +290,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          include-hidden-files: true
           name: release-public-verification-${{ github.run_attempt }}
           path: |
             .artifacts/release-proof/
