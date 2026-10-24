@@ -9,8 +9,9 @@ use devkit::{
         ComponentState, Environment, PackageMode, ProjectState, Release, Role, ToolingProfile,
     },
     native::{
-        admit_native_components, assert_native_components, assert_npmrc_compatibility,
-        collect_native_input_closure, derive_component_dependencies, package_lock, valid_integrity,
+        admit_native_components, assert_input_identities, assert_native_components,
+        assert_npmrc_compatibility, collect_native_input_closure, derive_component_dependencies,
+        package_lock, valid_integrity,
     },
     project::{
         ComponentSpec, InitOptions, LockResolver, UpdateOptions, init_project,
@@ -210,7 +211,14 @@ fn node_project(root: &Path, state: &ProjectState, members: &[(&str, Value)], ar
 fn rust(root: &Path, path: &str, contents: &str, registered: bool) {
     put(root, &format!("{path}/Cargo.toml"), contents);
     if registered {
-        put(root, &format!("{path}/Cargo.lock"), "version = 4\n");
+        // Seed the std-only package identity, as Cargo does. Tests selecting
+        // dependencies or workspace members supply their explicit lock graph.
+        let manifest: toml::Value = toml::from_str(contents).unwrap();
+        let packages = manifest.get("package").map_or_else(Vec::new, |package| {
+            vec![json!({"name":package["name"].as_str().unwrap(),
+                "version":package.get("version").and_then(toml::Value::as_str).unwrap_or("0.0.0")})]
+        });
+        selected_cargo_lock(root, path, json!(packages));
         put(
             root,
             &format!("{path}/rustfmt.toml"),
@@ -1021,31 +1029,49 @@ fn cargo_patch_replace_and_config_override_closures_bind_paths_and_transitive_in
         );
         override_crate(root, "vendor/leaf", "leaf");
         profiles(root, &state);
-        let admitted = admit_native_components(root, &state).unwrap();
+        let admitted = if form == "workspace-patch" {
+            // The enclosing workspace is still part of the conservative input
+            // closure, but its root lock cannot admit this registered member.
+            assert!(
+                admit_native_components(root, &state)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("component-root workspace/lock authority")
+            );
+            None
+        } else {
+            Some(admit_native_components(root, &state).unwrap())
+        };
+        let inputs = admitted.as_ref().map_or_else(
+            || collect_native_input_closure(root, &state).unwrap(),
+            |admitted| admitted.inputs.clone(),
+        );
+        let recheck = || match &admitted {
+            Some(admitted) => admitted.recheck(root),
+            None => assert_input_identities(root, &inputs),
+        };
         assert!(
-            admitted.inputs.files["vendor/patched/Cargo.toml"].is_some(),
+            inputs.files["vendor/patched/Cargo.toml"].is_some(),
             "{form}"
         );
-        assert!(
-            admitted.inputs.files["vendor/leaf/Cargo.toml"].is_some(),
-            "{form}"
-        );
+        assert!(inputs.files["vendor/leaf/Cargo.toml"].is_some(), "{form}");
         assert_eq!(
-            admitted.inputs.files["vendor/patched/.cargo/config.toml"], None,
+            inputs.files["vendor/patched/.cargo/config.toml"], None,
             "{form}"
         );
         put(root, "vendor/leaf/.cargo/config.toml", "[build]\njobs=1\n");
-        assert!(admitted.recheck(root).is_err(), "{form}");
+        assert!(recheck().is_err(), "{form}");
         fs::remove_file(root.join("vendor/leaf/.cargo/config.toml")).unwrap();
-        admitted.recheck(root).unwrap();
+        recheck().unwrap();
         put(
             root,
             "vendor/patched/Cargo.toml",
             "[package]\nname=\"patched\"\nversion=\"1.0.0\"\nedition=\"2021\"\n",
         );
-        assert!(admitted.recheck(root).is_err(), "{form}");
+        assert!(recheck().is_err(), "{form}");
         assert_ne!(
-            admitted.inputs.digest,
+            inputs.digest,
             collect_native_input_closure(root, &state).unwrap().digest,
             "{form}"
         );
@@ -1147,6 +1173,224 @@ fn selected_cargo_lock(root: &Path, path: &str, packages: Value) {
         &toml::to_string(&json!({"version":4,"package":packages})).unwrap(),
     );
 }
+
+#[test]
+fn internal_cargo_roots_require_an_exact_locked_package() {
+    for path in ["apps/main", "packages/main"] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let mut state = state(&[(path, "rust")]);
+        state.version = "0.3.0".into();
+        rust(
+            root,
+            path,
+            "[package]\nname=\"main\"\nversion=\"1.0.0\"\n",
+            true,
+        );
+        profiles(root, &state);
+        selected_cargo_lock(root, path, json!([{"name":"main","version":"1.0.0"}]));
+        assert!(admit_native_components(root, &state).is_ok());
+        for (case, contents) in [
+            ("malformed", "not a Cargo lock".to_owned()),
+            ("missing-records", "version = 4\n".to_owned()),
+            ("wrong-root", toml::to_string(&json!({"version":4,"package":[{"name":"wrong","version":"0.0.0"}]})).unwrap()),
+            ("wrong-version", toml::to_string(&json!({"version":4,"package":[{"name":"main","version":"2.0.0"}]})).unwrap()),
+            ("registry-root", toml::to_string(&json!({"version":4,"package":[{"name":"main","version":"1.0.0","source":"registry+https://example.invalid/index"}]})).unwrap()),
+            ("duplicate-root", toml::to_string(&json!({"version":4,"package":[{"name":"main","version":"1.0.0"},{"name":"main","version":"1.0.0"}]})).unwrap()),
+        ] {
+            put(root, &format!("{path}/Cargo.lock"), &contents);
+            assert!(
+                admit_native_components(root, &state).is_err(),
+                "{path}/{case}: admitted a lock without a unique matching local package root"
+            );
+            assert_eq!(fs::read_to_string(root.join(path).join("Cargo.lock")).unwrap(), contents);
+        }
+    }
+}
+
+#[test]
+fn internal_cargo_chain_validates_every_reachable_lock_reference() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let path = "apps/main";
+    let mut state = state(&[(path, "rust")]);
+    state.version = "0.3.0".into();
+    rust(
+        root,
+        path,
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[dependencies]\ndep079={path=\"vendor/dep079\"}\n",
+        true,
+    );
+    let mut packages = vec![json!({"name":"main","version":"1.0.0","dependencies":["dep079"]})];
+    for index in 0..80 {
+        let name = format!("dep{index:03}");
+        let dependency = if index == 0 {
+            String::new()
+        } else {
+            format!(
+                "[dependencies]\ndep{previous:03}={{path=\"../dep{previous:03}\"}}\n",
+                previous = index - 1
+            )
+        };
+        rust(
+            root,
+            &format!("{path}/vendor/{name}"),
+            &format!("[package]\nname=\"{name}\"\nversion=\"1.0.0\"\n{dependency}"),
+            false,
+        );
+        let mut package = json!({"name":name,"version":"1.0.0"});
+        if index > 0 {
+            package["dependencies"] = json!([format!("dep{:03}", index - 1)]);
+        }
+        packages.push(package);
+    }
+    profiles(root, &state);
+    selected_cargo_lock(root, path, json!(packages));
+    assert!(
+        admit_native_components(root, &state)
+            .unwrap()
+            .effective_dependencies[path]
+            .is_empty()
+    );
+    for case in [
+        "missing-record",
+        "missing-reference",
+        "ambiguous-reference",
+        "wrong-local-identity",
+    ] {
+        let mut broken = packages.clone();
+        match case {
+            "missing-record" => {
+                broken.remove(41);
+            }
+            "missing-reference" => {
+                broken[41]["dependencies"] = json!(["absent"]);
+            }
+            "ambiguous-reference" => {
+                broken[41]["dependencies"] = json!(["remote"]);
+                broken.push(json!({"name":"remote","version":"1.0.0","source":"registry+https://example.invalid/index"}));
+                broken.push(json!({"name":"remote","version":"2.0.0","source":"registry+https://example.invalid/index"}));
+            }
+            "wrong-local-identity" => {
+                broken[41]["version"] = json!("2.0.0");
+            }
+            _ => unreachable!(),
+        }
+        selected_cargo_lock(root, path, json!(broken));
+        let before = fs::read(root.join(path).join("Cargo.lock")).unwrap();
+        assert!(
+            admit_native_components(root, &state).is_err(),
+            "{case}: skipped an internal reachable lock record"
+        );
+        assert_eq!(
+            fs::read(root.join(path).join("Cargo.lock")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn internal_cargo_workspace_members_use_the_component_lock_authority() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut state = state(&[("apps/main", "rust")]);
+    state.version = "0.3.0".into();
+    rust(
+        root,
+        "apps/main",
+        "[workspace]\nmembers=[\"member\"]\n[workspace.package]\nversion=\"1.0.0\"\n",
+        true,
+    );
+    rust(
+        root,
+        "apps/main/member",
+        "[package]\nname=\"member\"\nversion.workspace=true\n",
+        false,
+    );
+    profiles(root, &state);
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"member","version":"1.0.0"}]),
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .unwrap()
+            .effective_dependencies["apps/main"]
+            .is_empty()
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"wrong","version":"1.0.0"}]),
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("does not uniquely identify workspace package member")
+    );
+    // A valid package record in a member-local lock does not change the lock
+    // authority Cargo actually chooses from an enclosing workspace.
+    put(root, "Cargo.toml", "[workspace]\nmembers=[\"apps/main\"]\n");
+    put(
+        root,
+        "apps/main/Cargo.toml",
+        "[package]\nname=\"main\"\nversion=\"1.0.0\"\n",
+    );
+    selected_cargo_lock(
+        root,
+        "apps/main",
+        json!([{"name":"main","version":"1.0.0"}]),
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("component-root workspace/lock authority")
+    );
+}
+
+#[test]
+fn internal_cargo_unused_declarations_remain_inputs_without_selected_edges() {
+    for path in ["apps/main", "packages/main"] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let mut state = state(&[(path, "rust")]);
+        state.version = "0.3.0".into();
+        rust(
+            root,
+            path,
+            "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[workspace.dependencies]\nunused={path=\"vendor/unused\"}\n[patch.crates-io]\nunused={path=\"vendor/unused\"}\n",
+            true,
+        );
+        rust(
+            root,
+            &format!("{path}/vendor/unused"),
+            "[package]\nname=\"unused\"\nversion=\"1.0.0\"\n",
+            false,
+        );
+        profiles(root, &state);
+        let admission = admit_native_components(root, &state).unwrap();
+        assert!(admission.effective_dependencies[path].is_empty());
+        assert!(admission.inputs.files[&format!("{path}/vendor/unused/Cargo.toml")].is_some());
+        put(
+            root,
+            &format!("{path}/vendor/unused/Cargo.toml"),
+            "[package]\nname=\"unused\"\nversion=\"2.0.0\"\n",
+        );
+        assert!(admission.recheck(root).is_err());
+        assert!(
+            admit_native_components(root, &state)
+                .unwrap()
+                .effective_dependencies[path]
+                .is_empty()
+        );
+    }
+}
+
 fn selected_cargo_fixture(root: &Path, role: Role) -> ProjectState {
     let target = if role == Role::App {
         "apps/helper"

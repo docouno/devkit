@@ -923,13 +923,9 @@ impl<'a> ReadContext<'a> {
         local: &CargoLocalContext,
         deps: &mut BTreeSet<String>,
     ) -> Result<()> {
-        if !local
-            .paths
-            .iter()
-            .any(|path| component_owner(state, path).is_some_and(|owner| owner != component))
-        {
-            return Ok(());
-        }
+        // The selected lock graph is an admission boundary even when every
+        // local package belongs to this component. Component ownership only
+        // controls edge projection below, never whether the lock is validated.
         let lock = self.cargo_lock_graph(component)?;
         let workspace = self.cargo_workspace_packages(component)?;
         let mut candidates: BTreeMap<CargoPackageId, BTreeSet<String>> = BTreeMap::new();

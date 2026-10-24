@@ -193,7 +193,10 @@ fn node_snapshot_is_projected_before_cargo_but_full_recheck_retains_namespace_ba
             "Cargo.toml",
             "[package]\nname=\"api\"\nversion=\"1.0.0\"\nedition=\"2024\"\n",
         ),
-        ("Cargo.lock", "version = 4\n"),
+        (
+            "Cargo.lock",
+            "version = 4\n\n[[package]]\nname = \"api\"\nversion = \"1.0.0\"\n",
+        ),
         ("rust-toolchain.toml", "[toolchain]\nchannel=\"1.99.1\"\n"),
         ("rustfmt.toml", "edition=\"2024\"\n"),
     ] {
