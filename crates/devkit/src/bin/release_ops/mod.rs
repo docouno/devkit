@@ -817,6 +817,7 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
                     .is_some_and(|a| !a.is_empty()),
                 "Performance measurements missing"
             );
+            validate_performance_trace(value)?;
         }
         if name == "transport-cold" {
             ensure!(
@@ -867,6 +868,54 @@ fn selected(value: &Value, keys: &[&str]) -> Value {
             .filter_map(|key| value.get(*key).map(|v| ((*key).into(), v.clone())))
             .collect(),
     )
+}
+const PERFORMANCE_TRACE_COLUMNS: &[&str] = &[
+    "dockerCliCalls",
+    "oneShotContainers",
+    "controlContainers",
+    "toolContainers",
+    "otherContainers",
+    "execSyscallAttempts",
+    "execSyscallErrors",
+    "successfulExecs",
+    "instrumentedTotalSeconds",
+    "instrumentedToolContainerSeconds",
+    "instrumentedOutsideToolSeconds",
+];
+fn validate_performance_trace(value: &Value) -> Result<()> {
+    let measurements = value["measurements"]
+        .as_array()
+        .context("Performance measurements missing")?;
+    let columns = value.get("traceColumns");
+    if columns.is_none() && measurements.iter().all(|m| !m["trace"].is_array()) {
+        // Historical schema1 proofs carry trace objects without a column list.
+        return Ok(());
+    }
+    ensure!(
+        columns == Some(&json!(PERFORMANCE_TRACE_COLUMNS)),
+        "Invalid performance trace columns"
+    );
+    for measurement in measurements {
+        let row = measurement["trace"]
+            .as_array()
+            .context("Performance trace row missing")?;
+        ensure!(
+            row.len() == PERFORMANCE_TRACE_COLUMNS.len(),
+            "Invalid performance trace row width"
+        );
+        for (index, value) in row.iter().enumerate() {
+            ensure!(
+                if index < 8 {
+                    value.as_u64().is_some()
+                } else {
+                    value.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0)
+                },
+                "Invalid performance trace value: {}",
+                PERFORMANCE_TRACE_COLUMNS[index]
+            );
+        }
+    }
+    Ok(())
 }
 fn compact_gate(name: &str, value: Value) -> Result<Value> {
     if name == "readme" {
@@ -924,6 +973,10 @@ fn compact_gate(name: &str, value: Value) -> Result<Value> {
         let measurements = value["measurements"]
             .as_array()
             .context("Performance measurements missing")?;
+        // Keep every trace value exactly, with the repeated column names once
+        // for the complete measurement set. Raw receipt identity remains bound
+        // by Gate.sha256; no timing statistic is rounded or discarded.
+        summary["traceColumns"] = json!(PERFORMANCE_TRACE_COLUMNS);
         summary["measurements"] = Value::Array(
             measurements
                 .iter()
@@ -944,21 +997,11 @@ fn compact_gate(name: &str, value: Value) -> Result<Value> {
                             "inputsBytesAndModesUnchanged",
                         ],
                     );
-                    item["trace"] = selected(
-                        &measurement["trace"],
-                        &[
-                            "dockerCliCalls",
-                            "oneShotContainers",
-                            "controlContainers",
-                            "toolContainers",
-                            "otherContainers",
-                            "execSyscallAttempts",
-                            "execSyscallErrors",
-                            "successfulExecs",
-                            "instrumentedTotalSeconds",
-                            "instrumentedToolContainerSeconds",
-                            "instrumentedOutsideToolSeconds",
-                        ],
+                    item["trace"] = Value::Array(
+                        PERFORMANCE_TRACE_COLUMNS
+                            .iter()
+                            .map(|key| measurement["trace"][*key].clone())
+                            .collect(),
                     );
                     item
                 })
@@ -1020,6 +1063,16 @@ fn compact_gate(name: &str, value: Value) -> Result<Value> {
     }
     Ok(summary)
 }
+fn gate_from_receipt(name: &str, bytes: &[u8], value: Value, c: &Contract) -> Result<Gate> {
+    validate_gate(name, &value, c)?;
+    let summary = compact_gate(name, value)?;
+    validate_gate(name, &summary, c)?;
+    Ok(Gate {
+        sha256: digest(bytes),
+        bytes: bytes.len() as u64,
+        summary,
+    })
+}
 fn proof_from_files(c: &Contract, run: &str, paths: &BTreeMap<String, PathBuf>) -> Result<Proof> {
     let mut gates = BTreeMap::new();
     for (name, path) in paths {
@@ -1044,18 +1097,9 @@ fn proof_from_files(c: &Contract, run: &str, paths: &BTreeMap<String, PathBuf>) 
             value["consumerSuccess"] = json!(true);
             value["consumerReceiptSha256"] = json!(digest(&consumer_bytes));
         }
-        validate_gate(name, &value, c)?;
         // Keep durable content compact, while original receipt digest binds the
         // full diagnostic evidence retained by Actions and the operator.
-        let summary = compact_gate(name, value)?;
-        gates.insert(
-            name.clone(),
-            Gate {
-                sha256: digest(&bytes),
-                bytes: bytes.len() as u64,
-                summary,
-            },
-        );
+        gates.insert(name.clone(), gate_from_receipt(name, &bytes, value, c)?);
     }
     let proof = Proof {
         schema_version: 1,
@@ -1069,6 +1113,39 @@ fn proof_from_files(c: &Contract, run: &str, paths: &BTreeMap<String, PathBuf>) 
     };
     proof.validate(c)?;
     Ok(proof)
+}
+fn proof_body(old: &str, proof: &Proof) -> Result<String> {
+    let raw = serde_json::to_string(proof)?;
+    ensure!(
+        raw.len() <= 40000,
+        "Compact public proof exceeds release-body budget"
+    );
+    let replacement = format!(
+        "Public verification: passed. Receipt SHA256 `{}`.\n{PROOF_OPEN}{raw}{PROOF_CLOSE}",
+        digest(raw.as_bytes())
+    );
+    if old.contains(PROOF_OPEN) || old.contains(PROOF_CLOSE) {
+        let previous = block(old, PROOF_OPEN, PROOF_CLOSE)?;
+        let (prefix, rest) = old.split_once(PROOF_OPEN).unwrap();
+        let (_, suffix) = rest.split_once(PROOF_CLOSE).unwrap();
+        let owned = format!(
+            "Public verification: passed. Receipt SHA256 `{}`.\n",
+            digest(previous.as_bytes())
+        );
+        let prefix = prefix
+            .strip_suffix(&owned)
+            .filter(|base| base.is_empty() || base.ends_with('\n'))
+            .unwrap_or(prefix);
+        let separator = if prefix.is_empty() || prefix.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        Ok(format!("{prefix}{separator}{replacement}{suffix}"))
+    } else {
+        let separator = if old.ends_with('\n') { "" } else { "\n" };
+        Ok(format!("{old}{separator}{replacement}\n"))
+    }
 }
 fn record_proof(
     remote: &mut impl Remote,
@@ -1093,36 +1170,49 @@ fn record_proof(
     check_remote_assets(remote, &release, set, true)?;
     check_npm(remote, set, true)?;
     let old = release.body.as_deref().context("Release body missing")?;
-    let base = if old.contains(PROOF_OPEN) {
-        block(old, PROOF_OPEN, PROOF_CLOSE)?;
-        old.split_once(PROOF_OPEN).unwrap().0
-    } else {
-        old
-    };
-    let raw = serde_json::to_string(proof)?;
-    ensure!(
-        raw.len() <= 40000,
-        "Compact public proof exceeds release-body budget"
-    );
-    let body = format!(
-        "{}\nPublic verification: passed. Receipt SHA256 `{}`.\n{PROOF_OPEN}{raw}{PROOF_CLOSE}\n",
-        base.trim_end(),
-        digest(raw.as_bytes())
-    );
+    let body = proof_body(old, proof)?;
     remote.edit_release(&release, &body, None)?;
     let saved = remote
         .release(&c.tag())?
         .context("Release disappeared after saving proof")?;
     ensure!(
-        saved.contract()? == *c
-            && block(
-                saved.body.as_deref().unwrap_or_default(),
-                PROOF_OPEN,
-                PROOF_CLOSE
-            )? == raw,
+        saved.contract()? == *c && saved.body.as_deref() == Some(body.as_str()),
         "Durable proof write did not persist"
     );
     Ok(())
+}
+fn record_latest(
+    remote: &mut impl Remote,
+    set: &FrozenSet,
+    c: &Contract,
+    bytes: &[u8],
+) -> Result<()> {
+    let release = remote
+        .release(&c.tag())?
+        .context("Public release missing")?;
+    ensure!(
+        release.contract()? == *c,
+        "Durable release contract differs"
+    );
+    let selectors = remote.selectors()?;
+    ensure!(
+        selectors.environment.as_deref() == Some(&c.version)
+            && selectors.cli.as_deref() == Some(&c.version)
+            && selectors.github.as_deref() == Some(&c.tag()),
+        "Unqualified npx proof requires completed promotion"
+    );
+    let mut proof: Proof = serde_json::from_str(block(
+        release.body.as_deref().unwrap_or_default(),
+        PROOF_OPEN,
+        PROOF_CLOSE,
+    )?)?;
+    proof.post_promotion_npx = Some(gate_from_receipt(
+        "npx-latest",
+        bytes,
+        serde_json::from_slice(bytes)?,
+        c,
+    )?);
+    record_proof(remote, set, c, &proof)
 }
 fn promote(remote: &mut impl Remote, set: &FrozenSet, c: &Contract) -> Result<()> {
     c.check_index(set)?;
@@ -1400,31 +1490,8 @@ fn run_args(args: Args) -> Result<()> {
             }
             "promote" => promote(&mut remote, &set, &c)?,
             "record-latest" => {
-                let release = remote
-                    .release(&c.tag())?
-                    .context("Public release missing")?;
-                ensure!(release.contract()? == c, "Durable release contract differs");
-                let selectors = remote.selectors()?;
-                ensure!(
-                    selectors.environment.as_deref() == Some(&c.version)
-                        && selectors.cli.as_deref() == Some(&c.version)
-                        && selectors.github.as_deref() == Some(&c.tag()),
-                    "Unqualified npx proof requires completed promotion"
-                );
-                let mut proof: Proof = serde_json::from_str(block(
-                    release.body.as_deref().unwrap_or_default(),
-                    PROOF_OPEN,
-                    PROOF_CLOSE,
-                )?)?;
                 let bytes = read_bounded(Path::new(args.get("--npx")?), 16 * 1024 * 1024)?;
-                let summary: Value = serde_json::from_slice(&bytes)?;
-                validate_gate("npx-latest", &summary, &c)?;
-                proof.post_promotion_npx = Some(Gate {
-                    sha256: digest(&bytes),
-                    bytes: bytes.len() as u64,
-                    summary,
-                });
-                record_proof(&mut remote, &set, &c, &proof)?;
+                record_latest(&mut remote, &set, &c, &bytes)?;
             }
             _ => bail!("Unknown release command: {}", args.command),
         }
