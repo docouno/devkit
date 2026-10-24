@@ -1,6 +1,6 @@
 {
   "name": "@docouno/env",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Shared, checked JavaScript and TypeScript configuration for Devkit projects",
   "type": "module",
   "license": "MIT",

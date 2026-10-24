@@ -56,6 +56,7 @@ pub struct ToolPins {
     pub rust_version: String,
     pub rust_recipe: String,
     pub desktop_recipe: String,
+    pub engine: Option<crate::delivery::EnginePin>,
 }
 impl ToolPins {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -74,7 +75,9 @@ impl ToolPins {
                     "DEVKIT_NODE_VERSION",
                     "DEVKIT_RUST_VERSION",
                     "DEVKIT_RUST_RECIPE_HASH",
-                    "DEVKIT_DESKTOP_RECIPE_HASH"
+                    "DEVKIT_DESKTOP_RECIPE_HASH",
+                    "DEVKIT_ENGINE_SHA256",
+                    "DEVKIT_ENGINE_TARGET"
                 ]
                 .contains(&k)
                     && !v.is_empty()
@@ -88,13 +91,31 @@ impl ToolPins {
         let get = |k| -> Result<String> {
             Ok(values.get(k).context("Missing toolchain pin")?.to_string())
         };
+        let release_version = get("DEVKIT_VERSION")?;
+        let engine = if crate::cache::legacy(&release_version) {
+            ensure!(
+                !values.contains_key("DEVKIT_ENGINE_SHA256")
+                    && !values.contains_key("DEVKIT_ENGINE_TARGET"),
+                "Legacy tool pins cannot select a native engine"
+            );
+            None
+        } else {
+            let engine = crate::delivery::EnginePin {
+                version: release_version.clone(),
+                target: get("DEVKIT_ENGINE_TARGET")?,
+                sha256: get("DEVKIT_ENGINE_SHA256")?,
+            };
+            engine.validate()?;
+            Some(engine)
+        };
         let s = Self {
-            version: get("DEVKIT_VERSION")?,
+            version: release_version,
             node_image: get("DEVKIT_NODE_IMAGE")?,
             node_version: get("DEVKIT_NODE_VERSION")?,
             rust_version: get("DEVKIT_RUST_VERSION")?,
             rust_recipe: get("DEVKIT_RUST_RECIPE_HASH")?,
             desktop_recipe: get("DEVKIT_DESKTOP_RECIPE_HASH")?,
+            engine,
         };
         version(&s.version)?;
         version(&s.node_version)?;
@@ -256,6 +277,9 @@ impl<'a> PreparedContext<'a> {
             identity(&engine)?.is_some(),
             "Current native engine is not a regular executable"
         );
+        if let Some(pin) = &admission.pins.engine {
+            crate::delivery::verify_engine(&engine, pin)?;
+        }
         let project = format!(
             "devkit-{}",
             &digest(admission.root.as_os_str().as_encoded_bytes())[..16]

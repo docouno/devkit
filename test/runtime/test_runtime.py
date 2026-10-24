@@ -121,7 +121,22 @@ if (fs.existsSync('SLOW')) {
 
 
 def seal_runtime(root):
-    """Accept known fixture bytes; validation still uses the shipped project.mjs."""
+    """Accept known fixture bytes; the same native engine verifies admission."""
+    runtime = root / ".devkit/runtime"
+    engine_sha = hashlib.sha256(ENGINE.read_bytes()).hexdigest()
+    loader = runtime / "devkit.sh"
+    source = loader.read_text()
+    if "@@DEVKIT_MODE@@" in source:
+        for key, value in {"@@DEVKIT_MODE@@": "project", "@@DEVKIT_VERSION@@": VERSION,
+                           "@@DEVKIT_ENGINE_SHA256@@": engine_sha,
+                           "@@DEVKIT_ENGINE_TARGET@@": "x86_64-unknown-linux-musl"}.items():
+            assert source.count(key) == 1
+            source = source.replace(key, value)
+        loader.write_text(source)
+    pins = runtime / "toolchains.env"
+    source = pins.read_text()
+    if "DEVKIT_ENGINE_SHA256=" not in source:
+        pins.write_text(source + f"DEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n")
     def identity(path):
         return {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "mode": path.stat().st_mode & 0o777}
     managed = {str(path.relative_to(root)): identity(path)

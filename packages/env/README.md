@@ -1,35 +1,41 @@
-# Devkit environment
+# @docouno/env
 
-Reusable ESM configuration and source verification for Devkit applications. Standard tools remain native application dependencies; this package does not locate or dispatch their binaries.
-
-The supported suite is Node 24.22, ESLint 10.13, TypeScript 6.0 and Prettier 3.9. The exact accepted versions and application lockfiles belong to a Devkit release. TypeScript 7 is outside this package's peer range.
+ESM configurations, source checks and test reporters for Devkit's TypeScript applications. The component runs its installed TypeScript, ESLint, Prettier and test binaries directly. A Devkit release pins compatible versions in native lockfiles.
 
 ## Configuration
 
-An application owns its native files. In its `eslint.config.mjs`:
+Create `eslint.config.mjs` in the component:
 
 ```js
 import { nodeConfig } from '@docouno/env/eslint';
+
 export default nodeConfig(import.meta.dirname);
 ```
 
-Use `browserConfig` for React/browser code and `desktopConfig` for Electron's main/preload/renderer layout. Each factory requires the absolute component root. They enable typed linting and reject inline ESLint disable directives. Source-specific exceptions therefore remain visible configuration changes rather than local comments.
+Use `browserConfig` for React/browser code or `desktopConfig` for Electron. Each factory takes the absolute component root and enables typed linting. Desktop configurations separate main/preload from renderer code and check renderer imports against the native boundary. Inline ESLint disable directives are rejected; exceptions belong in visible configuration.
 
-The desktop factory applies Node rules to main/preload and browser rules to `src/renderer`. Renderer source cannot directly use Node/Electron imports or native globals. Literal dynamic imports are checked too; arbitrary computed runtime imports are outside this static contract. The native capabilities of an application still need a deliberately designed preload interface.
+Extend the appropriate compiler baseline in `tsconfig.json`:
 
-An application TSConfig extends `@docouno/env/tsconfig/node.json` or `@docouno/env/tsconfig/browser.json`. These configs contain compiler settings and no application source/output paths. Set `include`, `exclude`, `rootDir`, `outDir` and any runtime-specific types in the application. The Node config includes Node types; the browser config keeps DOM types separate.
+```json
+{
+  "extends": "@docouno/env/tsconfig/node.json",
+  "include": ["src"]
+}
+```
 
-In `prettier.config.mjs`:
+Use `@docouno/env/tsconfig/browser.json` for browser code. The component supplies its source/output paths and runtime-specific types.
+
+Create `prettier.config.mjs`:
 
 ```js
 export { default } from '@docouno/env/prettier';
 ```
 
-## Declared source verification
+## Source verification
 
-Run the installed `devkit-verify` command from the application, or pass `--root <application>`. `--json` emits its structured result. Success returns 0; metadata, coverage or policy failures return nonzero. It validates coverage and configuration; native lint, compiler and test commands still run separately.
+Run the installed `devkit-verify` from the component, or use `devkit-verify --root PATH`. `--json` returns a structured result. Configuration or coverage failures return nonzero.
 
-Optional application metadata in `package.json`:
+The defaults can be declared explicitly in `package.json`:
 
 ```json
 {
@@ -44,26 +50,36 @@ Optional application metadata in `package.json`:
 }
 ```
 
-These values are the defaults. Unknown options, parent traversal, source symlinks, empty source directories and unreadable configuration fail explicitly. Every declared JS/TS semantic file must be included in a declared compiler config; JavaScript also requires `checkJs`. Files intentionally outside these directories are not implicitly promised covered. Keep synthetic invalid source payloads outside declared semantic roots.
+Declared source requires strict compiler and lint coverage. TypeScript additionally requires typed linting; JavaScript requires `checkJs`. Ignored or empty source roots, `noCheck`, `ts-nocheck`, source symlinks and unsupported configuration are errors. For multiple compiler projects, list the leaf configurations.
 
-Typechecking must remain strict and cannot use `noCheck` or a leading `ts-nocheck` directive. Coverage follows the compiler's actual import graph, not only its initial root file list. Authored declaration files are not claimed checked when `skipLibCheck` skips them. Every declared TS file must have the typed parser, project context and mandatory type-aware error rules. An ignored file is rejected even when the compiler could accept its code. Multiple `typecheckConfigs` select explicit rooted lint projects; a single ordinary `tsconfig.json` uses the TypeScript project service. List leaf configs rather than only an empty solution config.
+In Devkit projects, verification also checks native dependency declarations and shared packages' public exports using TypeScript resolution. Cross-app imports, library-to-app imports and private library paths fail. Computed runtime module paths remain outside static import checking.
 
-Cross-app checking rejects static relative import, re-export, dynamic-import and `require` literals into a sibling under `apps/`. It is not a runtime dependency graph or a proof about computed module paths. The policy can be disabled explicitly. Directory bans are opt-in basenames; no private naming scheme or legacy `spec` link is embedded.
+Verification checks compiler and lint coverage. Generated scripts also run the compiler, ESLint and Prettier.
 
-In a schema-2 Devkit consumer, workspace checking also uses the registered component graph and actual native manifests. A local shared library must be a declared native dependency, and imports must resolve through its public `exports`. Hoisted visibility alone is not a dependency declaration. Cross-app imports, library-to-app imports and private library paths fail. The verifier checks TypeScript's real import mode and resolution conditions, including aliases and asset imports, without changing source files. Dependencies outside the registered component graph retain ordinary native resolution.
+## Test reporters
 
-Use `eslint --no-ignore --max-warnings 0` on the declared source roots, a separate `tsc --noEmit`, and `prettier --check`. Formatting and lint autofix belong to a separate explicit command. Template checks also require real tests; empty test suites are not accepted.
+For Node's test runner:
 
-Template formatting commands cover source and human-owned tool configuration. Native `package.json` and lockfiles are machine-managed metadata validated by the schema, package manager and lock checks. Their serialization is not a source-formatting gate, so ordinary dependency updates do not require a formatter before setup.
+```sh
+node --test --test-reporter=@docouno/env/node-test-reporter
+```
 
-## Native Node tests
+For Vitest:
 
-The Node template invokes native `node --test` with `--test-reporter=@docouno/env/node-test-reporter`. The reporter delegates normal output to Node's spec reporter and requires at least one runnable registered `node:test` case across file summaries. Empty modules and skipped/TODO-only suites fail even when the native runner would report successful test files. This profile requires the `node:test` registration API; custom top-level-assertion harnesses without registrations are not promised covered. Ordinary failed tests preserve their native failure.
+```js
+import { defineConfig } from 'vitest/config';
+import RunnableTestsReporter from '@docouno/env/vitest-reporter';
 
-## Native Vitest tests
+export default defineConfig({
+  test: {
+    passWithNoTests: false,
+    reporters: ['default', new RunnableTestsReporter()],
+  },
+});
+```
 
-The React template keeps Vitest's default reporter and adds `new RunnableTestsReporter()` from `@docouno/env/vitest-reporter`. With `passWithNoTests: false`, missing and empty modules fail natively; the additional reporter rejects a successful run containing only skipped or TODO cases. Individual skipped tests remain valid alongside a completed test. Failed runs retain their native diagnostics. This export targets the tested Vitest 5.0.5 reporter API through an optional exact peer; Node applications do not need Vitest installed. Reporter interfaces can change within a minor release, so update this compatibility constraint only after testing the actual native CLI.
+Both profiles require a runnable registered test case. Empty, skipped-only and TODO-only suites fail; ordinary test failures retain native diagnostics. The Node profile uses `node:test` registrations. Vitest is an optional peer, required only by the Vitest reporter.
 
-## Verification
+## License
 
-`npm test` runs source-level package tests. Release validation must additionally install the real package archive in a separate consumer without access to this checkout, then exercise its exports and commands. Passing the source tests alone does not establish packaging correctness.
+[MIT](LICENSE).

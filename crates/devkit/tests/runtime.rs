@@ -57,12 +57,44 @@ fn old_desktop_projection_stays_shell_compatible_while_native_uses_same_elf() {
 #[test]
 fn tool_pin_parser_never_evaluates_shell_and_rejects_duplicate_or_unpinned_images() {
     let source = format!(
-        "DEVKIT_VERSION=0.3.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\n",
+        "DEVKIT_VERSION=0.3.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
         "a".repeat(64),
         "b".repeat(64),
-        "c".repeat(64)
+        "c".repeat(64),
+        "d".repeat(64)
     );
     assert!(ToolPins::parse(source.as_bytes()).is_ok());
+    let legacy = source
+        .lines()
+        .filter(|line| !line.starts_with("DEVKIT_ENGINE_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("DEVKIT_VERSION=0.3.0", "DEVKIT_VERSION=0.2.1");
+    assert!(ToolPins::parse(legacy.as_bytes()).unwrap().engine.is_none());
+    assert!(
+        ToolPins::parse(
+            legacy
+                .replace("DEVKIT_VERSION=0.2.1", "DEVKIT_VERSION=0.3.0")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    assert!(
+        ToolPins::parse(
+            source
+                .replace("DEVKIT_VERSION=0.3.0", "DEVKIT_VERSION=0.2.1")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    assert!(
+        ToolPins::parse(
+            source
+                .replace("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl")
+                .as_bytes()
+        )
+        .is_err()
+    );
     assert!(ToolPins::parse(format!("{source}DEVKIT_VERSION=0.3.0\n").as_bytes()).is_err());
     assert!(
         ToolPins::parse(

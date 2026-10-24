@@ -171,10 +171,25 @@ fn native_process_probe() {
         "inflight-create" => {
             "trap 'printf accepted-token > \"$DEVKIT_PROCESS_FIXTURE/container\"; touch \"$DEVKIT_PROCESS_FIXTURE/created\"; exit 143' TERM; sleep 25 & touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
         }
+        "timed-owned" => {
+            "trap '' TERM; printf accepted-token > \"$DEVKIT_PROCESS_FIXTURE/container\"; sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
+        }
+        "timed-foreign" => {
+            "trap '' TERM; printf foreign-token > \"$DEVKIT_PROCESS_FIXTURE/container\"; sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
+        }
         _ => panic!("Unknown process probe"),
     };
     command.args(["-c", source]);
-    let result = runner.run_owned(&mut command, OutputMode::Inherit, &owned);
+    let result = if scenario.starts_with("timed-") {
+        runner.run_owned_with_timeout(
+            &mut command,
+            OutputMode::Inherit,
+            &owned,
+            Duration::from_millis(300),
+        )
+    } else {
+        runner.run_owned(&mut command, OutputMode::Inherit, &owned)
+    };
     let code = match result {
         Ok(_) => 0,
         Err(error) => {
@@ -317,4 +332,69 @@ fn cancellation_reaps_before_cleanup_and_never_reports_success() {
             }
         }
     }
+}
+
+#[test]
+fn deadlines_reap_the_creator_group_before_exact_owned_cleanup() {
+    for scenario in ["timed-owned", "timed-foreign"] {
+        let fixture = Fixture::new();
+        let started = Instant::now();
+        let output = wait(fixture.start(scenario));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("exceeded its deadline"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "Timed-out creator descendant survived"
+        );
+        if scenario == "timed-owned" {
+            assert!(!fixture.root().join("container").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.root().join("mutations")).unwrap(),
+                format!("stop {ID}\nrm {ID}\n")
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Refusing unowned"));
+            assert_eq!(
+                fs::read_to_string(fixture.root().join("container")).unwrap(),
+                "foreign-token"
+            );
+            assert!(!fixture.root().join("mutations").exists());
+        }
+    }
+}
+
+#[test]
+fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() {
+    let fixture = Fixture::new();
+    let runner = ProcessRunner::new().unwrap();
+    let error = runner
+        .checked_with_timeout(
+            Command::new("sh").args(["-c", "exit 42"]),
+            OutputMode::Capture(4096),
+            Duration::from_secs(2),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(exit_code(&error), 42);
+    let started = Instant::now();
+    let error = runner
+        .checked_with_timeout(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; sleep 25 & printf '%s' \"$!\" > \"$1\"; wait",
+                    "sh",
+                ])
+                .arg(fixture.root().join("child-pid")),
+            OutputMode::Capture(4096),
+            Duration::from_millis(150),
+        )
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("exceeded its deadline"));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
 }

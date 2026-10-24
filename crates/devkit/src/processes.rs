@@ -188,6 +188,15 @@ impl ProcessRunner {
         self.run(command, mode)?
             .success(&command.get_program().to_string_lossy())
     }
+    pub fn checked_with_timeout(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_inner(command, mode, false, Some(timeout))?
+            .success(&command.get_program().to_string_lossy())
+    }
     pub fn capture(&self, command: &mut Command) -> Result<ProcessOutput> {
         self.checked(command, OutputMode::Capture(16 * 1024 * 1024))
     }
@@ -244,7 +253,7 @@ impl ProcessRunner {
                 break Err(error);
             }
             if timeout.is_some_and(|t| started.elapsed() >= t) {
-                break Err(anyhow::anyhow!("Process exceeded its cleanup deadline"));
+                break Err(anyhow::anyhow!("Process exceeded its deadline"));
             }
             if overflow.load(Ordering::SeqCst) {
                 break Err(anyhow::anyhow!("Native command output exceeds byte budget"));
@@ -351,6 +360,24 @@ impl ProcessRunner {
         mode: OutputMode,
         owned: &OwnedContainer,
     ) -> Result<ProcessOutput> {
+        self.run_owned_inner(command, mode, owned, None)
+    }
+    pub fn run_owned_with_timeout(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        owned: &OwnedContainer,
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_owned_inner(command, mode, owned, Some(timeout))
+    }
+    fn run_owned_inner(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        owned: &OwnedContainer,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutput> {
         owned.validate()?;
         self.check_cancelled()?;
         ensure!(
@@ -360,7 +387,7 @@ impl ProcessRunner {
             owned.name
         );
         let result = self
-            .run(command, mode)
+            .run_inner(command, mode, false, timeout)
             .and_then(|o| o.success("Container task"));
         // Output/IO failures can also abort an in-flight create request. As with
         // cancellation, observe briefly AFTER its creator group has been reaped.

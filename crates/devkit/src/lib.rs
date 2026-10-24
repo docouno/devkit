@@ -14,8 +14,17 @@ pub mod transaction;
 
 pub type Result<T> = anyhow::Result<T>;
 
+pub mod archive;
+pub mod assembler;
+pub mod cache;
 pub mod cli;
+pub mod delivery;
 pub mod desktop;
+pub mod distribution;
+pub mod download;
+mod lifecycle_cli;
+pub mod notices;
 pub mod processes;
 pub mod runtime;
+mod runtime_cli;
 pub mod rust_gate;
