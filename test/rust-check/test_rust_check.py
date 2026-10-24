@@ -104,8 +104,9 @@ class RustCheckTests(unittest.TestCase):
 
     @classmethod
     def write_receipt(cls):
-        paths = [HELPER, RECIPE, Path(__file__), REPO / "templates/rust-api/README.md"]
+        paths = [RECIPE, Path(__file__), REPO / "crates/devkit/src/rust_gate.rs"]
         receipt = {"imageId": cls.image, "recipeSha256": cls.recipe_sha,
+                   "engine": {"path": str(HELPER), "sha256": hashlib.sha256(HELPER.read_bytes()).hexdigest()},
                    "sourceSha256": {str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                     for path in paths}, "commands": cls.commands}
         (cls.artifacts / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
