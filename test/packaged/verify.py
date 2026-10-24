@@ -671,6 +671,69 @@ class Verification:
         require(source_snapshot(root) == before, "Recovery did not restore known bytes")
         self.results.append({"label": "synthetic-interrupted-journal", "passed": True, "liveCrashReproduced": False})
 
+    def upgrade_product(self, root, kind):
+        """Exercise real Rust/fullstack transitions as well as the Node case."""
+        if self.next_release is None:
+            return
+        version = json.loads((self.next_release / "release.json").read_text())["version"]
+        state_file = root / ".devkit/manifest.json"
+        state = json.loads(state_file.read_text())
+        require(version != state["version"], "Upgrade proof needs distinct versions")
+        state["verificationExtension"] = {"kind": kind, "keep": [True, "opaque"]}
+        native_packages = {}
+        preserve = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml")}
+        for path, component in state["components"].items():
+            component["verificationExtension"] = {"component": path}
+            component["origin"]["verificationExtension"] = {"origin": "preserve"}
+            if component.get("development"):
+                component["development"]["verificationExtension"] = {"development": "preserve"}
+            directory = root / path
+            for source_dir in (directory / "src", directory / "tests"):
+                if source_dir.is_dir():
+                    for source in source_dir.rglob("*"):
+                        if source.is_file():
+                            preserve[source] = source.read_bytes()
+            for native in (directory / "Cargo.toml", directory / "Cargo.lock"):
+                if native.is_file():
+                    preserve[native] = native.read_bytes()
+            if component["toolchain"] == "node":
+                package_path = directory / "package.json"
+                package = json.loads(package_path.read_text())
+                package["description"] = f"Preserved {kind} consumer metadata"
+                package["scripts"]["consumer:retained"] = "node --version"
+                package_path.write_text(json.dumps(package, indent=2) + "\n")
+                native_packages[path] = {key: value for key, value in package.items() if key != "devDependencies"}
+        state_file.write_text(json.dumps(state, indent=2) + "\n")
+        before = source_snapshot(root)
+        self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
+        require(source_snapshot(root) == before, f"{kind} preview changed project bytes")
+        self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
+        after = json.loads(state_file.read_text())
+        require(after["version"] == version and after["packageMode"] == self.package_source,
+                f"{kind} accepted wrong environment")
+        require(after["verificationExtension"] == state["verificationExtension"], "Top-level metadata lost")
+        for path, old in state["components"].items():
+            current = after["components"][path]
+            require(current["verificationExtension"] == old["verificationExtension"]
+                    and current["origin"]["verificationExtension"] == old["origin"]["verificationExtension"],
+                    f"Component/origin metadata lost: {path}")
+            if old.get("development"):
+                require(current["development"]["verificationExtension"] == old["development"]["verificationExtension"],
+                        f"Development metadata lost: {path}")
+        for path, content in preserve.items():
+            require(path.read_bytes() == content, f"{kind} update overwrote {path.relative_to(root)}")
+        for path, fields in native_packages.items():
+            current = json.loads((root / path / "package.json").read_text())
+            require({key: value for key, value in current.items() if key != "devDependencies"} == fields,
+                    f"{kind} update changed product manifest fields: {path}")
+        self.healthy(root, f"upgraded-{kind}")
+        unchanged = source_snapshot(root)
+        self.run(f"{kind}-upgrade-noop", self.cli(self.next_release, "update", root))
+        require(source_snapshot(root) == unchanged, f"{kind} repeated upgrade rewrote source")
+        self.results.append({"label": f"{kind}-native-upgrade-preservation", "passed": True,
+                             "fromVersion": state["version"], "toVersion": version,
+                             "preservedFiles": len(preserve), "unknownMetadataPreserved": True})
+
     def cleanup(self):
         errors = []
         for root in reversed(self.projects):
@@ -729,10 +792,11 @@ class Verification:
             self.readonly_mounts(rust, "rust")
             self.rust_negative(rust)
             self.emitted(rust, "rust")
-            fullstack = self.create("fullstack", "d-fullstack",
-                                    self.next_release if self.public_bootstrap and self.next_release else None)
+            self.upgrade_product(rust, "rust")
+            fullstack = self.create("fullstack", "d-fullstack")
             self.healthy(fullstack, "fullstack")
             self.library_negative(fullstack)
+            self.upgrade_product(fullstack, "fullstack")
             self.fullstack(fullstack, node)
             self.add_app(node)
             self.upgrade(node)
