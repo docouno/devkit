@@ -1,0 +1,54 @@
+name: Admit the frozen verification input
+description: Restore one attributed distribution set and the genuine baseline without rebuilding consumer bytes
+inputs:
+  version:
+    required: true
+    description: Frozen version
+  source_commit:
+    required: true
+    description: Frozen source commit
+  source_tree:
+    required: true
+    description: Frozen source tree
+  index_sha256:
+    required: true
+    description: SHA256 of the original raw release index
+  artifact_suffix:
+    required: true
+    description: Successful prepare attempt, retained on failed-only reruns
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-compose
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      with:
+        name: devkit-frozen-set-${{ inputs.artifact_suffix }}
+        path: .artifacts/frozen
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      with:
+        name: devkit-release-controller-${{ inputs.artifact_suffix }}
+        path: .artifacts/release-ops
+    - name: Verify identities and hydrate the original archive
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        SOURCE_COMMIT: ${{ inputs.source_commit }}
+        SOURCE_TREE: ${{ inputs.source_tree }}
+        INDEX_SHA256: ${{ inputs.index_sha256 }}
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+        test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+        test "$(sha256sum .artifacts/frozen/release-index.json | cut -d ' ' -f 1)" = "$INDEX_SHA256"
+        chmod 755 .artifacts/release-ops/devkit-release .artifacts/frozen/devkit-x86_64-unknown-linux-musl
+        .artifacts/release-ops/devkit-release hydrate --root "$PWD" --version "$VERSION" \
+          --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" --build-set "$PWD/.artifacts/frozen"
+    - name: Preserve the genuine public baseline
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .artifacts/legacy
+        curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
+        printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
+        (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
+        tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy

@@ -1,0 +1,130 @@
+name: Verify one frozen set
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+      source_tree:
+        required: true
+        type: string
+      index_sha256:
+        required: true
+        type: string
+      artifact_suffix:
+        required: true
+        type: string
+      run_performance:
+        default: false
+        type: boolean
+    outputs:
+      performance_artifact:
+        description: Artifact from the successful isolated performance job, including its original attempt
+        value: ${{ jobs.performance.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  functional:
+    name: ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [source, runtime, delivery, packaged, registry]
+        include:
+          - group: source
+            target: verify-source-gates
+          - group: runtime
+            target: verify-runtime-gates
+          - group: delivery
+            target: verify-delivery-gates
+          - group: packaged
+            target: verify-packaged
+          - group: registry
+            target: verify-registry
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/verify-frozen
+        with:
+          version: ${{ inputs.version }}
+          source_commit: ${{ inputs.source_commit }}
+          source_tree: ${{ inputs.source_tree }}
+          index_sha256: ${{ inputs.index_sha256 }}
+          artifact_suffix: ${{ inputs.artifact_suffix }}
+      - name: Prepare pinned author SDKs
+        run: make setup
+      - name: Verify the selected canonical Make group
+        env:
+          VERIFY_TARGET: ${{ matrix.target }}
+        run: make "$VERIFY_TARGET" build_set="$PWD/.artifacts/frozen" release="$PWD/.artifacts/frozen/payload" previous="$PWD/.artifacts/legacy/devkit-0.2.1" legacy_archive="$PWD/.artifacts/legacy/devkit-0.2.1.tar.gz"
+      - name: Preserve group diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verify-${{ matrix.group }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/**/receipt.json
+            .artifacts/**/*.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  performance:
+    if: inputs.run_performance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      artifact_name: ${{ steps.receipt.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/verify-frozen
+        with:
+          version: ${{ inputs.version }}
+          source_commit: ${{ inputs.source_commit }}
+          source_tree: ${{ inputs.source_tree }}
+          index_sha256: ${{ inputs.index_sha256 }}
+          artifact_suffix: ${{ inputs.artifact_suffix }}
+      - name: Prepare pinned author SDKs
+        run: make setup
+      - name: Measure all R14 shapes and samples on this isolated runner
+        run: |
+          set -euo pipefail
+          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
+          export DEVKIT_PERFORMANCE_TRACE_IMAGE
+          DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
+          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/legacy/devkit-0.2.1" --output "$PWD/.artifacts/release-ops/performance.json"
+      - name: Preserve the exact successful performance receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devkit-performance-${{ github.run_attempt }}
+          path: .artifacts/release-ops/performance.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Identify this successful performance artifact for failed-only reruns
+        id: receipt
+        run: printf 'artifact_name=devkit-performance-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Preserve performance diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verify-performance-diagnostics-${{ github.run_attempt }}
+          path: |
+            .artifacts/**/receipt.json
+            .artifacts/**/*.log
+            .artifacts/release-ops/performance.json
+          retention-days: 90
+          if-no-files-found: warn

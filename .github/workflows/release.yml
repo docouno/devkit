@@ -81,21 +81,7 @@ jobs:
       - name: Prepare pinned author SDKs
         run: make setup
       - name: Build the author-only controller
-        run: |
-          set -euo pipefail
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          # Only the controller may be rebuilt when resuming. A partially
-          # published consumer artifact set is always restored from GitHub.
-          docker run --pull never --rm --init --user "$(id -u):$(id -g)" --memory 2g --cpus 2 \
-            --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-            --tmpfs /tmp:rw,exec,mode=1777 --volume "$PWD:/workspace:ro" \
-            --volume "$PWD/.artifacts/author/cargo-home:/cargo" \
-            --volume "$PWD/.artifacts/author/target:/target" --workdir /workspace \
-            --env HOME=/tmp/home --env CARGO_HOME=/cargo --env CARGO_TARGET_DIR=/target \
-            --env CARGO_BUILD_JOBS=1 --env RUSTUP_AUTO_INSTALL=0 \
-            "devkit-author-rust:$recipe_sha" cargo build --locked --offline --target x86_64-unknown-linux-musl --bin devkit-release
-          mkdir -p .artifacts/release-ops
-          cp .artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit-release .artifacts/release-ops/devkit-release
+        run: make build-controller
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 24.22.1
@@ -123,23 +109,6 @@ jobs:
             --source-commit "$SOURCE_COMMIT" --source-tree "$source_tree" \
             --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" \
             --build-set "$PWD/.artifacts/frozen"
-      - name: Preserve the genuine public baseline
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/legacy
-          curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
-          printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
-          (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
-          tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy
-      - name: Verify exactly the frozen bytes
-        run: make verify build_set="$PWD/.artifacts/frozen" release="$PWD/.artifacts/frozen/payload" previous="$PWD/.artifacts/legacy/devkit-0.2.1" legacy_archive="$PWD/.artifacts/legacy/devkit-0.2.1.tar.gz"
-      - name: Measure frozen native artifacts
-        run: |
-          set -euo pipefail
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          export DEVKIT_PERFORMANCE_TRACE_IMAGE
-          DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
-          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/legacy/devkit-0.2.1" --output "$PWD/.artifacts/release-ops/performance.json"
       - name: Freeze handoff identities
         id: freeze
         run: |
@@ -184,8 +153,19 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-  publish:
+  verify:
     needs: prepare
+    uses: ./.github/workflows/verify.yml
+    with:
+      version: ${{ inputs.version }}
+      source_commit: ${{ inputs.source_commit }}
+      source_tree: ${{ needs.prepare.outputs.source_tree }}
+      index_sha256: ${{ needs.prepare.outputs.index_sha256 }}
+      artifact_suffix: ${{ needs.prepare.outputs.artifact_suffix }}
+      run_performance: true
+
+  publish:
+    needs: [prepare, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -208,6 +188,10 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: devkit-release-controller-${{ needs.prepare.outputs.artifact_suffix }}
+          path: .artifacts/release-ops
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ needs.verify.outputs.performance_artifact }}
           path: .artifacts/release-ops
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
