@@ -64,16 +64,35 @@ def execute(argv, cwd, env, timeout=120):
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except BaseException:
-        if process.poll() is None:
+        def signal_owned_group(value):
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, value)
             except ProcessLookupError:
                 pass
+
+        # communicate can time out after the leader exited because an owned
+        # descendant inherited its pipes. Leader status says nothing about the
+        # rest of this new session's process group.
+        signal_owned_group(signal.SIGTERM)
+        try:
             try:
                 process.communicate(timeout=8)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+                signal_owned_group(signal.SIGKILL)
+                try:
+                    process.communicate(timeout=8)
+                except subprocess.TimeoutExpired:
+                    # An escaped process may retain a pipe. Do not wait for it
+                    # without a deadline or extend ownership to unrelated PIDs.
+                    pass
+        finally:
+            # A descendant can close its pipes but ignore TERM. Finish the
+            # owned group even when draining the leader succeeded immediately.
+            signal_owned_group(signal.SIGKILL)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            process.wait(timeout=8)
         raise
     return {"seconds": time.perf_counter() - started, "exitCode": process.returncode,
             "stdout": stdout, "stderr": stderr}
@@ -112,20 +131,52 @@ def paired(cases, samples, warmups, run, persist):
 
 
 def docker_kind(argv):
-    """Logger observes full Docker argv; classify creates, never inspect calls."""
+    """Count supported single-container run requests; reject unknown mutations."""
+    require(isinstance(argv, list) and argv and all(isinstance(arg, str) and arg for arg in argv),
+            "Unsupported Docker trace argv")
     if argv[:1] == ["run"] or argv[:2] == ["container", "run"]:
         return "tool" if "/devkit/devkit" in argv and "rust" in argv else "other"
-    if argv[:1] == ["compose"] and "run" in argv:
-        arguments = argv[argv.index("run") + 1:]
-        values = {"--name", "--label", "--pull", "--user", "--entrypoint", "-e", "--env", "-v", "--volume"}
+
+    def skip_options(arguments, values, switches):
         while arguments and arguments[0].startswith("-"):
             option = arguments.pop(0)
+            if "=" in option and option.split("=", 1)[0] in values:
+                continue
+            require(option in values or option in switches,
+                    f"Unsupported Docker Compose option in measured trace: {option}")
             if option in values:
-                require(arguments, "Incomplete Compose run option in trace")
+                require(arguments, "Unsupported Docker trace: incomplete Compose option")
                 arguments.pop(0)
-        require(arguments, "Missing Compose service in trace")
-        return "control" if arguments[0] == "control" else "tool" if arguments[0] == "rust" else "other"
-    return None
+        require(arguments, "Unsupported Docker trace: missing Compose operation/service")
+        return arguments
+
+    if argv[:1] == ["compose"]:
+        arguments = skip_options(argv[1:], {
+            "--project-directory", "--project-name", "-p", "--env-file", "--file", "-f",
+            "--profile", "--parallel", "--ansi", "--progress"}, {"--compatibility"})
+        operation = arguments.pop(0)
+        if operation == "run":
+            arguments = skip_options(arguments, {
+                "--name", "--label", "-l", "--pull", "--user", "-u", "--entrypoint", "-e", "--env",
+                "--env-from-file", "-v", "--volume", "--workdir", "-w", "--publish", "-p"},
+                {"--rm", "-T", "--no-TTY", "--no-deps", "-d", "--detach", "--use-aliases",
+                 "--quiet", "--quiet-pull", "--service-ports"})
+            return "control" if arguments[0] == "control" else "tool" if arguments[0] == "rust" else "other"
+        require(operation in {"version", "config", "ps", "logs", "ls", "images", "top", "port",
+                              "down", "stop", "kill", "rm"},
+                f"Unsupported Docker Compose operation in measured trace: {operation}")
+        return None
+    readonly_or_cleanup = {
+        "container": {"inspect", "ls", "logs", "top", "port", "stats", "stop", "kill", "rm"},
+        "image": {"inspect", "ls", "history"},
+        "network": {"inspect", "ls"}, "volume": {"inspect", "ls"},
+        "context": {"inspect", "ls", "show"}, "system": {"info", "df"},
+    }
+    if argv[0] in readonly_or_cleanup and len(argv) > 1 and argv[1] in readonly_or_cleanup[argv[0]]:
+        return None
+    if argv[0] in {"version", "info", "inspect", "ps", "logs", "top", "port", "stats", "stop", "kill", "rm"}:
+        return None
+    raise RuntimeError(f"Unsupported Docker operation in measured trace: {argv!r}")
 
 
 def exec_counts(summary):
