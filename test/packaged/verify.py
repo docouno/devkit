@@ -681,6 +681,7 @@ class Verification:
         require(version != state["version"], "Upgrade proof needs distinct versions")
         state["verificationExtension"] = {"kind": kind, "keep": [True, "opaque"]}
         native_packages = {}
+        native_dev_dependencies = {}
         preserve = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml")}
         for path, component in state["components"].items():
             component["verificationExtension"] = {"component": path}
@@ -688,6 +689,16 @@ class Verification:
             if component.get("development"):
                 component["development"]["verificationExtension"] = {"development": "preserve"}
             directory = root / path
+            rust_source = directory / "src/lib.rs"
+            if component["toolchain"] == "rust" and rust_source.is_file():
+                text = rust_source.read_text()
+                marker = 'pub const CONSUMER_MIGRATION_MARKER: &str = "preserve user Rust code";'
+                require("CONSUMER_MIGRATION_MARKER" not in text, "Migration marker already exists")
+                boundary = text.find("\n#[cfg(test)]")
+                boundary = len(text) if boundary < 0 else boundary
+                tail = text[boundary:].lstrip()
+                rust_source.write_text(text[:boundary].rstrip() + "\n\n" + marker
+                                       + ("\n\n" + tail if tail else "\n"))
             for source_dir in (directory / "src", directory / "tests"):
                 if source_dir.is_dir():
                     for source in source_dir.rglob("*"):
@@ -703,6 +714,7 @@ class Verification:
                 package["scripts"]["consumer:retained"] = "node --version"
                 package_path.write_text(json.dumps(package, indent=2) + "\n")
                 native_packages[path] = {key: value for key, value in package.items() if key != "devDependencies"}
+                native_dev_dependencies[path] = dict(package.get("devDependencies", {}))
         state_file.write_text(json.dumps(state, indent=2) + "\n")
         before = source_snapshot(root)
         self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
@@ -726,6 +738,16 @@ class Verification:
             current = json.loads((root / path / "package.json").read_text())
             require({key: value for key, value in current.items() if key != "devDependencies"} == fields,
                     f"{kind} update changed product manifest fields: {path}")
+            old_dependencies = native_dev_dependencies[path]
+            old_tools = set(state["components"][path]["toolDependencies"])
+            new_tools = set(after["components"][path]["toolDependencies"])
+            product_dependencies = {name: value for name, value in old_dependencies.items() if name not in old_tools}
+            current_product_dependencies = {
+                name: value for name, value in current.get("devDependencies", {}).items()
+                if name not in old_tools | new_tools or name in product_dependencies
+            }
+            require(current_product_dependencies == product_dependencies,
+                    f"{kind} update changed consumer-owned devDependencies: {path}")
         self.healthy(root, f"upgraded-{kind}")
         unchanged = source_snapshot(root)
         self.run(f"{kind}-upgrade-noop", self.cli(self.next_release, "update", root))
