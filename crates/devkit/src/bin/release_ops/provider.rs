@@ -4,6 +4,10 @@ use super::*;
 use devkit::processes::{OutputMode, ProcessOutput};
 use std::{process::Command, time::Duration};
 
+#[cfg(test)]
+#[path = "provider_lookup_tests.rs"]
+mod lookup_tests;
+
 fn github_response(output: ProcessOutput, method: &str, path: &str) -> Result<Option<Value>> {
     let text = output.text()?;
     let line = text
@@ -104,12 +108,19 @@ pub(super) fn require_actions(source: &str) -> Result<()> {
 pub(super) struct GhNpm {
     runner: ProcessRunner,
     scratch: tempfile::TempDir,
+    gh_executable: PathBuf,
+    release_ids: BTreeMap<String, u64>,
 }
 impl GhNpm {
     pub(super) fn new(runner: ProcessRunner) -> Result<Self> {
         let scratch = tempfile::tempdir()?;
         fs::create_dir(scratch.path().join("npm"))?;
-        Ok(Self { runner, scratch })
+        Ok(Self {
+            runner,
+            scratch,
+            gh_executable: PathBuf::from("gh"),
+            release_ids: BTreeMap::new(),
+        })
     }
     fn execute(&self, command: &mut Command, limit: usize) -> Result<ProcessOutput> {
         self.runner.checked_with_timeout(
@@ -119,12 +130,69 @@ impl GhNpm {
         )
     }
     fn gh(&self) -> Command {
-        let mut command = Command::new("gh");
+        let mut command = Command::new(&self.gh_executable);
         command
             .current_dir(self.scratch.path())
             .env("GH_HOST", "github.com")
             .env("GH_PROMPT_DISABLED", "1");
         command
+    }
+    fn pending_release(&self, tag: &str) -> Result<Option<(u64, bool)>> {
+        // This is the same pending-tag lookup used by official gh FetchRelease.
+        // REST /releases/tags only discovers published releases. Source/tag/
+        // assets are read from the resulting REST record, not inferred here.
+        let request = json!({
+            "query": "query($owner:String!, $name:String!, $tagName:String!) { repository(owner:$owner,name:$name) { release(tagName:$tagName) { databaseId isDraft } } }",
+            "variables": {"owner":"docouno", "name":"devkit", "tagName":tag},
+        });
+        let input = tempfile::NamedTempFile::new_in(self.scratch.path())?;
+        fs::write(input.path(), serde_json::to_vec(&request)?)?;
+        let mut command = self.gh();
+        command
+            .args(["api", "graphql", "--hostname", "github.com", "--input"])
+            .arg(input.path());
+        let output = self.execute(&mut command, 4 * 1024 * 1024)?;
+        let response: Value = serde_json::from_slice(&output.stdout)
+            .context("GraphQL release lookup returned malformed JSON")?;
+        ensure!(
+            response.get("errors").is_none(),
+            "GraphQL release lookup returned errors; absence is not established"
+        );
+        let repository = response
+            .get("data")
+            .and_then(|v| v.get("repository"))
+            .and_then(Value::as_object)
+            .context("GraphQL repository is missing or inaccessible; absence is not established")?;
+        let release = repository
+            .get("release")
+            .context("GraphQL release field is missing; absence is not established")?;
+        if release.is_null() {
+            return Ok(None);
+        }
+        let id = release
+            .get("databaseId")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .context("GraphQL release databaseId must be a positive integer")?;
+        let draft = release
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .context("GraphQL release isDraft must be a boolean")?;
+        Ok(Some((id, draft)))
+    }
+    fn remember_release(&mut self, tag: &str, release: RemoteRelease) -> Result<RemoteRelease> {
+        ensure!(
+            release.id > 0 && release.tag_name == tag,
+            "GitHub returned another release ID/tag"
+        );
+        if let Some(id) = self.release_ids.get(tag) {
+            ensure!(
+                *id == release.id,
+                "GitHub release ID changed during this operation; refusing to replace the original release"
+            );
+        }
+        self.release_ids.insert(tag.into(), release.id);
+        Ok(release)
     }
     fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Option<Value>> {
         ensure!(
@@ -230,13 +298,34 @@ impl GhNpm {
 }
 impl Remote for GhNpm {
     fn release(&mut self, tag: &str) -> Result<Option<RemoteRelease>> {
-        self.api("GET", &format!("repos/{REPO}/releases/tags/{tag}"), None)?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(Into::into)
+        let published = self.api("GET", &format!("repos/{REPO}/releases/tags/{tag}"), None)?;
+        if let Some(value) = published {
+            return self
+                .remember_release(tag, serde_json::from_value(value)?)
+                .map(Some);
+        }
+        let Some((id, draft)) = self.pending_release(tag)? else {
+            ensure!(
+                !self.release_ids.contains_key(tag),
+                "Previously observed GitHub release is missing; refusing to replace it"
+            );
+            return Ok(None);
+        };
+        let value = self
+            .api("GET", &format!("repos/{REPO}/releases/{id}"), None)?
+            .context(
+                "GraphQL release ID is not readable through REST; retry without replacing it",
+            )?;
+        let release: RemoteRelease = serde_json::from_value(value)?;
+        ensure!(
+            release.id == id && release.draft == draft,
+            "GraphQL and REST release ID/state differ; retry without replacing it"
+        );
+        self.remember_release(tag, release).map(Some)
     }
     fn create_draft(&mut self, contract: &Contract) -> Result<RemoteRelease> {
-        serde_json::from_value(self.api("POST", &format!("repos/{REPO}/releases"), Some(json!({"tag_name":contract.tag(),"target_commitish":contract.source_commit,"name":contract.tag(),"body":contract.body()?,"draft":true,"prerelease":true,"make_latest":"false"})))?.context("Create draft returned no release")?).map_err(Into::into)
+        let release = serde_json::from_value(self.api("POST", &format!("repos/{REPO}/releases"), Some(json!({"tag_name":contract.tag(),"target_commitish":contract.source_commit,"name":contract.tag(),"body":contract.body()?,"draft":true,"prerelease":true,"make_latest":"false"})))?.context("Create draft returned no release")?)?;
+        self.remember_release(&contract.tag(), release)
     }
     fn download_asset(
         &mut self,
