@@ -13,9 +13,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.freeze.outputs.version }}
+      source_commit: ${{ steps.freeze.outputs.source_commit }}
+      source_tree: ${{ steps.freeze.outputs.source_tree }}
+      index_sha256: ${{ steps.freeze.outputs.index_sha256 }}
+      artifact_suffix: ${{ steps.freeze.outputs.artifact_suffix }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -28,35 +34,66 @@ jobs:
       - uses: ./.github/actions/setup-compose
       - name: Prepare pinned author SDKs
         run: make setup
-      - name: Preserve the genuine public baseline
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/legacy
-          curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
-          printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
-          (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
-          tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy
+      - name: Build the author-only controller
+        run: make build-controller
       - name: Assemble one frozen test set from clean source
         env:
           BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: make pack output="$PWD/.artifacts/frozen" build_id=ci build_run="$BUILD_RUN"
-      - name: Source quality and complete local consumer gates
-        run: make verify build_set="$PWD/.artifacts/frozen" release="$PWD/.artifacts/frozen/payload" previous="$PWD/.artifacts/legacy/devkit-0.2.1" legacy_archive="$PWD/.artifacts/legacy/devkit-0.2.1.tar.gz"
-      - name: Measure native performance without weakening gates
+      - name: Freeze handoff identities
+        id: freeze
         run: |
-          set -euo pipefail
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          export DEVKIT_PERFORMANCE_TRACE_IMAGE
-          DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
-          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/legacy/devkit-0.2.1" --output "$PWD/.artifacts/performance.json"
-      - name: Preserve diagnostics
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          raw = Path('.artifacts/frozen/release-index.json').read_bytes()
+          index = json.loads(raw)
+          assert index['publicationEligible'] is True
+          assert index['sourceCommit'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert index['sourceTree'] == subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in (('version', index['version']), ('source_commit', index['sourceCommit']), ('source_tree', index['sourceTree']), ('index_sha256', hashlib.sha256(raw).hexdigest()), ('artifact_suffix', os.environ['GITHUB_RUN_ATTEMPT'])):
+                  output.write(key + '=' + value + '\n')
+          PY
+      - name: Preserve every frozen distribution file
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: devkit-frozen-set-${{ github.run_attempt }}
+          path: |
+            .artifacts/frozen/*.json
+            .artifacts/frozen/*.tgz
+            .artifacts/frozen/*.tar.gz
+            .artifacts/frozen/*.sh
+            .artifacts/frozen/*.txt
+            .artifacts/frozen/devkit-x86_64-unknown-linux-musl
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: devkit-release-controller-${{ github.run_attempt }}
+          path: .artifacts/release-ops/devkit-release
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: source-verification
+          include-hidden-files: true
+          name: source-build-diagnostics-${{ github.run_attempt }}
           path: |
-            .artifacts/**/receipt.json
             .artifacts/**/*.log
-            .artifacts/performance.json
+            .artifacts/author/*notice-producer.json
           retention-days: 14
           if-no-files-found: warn
+
+  verify:
+    needs: prepare
+    uses: ./.github/workflows/verify.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      source_commit: ${{ needs.prepare.outputs.source_commit }}
+      source_tree: ${{ needs.prepare.outputs.source_tree }}
+      index_sha256: ${{ needs.prepare.outputs.index_sha256 }}
+      artifact_suffix: ${{ needs.prepare.outputs.artifact_suffix }}

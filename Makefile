@@ -5,7 +5,7 @@ include toolchains.env
 include tooling/author.mk
 
 .PHONY: verify-engine fix-rust-format verify-core-legacy pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
-	test-env test-npm-inputs build build-fixtures npm-lock npm-inputs notices pack pack-local verify verify-runtime verify-rust verify-delivery \
+	test-env test-npm-inputs build build-fixtures build-controller npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
 	@printf '%s\n' 'Devkit author workspace (Linux x86_64 + Docker Compose >=5.0.0 + Python 3)' \
@@ -66,6 +66,10 @@ build:
 	$(call author_rust,cargo build --release --locked --offline --target x86_64-unknown-linux-musl --bin devkit)
 build-fixtures:
 	$(call author_rust,cargo build --locked --offline --target x86_64-unknown-linux-musl --examples)
+build-controller:
+	$(call author_rust,cargo build --locked --offline --target x86_64-unknown-linux-musl --bin devkit-release)
+	@mkdir -p "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops"
+	@cp "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/devkit-release" "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops/devkit-release"
 npm-lock:
 	$(call author_node,bridge,npm install --package-lock-only --ignore-scripts --include=dev --strict-peer-deps,--volume "$$DEVKIT_AUTHOR_ROOT/package-lock.json:/workspace/package-lock.json:z")
 npm-inputs:
@@ -81,7 +85,10 @@ pack-local: pack-guard build npm-inputs notices
 pack-guard:
 	@test -n "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Set output=/absolute/new/build-set.' >&2; exit 1; }
 	@test ! -e "$$DEVKIT_ASSEMBLY_OUTPUT" -a ! -L "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Assembly output must be new.' >&2; exit 1; }
-verify: check test verify-author verify-core-legacy build-fixtures verify-runtime verify-rust verify-delivery verify-bootstrap verify-packaged verify-registry
+verify: verify-source-gates verify-runtime-gates verify-delivery-gates verify-packaged verify-registry
+verify-source-gates: check test verify-author verify-core-legacy
+verify-runtime-gates: verify-runtime verify-rust
+verify-delivery-gates: verify-delivery verify-bootstrap
 verify-core-legacy:
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core --no-run)
 	@set -eu; image=$$(docker image inspect --format '{{.Id}}' "$$DEVKIT_AUTHOR_RUST_IMAGE"); DEVKIT_TEST_RUST_IMAGE="$$image" DEVKIT_VERIFY_PREVIOUS="$$DEVKIT_VERIFY_PREVIOUS" python3 test/core_legacy.py

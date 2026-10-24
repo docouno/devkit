@@ -1151,7 +1151,9 @@ impl Args {
     }
 }
 pub(super) fn run() -> Result<()> {
-    let args = Args::parse()?;
+    run_args(Args::parse()?)
+}
+fn run_args(args: Args) -> Result<()> {
     let runner = ProcessRunner::new()?;
     if args.command == "internal-fetch" {
         return devkit::download::fetch(
@@ -1234,11 +1236,17 @@ pub(super) fn run() -> Result<()> {
         return Ok(());
     }
     let set = FrozenSet::load(Path::new(args.get("--build-set")?))?;
-    let c = set.contract(args.previous()?)?;
-    args.check_contract(&c)?;
     if args.command == "hydrate" {
+        ensure!(
+            set.index.version == args.get("--version")?
+                && set.index.source_commit == args.get("--source-commit")?
+                && set.index.source_tree == args.get("--source-tree")?,
+            "Frozen build set differs from requested source/version"
+        );
         set.hydrate()?;
     } else {
+        let c = set.contract(args.previous()?)?;
+        args.check_contract(&c)?;
         provider::require_actions(&c.source_commit)?;
         match args.command.as_str() {
             "stage" => stage(&mut remote, &set, &c)?,
@@ -1310,7 +1318,7 @@ pub(super) fn run() -> Result<()> {
     }
     println!(
         "{}",
-        json!({"ok":true,"command":args.command,"indexSha256":c.index_sha256,"version":c.version})
+        json!({"ok":true,"command":args.command,"indexSha256":set.index_sha256,"version":set.index.version})
     );
     Ok(())
 }

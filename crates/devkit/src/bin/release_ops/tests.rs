@@ -89,6 +89,172 @@ impl Fixture {
     }
 }
 
+#[test]
+fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
+    let fixture = Fixture::new();
+    let source = tempfile::tempdir().unwrap();
+    let git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(source.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    for name in [
+        "VERSION",
+        "LICENSE",
+        "README.md",
+        "toolchains.env",
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "runtime/file",
+        "templates/file",
+        "packages/env/file",
+    ] {
+        files::write_atomic(&source.path().join(name), b"reviewed source\n", 0o644).unwrap();
+    }
+    git(&["init", "--quiet"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    ]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let payload_source = tempfile::tempdir().unwrap();
+    let environment = b"fixture environment archive";
+    files::write_atomic(
+        &payload_source.path().join("npm/env.tgz"),
+        environment,
+        0o644,
+    )
+    .unwrap();
+    files::write_json(
+        &payload_source.path().join("release.json"),
+        &devkit::model::Release {
+            schema_version: 1,
+            version: "0.3.0".into(),
+            rust_version: "1.99.1".into(),
+            environment: devkit::model::Environment {
+                name: ENVIRONMENT.into(),
+                version: "0.3.0".into(),
+                archive: "npm/env.tgz".into(),
+                integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(environment))),
+            },
+            files: files::file_map(payload_source.path()).unwrap(),
+        },
+    )
+    .unwrap();
+    let set_root = fixture.directory.path();
+    fs::copy(
+        payload_source.path().join("release.json"),
+        set_root.join("release.json"),
+    )
+    .unwrap();
+    fs::remove_file(set_root.join("devkit-0.3.0.tar.gz")).unwrap();
+    archive::create_archive(
+        payload_source.path(),
+        "devkit-0.3.0",
+        &set_root.join("devkit-0.3.0.tar.gz"),
+    )
+    .unwrap();
+    let mut index: ReleaseIndex = files::read_json(&set_root.join("release-index.json")).unwrap();
+    index.source_commit = commit.clone();
+    index.source_tree = tree.clone();
+    index.build_run = "https://github.com/example/fork/actions/runs/456/attempts/2".into();
+    for name in ["release.json", "devkit-0.3.0.tar.gz"] {
+        let bytes = fs::read(set_root.join(name)).unwrap();
+        index.files.insert(
+            name.into(),
+            devkit::distribution::AssetIdentity {
+                sha256: digest(&bytes),
+                size: bytes.len() as u64,
+            },
+        );
+    }
+    index.release_identity = index.files["release.json"].sha256.clone();
+    files::write_json(&set_root.join("release-index.json"), &index).unwrap();
+    let mut args = Args {
+        command: "hydrate".into(),
+        values: BTreeMap::from([
+            ("--root".into(), source.path().to_str().unwrap().into()),
+            ("--version".into(), "0.3.0".into()),
+            ("--source-commit".into(), commit),
+            ("--source-tree".into(), tree),
+            ("--build-set".into(), set_root.to_str().unwrap().into()),
+        ]),
+    };
+    run_args(Args {
+        command: args.command.clone(),
+        values: args.values.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        fs::read(set_root.join("payload/npm/env.tgz")).unwrap(),
+        environment
+    );
+    assert_eq!(
+        devkit::release::admit_release(&set_root.join("payload"))
+            .unwrap()
+            .identity,
+        index.release_identity
+    );
+    for (field, wrong) in [
+        ("--version", "0.4.0"),
+        ("--source-commit", &"c".repeat(40)),
+        ("--source-tree", &"d".repeat(40)),
+    ] {
+        let mut wrong_args = Args {
+            command: args.command.clone(),
+            values: args.values.clone(),
+        };
+        wrong_args.values.insert(field.into(), wrong.into());
+        assert!(run_args(wrong_args).is_err(), "Accepted wrong {field}");
+    }
+    for field in ["commit", "tree"] {
+        let mut wrong_index = index.clone();
+        if field == "commit" {
+            wrong_index.source_commit = "c".repeat(40);
+        } else {
+            wrong_index.source_tree = "d".repeat(40);
+        }
+        files::write_json(&set_root.join("release-index.json"), &wrong_index).unwrap();
+        assert!(
+            run_args(Args {
+                command: args.command.clone(),
+                values: args.values.clone()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("Frozen build set differs from requested source/version")
+        );
+    }
+    files::write_json(&set_root.join("release-index.json"), &index).unwrap();
+    args.command = "stage".into();
+    for key in ["--previous-env", "--previous-cli", "--previous-github"] {
+        args.values.insert(key.into(), "none".into());
+    }
+    assert!(
+        run_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("original GitHub Actions attempt")
+    );
+    fs::write(set_root.join("install.sh"), "changed frozen bytes").unwrap();
+    assert!(FrozenSet::load(set_root).is_err());
+}
+
 struct Fake {
     release: Option<RemoteRelease>,
     assets: BTreeMap<String, Vec<u8>>,
