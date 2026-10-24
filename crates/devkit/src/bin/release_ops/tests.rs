@@ -36,12 +36,13 @@ impl Fake {
     }
     fn proof(&mut self, c: &Contract) {
         let mut gates = BTreeMap::new();
-        for name in ["public-0.2.0", "public-0.2.1", "npx-pinned", "performance", "transport-cold"] {
+        for name in ["public-0.2.0", "public-0.2.1", "npx-pinned", "performance", "transport-cold", "readme"] {
             let mut summary = json!({"schemaVersion":1,"success":true,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256});
             if let Some(old) = name.strip_prefix("public-") { summary = json!({"schemaVersion":3,"success":true,"version":old,"nextVersion":c.version,"expectedIndexSha256":c.index_sha256,"authenticationUsedForDownloads":false,"defaultReleaseBaseTested":true,"consumerSuccess":true,"identities":[{"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256}]}); }
             if name == "npx-pinned" { summary["selectorMode"] = json!("pinned"); summary["ignoreScripts"] = json!(true); summary["authenticationUsed"] = json!(false); summary["umasks"] = json!(["022", "077"]); }
             if name == "performance" { summary["measurements"] = json!([{"case":"warm","samples":30}]); }
             if name == "transport-cold" { summary["authenticationUsed"] = json!(false); summary["measurements"] = json!([{"transport":"npx","cacheState":"empty","seconds":2.0},{"transport":"curl","cacheState":"empty","seconds":2.0,"hostLanguageSDKAttempted":false}]); }
+            if name == "readme" { for key in ["publicNpx", "barePtyCancelled", "standaloneWebStatePreservingHmr"] { summary[key] = json!(true); } summary["authenticationUsed"] = json!(false); summary["hostLanguageSDKAttemptedForNativeCommands"] = json!(false); summary["readmeSha256"] = json!("d".repeat(64)); }
             gates.insert(name.into(), Gate { sha256: "c".repeat(64), bytes: 100, summary });
         }
         let proof = Proof { schema_version: 1, version: c.version.clone(), source_commit: c.source_commit.clone(), source_tree: c.source_tree.clone(), index_sha256: c.index_sha256.clone(), publication_run: c.build_run.clone(), gates, post_promotion_npx: None };

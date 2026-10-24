@@ -257,6 +257,8 @@ jobs:
           PY
       - name: Anonymous public pinned npx and README entry checks
         run: python3 test/public/npx.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/npx-pinned.json" --transport-output "$PWD/.artifacts/release-proof/transport-cold.json"
+      - name: Execute the actual principal README project flow
+        run: python3 test/public/readme.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/readme.json"
       - name: Persist compact public proof before changing selectors
         env:
           GH_TOKEN: ${{ github.token }}
@@ -270,6 +272,7 @@ jobs:
             --npx "$PWD/.artifacts/release-proof/npx-pinned.json" \
             --performance "$PWD/.artifacts/release-ops/performance.json" \
             --transport "$PWD/.artifacts/release-proof/transport-cold.json" \
+            --readme "$PWD/.artifacts/release-proof/readme.json" \
             --output "$PWD/.artifacts/release-proof/compact.json"
       - name: Promote only after all actual public gates pass
         env:

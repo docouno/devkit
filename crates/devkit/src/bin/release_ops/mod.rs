@@ -290,7 +290,7 @@ impl Proof {
     fn validate(&self, contract: &Contract) -> Result<()> {
         ensure!(self.schema_version == 1 && self.version == contract.version && self.source_commit == contract.source_commit && self.source_tree == contract.source_tree && self.index_sha256 == contract.index_sha256, "Public proof identifies a different frozen set");
         ensure!(self.publication_run.starts_with("https://github.com/docouno/devkit/actions/runs/"), "Proof must identify its Actions run");
-        ensure!(self.gates.keys().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from(["public-0.2.0", "public-0.2.1", "npx-pinned", "performance", "transport-cold"]), "Public proof is missing required gates");
+        ensure!(self.gates.keys().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from(["public-0.2.0", "public-0.2.1", "npx-pinned", "performance", "transport-cold", "readme"]), "Public proof is missing required gates");
         for (name, gate) in &self.gates {
             ensure!(SHA256_RE.is_match(&gate.sha256) && gate.bytes > 0 && gate.bytes <= 16 * 1024 * 1024, "Invalid receipt identity: {name}");
             validate_gate(name, &gate.summary, contract)?;
@@ -321,6 +321,9 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
             }
             ensure!(measurements.iter().filter(|m| m["transport"] == "curl").all(|m| m["hostLanguageSDKAttempted"] == false), "Cold curl attempted a host SDK");
         }
+        if name == "readme" {
+            ensure!(value["authenticationUsed"] == false && value["publicNpx"] == true && value["barePtyCancelled"] == true && value["standaloneWebStatePreservingHmr"] == true && value["hostLanguageSDKAttemptedForNativeCommands"] == false && value["readmeSha256"].as_str().is_some_and(|sha| SHA256_RE.is_match(sha)), "Actual public README flow is incomplete");
+        }
     }
     Ok(())
 }
@@ -328,8 +331,13 @@ fn selected(value: &Value, keys: &[&str]) -> Value {
     Value::Object(keys.iter().filter_map(|key| value.get(*key).map(|v| ((*key).into(), v.clone()))).collect())
 }
 fn compact_gate(name: &str, value: Value) -> Result<Value> {
+    if name == "readme" {
+        let mut summary = selected(&value, &["schemaVersion", "success", "version", "sourceCommit", "sourceTree", "indexSha256", "authenticationUsed", "publicNpx", "barePtyCancelled", "standaloneWebStatePreservingHmr", "hostLanguageSDKAttemptedForNativeCommands", "readmeSha256", "seconds", "limits"]);
+        summary["exampleResults"] = Value::Array(value["results"].as_array().context("README command receipts missing")?.iter().map(|v| selected(v, &["label", "passed", "durationSeconds", "exitCode"])).collect());
+        return Ok(summary);
+    }
     if name == "performance" {
-        let mut summary = selected(&value, &["schemaVersion", "success", "version", "sourceCommit", "sourceTree", "indexSha256", "buildRun", "releaseIdentity", "comparisons", "definitions", "limits", "harness", "admissionChecks"]);
+        let mut summary = selected(&value, &["schemaVersion", "success", "version", "sourceCommit", "sourceTree", "indexSha256", "buildRun", "releaseIdentity", "baseline", "durationSeconds", "comparisons", "definitions", "limits", "harness", "admissionChecks"]);
         let measurements = value["measurements"].as_array().context("Performance measurements missing")?;
         summary["measurements"] = Value::Array(measurements.iter().map(|measurement| {
             let mut item = selected(measurement, &["name", "shape", "side", "operation", "componentCount", "sampleCount", "medianSeconds", "p95Seconds", "minSeconds", "maxSeconds", "inputsBytesAndModesUnchanged"]);
@@ -412,7 +420,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let command = args.next().context("Usage: devkit-release inspect|stage|publish|record-proof|promote|hydrate --root PATH --version X.Y.Z --source-commit SHA --source-tree SHA --previous-env VERSION|none --previous-cli VERSION|none --previous-github vVERSION|none [--build-set PATH] [--output PATH]")?;
         let mut values = BTreeMap::new();
-        let allowed = ["--root", "--version", "--source-commit", "--source-tree", "--previous-env", "--previous-cli", "--previous-github", "--build-set", "--output", "--publication-run", "--public-020", "--public-021", "--npx", "--performance", "--transport", "--url", "--max-bytes"];
+        let allowed = ["--root", "--version", "--source-commit", "--source-tree", "--previous-env", "--previous-cli", "--previous-github", "--build-set", "--output", "--publication-run", "--public-020", "--public-021", "--npx", "--performance", "--transport", "--readme", "--url", "--max-bytes"];
         while let Some(key) = args.next() { ensure!(allowed.contains(&key.as_str()) && !values.contains_key(&key), "Unknown or repeated option: {key}"); let value = args.next().context("Missing option value")?; ensure!(!value.starts_with("--"), "Missing option value: {key}"); values.insert(key, value); }
         Ok(Self { command, values })
     }
@@ -468,7 +476,10 @@ pub(super) fn run() -> Result<()> {
             "stage" => stage(&mut remote, &set, &c)?,
             "publish" => publish(&mut remote, &set, &c)?,
             "record-proof" => {
-                let paths = BTreeMap::from([("public-0.2.0".into(), PathBuf::from(args.get("--public-020")?)), ("public-0.2.1".into(), PathBuf::from(args.get("--public-021")?)), ("npx-pinned".into(), PathBuf::from(args.get("--npx")?)), ("performance".into(), PathBuf::from(args.get("--performance")?)), ("transport-cold".into(), PathBuf::from(args.get("--transport")?))]);
+                let paths = BTreeMap::from([("public-0.2.0".into(), PathBuf::from(args.get("--public-020")?)), ("public-0.2.1".into(), PathBuf::from(args.get("--public-021")?)), ("npx-pinned".into(), PathBuf::from(args.get("--npx")?)), ("performance".into(), PathBuf::from(args.get("--performance")?)), ("transport-cold".into(), PathBuf::from(args.get("--transport")?)), ("readme".into(), PathBuf::from(args.get("--readme")?))]);
+                let readme: Value = serde_json::from_slice(&read_bounded(&paths["readme"], 16 * 1024 * 1024)?)?;
+                let manifest: Value = serde_json::from_slice(&set.asset_bytes("release.json")?)?;
+                ensure!(readme["readmeSha256"] == manifest["files"]["README.md"]["sha256"], "README gate did not execute the frozen public README");
                 let proof = proof_from_files(&c, args.get("--publication-run")?, &paths)?;
                 if let Some(output) = args.values.get("--output") { files::write_json(Path::new(output), &proof)?; }
                 record_proof(&mut remote, &set, &c, &proof)?;
