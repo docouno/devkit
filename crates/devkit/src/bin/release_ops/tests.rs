@@ -331,6 +331,23 @@ fn lost_upload_response_resumes_without_overwriting_any_original_bytes() {
 }
 
 #[test]
+fn existing_incomplete_draft_checks_selectors_before_any_asset_mutation() {
+    for unexpected in ["0.4.0", "0.2.0"] {
+        let fixture = Fixture::new();
+        let set = fixture.set();
+        let mut remote = fixture.remote();
+        stage(&mut remote, &set, &fixture.contract).unwrap();
+        remote.assets.remove("checksums.txt");
+        remote.selectors.environment = Some(unexpected.into());
+        let before = remote.mutations.len();
+        let assets_before = remote.assets.clone();
+        assert!(stage(&mut remote, &set, &fixture.contract).is_err());
+        assert_eq!(remote.mutations.len(), before);
+        assert_eq!(remote.assets, assets_before);
+    }
+}
+
+#[test]
 fn lost_publish_response_at_every_boundary_resumes_the_same_set() {
     for fault in ["npm:@docouno/env", "npm:@docouno/devkit", "public"] {
         let f = Fixture::new();

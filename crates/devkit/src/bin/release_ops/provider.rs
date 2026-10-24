@@ -56,7 +56,17 @@ fn npm_response(output: ProcessOutput) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-pub(super) fn require_actions() -> Result<()> {
+pub(super) fn require_event_source(source: &str, event_sha: Option<&str>) -> Result<()> {
+    ensure!(source_hash(source), "Publication requires an exact source SHA");
+    ensure!(
+        event_sha == Some(source),
+        "Frozen source must equal the authentic workflow GITHUB_SHA for npm provenance. To retry a historical release after main moves, rerun its original run: gh run rerun ORIGINAL_RUN_ID --failed; do not dispatch it from a newer commit"
+    );
+    Ok(())
+}
+
+pub(super) fn require_actions(source: &str) -> Result<()> {
+    require_event_source(source, std::env::var("GITHUB_SHA").ok().as_deref())?;
     for (key, expected) in [
         ("GITHUB_ACTIONS", "true"),
         ("GITHUB_REPOSITORY", REPO),
@@ -438,6 +448,15 @@ mod response_tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: b"provider diagnostic".to_vec(),
         }
+    }
+    #[test]
+    fn controller_publication_boundary_requires_authentic_event_source() {
+        let source = "a".repeat(40);
+        assert!(require_event_source(&source, None).is_err());
+        let different = "b".repeat(40);
+        let error = require_event_source(&source, Some(&different)).unwrap_err();
+        assert!(error.to_string().contains("rerun its original run"));
+        assert!(require_event_source(&source, Some(&source)).is_ok());
     }
     #[test]
     fn actual_absence_is_distinct_from_auth_transport_rate_limit_and_bad_json() {

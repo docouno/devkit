@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       source_commit:
-        description: Exact reviewed main commit (40 lowercase hexadecimal characters)
+        description: Exact dispatch event commit; retry historical releases through their original run
         required: true
         type: string
       previous_env:
@@ -60,6 +60,7 @@ jobs:
           import json, os, re, subprocess
           sha = os.environ['SOURCE_COMMIT']
           assert re.fullmatch('[a-f0-9]{40}', sha), 'Exact lowercase source SHA required'
+          assert os.environ.get('GITHUB_SHA') == sha, 'SOURCE_COMMIT must equal the authentic event GITHUB_SHA for npm provenance. Retry a historical release using gh run rerun ORIGINAL_RUN_ID --failed; do not dispatch it at a newer commit.'
           assert re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', os.environ['VERSION']), 'Exact stable version required'
           def api(path):
               return json.loads(subprocess.run(['gh', 'api', path], check=True, capture_output=True, text=True, timeout=90).stdout)
@@ -74,6 +75,10 @@ jobs:
           fetch-depth: 0
       - name: Prepare pinned author SDKs
         run: make setup
+      - name: Verify source admission and performance failure guards
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
       - name: Build the author-only controller
         run: |
           set -euo pipefail

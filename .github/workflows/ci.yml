@@ -23,6 +23,10 @@ jobs:
           fetch-depth: 0
       - name: Prepare pinned author SDKs
         run: make setup
+      - name: Verify source admission and performance failure guards
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
       - name: Preserve the genuine public baseline
         run: |
           set -euo pipefail

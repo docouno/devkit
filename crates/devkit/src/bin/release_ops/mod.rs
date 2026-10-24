@@ -499,6 +499,7 @@ fn guard_selectors(current: &Selectors, contract: &Contract) -> Result<()> {
 fn stage(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Result<()> {
     contract.check_index(set)?;
     check_source(remote, contract)?;
+    guard_selectors(&remote.selectors()?, contract)?;
     let existing = check_npm(remote, set, false)?;
     let release = if let Some(release) = remote.release(&contract.tag())? {
         ensure!(
@@ -511,7 +512,6 @@ fn stage(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Resu
             existing.is_empty(),
             "Registry version already exists without an original GitHub frozen set; use a new patch"
         );
-        guard_selectors(&remote.selectors()?, contract)?;
         remote.create_draft(contract)?
     };
     ensure!(
@@ -1239,7 +1239,7 @@ pub(super) fn run() -> Result<()> {
     if args.command == "hydrate" {
         set.hydrate()?;
     } else {
-        provider::require_actions()?;
+        provider::require_actions(&c.source_commit)?;
         match args.command.as_str() {
             "stage" => stage(&mut remote, &set, &c)?,
             "publish" => publish(&mut remote, &set, &c)?,
