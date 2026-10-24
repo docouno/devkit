@@ -1,328 +1,163 @@
 #!/usr/bin/env python3
-"""Bounded transport, archive and cancellation regressions for the bootstrap."""
+"""Native loader/download/archive bounds and cancellation regressions."""
 from __future__ import annotations
-
-from hashlib import sha256
-from pathlib import Path
-import io
 import gzip
-import json
+import io
 import os
-import resource
-import shutil
+from pathlib import Path
 import signal
-import socket
 import subprocess
 import tarfile
 import time
-
-from support import Harness, AUTHOR
-
-
-class Zeros:
-    def read(self, size):
-        return bytes(size)
+from support import Harness, digest, require
 
 
 class Safety(Harness):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.script.write_bytes(self.script_bytes)
-        self.bin = Path(self.env["PATH"].split(os.pathsep)[0])
-        self.audit = self.scratch / "stream-audit.jsonl"
-        self.env["STREAM_AUDIT"] = str(self.audit)
-        self.stage_audit = self.scratch / "stage-audit.jsonl"
-        self.env["STAGE_AUDIT"] = str(self.stage_audit)
-        self.stage_cursor = 0
-        # Record bounded on-disk files at the real cleanup boundary.
-        rm = self.bin / "rm"
-        rm.write_text('#!/usr/bin/python3\nimport json,os,sys\nfrom pathlib import Path\n'
-                      'for arg in sys.argv[1:]:\n'
-                      ' p=Path(arg)\n'
-                      ' if p.is_dir() and p.name.startswith("devkit-bootstrap."):\n'
-                      '  sizes={f.name:f.stat().st_size for f in p.iterdir() if f.is_file()}\n'
-                      '  with open(os.environ["STAGE_AUDIT"],"a") as out: out.write(json.dumps(sizes)+"\\n")\n'
-                      f'os.execv({shutil.which("rm")!r},[{shutil.which("rm")!r}]+sys.argv[1:])\n')
-        rm.chmod(0o755)
-        # The observers wrap real native utilities; they count transferred bytes,
-        # record cancellation, and always reap their own subprocesses.
-        template = '''#!/usr/bin/python3
-import json,os,signal,subprocess,sys
-kind=KIND
-args=sys.argv[1:]
-if kind == 'tar' and '--list' not in args: os.execv(REAL,[REAL]+args)
-child=None
-total=0
-cancelled=False
-status=None
-def cancel(sig,frame):
- global cancelled
- cancelled=True
- raise SystemExit(128+sig)
-signal.signal(signal.SIGTERM,cancel)
-try:
- child=subprocess.Popen([REAL]+args,stdout=subprocess.PIPE)
- while True:
-  data=os.read(child.stdout.fileno(),8192)
-  if not data: break
-  total+=len(data)
-  os.write(1,data)
- status=child.wait()
-except BrokenPipeError:
- status=141
-finally:
- signal.signal(signal.SIGTERM,signal.SIG_IGN)
- if child is not None and child.poll() is None:
-  child.terminate()
-  try: child.wait(timeout=3)
-  except subprocess.TimeoutExpired: child.kill(); child.wait()
- with open(os.environ['STREAM_AUDIT'],'a') as f:
-  f.write(json.dumps({'kind':kind,'bytes':total,'cancelled':cancelled,'status':status})+'\\n')
-if status: sys.exit(status)
-'''
-        for kind in ("tar", "gzip"):
-            file = self.bin / kind
-            file.write_text(template.replace("KIND", repr(kind)).replace("REAL", repr(shutil.which(kind))))
-            file.chmod(0o755)
-
-    def record(self, *args, **kwargs):
-        super().record(*args, **kwargs)
-        rows = self.stage_audit.read_text().splitlines() if self.stage_audit.exists() else []
-        stages = [json.loads(row) for row in rows[self.stage_cursor:]]
-        self.stage_cursor = len(rows)
-        for files in stages:
-            for name, size in files.items():
-                if name.endswith('.tar.gz'): assert size <= 33554433, files
-                if name == 'checksum': assert size <= 257, files
-                if name == 'preflight.metadata': assert size <= 4194305, files
-                if name == 'metadata-version': assert size <= 129, files
-        if stages:
-            self.results[-1]['stageFileBytesBeforeCleanup'] = stages
-
-    def archive(self, case, *, count=None, large=None, long_names=False):
-        file = self.scratch / (case + ".tar.gz")
-        with tarfile.open(file, "w:gz", format=tarfile.PAX_FORMAT if long_names else tarfile.USTAR_FORMAT) as tf:
-            root = tarfile.TarInfo(f"devkit-{self.version}/")
-            root.type, root.mode = tarfile.DIRTYPE, 0o755
-            tf.addfile(root)
-            if count:
-                for i in range(count):
-                    prefix = ("a" * 120 + "/") * 15 if long_names else ""
-                    info = tarfile.TarInfo(f"devkit-{self.version}/" + prefix + "file-" + str(i))
-                    info.mode = 0o644
-                    tf.addfile(info, io.BytesIO())
-            else:
-                info = tarfile.TarInfo(f"devkit-{self.version}/large")
-                info.mode, info.size = 0o644, large
-                tf.addfile(info, Zeros())
-        data = file.read_bytes()
-        Path(str(file) + ".sha256").write_text(sha256(data).hexdigest() + f"  devkit-{self.version}.tar.gz\n")
-        return file
-
-    def resource_case(self, name, file, expected, maximum_decompressed=None):
-        self.audit.unlink(missing_ok=True)
-        started = time.monotonic()
-        self.boot(name, "init", self.scratch / name, "--version", self.version, "--release-archive", file, expect=expected)
-        entries = [json.loads(s) for s in self.audit.read_text().splitlines()]
-        tar_entries = [e for e in entries if e["kind"] == "tar"]
-        assert len(tar_entries) == 1, entries
-        decompressed = sum(e["bytes"] for e in entries if e["kind"] == "gzip")
-        if maximum_decompressed is not None:
-            assert decompressed < maximum_decompressed, entries
-        self.results[-1].update(streams=entries, decompressedBytes=decompressed,
-                                elapsedSeconds=round(time.monotonic() - started, 3))
-
-    def cancellation(self):
-        original = (self.bin / "docker").read_text()
-        state = self.scratch / "cancellation-state"
-        state.mkdir()
-        self.env["REVIEW_STATE"] = str(state)
-        (self.bin / "docker").write_text('''#!/usr/bin/python3
-import json,os,sys,time
-from pathlib import Path
-p=Path(os.environ['REVIEW_STATE']); a=sys.argv[1:]
-if a[:2]==['image','inspect']:
- f=p/'inspects'; n=int(f.read_text())+1 if f.exists() else 1; f.write_text(str(n))
- sys.exit(0 if n==1 else 1)
-if a[:1]==['pull']:
- (p/'pull-pid').write_text(str(os.getpid()))
- while True: time.sleep(.1)
-if a[:1]==['run']: print('0.1.0',end=''); sys.exit(0)
-if a[:2]==['container','ls']: sys.exit(0)
-sys.exit(1)
-'''.replace("0.1.0", self.version))
-        output = self.scratch / "cancel.log"
+    def archive(self, entries):
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz', format=tarfile.GNU_FORMAT) as archive:
+            for name, kind, mode, data in entries:
+                item = tarfile.TarInfo(name)
+                item.type, item.mode, item.size = kind, mode, len(data)
+                archive.addfile(item, io.BytesIO(data))
+        return stream.getvalue()
+    def reject_archive(self, name, data):
+        self.fixture.routes[self.archive_route] = data
+        self.fixture.routes[self.archive_route + '.sha256'] = f'{digest(data)}  devkit-{self.old_version}.tar.gz\n'.encode()
+        result = self.cold_old(name, expected='devkit:')
+        require('Downloaded archive checksum mismatch' not in result.stderr, 'Archive attack stopped at transport hash rather than archive admission')
+    def cancel(self, name, argv, route):
+        self.fixture.ready.clear(); self.fixture.resume.clear()
+        original = self.fixture.routes.get(route)
+        self.fixture.routes[route] = self.fixture.stall
+        env = self.environment(name)
+        process = subprocess.Popen([str(v) for v in argv], env=env, cwd=self.scratch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        children = []
         try:
-            with output.open("w") as out:
-                child = self.spawn(["bash", str(self.script), "init", str(self.scratch / "pre-guard"),
-                                          "--version", self.version, "--release-archive", str(self.release_path)],
-                                         env=self.env, cwd=self.scratch, stdout=out, stderr=subprocess.STDOUT)
-                deadline = time.monotonic() + 15
-                while not (state / "pull-pid").exists() and child.poll() is None and time.monotonic() < deadline:
-                    time.sleep(.02)
-                assert (state / "pull-pid").exists(), output.read_text()
-                pid = int((state / "pull-pid").read_text())
-                child.send_signal(signal.SIGTERM)
-                code = child.wait(timeout=15)
-            survived = Path(f"/proc/{pid}").exists()
-            self.record("pre-guard-pull-process-group", code, output.read_text() + f"exit={code}\n", "exit=143",
-                        descendantSurvived=survived)
-            assert not survived, f"pull PID {pid} survived"
+            require(self.fixture.ready.wait(10), 'Download never reached its real TLS endpoint')
+            leaf = Path(f'/proc/{process.pid}/task/{process.pid}/children')
+            children = [int(v) for v in leaf.read_text().split()]
+            require(children, 'No real supervised download child')
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=8)
+            require(process.returncode == 143, f'Cancellation exit {process.returncode}: {stdout}{stderr}')
+            require(all(not Path(f'/proc/{pid}').exists() for pid in children), 'A supervised download child survived')
+            cache = Path(env['DEVKIT_CACHE_DIR'])
+            require(not list(cache.rglob('.engine.*')) and not list(cache.glob('.acquire-*')), 'Cancelled acquisition left partial files')
+            require(not (self.scratch / name).exists(), 'Cancelled operation wrote a project')
+            self.results.append(dict(name=name, passed=True, exitCode=process.returncode, childrenReaped=children))
+            print('PASS ' + name, flush=True)
         finally:
-            (self.bin / "docker").write_text(original)
-
-    def startup_failures(self):
-        limit = 256 * 1024 * 1024
-        def restrict():
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        for name, environment, before_exec, expected in (
-            ("producer-hard-rlimit-before-open", self.env, restrict, "cannot modify limit"),
-            ("producer-exit-before-open", dict(self.env, **{
-                "BASH_FUNC_ulimit%%": "() { printf 'producer failed before FIFO writer\\n' >&2; exit 47; }"
-            }), None, "producer failed before FIFO writer"),
-        ):
-            started = time.monotonic()
-            child = self.spawn(["bash", str(self.script), "init", str(self.scratch / name),
-                                      "--version", self.version, "--release-archive",
-                                      str(self.release_path)], env=environment,
-                                     cwd=self.scratch, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, start_new_session=True, preexec_fn=before_exec)
-            try:
-                output, _ = child.communicate(timeout=8)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGTERM)
-                child.communicate(timeout=5)
-                raise AssertionError(f"{name}: early producer failure did not return promptly")
-            elapsed = time.monotonic() - started
-            self.record(name, child.returncode, output, expected,
-                        elapsedSeconds=round(elapsed, 3), inheritedRlimitAsBytes=limit if before_exec else None)
-            assert elapsed < 5, elapsed
-            assert child.returncode == (1 if before_exec else 47), child.returncode
-
+            self.fixture.resume.set()
+            if process.poll() is None:
+                process.kill(); process.communicate(timeout=5)
+            if original is None: self.fixture.routes.pop(route, None)
+            else: self.fixture.routes[route] = original
     def execute(self):
-        self.startup_failures()
-        self.boot("startup-stream-positive", "init", self.scratch / "startup happy path", "--version", self.version,
-                  "--template", "rust", "--package-source", "local")
-        self.cancellation()
-        # The server records the denied HTTP target. Binding all local interfaces
-        # reproduces the review without touching an external server.
-        ip = next(x for x in socket.gethostbyname_ex(socket.gethostname())[2] if not x.startswith("127."))
-        seen = []
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        from threading import Thread
-        class Redirect(BaseHTTPRequestHandler):
-            def log_message(self, *args): pass
-            def do_GET(self):
-                seen.append({"host": self.headers.get("Host"), "path": self.path})
-                self.send_response(302 if self.path.startswith("/origin/") else 404)
-                if self.path.startswith("/origin/"):
-                    self.send_header("Location", f"http://{ip}:{self.server.server_address[1]}/destination")
-                self.end_headers()
-        server = ThreadingHTTPServer(("0.0.0.0", 0), Redirect)
-        Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            self.run("deny-nonloopback-http-redirect", ["bash", self.script, "init", self.scratch / "redirect",
-                     "--version", self.version, "--release-base-url", f"http://127.0.0.1:{server.server_address[1]}/origin"], "Protocol")
-            assert len(seen) == 1 and seen[0]["path"].startswith("/origin/"), seen
-            self.results[-1]["requests"] = seen
-        finally:
-            server.shutdown(); server.server_close()
-        self.resource_case("original-entry-limit", self.archive("entries-original", count=10001), "invalid archive file count")
-        self.resource_case("amplified-entry-limit", self.archive("entries-amplified", count=100000),
-                           "invalid archive file count", maximum_decompressed=20 * 1024 * 1024)
-        self.resource_case("original-expanded-limit", self.archive("large-original", large=268435457),
-                           "archive expands beyond the bootstrap limit", maximum_decompressed=2 * 1024 * 1024)
-        self.resource_case("metadata-stream-limit", self.archive("long-names", count=3000, long_names=True),
-                           "archive metadata exceeds 4194304 bytes", maximum_decompressed=16 * 1024 * 1024)
-        # A declared giant GNU long-name header must not request unbounded heap.
-        long_name = tarfile.TarInfo("././@LongLink")
-        long_name.type, long_name.size = tarfile.GNUTYPE_LONGNAME, 1024 * 1024 * 1024
-        malformed = self.scratch / "giant-header.tar.gz"
-        malformed.write_bytes(gzip.compress(long_name.tobuf(format=tarfile.GNU_FORMAT) + bytes(10240)))
-        Path(str(malformed) + ".sha256").write_text(sha256(malformed.read_bytes()).hexdigest() + f"  devkit-{self.version}.tar.gz\n")
-        self.boot("extended-header-memory-bound", "init", self.scratch / "giant-header", "--version", self.version,
-                  "--release-archive", malformed, expect="memory exhausted")
-        # No Content-Length and no --max-filesize dependency; chunks are generated
-        # lazily, so the sender itself does not allocate a large response.
-        raw_server = self.server
-        handler = raw_server.RequestHandlerClass
-        previous = handler.do_GET
-        response_bytes = {}
-        def oversized(instance):
-            if instance.path.startswith("/unbounded/"):
-                self.requests.append(instance.path)
-                instance.send_response(200)
-                instance.end_headers()
-                sent = 0
-                try:
-                    for _ in range(1024):
-                        instance.wfile.write(b"x" * 65536)
-                        instance.wfile.flush()
-                        sent += 65536
-                except (BrokenPipeError, ConnectionResetError): pass
-                response_bytes[instance.path] = sent
-            else: previous(instance)
-        handler.do_GET = oversized
-        try:
-            self.boot("unknown-length-checksum-limit", "init", self.scratch / "big-checksum", "--version", self.version,
-                      route="unbounded", expect="checksum metadata exceeds 256 bytes")
-            # Serve the real checksum, then a >32MiB unknown-length archive.
-            old = handler.do_GET
-            def archive_only(instance):
-                if instance.path.endswith(".sha256") and instance.path.startswith("/big-archive/"):
-                    self.requests.append(instance.path)
-                    data = self.routes[f"/releases/v{self.version}/devkit-{self.version}.tar.gz.sha256"]
-                    instance.send_response(200); instance.end_headers(); instance.wfile.write(data)
-                elif instance.path.startswith("/big-archive/"):
-                    instance.path = instance.path.replace("/big-archive/", "/unbounded/")
-                    oversized(instance)
-                else: old(instance)
-            handler.do_GET = archive_only
-            self.boot("unknown-length-archive-limit", "init", self.scratch / "big-archive", "--version", self.version,
-                      route="big-archive", expect="archive exceeds 33554432 bytes")
-            deadline = time.monotonic() + 2
-            while len(response_bytes) < 2 and time.monotonic() < deadline:
-                time.sleep(.01)
-            assert len(response_bytes) == 2, response_bytes
-            assert all(n < 64 * 1024 * 1024 for n in response_bytes.values()), response_bytes
-            self.results[-1]["responseBytesSent"] = response_bytes
-        finally:
-            handler.do_GET = previous
-        manifest = self.scratch / "large manifest" / ".devkit"
-        manifest.mkdir(parents=True)
-        (manifest / "manifest.json").write_bytes(b" " * (4 * 1024 * 1024 + 1))
-        self.boot("manifest-input-limit", "register", manifest.parent, "--app", "worker", "--template", "rust",
-                  expect="manifest exceeds metadata limit")
-        original_docker = (self.bin / "docker").read_text()
-        # Simulate an overlong daemon/stdout response; host buffer still stops at 129 bytes.
-        (self.bin / "docker").write_text('#!/usr/bin/python3\nimport os,sys\n'
-                                       'if sys.argv[1:3] == ["image","inspect"]: sys.exit(0)\n'
-                                       'if sys.argv[1:3] == ["container","ls"]: sys.exit(0)\n'
-                                       'if sys.argv[1:2] == ["run"]: os.write(1,b"x"*1024); sys.exit(0)\n'
-                                       'sys.exit(1)\n')
-        try:
-            self.boot("metadata-output-limit", "register", manifest.parent, "--app", "worker", "--template", "rust",
-                      expect="version metadata exceeds 128 bytes")
-        finally:
-            (self.bin / "docker").write_text(original_docker)
-        # A stalled native reader is bounded by the actual 60-second deadline.
-        original_tar = (self.bin / "tar").read_text()
-        stalled_pid = self.scratch / "stalled-tar.pid"
-        (self.bin / "tar").write_text('#!/usr/bin/python3\nimport os,sys,time\nfrom pathlib import Path\n'
-                                     f'if "--list" not in sys.argv: os.execv({shutil.which("tar")!r},[{shutil.which("tar")!r}]+sys.argv[1:])\n'
-                                     f'Path({str(stalled_pid)!r}).write_text(str(os.getpid()))\n'
-                                     'while True: time.sleep(.1)\n')
+        self.script.write_bytes((self.build_set / 'install.sh').read_bytes())
+        real_engine = self.fixture.routes[self.engine_route]
+        for name, body, expected in [('missing-native-ELF', None, '404'), ('corrupt-native-ELF', real_engine[:-1] + bytes([real_engine[-1] ^ 1]), 'checksum differs'), ('truncated-native-ELF', real_engine[:128], 'checksum differs')]:
+            self.fixture.routes[self.engine_route] = body
+            self.boot(name, '--version', expected=expected)
+            cache = self.scratch / ('cache ' + name)
+            require(not list(cache.rglob('devkit')) and not list(cache.rglob('.engine.*')), 'Bad ELF became a cached engine')
+        self.fixture.routes[self.engine_route] = real_engine
+        self.cancel('cancel-initial-curl', ['sh', self.script, '--version'], self.engine_route)
+        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.old_version, '--app', 'api=rust-api', '--non-interactive'], self.old_base + '/release.json')
+        # The native HTTP reader has one bounded path for known/unknown lengths.
+        def unknown(handler):
+            handler.send_response(200); handler.send_header('Connection', 'close'); handler.end_headers()
+            try: handler.wfile.write(b'x' * 4096); handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError): pass
+            handler.close_connection = True
+        self.fixture.routes['/unknown-length'] = unknown
+        output = self.scratch / 'fetch-output'
+        self.run('unknown-length-native-byte-limit', [self.engine, 'internal', 'fetch', '--url', 'https://github.com/unknown-length', '--output', output, '--max-bytes', '128'], expected='byte budget')
+        require(not output.exists(), 'Rejected download left partial output')
+        def redirect(handler):
+            handler.send_response(302); handler.send_header('Location', 'http://127.0.0.1:1/denied'); handler.send_header('Content-Length', '0'); handler.end_headers()
+        self.fixture.routes['/downgrade'] = redirect
+        self.run('deny-HTTP-redirect', [self.engine, 'internal', 'fetch', '--url', 'https://github.com/downgrade', '--output', output, '--max-bytes', '128'], expected='devkit:')
+        require(not output.exists(), 'Downgrade published a file')
+        self.fixture.routes['/deadline'] = self.fixture.stall
         started = time.monotonic()
+        self.run('native-reader-deadline', [self.engine, 'internal', 'fetch', '--url', 'https://github.com/deadline', '--output', output, '--max-bytes', '128'], expected='devkit:', timeout=16)
+        require(time.monotonic() - started < 15 and not output.exists(), 'Stalled reader outlived its bound')
+        self.fixture.resume.set()
+        original_archive = self.fixture.routes[self.archive_route]
+        original_checksum = self.fixture.routes[self.archive_route + '.sha256']
+        self.fixture.routes[self.archive_route] = None
+        self.cold_old('missing-release-archive', expected='devkit:')
+        def partial(handler):
+            handler.send_response(200); handler.send_header('Content-Length', str(len(original_archive))); handler.end_headers()
+            handler.wfile.write(original_archive[:128]); handler.wfile.flush(); handler.close_connection = True
+        self.fixture.routes[self.archive_route] = partial
+        self.cold_old('truncated-HTTP-archive', expected='devkit:')
+        self.fixture.routes[self.archive_route] = original_archive
+        self.fixture.routes[self.archive_route + '.sha256'] = f"{'0' * 64}  devkit-{self.old_version}.tar.gz\n".encode()
+        self.cold_old('archive-checksum-mismatch', expected='checksum mismatch')
+        self.fixture.routes[self.archive_route + '.sha256'] = original_checksum
+        prefix = f'devkit-{self.old_version}/'
+        base = [(prefix, tarfile.DIRTYPE, 0o755, b'')]
+        for name, path, kind, mode in (
+            ('traversal', prefix + '../escape', tarfile.REGTYPE, 0o644),
+            ('absolute', '/tmp/escape', tarfile.REGTYPE, 0o644),
+            ('newline', prefix + 'a\nb', tarfile.REGTYPE, 0o644),
+            ('symlink', prefix + 'link', tarfile.SYMTYPE, 0o755),
+            ('hardlink', prefix + 'link', tarfile.LNKTYPE, 0o644),
+            ('fifo', prefix + 'pipe', tarfile.FIFOTYPE, 0o644),
+            ('device', prefix + 'device', tarfile.CHRTYPE, 0o644),
+            ('setuid', prefix + 'mode', tarfile.REGTYPE, 0o4755),
+            ('wrong-root', 'other/file', tarfile.REGTYPE, 0o644)):
+            self.reject_archive(name, self.archive(base + [(path, kind, mode, b'')]))
+        item = (prefix + 'duplicate', tarfile.REGTYPE, 0o644, b'a')
+        self.reject_archive('duplicate-entry', self.archive(base + [item, item]))
+        self.reject_archive('native-entry-budget', self.archive(base + [(prefix + str(i), tarfile.REGTYPE, 0o644, b'') for i in range(16385)]))
+        # Giant declared sizes exercise admission without creating giant fixture files.
+        for name, kind, size in [('native-file-budget', tarfile.REGTYPE, 64 * 1024 * 1024 + 1), ('extended-header-bound', tarfile.GNUTYPE_LONGNAME, 1024 * 1024 * 1024)]:
+            header = tarfile.TarInfo(prefix + 'giant')
+            header.type, header.mode, header.size = kind, 0o644, size
+            self.reject_archive(name, gzip.compress(header.tobuf(format=tarfile.GNU_FORMAT) + bytes(10240)))
+        long_path = prefix + ('a' * 120 + '/') * 36 + 'file'
+        self.reject_archive('metadata-path-budget', self.archive(base + [(long_path, tarfile.REGTYPE, 0o644, b'')]))
+        class Zeros:
+            def read(self, size):
+                return bytes(size)
+        expanded = io.BytesIO()
+        with tarfile.open(fileobj=expanded, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+            for index in range(5):
+                item = tarfile.TarInfo(prefix + f'large-{index}')
+                item.mode, item.size = 0o644, 60 * 1024 * 1024
+                archive.addfile(item, Zeros())
+        self.reject_archive('native-expanded-budget', expanded.getvalue())
+        # Interrupt the actual in-process archive reader, with no external tar.
+        env = self.environment('cancel-native-extraction')
+        target = self.scratch / 'cancel-native-extraction'
+        process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.old_version,
+            '--app', 'api=rust-api', '--non-interactive'], cwd=self.scratch, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            self.boot("preflight-deadline", "init", self.scratch / "stalled", "--version", self.version,
-                      "--release-archive", self.release_path, expect="archive preflight timed out")
-            elapsed = time.monotonic() - started
-            assert 58 <= elapsed <= 75, elapsed
-            pid = int(stalled_pid.read_text())
-            assert not Path(f"/proc/{pid}").exists(), f"stalled worker {pid} survived"
-            self.results[-1].update(elapsedSeconds=round(elapsed, 3), descendantSurvived=False)
+            deadline = time.monotonic() + 10
+            cache = Path(env['DEVKIT_CACHE_DIR'])
+            while not list(cache.glob('.acquire-*/.devkit-extract-*/payload')) and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.001)
+            require(list(cache.glob('.acquire-*/.devkit-extract-*/payload')), 'Native extraction was never observed')
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=8)
+            require(process.returncode == 143, f'Archive cancellation exit {process.returncode}: {stdout}{stderr}')
+            require(not target.exists() and not list(cache.glob('.acquire-*')), 'Cancelled extraction left files')
+            self.results.append(dict(name='cancel-native-extraction', passed=True, exitCode=143))
+            print('PASS cancel-native-extraction', flush=True)
         finally:
-            (self.bin / "tar").write_text(original_tar)
-        self.record("no-host-language-sdk", 0, "No host Node/npm/Rust executable was invoked.\n")
-        assert not self.forbidden.exists()
-        self.owned_cleanup()
+            if process.poll() is None: process.kill(); process.communicate(timeout=5)
+        valid = self.legacy.read_bytes()
+        # CRC/truncation reach the actual native reader with a matching transport hash.
+        changed = bytearray(valid); changed[-8] ^= 1
+        self.reject_archive('native-CRC', bytes(changed))
+        self.reject_archive('native-truncated-gzip', valid[:-1])
+        # Oversized metadata is refused before any project write or SDK process.
+        project = self.scratch / 'oversized manifest'
+        (project / '.devkit').mkdir(parents=True)
+        (project / '.devkit/manifest.json').write_bytes(b' ' * (4 * 1024 * 1024 + 1))
+        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='devkit:')
+        require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')

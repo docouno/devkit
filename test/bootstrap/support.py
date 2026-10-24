@@ -1,417 +1,208 @@
 #!/usr/bin/env python3
-"""Shared HTTP fixture for packaged bootstrap verification."""
+"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable 0.2 archive."""
 from __future__ import annotations
-
-import re
-
-from hashlib import sha256
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from threading import Event, Thread
-import io
+import hashlib
+import http.server
 import json
 import os
+import resource
+from pathlib import Path
 import shutil
 import signal
+import socketserver
+import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 
-
-HERE = Path(__file__).resolve().parent
-AUTHOR = HERE.parents[1]
+AUTHOR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(AUTHOR / 'test/delivery'))
+from test_delivery import HttpsFixture  # noqa: E402
 
 
 def require(value, message):
     if not value:
-        raise RuntimeError(message)
+        raise AssertionError(message)
 
 
-def release_version(path):
-    require(path.is_file(), f"Missing release archive: {path}")
-    with tarfile.open(path, "r:gz") as archive:
-        manifests = [entry for entry in archive.getmembers() if re.fullmatch(r"devkit-[^/]+/release\.json", entry.name)]
-        require(len(manifests) == 1 and manifests[0].isfile(), "Expected one release manifest")
-        version = json.load(archive.extractfile(manifests[0]))["version"]
-    require(isinstance(version, str) and re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-z0-9][a-z0-9.-]*)?", version), "Invalid fixture release version")
-    require(Path(str(path) + ".sha256").read_text() == f"{sha256(path.read_bytes()).hexdigest()}  devkit-{version}.tar.gz\n", "Release fixture checksum differs")
-    return version
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class Fixture:
+    """CONNECT is confined to github.com and is terminated locally with a test CA."""
+    def __init__(self, directory):
+        self.cert = HttpsFixture(directory)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(str(directory / 'server.pem'), str(directory / 'server.key'))
+        self.routes = {}
+        self.requests = []
+        self.ready = threading.Event()
+        self.resume = threading.Event()
+        fixture = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                fixture.requests.append(self.path)
+                value = fixture.routes.get(self.path)
+                if callable(value):
+                    value(self)
+                    return
+                if value is None:
+                    self.send_response(404); self.send_header('Content-Length', '0'); self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(value)))
+                self.end_headers()
+                try:
+                    self.wfile.write(value)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                    pass
+        class ProxyHandler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    self.request.settimeout(15)
+                    header = bytearray()
+                    while not header.endswith(b'\r\n\r\n'):
+                        byte = self.request.recv(1)
+                        if not byte:
+                            return
+                        header.extend(byte)
+                        require(len(header) <= 16384, 'Proxy request exceeded its bound')
+                    require(bytes(header).split(b'\r\n')[0] == b'CONNECT github.com:443 HTTP/1.1', 'Unexpected proxy authority')
+                    self.request.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                    with fixture.context.wrap_socket(self.request, server_side=True) as secure:
+                        Handler(secure, self.client_address, self.server)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError, TimeoutError):
+                    pass
+        class Proxy(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+        self.server = Proxy(('127.0.0.1', 0), ProxyHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
+        self.thread.start()
+    def stall(self, handler):
+        handler.send_response(200)
+        handler.send_header('Content-Length', '128')
+        handler.end_headers(); handler.wfile.flush()
+        self.ready.set()
+        self.resume.wait(20)
+        handler.close_connection = True
+    def close(self):
+        self.resume.set()
+        self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=2)
 
 
 class Harness:
-    def __init__(self, release, next_release, bootstrap=None, *, render_template=False):
-        self.release_path = Path(release).resolve()
-        self.next_release_path = Path(next_release).resolve()
-        self.version = release_version(self.release_path)
-        self.next_version = release_version(self.next_release_path)
-        self.modular = tuple(int(part) for part in self.version.split("-", 1)[0].split(".")) >= (0, 2, 0)
-        require(self.version != self.next_version, "Provide two distinct release versions")
-        self.bootstrap_version = (AUTHOR / "VERSION").read_text().strip()
-        self.release_paths = {self.version: self.release_path, self.next_version: self.next_release_path}
-        self.source_identities = {str(p): sha256(p.read_bytes()).hexdigest() for p in self.release_paths.values()}
-        if not render_template:
-            bootstrap = Path(bootstrap or AUTHOR / f".artifacts/devkit-{self.bootstrap_version}.sh").resolve()
-            require(bootstrap.is_file(), f"Build the bootstrap first: {bootstrap}")
-            self.script_bytes = bootstrap.read_bytes()
-            baked_version = re.search(rb"^  bootstrap_version='([^']+)'$", self.script_bytes, re.MULTILINE)
-            require(baked_version is not None, "Bootstrap does not declare its release version")
-            self.bootstrap_version = baked_version[1].decode("ascii")
-        template = (AUTHOR / "tooling/bootstrap.sh").read_text()
-        pins = dict(line.split("=", 1) for line in (AUTHOR / "toolchains.env").read_text().splitlines())
-        expected_script = template.replace("@@BOOTSTRAP_VERSION@@", self.bootstrap_version).replace("@@GUARD@@", (AUTHOR / "runtime/guard.sh").read_text()).replace(
-            "@@NODE_IMAGE@@", pins["DEVKIT_NODE_IMAGE"]).replace("@@NODE_VERSION@@", pins["DEVKIT_NODE_VERSION"]).encode()
-        require("@@" not in expected_script.decode(), "Bootstrap template has unresolved placeholders")
-        if render_template:
-            self.script_bytes = expected_script
-        else:
-            require(self.script_bytes == expected_script, "Built bootstrap differs from its current template, guard or pins")
-            checksum = Path(str(bootstrap) + ".sha256")
-            require(checksum.read_text() == f"{sha256(self.script_bytes).hexdigest()}  {bootstrap.name}\n", "Bootstrap checksum differs")
-        self.token = uuid.uuid4().hex
-        self.scratch = Path(tempfile.mkdtemp(prefix="devkit bootstrap test "))
-        self.logs = AUTHOR / ".artifacts/bootstrap" / self.token
+    def __init__(self, build_set, legacy_release):
+        self.build_set = Path(build_set).resolve()
+        self.payload = self.build_set / 'payload'
+        self.index = json.loads((self.build_set / 'release-index.json').read_text())
+        self.version = self.index['version']
+        self.engine = self.build_set / self.index['engine']
+        for name, identity in self.index['files'].items():
+            data = (self.build_set / name).read_bytes()
+            require(len(data) == identity['size'] and digest(data) == identity['sha256'], f'Build-set identity differs: {name}')
+        self.source_before = {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}
+        self.legacy = Path(legacy_release).resolve()
+        self.legacy_before = digest(self.legacy.read_bytes())
+        with tarfile.open(self.legacy, 'r:gz') as archive:
+            names = [e for e in archive.getmembers() if e.name.endswith('/release.json')]
+            require(len(names) == 1 and names[0].isfile(), 'Expected one genuine legacy manifest')
+            self.legacy_manifest = archive.extractfile(names[0]).read()
+        self.old_version = json.loads(self.legacy_manifest)['version']
+        require(self.old_version in ('0.2.0', '0.2.1'), 'Only published schema2 legacy releases are supported')
+        expected = f'{self.legacy_before}  devkit-{self.old_version}.tar.gz\n'
+        require(Path(str(self.legacy) + '.sha256').read_text() == expected, 'Legacy checksum differs')
+        self.temp = tempfile.TemporaryDirectory(prefix='devkit bootstrap ')
+        self.scratch = Path(self.temp.name)
+        self.logs = AUTHOR / '.artifacts/bootstrap' / uuid.uuid4().hex
         self.logs.mkdir(parents=True)
-        self.results = []
-        self.processes = []
-        self.requests = []
-        self.routes = {}
-        self.slow_started = Event()
-        self.temp = self.scratch / "bootstrap temp"
-        self.temp.mkdir()
-        blockers = self.scratch / "without host languages"
+        self.fixture = Fixture(self.scratch / 'tls')
+        self.base = '/docouno/devkit/releases/download'
+        self.engine_route = f'{self.base}/v{self.version}/{self.index["engine"]}'
+        self.fixture.routes[self.engine_route] = self.engine.read_bytes()
+        self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
+        self.old_base = f'{self.base}/v{self.old_version}'
+        self.archive_route = f'{self.old_base}/devkit-{self.old_version}.tar.gz'
+        self.fixture.routes[self.archive_route] = self.legacy.read_bytes()
+        self.fixture.routes[self.archive_route + '.sha256'] = expected.encode()
+        self.fixture.routes[self.old_base + '/release.json'] = self.legacy_manifest
+        self.forbidden = self.scratch / 'host-sdk-attempts'
+        blockers = self.scratch / 'without host SDK'
         blockers.mkdir()
-        self.forbidden = self.scratch / "host-language-attempts"
-        for name in ("node", "npm", "npx", "cargo", "rustc", "rustup", "tsc", "eslint"):
-            file = blockers / name
-            file.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$DEVKIT_FORBIDDEN_HOST_SDK_LOG"\nexit 97\n')
-            file.chmod(0o755)
-        self.docker_log = self.scratch / "docker argv.jsonl"
-        tar = shutil.which("tar")
-        tar_wrapper = blockers / "tar"
-        tar_wrapper.write_text("#!/usr/bin/python3\nimport os,sys,time\n"
-                               "if os.environ.get('PROBE_PAUSE_EXTRACTION') == '1' and '--extract' in sys.argv:\n"
-                               " open(os.environ['PROBE_EXTRACTION_STARTED'],'w').close()\n"
-                               " while True: time.sleep(1)\n"
-                               f"os.execv({tar!r},[{tar!r}]+sys.argv[1:])\n")
-        tar_wrapper.chmod(0o755)
-        docker = shutil.which("docker")
-        # Capture exact resources created by this probe, never global docker state.
-        docker_wrapper = blockers / "docker"
-        docker_wrapper.write_text("#!/usr/bin/python3\nimport json,os,sys\n"
-                                  "with open(os.environ['PROBE_DOCKER_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
-                                  f"os.execv({docker!r},[{docker!r}]+sys.argv[1:])\n")
-        docker_wrapper.chmod(0o755)
-        self.env = dict(os.environ)
-        for key in list(self.env):
-            if key.startswith(("COMPOSE_", "DEVKIT_", "npm_", "NPM_")) or key in ("NODE_OPTIONS", "NODE_PATH"):
-                self.env.pop(key)
-        self.env.update(PATH=str(blockers) + os.pathsep + os.environ["PATH"], TMPDIR=str(self.temp),
-                        PROBE_DOCKER_LOG=str(self.docker_log), DEVKIT_FORBIDDEN_HOST_SDK_LOG=str(self.forbidden))
-        for version, path in self.release_paths.items():
-            filename = f"devkit-{version}.tar.gz"
-            self.routes[f"/releases/v{version}/{filename}"] = path.read_bytes()
-            self.routes[f"/releases/v{version}/{filename}.sha256"] = Path(str(path) + ".sha256").read_bytes()
-        self.routes[f"/releases/v{self.bootstrap_version}/bootstrap.sh"] = self.script_bytes
-        archive = self.routes[f"/releases/v{self.version}/devkit-{self.version}.tar.gz"]
-        checksum = self.routes[f"/releases/v{self.version}/devkit-{self.version}.tar.gz.sha256"]
-        for route in ("corrupt", "truncated", "slow"):
-            self.routes[f"/{route}/v{self.version}/devkit-{self.version}.tar.gz"] = archive
-            self.routes[f"/{route}/v{self.version}/devkit-{self.version}.tar.gz.sha256"] = checksum
-        self.routes[f"/corrupt/v{self.version}/devkit-{self.version}.tar.gz"] = archive[:-1] + bytes([archive[-1] ^ 1])
-        probe = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                probe.requests.append(self.path)
-                body = probe.routes.get(self.path)
-                if body is None:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                try:
-                    if self.path.startswith("/truncated/") and self.path.endswith(".tar.gz"):
-                        self.wfile.write(body[:100])
-                        self.close_connection = True
-                    elif self.path.startswith("/slow/") and self.path.endswith(".tar.gz"):
-                        probe.slow_started.set()
-                        for offset in range(0, len(body), 100):
-                            self.wfile.write(body[offset:offset + 100])
-                            self.wfile.flush()
-                            time.sleep(0.03)
-                    else:
-                        self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.thread = Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.script = self.scratch / "downloaded bootstrap.sh"
-
-    def record(self, name, code, output, expect=None, **extra):
-        passed = code == 0 if expect is None else code != 0 and expect in output
-        path = self.logs / f"{len(self.results)+1:02d}-{name}.log"
-        path.write_text(output)
-        self.results.append(dict(name=name, exitCode=code, passed=passed, expectedFailure=expect,
-                                 log=path.name, **extra))
-        print(("PASS " if passed else "FAIL ") + name, flush=True)
-        if not passed:
-            raise RuntimeError(f"{name}: code={code}; expected={expect!r}\n{output[-5000:]}")
-        if list(self.temp.iterdir()):
-            raise RuntimeError(f"{name}: bootstrap staging leaked: {list(self.temp.iterdir())}")
-
-    def spawn(self, arguments, **kwargs):
-        kwargs.setdefault("start_new_session", True)
-        process = subprocess.Popen(arguments, **kwargs)
-        self.processes.append(process)
-        return process
-
-    def run(self, name, arguments, expect=None):
-        before = len(self.requests)
-        process = self.spawn([str(x) for x in arguments], env=self.env, cwd=self.scratch,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   start_new_session=True)
-        try:
-            output, _ = process.communicate(timeout=600)
-        except BaseException:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                output, _ = process.communicate(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                output, _ = process.communicate()
-            (self.logs / f"interrupted-{name}.log").write_text(output)
-            raise
-        self.record(name, process.returncode, output, expect, requests=self.requests[before:])
-        return output
-
-    def boot(self, name, *arguments, route="releases", expect=None):
-        return self.run(name, ["bash", self.script, *arguments, "--release-base-url", self.base + "/" + route], expect)
-
-    def attack(self, name, members):
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
-            for path, kind, mode in members:
-                info = tarfile.TarInfo(path)
-                info.mode = mode
-                if kind == "directory":
-                    info.type = tarfile.DIRTYPE
-                elif kind == "symlink":
-                    info.type = tarfile.SYMTYPE
-                    info.linkname = "/tmp"
-                elif kind == "hardlink":
-                    info.type = tarfile.LNKTYPE
-                    info.linkname = f"devkit-{self.version}/a"
-                elif kind == "fifo":
-                    info.type = tarfile.FIFOTYPE
-                archive.addfile(info)
-        body = buffer.getvalue()
-        base = f"/attack-{name}/v{self.version}/devkit-{self.version}.tar.gz"
-        self.routes[base] = body
-        self.routes[base + ".sha256"] = f"{sha256(body).hexdigest()}  devkit-{self.version}.tar.gz\n".encode()
-        self.boot(name, "init", self.scratch / "must not exist", "--version", self.version, route="attack-" + name,
-                  expect="devkit bootstrap:")
-
-    def wrong_embedded_version(self):
-        buffer = io.BytesIO()
-        # Synthetic three-file fixture: no existing release is unpacked or repacked.
-        with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
-            directory = tarfile.TarInfo(f"devkit-{self.version}/")
-            directory.type = tarfile.DIRTYPE
-            directory.mode = 0o755
-            archive.addfile(directory)
-            for name, data, mode in (("devkit", b"#!/bin/sh\nexit 98\n", 0o755),
-                                     ("release.json", json.dumps({"schemaVersion": 1, "version": self.next_version}).encode(), 0o644)):
-                info = tarfile.TarInfo(f"devkit-{self.version}/" + name)
-                info.mode = mode
-                info.size = len(data)
-                archive.addfile(info, io.BytesIO(data))
-        body = buffer.getvalue()
-        path = f"/wrong-version/v{self.version}/devkit-{self.version}.tar.gz"
-        self.routes[path] = body
-        self.routes[path + ".sha256"] = f"{sha256(body).hexdigest()}  devkit-{self.version}.tar.gz\n".encode()
-        self.boot("wrong-embedded-version", "init", self.scratch / "wrong version", "--version", self.version, route="wrong-version",
-                  expect="archive release version differs from requested version")
-
+        for name in ('node', 'npm', 'npx', 'cargo', 'rustc', 'rustup', 'tsc', 'eslint'):
+            path = blockers / name
+            path.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$DEVKIT_FORBIDDEN_HOST_SDK_LOG"\nexit 97\n')
+            path.chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'LC_ALL', 'TERM')}
+        self.env.update(PATH=str(blockers) + os.pathsep + self.env['PATH'], HOME=str(self.scratch / 'home'),
+            CI='true', HTTPS_PROXY=f'http://127.0.0.1:{self.fixture.server.server_address[1]}',
+            SSL_CERT_FILE=str(self.fixture.cert.root / 'ca.pem'), CURL_CA_BUNDLE=str(self.fixture.cert.root / 'ca.pem'),
+            DEVKIT_FORBIDDEN_HOST_SDK_LOG=str(self.forbidden))
+        self.script = self.scratch / 'downloaded install.sh'
+        self.results = []
+    def environment(self, name):
+        return dict(self.env, DEVKIT_CACHE_DIR=str(self.scratch / ('cache ' + name)))
+    def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None):
+        started = time.monotonic()
+        result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=self.scratch,
+            capture_output=True, text=True, timeout=timeout,
+            preexec_fn=(lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))) if memory_limit else None)
+        output = result.stdout + result.stderr
+        (self.logs / f'{len(self.results):02d}-{name}.log').write_text(output)
+        passed = result.returncode == 0 if expected is None else result.returncode != 0 and expected in output
+        self.results.append(dict(name=name, exitCode=result.returncode, passed=passed, seconds=time.monotonic() - started, addressSpaceLimit=memory_limit))
+        require(passed, f'{name}: {result.returncode}\n{output}')
+        print('PASS ' + name, flush=True)
+        require(not self.forbidden.exists(), 'Invoked host language SDK')
+        return result
+    def boot(self, name, *args, **kwargs):
+        return self.run(name, ['sh', self.script, *args], **kwargs)
+    def cold_old(self, name, *, expected=None):
+        target = self.scratch / name
+        result = self.run(name, [self.engine, 'init', target, '--to', self.old_version, '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], expected=expected, memory_limit=512 * 1024 * 1024 if expected is not None else None)
+        cache = self.scratch / ('cache ' + name)
+        require(not list(cache.glob('.acquire-*')), 'Unaccepted acquisition directory leaked')
+        if expected is not None:
+            require(not target.exists(), 'Rejected archive wrote the project')
+        return result
     def execute(self):
-        self.run("download-bootstrap-via-curl", ["curl", "-q", "--fail", "--silent", "--show-error", "--output",
-                                                  self.script, self.base + f"/releases/v{self.bootstrap_version}/bootstrap.sh"])
-        self.run("shell-syntax", ["bash", "-n", self.script])
-        help_text = self.run("help", ["bash", self.script, "--help"])
-        require(self.bootstrap_version in help_text, "Help omitted the bootstrap release version")
-        product = self.scratch / "product with spaces and $(touch injected)"
-        init_options = ["--app", "api=rust-api", "--app", "batch=rust-api"] if self.modular else ["--template", "rust"]
-        self.boot("http-init-selected-version", "init", product, "--version", self.version, *init_options, "--package-source", "local")
-        state = json.loads((product / ".devkit/manifest.json").read_text())
-        require(state["version"] == self.version, "Init accepted an unexpected release version")
-        require(not self.modular or state["schemaVersion"] >= 2, "A modular release generated an old manifest schema")
-        require(not self.modular or (product / "apps/batch/Cargo.toml").is_file(), "Repeated --app did not reach the factory")
-        assert not (self.scratch / "injected").exists()
-        source = product / "apps/api/src/main.rs"
-        source.write_text(source.read_text() + "\n// Preserve this product source.\n")
-        (product / ".env").write_text("PRODUCT_SENTINEL=preserve\n")
-        preserved = {p: p.read_bytes() for p in (source, product / ".env", product / "Makefile", product / "compose.yaml")}
-        if self.modular:
-            self.boot("http-add-app-accepted-version", "add-app", product, "--name", "background", "--template", "rust-api")
-            require(all(f"v{self.version}/" in path for path in self.results[-1]["requests"]), "Add-app did not use accepted release")
-            self.boot("http-add-package-accepted-version", "add-package", product, "--name", "client", "--template", "react-client")
-            require(all(f"v{self.version}/" in path for path in self.results[-1]["requests"]), "Add-package did not use accepted release")
-            require((product / "apps/background/Cargo.toml").is_file(), "Add-app omitted Rust application")
-            require((product / "packages/client/package.json").is_file(), "Add-package omitted shared package")
-            require(source.read_bytes() == preserved[source] and (product / ".env").read_bytes() == preserved[product / ".env"], "Adding a component changed product files")
-            preserved = {p: p.read_bytes() for p in preserved}
-        self.boot("http-update-selected-version", "update", product, "--version", self.next_version)
-        assert json.loads((product / ".devkit/manifest.json").read_text())["version"] == self.next_version
-        assert all(p.read_bytes() == data for p, data in preserved.items())
-        self.boot("recover-needs-explicit-version", "recover", product, expect="recover requires explicit --version")
-        self.boot("http-recover-no-pending", "recover", product, "--version", self.next_version)
-        shutil.copytree(product / "apps/api", product / "apps/worker")
-        self.boot("accepted-version-mismatch", "register", product, "--version", self.version, "--app", "worker", "--template", "rust",
-                  expect="this action requires the project accepted version")
-        profile_options = ["--profile", "rust"] if self.modular else ["--template", "rust"]
-        self.boot("accepted-version-selected", "register", product, "--app", "worker", *profile_options)
-        assert self.results[-1]["requests"] == [f"/releases/v{self.next_version}/devkit-{self.next_version}.tar.gz.sha256", f"/releases/v{self.next_version}/devkit-{self.next_version}.tar.gz"]
-        for name, value, expected in (
-            ("compact-json", '{"schemaVersion":1,"version":"0.1.1"}', "devkit:"),
-            ("nested-json-version", '{"noise":{"version":"9.9.9"},"version":"0.1.1","schemaVersion":1}', "devkit:"),
-            ("duplicate-json-last-wins", '{"schemaVersion":1,"version":"9.9.9","version":"0.1.1"}', "devkit:"),
-            ("invalid-json-version-type", '{"schemaVersion":1,"version":3}', "invalid project version/schema"),
-            ("unsupported-json-schema", '{"schemaVersion":99,"version":"0.1.1"}', "invalid project version/schema"),
-            ("invalid-json", '{"schemaVersion":1,"version":', "SyntaxError"),
-        ):
-            root = self.scratch / name
-            (root / ".devkit").mkdir(parents=True)
-            (root / ".devkit/manifest.json").write_text(value.replace("0.1.1", self.next_version))
-            self.boot(name, "register", root, "--app", "worker", "--template", "rust", expect=expected)
-            if expected == "devkit:":
-                assert all(f"v{self.next_version}/" in path for path in self.results[-1]["requests"])
-            else:
-                assert not self.results[-1]["requests"]
-        for name, route, expected in (("missing-release", "missing", "404"), ("corrupt-archive", "corrupt", "archive checksum mismatch"),
-                                      ("interrupted-http-response", "truncated", "bytes missing")):
-            self.boot(name, "init", self.scratch / name, "--version", self.version, "--template", "rust", route=route, expect=expected)
-        root = (f"devkit-{self.version}/", "directory", 0o755)
-        base = [root, (f"devkit-{self.version}/a", "file", 0o644)]
-        for name, member in (
-            ("traversal", (f"devkit-{self.version}/../escape", "file", 0o644)),
-            ("absolute-path", ("/tmp/escape", "file", 0o644)),
-            ("newline-path", (f"devkit-{self.version}/a\nb", "file", 0o644)),
-            ("symlink", (f"devkit-{self.version}/b", "symlink", 0o777)),
-            ("hardlink", (f"devkit-{self.version}/b", "hardlink", 0o644)),
-            ("fifo", (f"devkit-{self.version}/b", "fifo", 0o644)),
-            ("setuid-mode", (f"devkit-{self.version}/b", "file", 0o4755)),
-            ("wrong-root", ("another-release/b", "file", 0o644)),
-            ("duplicate-entry", (f"devkit-{self.version}/a", "file", 0o644)),
-        ):
-            self.attack(name, base + [member])
-        self.wrong_embedded_version()
-        self.boot("local-archive-without-http", "init", self.scratch / "offline rust", "--version", self.version, "--template", "rust", "--package-source", "local",
-                  "--release-archive", self.release_path)
-        assert not self.results[-1]["requests"]
-        before = len(self.requests)
-        process = self.spawn(["bash", str(self.script), "init", str(self.scratch / "cancelled"), "--version", self.version, "--template", "rust",
-                                    "--release-base-url", self.base + "/slow"], env=self.env, cwd=self.scratch,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        assert self.slow_started.wait(10)
-        process.send_signal(signal.SIGTERM)
-        output, _ = process.communicate(timeout=15)
-        self.record("cancel-download-cleanup", process.returncode, output + f"exit={process.returncode}\n", "exit=143", requests=self.requests[before:])
-        assert not (self.scratch / "cancelled").exists()
-        marker = self.scratch / "extraction started"
-        environment = dict(self.env, PROBE_PAUSE_EXTRACTION="1", PROBE_EXTRACTION_STARTED=str(marker))
-        process = self.spawn(["bash", str(self.script), "init", str(self.scratch / "extract cancelled"), "--version", self.version,
-                                    "--template", "rust", "--release-base-url", self.base + "/releases"], env=environment,
-                                   cwd=self.scratch, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        deadline = time.monotonic() + 10
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert marker.exists(), "extraction phase did not start"
-        process.send_signal(signal.SIGTERM)
-        output, _ = process.communicate(timeout=15)
-        self.record("cancel-extraction-supervision", process.returncode, output + f"exit={process.returncode}\n", "exit=143")
-        assert not (self.scratch / "extract cancelled").exists()
-        assert not self.forbidden.exists()
-        self.record("no-host-language-sdk", 0, "No host Node/npm/Rust executable was invoked.\n")
-        self.owned_cleanup()
-
-    def owned_containers(self):
-        names = {}
-        for line in self.docker_log.read_text().splitlines() if self.docker_log.exists() else []:
-            args = json.loads(line)
-            if "--name" in args:
-                labels = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "--label"]
-                tokens = [label.split("=", 1)[1] for label in labels if label.startswith("io.docouno.devkit.invocation=")]
-                if len(tokens) == 1:
-                    names[args[args.index("--name") + 1]] = tokens[0]
-        return names
-
-    def container_present(self, name):
-        listed = subprocess.run(["docker", "container", "ls", "--all", "--filter", f"name=^/{name}$",
-                                 "--format", "{{.Names}}"], capture_output=True, text=True, timeout=20)
-        require(listed.returncode == 0, f"Cannot verify container cleanup: {listed.stderr.strip()}")
-        require(listed.stdout.strip() in ("", name), f"Unexpected exact-name listing for {name}")
-        return bool(listed.stdout.strip())
-
-    def owned_cleanup(self):
-        names = sorted(self.owned_containers())
-        remaining = []
-        for name in names:
-            if self.container_present(name):
-                remaining.append(name)
-        assert not remaining, f"Owned container cleanup failed: {remaining}"
-        self.record("exact-owned-containers-cleaned", 0, f"Verified absent {len(names)} exact created containers.\n", ownedNames=names)
-
-    def finish(self, success):
-        initially_successful = success
-        cleanup_problems = []
-        for process in self.processes:
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
-                try:
-                    process.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-        for name, token in self.owned_containers().items():
-            try:
-                if not self.container_present(name):
-                    continue
-            except (RuntimeError, subprocess.TimeoutExpired) as error:
-                cleanup_problems.append(str(error))
-                continue
-            inspected = subprocess.run(["docker", "container", "inspect", name], capture_output=True, text=True, timeout=20)
-            if inspected.returncode != 0:
-                cleanup_problems.append(f"Cannot inspect owned container: {name}")
-            else:
-                labels = json.loads(inspected.stdout)[0]["Config"].get("Labels", {})
-                if labels.get("io.docouno.devkit.invocation") != token:
-                    cleanup_problems.append(f"Refused mismatched container identity: {name}")
-                else:
-                    removed = subprocess.run(["docker", "rm", "--force", name], capture_output=True, text=True, timeout=20)
-                    cleanup_problems.append(f"Container survived its guard: {name}; cleanup exit {removed.returncode}")
-        self.server.shutdown()
-        self.server.server_close()
-        for path, expected in self.source_identities.items():
-            if sha256(Path(path).read_bytes()).hexdigest() != expected:
-                success = False
-                self.results.append(dict(name="source-archive-unchanged", passed=False, path=path))
-                cleanup_problems.append(f"Source archive changed during verification: {path}")
-        if cleanup_problems:
-            success = False
-        (self.logs / "receipt.json").write_text(json.dumps(dict(
-            success=success, releaseVersion=self.version, nextReleaseVersion=self.next_version, results=self.results,
-            sourceArtifacts=self.source_identities, cleanupProblems=cleanup_problems,
-            scriptSha256=sha256(self.script_bytes).hexdigest()), indent=2) + "\n")
-        if success:
-            shutil.rmtree(self.scratch)
-        print(f"Evidence: {self.logs}; scratch: {'removed' if success else self.scratch}", flush=True)
-        if initially_successful and cleanup_problems:
-            raise RuntimeError("; ".join(cleanup_problems))
+        self.run('download-versioned-loader', ['curl', '--disable', '--fail', '--silent', '--show-error', '--output', self.script,
+            f'https://github.com{self.base}/v{self.version}/install.sh'])
+        require(self.script.read_bytes() == (self.build_set / 'install.sh').read_bytes(), 'Downloaded loader bytes differ')
+        self.run('shell-syntax', ['sh', '-n', self.script])
+        target = self.scratch / 'product $(touch injected) with spaces'
+        env = self.environment('native-current')
+        self.boot('raw-ELF-bootstrap-init', 'init', target, '--app', 'api=rust-api', '--release-root', self.payload,
+            '--package-source', 'local', '--non-interactive', env=env)
+        state = json.loads((target / '.devkit/manifest.json').read_text())
+        require(state['version'] == self.version and not (self.scratch / 'injected').exists(), 'Wrong accepted version or shell expansion')
+        self.boot('cached-bootstrap-offline-metadata', 'describe', '--root', target, env=dict(env, HTTPS_PROXY='http://127.0.0.1:1'))
+        self.boot('recover-local-journal-no-cache', 'recover', target, env=self.environment('empty'))
+        self.cold_old('genuine-legacy-http-init')
+        legacy = self.scratch / 'genuine-legacy-http-init'
+        source = legacy / 'apps/api/src/main.rs'
+        source.write_text(source.read_text() + '\n// Preserve the product change.\n')
+        (legacy / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
+        before = {p: p.read_bytes() for p in (source, legacy / '.env', legacy / 'Makefile', legacy / 'compose.yaml')}
+        self.run('native-accepted-legacy-add', [self.engine, 'add-app', legacy, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-legacy-http-init'))
+        self.run('explicit-legacy-preview', [self.engine, 'update', legacy, '--to', self.version, '--release-root', self.payload, '--preview', '--non-interactive'])
+        self.run('explicit-legacy-native-update', [self.engine, 'update', legacy, '--to', self.version, '--release-root', self.payload, '--non-interactive'])
+        require(all(p.read_bytes() == data for p, data in before.items()), 'Migration changed product inputs')
+        require(json.loads((legacy / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+    def finish(self, passed):
+        self.fixture.close()
+        require(self.source_before == {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}, 'Modified source build-set')
+        require(digest(self.legacy.read_bytes()) == self.legacy_before, 'Modified legacy archive')
+        (self.logs / 'receipt.json').write_text(json.dumps(dict(passed=passed, cases=self.results, hostSdkAttempts=0,
+            sourceCommit=self.index['sourceCommit'], sourceTree=self.index['sourceTree'], releaseIdentity=self.index['releaseIdentity'],
+            legacyArchiveSha256=self.legacy_before, engineSha256=digest(self.engine.read_bytes()),
+            limits=['Temporary local CA/proxy; immutable input bytes. Public transport is a separate release gate.']), indent=2) + '\n')
+        self.temp.cleanup()

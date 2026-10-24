@@ -14,6 +14,6 @@
     "noEmit": true,
     "skipLibCheck": false
   },
-  "include": ["tooling/**/*.ts", "test/*.test.ts", "test/helpers/**/*.ts"],
+  "include": ["packages/env/src/*.d.ts"],
   "exclude": ["node_modules", ".artifacts", "templates"]
 }

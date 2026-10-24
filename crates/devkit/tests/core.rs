@@ -888,7 +888,8 @@ fn pinned_test_cargo(root: &Path, component: &str, args: &[&str]) -> std::proces
             "CARGO_BUILD_JOBS=1",
             "--env",
             "RUSTUP_AUTO_INSTALL=0",
-            "sha256:40481709a28aa6af42101260ce6f0c1746fc3453caa953960c279728395d4c18",
+            &std::env::var("DEVKIT_TEST_RUST_IMAGE")
+                .expect("explicit pinned DEVKIT_TEST_RUST_IMAGE for author Cargo fixture"),
             "cargo",
         ])
         .args(args)
@@ -1874,4 +1875,428 @@ fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
         fs::write(output, &bytes).unwrap();
     }
     assert_durable_transaction_trace(std::str::from_utf8(&bytes).unwrap());
+}
+
+// Ports of the source scenarios retained when the former TS factory was removed.
+#[test]
+fn author_port_same_component_basename_keeps_both_namespace_orders_and_owner_names() {
+    for package_first in [false, true] {
+        let f = TempDir::new().unwrap();
+        let release = fixture_release(f.path(), "0.3.0");
+        let target = f.path().join("consumer");
+        let first = if package_first { "starter" } else { "client" };
+        init_project(
+            &release,
+            &target,
+            &InitOptions {
+                apps: Some(vec![ComponentSpec {
+                    name: first.into(),
+                    template: "node-api".into(),
+                    uses: vec![],
+                }]),
+                package_mode: Some(PackageMode::Local),
+                ..Default::default()
+            },
+            &FixtureResolver,
+        )
+        .unwrap();
+        let original_path = format!("apps/{first}/package.json");
+        let original: Value = read_json(&target.join(&original_path)).unwrap();
+        let source_path = format!("apps/{first}/src/index.ts");
+        put(&target, &source_path, b"export const owner = 'keep';\n");
+        add_project_component(
+            &release,
+            &target,
+            Role::Library,
+            ComponentSpec {
+                name: "client".into(),
+                template: "react-client".into(),
+                uses: vec![],
+            },
+            &UpdateOptions::default(),
+            &FixtureResolver,
+        )
+        .unwrap();
+        if package_first {
+            let inventory = capture_compose_inputs(&target).unwrap();
+            add_project_component(
+                &release,
+                &target,
+                Role::App,
+                ComponentSpec {
+                    name: "client".into(),
+                    template: "node-api".into(),
+                    uses: vec![],
+                },
+                &UpdateOptions {
+                    compose_inventory: Some(&inventory),
+                    ..Default::default()
+                },
+                &FixtureResolver,
+            )
+            .unwrap();
+        }
+        let app: Value = read_json(&target.join("apps/client/package.json")).unwrap();
+        let library: Value = read_json(&target.join("packages/client/package.json")).unwrap();
+        assert_ne!(app["name"], library["name"]);
+        assert_eq!(
+            read_json::<Value>(&target.join(original_path)).unwrap()["name"],
+            original["name"]
+        );
+        assert_eq!(
+            fs::read(target.join(source_path)).unwrap(),
+            b"export const owner = 'keep';\n"
+        );
+        let state = read_project_state(&target).unwrap();
+        assert_eq!(state.components["apps/client"].role, Role::App);
+        assert_eq!(state.components["packages/client"].role, Role::Library);
+        devkit::native::assert_native_components(&target, &state).unwrap();
+    }
+}
+
+#[test]
+fn author_port_release_admission_refuses_unsafe_manifest_and_source_shapes() {
+    for case in ["parent", "symlink", "environment", "mode", "schema"] {
+        let f = TempDir::new().unwrap();
+        let release = fixture_release(f.path(), "0.3.0");
+        let outside = f.path().join("outside");
+        let loader = release.join("runtime/devkit.sh");
+        fs::write(&outside, fs::read(&loader).unwrap()).unwrap();
+        let sentinel = fs::read(&outside).unwrap();
+        let mut manifest: Value = read_json(&release.join("release.json")).unwrap();
+        match case {
+            "parent" => {
+                manifest["files"]["../outside"] = json!({"sha256":"0".repeat(64),"mode":0o644})
+            }
+            "symlink" => {
+                fs::remove_file(&loader).unwrap();
+                symlink(&outside, &loader).unwrap();
+            }
+            "environment" => manifest["environment"]["version"] = json!("0.2.0"),
+            "mode" => manifest["files"]["runtime/devkit.sh"]["mode"] = json!(0o777),
+            "schema" => manifest["schemaVersion"] = json!(2),
+            _ => unreachable!(),
+        }
+        put_json(&release, "release.json", &manifest);
+        let original = fs::read(release.join("release.json")).unwrap();
+        assert!(admit_release(&release).is_err(), "{case}");
+        let imported = f.path().join("private-cache");
+        assert!(
+            import_npm_payload(&release, &imported).is_err(),
+            "npm import: {case}"
+        );
+        assert!(
+            !imported.exists(),
+            "Rejected import published a cache: {case}"
+        );
+        assert_eq!(fs::read(release.join("release.json")).unwrap(), original);
+        assert_eq!(fs::read(&outside).unwrap(), sentinel);
+        if case == "symlink" {
+            assert_eq!(fs::read_link(&loader).unwrap(), outside);
+        }
+    }
+}
+
+#[test]
+fn author_port_opaque_product_links_survive_copy_and_native_update() {
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.2.1");
+    let new = fixture_release(f.path(), "0.3.0");
+    let source = f.path().join("opaque");
+    put(&source, "source.ts", b"export const owner = true;\n");
+    put(&source, "node_modules/cache", b"discard cache\n");
+    symlink("source.ts", source.join("source-link")).unwrap();
+    let strict = f.path().join("strict-copy");
+    assert!(copy_tree(&source, &strict, &|_| false, false).is_err());
+    let copied = f.path().join("preserved-copy");
+    copy_tree(&source, &copied, &|p| p.starts_with("node_modules"), true).unwrap();
+    assert_eq!(
+        fs::read_link(copied.join("source-link")).unwrap(),
+        PathBuf::from("source.ts")
+    );
+    assert_eq!(
+        fs::read(copied.join("source-link")).unwrap(),
+        b"export const owner = true;\n"
+    );
+    assert!(!copied.join("node_modules").exists());
+    let target = f.path().join("consumer");
+    init(&old, &target, "rust", PackageMode::Local);
+    copy_tree(
+        &source,
+        &target.join("assets"),
+        &|p| p.starts_with("node_modules"),
+        true,
+    )
+    .unwrap();
+    update_project(&new, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert_eq!(
+        fs::read_link(target.join("assets/source-link")).unwrap(),
+        PathBuf::from("source.ts")
+    );
+    assert_eq!(
+        fs::read(target.join("assets/source-link")).unwrap(),
+        b"export const owner = true;\n"
+    );
+    assert_eq!(
+        fs::read(source.join("source.ts")).unwrap(),
+        b"export const owner = true;\n"
+    );
+    assert!(!target.join("assets/node_modules").exists());
+}
+
+#[test]
+fn author_port_slug_paths_and_private_atomic_modes_keep_the_original_boundaries() {
+    assert_eq!(slug("app-42").unwrap(), "app-42");
+    for name in [
+        "../app",
+        "a--b",
+        "a-",
+        "App",
+        "a b",
+        "a;echo",
+        &"x".repeat(64),
+    ] {
+        assert!(slug(name).is_err(), "{name}");
+    }
+    for name in ["/absolute", "../parent", "a/../b", "a//b", "a\\b", "a\nb"] {
+        assert!(relative_path(name).is_err(), "{name}");
+    }
+    assert_eq!(
+        relative_path(".devkit/runtime/devkit.sh").unwrap(),
+        ".devkit/runtime/devkit.sh"
+    );
+    let f = TempDir::new().unwrap();
+    let private = f.path().join("private.json");
+    write_atomic(&private, b"before", 0o600).unwrap();
+    let before = identity(&private).unwrap().unwrap();
+    assert_eq!(before.mode, 0o600);
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_ne!(identity(&private).unwrap().unwrap(), before);
+    write_atomic(&private, b"after", 0o600).unwrap();
+    assert_eq!(fs::read(&private).unwrap(), b"after");
+    assert_eq!(identity(&private).unwrap().unwrap().mode, 0o600);
+}
+
+fn author_port_payload(root: &Path) -> BTreeMap<String, FileIdentity> {
+    file_map(root)
+        .unwrap()
+        .into_iter()
+        .filter(|(p, _)| !p.starts_with(".devkit/state/"))
+        .collect()
+}
+
+#[test]
+fn author_port_tool_profile_and_native_tool_edits_refuse_without_payload_writes() {
+    for accepted_profile in [true, false] {
+        let f = TempDir::new().unwrap();
+        let release = fixture_release(f.path(), "0.3.0");
+        let target = f.path().join("consumer");
+        init(&release, &target, "node", PackageMode::Local);
+        if accepted_profile {
+            let mut state: Value = read_json(&target.join(MANIFEST_PATH)).unwrap();
+            state["components"]["apps/main"]["toolDependencies"]["@docouno/env"] =
+                json!("tampered");
+            put_json(&target, MANIFEST_PATH, &state);
+        } else {
+            let mut manifest: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+            manifest["devDependencies"]["@docouno/env"] = json!("9.9.9");
+            put_json(&target, "apps/main/package.json", &manifest);
+        }
+        let before = author_port_payload(&target);
+        let error = update_project(
+            &release,
+            &target,
+            &UpdateOptions::default(),
+            &FixtureResolver,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if accepted_profile {
+                "Accepted tooling profile differs"
+            } else {
+                "Tool dependency conflict"
+            }),
+            "{error:#}"
+        );
+        assert_eq!(author_port_payload(&target), before);
+        assert!(!target.join(PENDING_PATH).exists());
+    }
+}
+
+#[test]
+fn author_port_register_existing_node_workspace_preserves_owner_identity_and_source() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let target = f.path().join("consumer");
+    init(&release, &target, "node", PackageMode::Local);
+    copy_tree(
+        &target.join("apps/main"),
+        &target.join("apps/existing"),
+        &|_| false,
+        true,
+    )
+    .unwrap();
+    let mut member: Value = read_json(&target.join("apps/existing/package.json")).unwrap();
+    member["name"] = json!("@adopt/existing");
+    member["owner"] = json!({"keep":true});
+    put_json(&target, "apps/existing/package.json", &member);
+    put(
+        &target,
+        "apps/existing/src/index.ts",
+        b"export const owner = 'adopted source';\n",
+    );
+    let mut root: Value = read_json(&target.join("package.json")).unwrap();
+    root["workspaces"] = json!(["apps/existing", "apps/main"]);
+    put_json(&target, "package.json", &root);
+    // Native npm fixture output for this already existing workspace member.
+    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    lock["packages"][""] = root;
+    lock["packages"]["apps/existing"] = member.clone();
+    lock["packages"]["node_modules/@adopt/existing"] =
+        json!({"resolved":"apps/existing","link":true});
+    put_json(&target, "package-lock.json", &lock);
+    let adopted = register_project_component(
+        &release,
+        &target,
+        Role::App,
+        "existing".into(),
+        ToolingProfile::Node,
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        adopted.state.components["apps/existing"].origin.template,
+        "adopted"
+    );
+    assert_eq!(
+        read_json::<Value>(&target.join("apps/existing/package.json")).unwrap(),
+        member
+    );
+    assert_eq!(
+        fs::read(target.join("apps/existing/src/index.ts")).unwrap(),
+        b"export const owner = 'adopted source';\n"
+    );
+    devkit::native::assert_native_components(&target, &adopted.state).unwrap();
+    let before = author_port_payload(&target);
+    let error = register_project_component(
+        &release,
+        &target,
+        Role::Library,
+        "invalid".into(),
+        ToolingProfile::Node,
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot register"), "{error:#}");
+    assert_eq!(author_port_payload(&target), before);
+    assert!(!target.join(PENDING_PATH).exists());
+}
+
+struct AuthorPortResolutionFailure;
+impl LockResolver for AuthorPortResolutionFailure {
+    fn regenerate(&self, _: &Path, _: &AdmittedRelease, _: Option<&str>) -> Result<()> {
+        bail!("author native npm resolution failure")
+    }
+}
+
+#[test]
+fn author_port_new_managed_collision_and_native_failures_preserve_payload_and_pending() {
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.2.1");
+    let new = fixture_release(f.path(), "0.3.0");
+    put(&new, "runtime/new-helper.sh", b"release helper\n");
+    seal(&new, "0.3.0");
+    let target = f.path().join("consumer");
+    init(&old, &target, "node", PackageMode::Local);
+    put(&target, ".devkit/runtime/new-helper.sh", b"owner helper\n");
+    let before = author_port_payload(&target);
+    let error =
+        update_project(&new, &target, &UpdateOptions::default(), &FixtureResolver).unwrap_err();
+    assert!(
+        error.to_string().contains("New managed file conflicts"),
+        "{error:#}"
+    );
+    assert_eq!(author_port_payload(&target), before);
+    assert!(!target.join(PENDING_PATH).exists());
+    fs::remove_file(target.join(".devkit/runtime/new-helper.sh")).unwrap();
+    let before = author_port_payload(&target);
+    let error = update_project(
+        &new,
+        &target,
+        &UpdateOptions::default(),
+        &AuthorPortResolutionFailure,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("author native npm resolution failure"),
+        "{error:#}"
+    );
+    assert_eq!(author_port_payload(&target), before);
+    assert!(!target.join(PENDING_PATH).exists());
+    let mut member: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    member["dependencies"] = json!({"missing-native-input":"file:../../shared/absent-package.tgz"});
+    put_json(&target, "apps/main/package.json", &member);
+    let before = author_port_payload(&target);
+    assert!(update_project(&new, &target, &UpdateOptions::default(), &FixtureResolver).is_err());
+    assert_eq!(author_port_payload(&target), before);
+    assert!(!target.join(PENDING_PATH).exists());
+}
+
+#[test]
+fn author_port_mixed_alias_keeps_api_web_wiring_and_edited_web_source_on_update() {
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.2.1");
+    let new = fixture_release(f.path(), "0.3.0");
+    for (release, version) in [(&old, "0.2.1"), (&new, "0.3.0")] {
+        put(
+            release,
+            "templates/react-web/src/main.tsx",
+            b"export const view = 'template';\n",
+        );
+        seal(release, version);
+    }
+    let target = f.path().join("consumer");
+    let state = init(&old, &target, "mixed", PackageMode::Local);
+    assert_eq!(
+        state
+            .components
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["apps/api", "apps/web"]
+    );
+    assert_eq!(
+        state.components["apps/web"]
+            .development
+            .as_ref()
+            .unwrap()
+            .api
+            .as_deref(),
+        Some("apps/api")
+    );
+    put(
+        &target,
+        "apps/web/src/main.tsx",
+        b"// Product-owned entry\nexport const view = 'edited';\n",
+    );
+    update_project(&new, &target, &UpdateOptions::default(), &FixtureResolver).unwrap();
+    assert_eq!(
+        fs::read(target.join("apps/web/src/main.tsx")).unwrap(),
+        b"// Product-owned entry\nexport const view = 'edited';\n"
+    );
+    let state = read_project_state(&target).unwrap();
+    assert_eq!(
+        state.components["apps/web"]
+            .development
+            .as_ref()
+            .unwrap()
+            .api
+            .as_deref(),
+        Some("apps/api")
+    );
+    devkit::native::assert_native_components(&target, &state).unwrap();
 }
