@@ -1,0 +1,57 @@
+name: Source and packaged consumers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare pinned author SDKs
+        run: make setup
+      - name: Preserve the genuine public baseline
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/legacy
+          curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
+          printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
+          (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
+          tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy
+      - name: Assemble one frozen test set from clean source
+        env:
+          BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: make pack output="$PWD/.artifacts/frozen" build_id=ci build_run="$BUILD_RUN"
+      - name: Source quality and complete local consumer gates
+        run: make verify build_set="$PWD/.artifacts/frozen" release="$PWD/.artifacts/frozen/payload" previous="$PWD/.artifacts/legacy/devkit-0.2.1" legacy_archive="$PWD/.artifacts/legacy/devkit-0.2.1.tar.gz"
+      - name: Measure native performance without weakening gates
+        run: |
+          set -euo pipefail
+          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
+          export DEVKIT_PERFORMANCE_TRACE_IMAGE
+          DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
+          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/legacy/devkit-0.2.1" --output "$PWD/.artifacts/performance.json"
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: source-verification
+          path: |
+            .artifacts/**/receipt.json
+            .artifacts/**/*.log
+            .artifacts/performance.json
+          retention-days: 14
+          if-no-files-found: warn
