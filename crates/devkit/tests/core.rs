@@ -888,7 +888,8 @@ fn pinned_test_cargo(root: &Path, component: &str, args: &[&str]) -> std::proces
             "CARGO_BUILD_JOBS=1",
             "--env",
             "RUSTUP_AUTO_INSTALL=0",
-            "sha256:40481709a28aa6af42101260ce6f0c1746fc3453caa953960c279728395d4c18",
+            &std::env::var("DEVKIT_TEST_RUST_IMAGE")
+                .expect("explicit pinned DEVKIT_TEST_RUST_IMAGE for author Cargo fixture"),
             "cargo",
         ])
         .args(args)
