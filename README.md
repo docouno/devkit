@@ -1,143 +1,118 @@
 # Devkit
 
-Devkit creates standalone TypeScript and Rust repositories with pinned container tools, native package managers and common Make commands. This monorepo builds `@docouno/env`, the runtime, app templates, project presets and a versioned CLI.
+A shared development environment for independent TypeScript and Rust repositories. Create applications from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
-The supported platform is **Linux with a local Docker daemon and Docker Compose**. The host needs Bash, GNU Make, coreutils, `flock`, curl and GNU tar. Node and Rust run in containers. Setup downloads dependencies; ordinary checks and builds use the accepted tools offline. Desktop development additionally needs an X11 display and authorization, or explicit headless mode.
+Requires Linux x86_64, a local Docker Engine with Compose v2, and GNU Make. Node.js is needed only for the optional npm entry point.
 
-Versioned CLI releases are available from [GitHub Releases](https://github.com/docouno/devkit/releases), and the environment package is published as [`@docouno/env`](https://www.npmjs.com/package/@docouno/env). The commands below use **0.2.1**. Its bootstrap defaults to this repository’s public release endpoint; no clone or registry credentials are needed.
+## Create a project
 
-## Create without cloning Devkit
-
-Download the bootstrap from your trusted release location and pass an exact version:
+Start the interactive CLI:
 
 ```sh
-bootstrap=$(mktemp)
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-  https://github.com/docouno/devkit/releases/download/v0.2.1/bootstrap.sh \
-  -o "$bootstrap"
-bash "$bootstrap" init /absolute/path/to/product \
-  --version 0.2.1 \
-  --app api=rust-api --app web=react-web
-cd /absolute/path/to/product
+npx @docouno/devkit@0.3.0
+```
+
+Or provide the choices explicitly:
+
+```sh
+npx @docouno/devkit@0.3.0 init my-product --app web=react-web
+cd my-product
 make setup
-make check build
-make dev
-make status
-make down
+make check
+make dev app=web
 ```
 
-The script also supports `curl … | bash -s -- init …`. Override `--release-base-url` or `DEVKIT_RELEASE_BASE_URL` only when using a different distribution endpoint. Registry mode is the default; `--package-source local` instead commits the release’s bundled npm archive for an explicit offline distribution workflow. It downloads and checks the selected archive, runs its self-contained CLI in the pinned Node container and removes temporary acquisition files. No author checkout or host language SDK is needed. HTTPS is required except for explicit loopback HTTP test servers. Checksums detect corruption; the bootstrap and release location must be trusted.
-
-The target must be new or empty, with an existing parent. Existing `.git` metadata is retained. Project/app names are lower-case slugs; pass `--name product` when the directory name is unsuitable.
-
-| Template         | Component                                                               |
-| ---------------- | ----------------------------------------------------------------------- |
-| `node-api`       | Node HTTP API, TypeScript compiler and native Node tests                |
-| `rust-api`       | Axum HTTP API, Cargo, rustfmt and Clippy                                |
-| `react-web`      | React browser app, Vite and Vitest                                      |
-| `electron-react` | Electron main/preload/React renderer, electron-vite and Linux packaging |
-| `react-client`   | Shared React library, explicit exports, compiler build and Vitest       |
-
-Repeat `--app NAME=TEMPLATE` to choose independent apps. Templates create one component; a preset also connects components. `--preset fullstack-desktop` creates a Rust API, web and Electron clients, and a shared `packages/client` UI with API adapters. Arbitrary `--app` selections do not invent service connections.
-
-## Add components during development
-
-Use the same bootstrap; add/register selects the version already accepted by the project:
+Without host Node.js:
 
 ```sh
-bash "$bootstrap" add-package "$PWD" \
-  --name client --template react-client
-bash "$bootstrap" add-app "$PWD" \
-  --name desktop \
-  --template electron-react --use client
+curl -fsSL https://github.com/docouno/devkit/releases/download/v0.3.0/install.sh | sh -s -- init my-product --app web=react-web
 ```
 
-`--use client` connects a **new** web or Electron app to an existing shared React library. Adding a package does not refactor existing application source. Existing component paths are never overwritten. To adopt code already in the project, use `register "$PWD" --app worker --profile node` (or `--package client --profile react-library`) after preparing the required native tooling. Profiles are `node`, `web`, `electron`, `react-library` and `rust`.
+Both entry points use the same native CLI. Projects record an exact release and its integrity; ordinary development commands use the verified local cache.
 
-An unpacked release offers the same commands directly through `./devkit`. Legacy init aliases `--template node|react|rust|mixed` remain supported.
+## Applications and shared packages
 
-## Generated repository
+Templates include `node-api`, `rust-api`, `react-web`, `electron-react`, and the shared `react-client` package. The `fullstack-desktop` preset combines a Rust API with web and Electron applications using one React client:
+
+```sh
+npx @docouno/devkit@0.3.0 init fullstack-product --preset fullstack-desktop
+```
 
 ```text
-Makefile                     # product-owned entry point and extra build edges
-compose.yaml                 # product-owned development overrides
-package.json                 # present for Node components; explicit npm workspaces
-package-lock.json            # one native Node workspace lock
-apps/
-  api/                       # Cargo.toml, Cargo.lock, native configuration and source
-  web/                       # package.json, Vite configuration and source
-  desktop/                   # package.json, main/preload/renderer and packaging
-packages/
-  client/                    # shared library package.json, exports and source
-.devkit/
-  manifest.json              # accepted release, components and ownership
-  project.mk                 # generated Make registration and dependency edges
-  compose.apps.yaml          # generated app services
-  compose.workspace.json     # generated writable dependency/output mounts
-  tooling-profiles.json      # accepted tool dependency sets
-  runtime/                   # versioned Make/Compose/native helpers
-  runtime.sha256
-  npm/                       # committed env archive in local package mode
-  cache/                     # ignored dependency caches
-  state/                     # ignored locks, setup receipts and image identities
+fullstack-product/
+├── Makefile
+├── compose.yaml
+├── apps/
+│   ├── api/       # Rust API
+│   ├── web/       # Web application
+│   └── desktop/   # Electron application
+└── packages/
+    └── client/    # UI and logic shared by web and desktop
 ```
 
-Only selected components are created. The root npm workspace contains Node components only; Rust uses its own Cargo manifest and lock. The shared library's native dependency edges determine prerequisite checks/builds. Generated files under `.devkit` are validated against metadata. Root Make, Compose and application code remain project-owned.
+Applications are runnable product entry points. Packages hold code reused by applications and expose it through their native public interfaces. npm components share a root workspace and lockfile; Rust components own their Cargo manifests and locks.
 
-## Daily commands
-
-| Command                           | Behavior                                                                      |
-| --------------------------------- | ----------------------------------------------------------------------------- |
-| `make setup [app=web]`            | Install the Node workspace, prepare pinned images and fetch Rust dependencies |
-| `make doctor`                     | Verify accepted metadata, installed dependencies and prepared tool images     |
-| `make check [app=web]`            | Source coverage/configuration, format, lint, types and tests                  |
-| `make test [package=client]`      | Native finite test run for the selected component                             |
-| `make build [app=web]`            | Native build, including required shared libraries                             |
-| `make fix [app=web]`              | Explicit formatter/linter edits                                               |
-| `make dev` / `make up`            | Start app services detached; `app=web` selects one                            |
-| `make dev app=desktop headless=1` | Run Electron under a container Xvfb display                                   |
-| `make package [app=desktop]`      | Build a Linux Electron directory and `.tar.gz` archive                        |
-| `make status`                     | Show actual localhost port mappings and service state                         |
-| `make logs [app=api] [tail=100]`  | Finite logs; `follow=1` enables streaming                                     |
-| `make down`                       | Stop this checkout's services and preserve data                               |
-
-`make -C /path/to/product check` works, including paths with spaces. Per-component targets include `check-web`, `build-api` and `build/packages/client`. Unknown selections and stale registration fail visibly. Checks, tests and builds mount source/configuration/locks read-only; dependency trees, caches and outputs have separate writable mounts. Fix permits source changes. Node setup is shared across the workspace even when selecting one app. Root recipes remain serial even with an inherited `-j`; native tools may parallelize internally.
-
-Electron uses a sandboxed, isolated renderer and a narrow preload bridge. GUI development forwards an authorized X11 socket without `xhost`; headless mode is explicit. Packaging is currently a Linux directory/archive, without installer signing, auto-update or macOS/Windows support. See [architecture](docs/architecture.md) for runtime limits.
-
-## Update through a reviewable diff
+Add components as the product grows:
 
 ```sh
-git switch -c chore/devkit-0.2.1
-bash "$bootstrap" update "$PWD" \
-  --version 0.2.1
-git diff
+npx @docouno/devkit@0.3.0 add-app . --name api --template rust-api
+npx @docouno/devkit@0.3.0 add-package . --name client --template react-client
+npx @docouno/devkit@0.3.0 add-app . --name desktop --template electron-react --use client
 make setup
-make check build
 ```
 
-The new release updates owned tooling, runtime and native lock integration, preserving product source, product dependencies, root Make/Compose additions and environment files. Local edits to managed files or tool-owned dependency values stop it before applying. The package source mode is retained unless explicitly changed. No automatic update runs during normal development; no Git commit, branch, PR or merge is created by the CLI.
+Use `register --help` to adopt an existing component without replacing its source.
 
-An interrupted apply blocks normal commands. `recover "$PWD" --version X.Y.Z` through the bootstrap, or `devkit recover "$PWD"` from a release, restores known pre-transaction bytes and rejects conflicting new edits. A migration from 0.1.0 adopts schema 2 and native root npm workspaces while retaining product-owned development services. See [releases and recovery](docs/releases.md).
+## Development
+
+| Command | Purpose |
+| --- | --- |
+| `make setup` | Prepare accepted images and dependencies |
+| `make check` | Check source, types, formatting, lint and applicable native gates |
+| `make test` | Run the registered components' native test suites |
+| `make build` | Build the registered components |
+| `make dev app=web` | Start one application's development service |
+| `make status` | Show services and their local ports |
+| `make down` | Stop services while preserving data volumes |
+
+Use `app=NAME` or `package=NAME` for setup, check, fix, test and build. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
+
+Checks and builds keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
+
+```sh
+npx @docouno/devkit@0.3.0 exec --component apps/web --write --network bridge -- npm install zod
+make setup
+make check
+```
+
+`make package app=desktop` builds a Linux Electron directory and archive. TypeScript uses its native compiler and linters; web uses Vite, Electron uses electron-vite, and Rust uses Cargo, rustfmt and Clippy.
+
+## Update an existing project
+
+Choose the target release, inspect the proposed changes, then apply them on a branch:
+
+```sh
+git switch -c chore/devkit-0.3.0
+npx @docouno/devkit@0.3.0 update . --to 0.3.0 --preview
+npx @docouno/devkit@0.3.0 update . --to 0.3.0
+make setup
+make check
+```
+
+Review and merge the resulting diff. Updating the CLI alone does not update a project's accepted environment. Application source, product dependencies and product-owned Make/Compose files retain their ownership; conflicting edits to managed files stop the update.
+
+After an interrupted update, `npx @docouno/devkit@0.3.0 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
+
+The native npm/curl entry points also upgrade public 0.2.0 and 0.2.1 projects. Use the new entry point for this migration.
+
+## CLI and automation
+
+Use `--help` for command options. Complete arguments run without prompts; `--non-interactive` makes missing choices an error. Lifecycle and metadata commands support `--json`. Runtime tasks stream native output and preserve their exit codes.
 
 ## Develop Devkit
 
-```sh
-make setup
-make check
-make pack-next                # local 0.2.1 and 0.2.2 previews, no publication
-make verify-runtime
-make verify-rust
-make verify-bootstrap
-make verify-packaged
-make verify-registry
-make verify-public from_version=0.2.0 version=0.2.1
-```
-
-`make verify` runs the complete set. The author black-box harnesses also require Python 3. They create isolated consumers and retain evidence under ignored `.artifacts/`; no host SDK, global npm configuration or public registry is installed. `make init template=mixed target=/path/to/product` is a source-author convenience, not the consumer distribution path.
-
-See [architecture](docs/architecture.md), [research](docs/research.md), [releases](docs/releases.md) and [verification](docs/verification.md). Private team conventions and agent instructions live in the team's knowledge system. Devkit ships executable tooling and ordinary usage documentation; it contains no agent files or documentation framework.
+Run `make help` for author commands. Releases are built, tested and published through [GitHub Actions](https://github.com/docouno/devkit/actions/workflows/release.yml).
 
 ## License
 
-MIT. Bundled third-party runtime notices are included under `runtime/licenses`.
+[MIT](LICENSE). Distributed binaries include third-party notices.
