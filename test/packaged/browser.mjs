@@ -156,10 +156,17 @@ try {
   let initial;
   for (let n = 0; n < 200; n += 1) {
     initial = await readState();
-    if ((standalone || initial.apiGreeting === 'Hello, ' + name + '!') && initial.counter === 'Clicks: 1') break;
+    if (
+      (standalone || initial.apiGreeting === 'Hello, ' + name + '!') &&
+      initial.counter === 'Clicks: 1'
+    )
+      break;
     await delay(100);
   }
-  if ((!standalone && initial.apiGreeting !== 'Hello, ' + name + '!') || initial.counter !== 'Clicks: 1')
+  if (
+    (!standalone && initial.apiGreeting !== 'Hello, ' + name + '!') ||
+    initial.counter !== 'Clicks: 1'
+  )
     throw new Error('Greeting or local interaction failed: ' + JSON.stringify(initial));
   await writeFile(output + '/ready.json', JSON.stringify({ mode, initial }, null, 2));
   let after = initial;
