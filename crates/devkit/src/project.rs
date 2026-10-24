@@ -26,6 +26,54 @@ use std::{
 const LEGACY_GITIGNORE:&[u8]=b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
 const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/apps/*/dist/\n/packages/*/dist/\n/apps/*/target/\n/packages/*/target/\n/apps/*/release/\n/packages/*/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
 
+fn project_readme(name: &str, state: &ProjectState) -> String {
+    let mut text = format!(
+        "# {name}\n\nAccepted development environment: Devkit {}.\n\n\
+         ```sh\nmake setup\nmake check\nmake test\nmake build\n```\n\n\
+         ## Components\n\n",
+        state.version
+    );
+    for (path, component) in &state.components {
+        let language = if component.toolchain == Toolchain::Rust {
+            "Rust"
+        } else {
+            "Node.js"
+        };
+        let role = if component.role == Role::App {
+            "application"
+        } else {
+            "shared package"
+        };
+        text += &format!("- `{path}` — {language} {role}.\n");
+    }
+    let app = state
+        .components
+        .iter()
+        .find(|(_, component)| component.tooling_profile == ToolingProfile::Web)
+        .or_else(|| {
+            state
+                .components
+                .iter()
+                .find(|(_, component)| component.role == Role::App)
+        });
+    if let Some((path, _)) = app {
+        text += &format!(
+            "\nStart development with `make dev app={}`. `make status` shows local ports; \
+             `make down` stops the project stack and preserves data volumes.\n",
+            path.rsplit('/').next().unwrap()
+        );
+    }
+    text += &format!(
+        "\nApplication source, the root Makefile and `compose.yaml` belong to this project. \
+         Shared code lives in `packages/` and is consumed through its native public interfaces.\n\n\
+         Use the [Devkit CLI](https://github.com/docouno/devkit/blob/v{}/README.md) to add \
+         components or explicitly accept an environment update. A newer CLI does not update \
+         this project's accepted environment automatically.\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    text
+}
+
 #[derive(Clone, Debug)]
 pub struct ComponentSpec {
     pub name: String,
@@ -751,9 +799,7 @@ pub fn init_project(
         0o644,
     )?;
     write_atomic(&stage.path().join(".gitignore"), PROJECT_GITIGNORE, 0o644)?;
-    let readme = format!(
-        "# {name}\n\nRun `make setup`, then `make check build`. Apps and packages use their native commands through the root Makefile. Use the accepted release's `devkit add-app` to add an app. Product source, root Make and Compose overrides belong to this project.\n"
-    );
+    let readme = project_readme(&name, &state);
     write_atomic(&stage.path().join("README.md"), readme.as_bytes(), 0o644)?;
     write_json(&safe_path(stage.path(), MANIFEST_PATH)?, &state)?;
     assert_native_components(stage.path(), &state)?;
