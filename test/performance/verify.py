@@ -128,7 +128,7 @@ class Gate:
                 "tooling": "Separate Docker trace records wall time of the real Rust tool container invocations including their mandatory Rust gate. Its instrumented time is excluded from plain latency; residual is a diagnostic, not a compiler-speed claim.",
                 "cold": "Not measured here. This receipt covers installed warm execution. Actual cold public npx/curl transport belongs to the public verification receipt and is required separately before promotion.",
                 "inputs": "Every source/config/lock and untracked file, directories/modes/link targets. Excludes only Git, .devkit state/cache and registered component native outputs/dependency directories.",
-                "fixture": "Both real release factories create matched Rust products. Product code is replaced with identical valid std-only Rust and actual Cargo-generated locks to expose controller costs. Large closure is an identical chain of 80 local crates on both sides.",
+                "fixture": "Both real release factories create matched Rust products. Product code, template README and actual Cargo-generated locks are normalized to identical std-only fixtures to expose controller costs. Large closure is an identical chain of 80 local crates on both sides.",
             },
             "limits": {
                 "minimumSamples": 30, "warmups": args.warmups, "p95": "nearest-rank ceil(0.95*n)",
@@ -266,6 +266,10 @@ class Gate:
             (app / "src/lib.rs").write_text(
                 f"pub fn value() -> usize {{\n    {expression}\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn value_is_expected() {{\n        assert_eq!(super::value(), {closure or 1});\n    }}\n}}\n")
             (app / "Cargo.lock").unlink()
+            # Historical template prose differs; compare identical fixture inputs.
+            readme = app / "README.md"
+            readme.write_text("# Matched Rust performance fixture\n")
+            readme.chmod(0o644)
 
     def product_inputs(self, root):
         return {name: value for name, value in snapshot(root).items() if name.startswith("apps/")}

@@ -164,6 +164,26 @@ finally:
         gate.run = run
         return gate, case
 
+    def test_fixture_inputs_normalize_historical_template_readme(self):
+        args = argparse.Namespace(output=Path(tempfile.gettempdir()) / "unused-performance.json",
+                                  samples=30, warmups=2)
+        gate = Gate(args)
+        self.addCleanup(shutil.rmtree, gate.scratch)
+        readmes = []
+        for side in ("baseline", "native"):
+            root = gate.scratch / side
+            app = root / "apps/app001"
+            (app / "src").mkdir(parents=True)
+            (app / "tests").mkdir()
+            (app / "Cargo.lock").write_text("original template lock\n")
+            if side == "baseline":
+                (app / "README.md").write_text("Historical template instructions\n")
+            gate.edit_product(root, 1, 0)
+            readme = app / "README.md"
+            readmes.append((readme.read_bytes(), readme.stat().st_mode & 0o777))
+        self.assertEqual(readmes[0], readmes[1])
+        self.assertEqual(readmes[0][1], 0o644)
+
     def test_metadata_trace_rejects_unrecognized_creation_and_mutation(self):
         probes = (
             [["create", "--name", "control-probe", "--label", "io.docouno.devkit.role=control", "control-image"],
