@@ -22,7 +22,10 @@ use sha2::{Digest, Sha512};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -53,6 +56,7 @@ pub struct AssemblyOptions {
     pub npm_inputs: PathBuf,
     pub output: PathBuf,
     pub notices: PathBuf,
+    pub notice_set_sha256: String,
     pub source_commit: String,
     pub source_tree: String,
     pub build_run: String,
@@ -513,12 +517,40 @@ pub fn verify_runtime_notices(root: &Path) -> Result<()> {
 }
 
 fn git(root: &Path, args: &[&str], runner: &ProcessRunner) -> Result<String> {
+    let mut command = source_git_command(root);
     let result = runner.checked_with_timeout(
-        Command::new("git").args(args).current_dir(root),
+        command.args(args),
         OutputMode::Capture(1024 * 1024),
         Duration::from_secs(15),
     )?;
     Ok(result.text()?.trim().to_owned())
+}
+
+fn source_git_command(root: &Path) -> Command {
+    isolated_git_command(root, std::env::vars_os().map(|(name, _)| name))
+}
+
+fn isolated_git_command(
+    root: &Path,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Command {
+    let mut command = Command::new("git");
+    // Ambient locator, object, index and config controls must not redirect any
+    // source query to a different checkout or object database.
+    for name in names {
+        if name.as_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(["-c", "core.fsmonitor=false"])
+        .current_dir(root);
+    command
 }
 
 fn verify_git(options: &AssemblyOptions, root: &Path, runner: &ProcessRunner) -> Result<()> {
@@ -538,18 +570,23 @@ pub fn verify_source_checkout(
     source_tree: &str,
     runner: &ProcessRunner,
 ) -> Result<()> {
+    let root = fs::canonicalize(root).context("Canonical assembly source root")?;
     ensure!(
         source_commit.len() == 40 && source_tree.len() == 40,
         "Published assembly requires exact source identities"
     );
     ensure!(
-        git(root, &["rev-parse", "HEAD"], runner)? == source_commit
-            && git(root, &["rev-parse", "HEAD^{tree}"], runner)? == source_tree,
+        fs::canonicalize(git(&root, &["rev-parse", "--show-toplevel"], runner)?)? == root,
+        "Git checkout root differs from the assembly source root"
+    );
+    ensure!(
+        git(&root, &["rev-parse", "HEAD"], runner)? == source_commit
+            && git(&root, &["rev-parse", "HEAD^{tree}"], runner)? == source_tree,
         "Assembly source commit/tree differs from checkout"
     );
     ensure!(
         git(
-            root,
+            &root,
             &["status", "--porcelain", "--untracked-files=all"],
             runner
         )?
@@ -558,9 +595,10 @@ pub fn verify_source_checkout(
     );
     // Index flags such as assume-unchanged can hide a working-tree edit from
     // git status. Compare each regular source byte to the actual HEAD blob too.
-    let entries = git(root, &["ls-tree", "-rz", "--full-tree", "HEAD"], runner)?;
+    let entries = git(&root, &["ls-tree", "-rz", "--full-tree", "HEAD"], runner)?;
     let mut count = 0;
     let mut total = 0_u64;
+    let mut tracked = BTreeSet::new();
     for record in entries.split('\0').filter(|entry| !entry.is_empty()) {
         count += 1;
         ensure!(count <= 16_384, "Source tree exceeds its file budget");
@@ -570,7 +608,8 @@ pub fn verify_source_checkout(
             fields.len() == 3 && fields[1] == "blob" && ["100644", "100755"].contains(&fields[0]),
             "Published source must contain regular Git blobs"
         );
-        let path = safe_path(root, name)?;
+        ensure!(tracked.insert(name.to_owned()), "Duplicate Git source path");
+        let path = safe_path(&root, name)?;
         let metadata = fs::symlink_metadata(&path)?;
         total = total
             .checked_add(metadata.len())
@@ -594,6 +633,12 @@ pub fn verify_source_checkout(
         runner.check_cancelled()?;
     }
     ensure!(count > 0, "Published source tree is empty");
+    for name in source_snapshot(&root)?.keys() {
+        ensure!(
+            tracked.contains(name),
+            "Assembly source input is absent from HEAD: {name}"
+        );
+    }
     Ok(())
 }
 
@@ -736,11 +781,24 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     verify_git(options, &root, runner)?;
     let source_before = source_snapshot(&root)?;
     verify_runtime_notices(&root)?;
+    let mut settings = pins(&root)?;
+    verify_notice_set(
+        &notices,
+        &root,
+        TARGET,
+        &settings["DEVKIT_RUST_VERSION"],
+        &options.notice_set_sha256,
+    )?;
     let npm_before = file_map(&npm_inputs)?;
     let notices_before = file_map(&notices)?;
+    ensure!(
+        notices_before
+            .get("notice-set.json")
+            .is_some_and(|file| file.sha256 == options.notice_set_sha256),
+        "Notice bundle changed after producer verification"
+    );
     let inputs = verify_npm_inputs(&root, &npm_inputs)?;
     let version = inputs.version.clone();
-    let mut settings = pins(&root)?;
     verify_rust_template(&root, &settings["DEVKIT_RUST_VERSION"])?;
     let source_version = fs::read_to_string(safe_path(&root, "VERSION")?)?;
     let workspace: toml::Value =
@@ -779,7 +837,6 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
             "ELF source attribution differs from assembly source"
         );
     }
-    verify_notice_set(&notices, &root, TARGET, &settings["DEVKIT_RUST_VERSION"])?;
     if !options.local {
         let receipt: crate::notices::NoticeSet =
             read_json(&safe_path(&notices, "notice-set.json")?)?;
@@ -1027,4 +1084,47 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     runner.check_cancelled()?;
     publish_new_directory(&build_set, &output)?;
     Ok(index)
+}
+
+#[cfg(test)]
+mod source_git_tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn every_ambient_git_control_is_removed_before_explicit_read_only_defaults() {
+        let controls = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_SHALLOW_FILE",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_FUTURE_CONTROL",
+        ];
+        let command = isolated_git_command(Path::new("/source"), controls.map(OsString::from));
+        let configured = command.get_envs().collect::<BTreeMap<_, _>>();
+        for name in controls {
+            let expected = match name {
+                "GIT_CONFIG_NOSYSTEM" | "GIT_NO_REPLACE_OBJECTS" => Some(OsStr::new("1")),
+                "GIT_CONFIG_SYSTEM" | "GIT_CONFIG_GLOBAL" => Some(OsStr::new("/dev/null")),
+                "GIT_OPTIONAL_LOCKS" => Some(OsStr::new("0")),
+                _ => None,
+            };
+            assert_eq!(configured.get(OsStr::new(name)), Some(&expected), "{name}");
+        }
+    }
 }

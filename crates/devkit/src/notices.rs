@@ -576,7 +576,14 @@ pub fn collect_notices(options: &NoticeOptions, runner: &ProcessRunner) -> Resul
         files: file_map(&payload)?,
     };
     write_json(&payload.join("notice-set.json"), &receipt)?;
-    verify_notice_set(&payload, &root, &options.target, &options.rust_version)?;
+    let notice_set_sha256 = digest(fs::read(payload.join("notice-set.json"))?);
+    verify_notice_set(
+        &payload,
+        &root,
+        &options.target,
+        &options.rust_version,
+        &notice_set_sha256,
+    )?;
     ensure!(
         identity(&safe_path(&root, "Cargo.lock")?)?.as_ref() == Some(&source_lock),
         "Cargo.lock changed during notice collection"
@@ -587,7 +594,9 @@ pub fn collect_notices(options: &NoticeOptions, runner: &ProcessRunner) -> Resul
     );
     runner.check_cancelled()?;
     publish_new_directory(&payload, &output)?;
-    Ok(serde_json::to_value(receipt)?)
+    let mut result = serde_json::to_value(receipt)?;
+    result["noticeSetSha256"] = serde_json::json!(notice_set_sha256);
+    Ok(result)
 }
 
 pub fn verify_notice_set(
@@ -595,10 +604,34 @@ pub fn verify_notice_set(
     root: &Path,
     target: &str,
     rust_version: &str,
+    expected_sha256: &str,
 ) -> Result<()> {
     let directory = project_root(directory)?;
+    ensure!(
+        SHA256_RE.is_match(expected_sha256),
+        "Invalid producer notice-set digest"
+    );
+    let path = safe_path(&directory, "notice-set.json")?;
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= MAX_NOTICE_BYTES,
+        "Invalid producer notice-set receipt"
+    );
+    let bytes = fs::read(&path)?;
+    ensure!(
+        digest(&bytes) == expected_sha256,
+        "Notice bundle differs from the producer notice-set digest"
+    );
+    let receipt: NoticeSet = serde_json::from_slice(&bytes)?;
     let mut actual = file_map(&directory)?;
-    let receipt: NoticeSet = read_json(&safe_path(&directory, "notice-set.json")?)?;
+    ensure!(
+        actual
+            .get("notice-set.json")
+            .is_some_and(|file| file.sha256 == expected_sha256),
+        "Notice bundle changed during producer verification"
+    );
     ensure!(
         receipt.schema_version == 1
             && receipt.target == target

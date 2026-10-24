@@ -198,6 +198,7 @@ fn an_existing_output_is_never_replaced_even_when_it_is_empty() {
         npm_inputs: temp.path().join("missing-inputs"),
         output: output.clone(),
         notices: temp.path().join("missing-notices"),
+        notice_set_sha256: "a".repeat(64),
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
@@ -256,6 +257,7 @@ fn runtime_notices_refuse_empty_missing_and_symlinked_sources_before_staging() {
         npm_inputs: root.join("missing-prepared-inputs"),
         output: temp.path().join("unpublished-set"),
         notices: root.join("missing-cargo-notices"),
+        notice_set_sha256: "a".repeat(64),
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
@@ -306,37 +308,13 @@ fn runtime_notices_refuse_empty_missing_and_symlinked_sources_before_staging() {
 #[test]
 #[ignore = "requires Git; run the compiled static test executable on the Linux author host"]
 fn strict_source_authority_detects_edits_hidden_by_git_assume_unchanged() {
-    use std::process::Command;
     let temp = TempDir::new().unwrap();
     let root = temp.path();
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-            ])
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
+    let git = |args: &[&str]| fixture_git(root, args);
     git(&["init", "--quiet", "--initial-branch=main"]);
+    source_checkout_fixture(root);
     fs::write(root.join("source.rs"), "original source\n").unwrap();
-    git(&["add", "source.rs"]);
+    git(&["add", "."]);
     git(&["commit", "--quiet", "-m", "fixture"]);
     let commit = git(&["rev-parse", "HEAD"]);
     let tree = git(&["rev-parse", "HEAD^{tree}"]);
@@ -351,4 +329,213 @@ fn strict_source_authority_detects_edits_hidden_by_git_assume_unchanged() {
             .to_string()
             .contains("differ from HEAD")
     );
+}
+
+fn source_checkout_fixture(root: &Path) {
+    for name in [
+        "VERSION",
+        "LICENSE",
+        "README.md",
+        "toolchains.env",
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "runtime/fixture",
+        "templates/rust-api/fixture",
+        "packages/env/fixture",
+    ] {
+        write_atomic(&root.join(name), b"tracked source\n", 0o644).unwrap();
+    }
+}
+
+fn fixture_git(root: &Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+#[ignore = "requires Git; run in the pinned author builder"]
+fn source_authority_ignores_ambient_git_controls_binds_membership_and_accepts_real_worktrees() {
+    const CHILD: &str = "DEVKIT_SOURCE_AUTHORITY_TEST";
+    if let Some(raw) = std::env::var_os(CHILD) {
+        let case: Value = serde_json::from_str(raw.to_str().unwrap()).unwrap();
+        let root = Path::new(case["root"].as_str().unwrap());
+        let runner = ProcessRunner::new().unwrap();
+        let result = verify_source_checkout(
+            root,
+            case["commit"].as_str().unwrap(),
+            case["tree"].as_str().unwrap(),
+            &runner,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["accepted"].as_bool().unwrap(),
+            "{result:?}"
+        );
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("actual");
+    fs::create_dir(&root).unwrap();
+    fixture_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+    source_checkout_fixture(&root);
+    fs::write(
+        root.join(".gitignore"),
+        "templates/rust-api/ignored-extra.txt\n",
+    )
+    .unwrap();
+    fixture_git(&root, &["add", "."]);
+    fixture_git(&root, &["commit", "--quiet", "-m", "fixture"]);
+    let commit = fixture_git(&root, &["rev-parse", "HEAD"]);
+    let tree = fixture_git(&root, &["rev-parse", "HEAD^{tree}"]);
+    let runner = ProcessRunner::new().unwrap();
+    verify_source_checkout(&root, &commit, &tree, &runner).unwrap();
+
+    let shadow = temp.path().join("shadow");
+    source_checkout_fixture(&shadow);
+    fs::write(
+        shadow.join(".gitignore"),
+        "templates/rust-api/ignored-extra.txt\n",
+    )
+    .unwrap();
+    fs::write(
+        shadow.join("templates/rust-api/untracked-extra.txt"),
+        "unattributed payload\n",
+    )
+    .unwrap();
+    assert!(!shadow.join(".git").exists());
+    for (directory, accepted) in [(&root, true), (&shadow, false)] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "source_authority_ignores_ambient_git_controls_binds_membership_and_accepts_real_worktrees", "--ignored", "--nocapture"])
+            .env(CHILD, json!({"root":directory,"commit":commit,"tree":tree,"accepted":accepted}).to_string())
+            .env("GIT_DIR", root.join(".git"))
+            .env("GIT_WORK_TREE", &root)
+            .env("GIT_INDEX_FILE", temp.path().join("nonexistent-index"))
+            .env("GIT_OBJECT_DIRECTORY", temp.path().join("nonexistent-objects"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", &root)
+            .status().unwrap();
+        assert!(
+            status.success(),
+            "inherited controls must not select the source checkout"
+        );
+    }
+    assert!(!temp.path().join("nonexistent-index").exists());
+    let worktree = temp.path().join("linked");
+    fixture_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worktree.to_str().unwrap(),
+            &commit,
+        ],
+    );
+    assert!(worktree.join(".git").is_file());
+    verify_source_checkout(&worktree, &commit, &tree, &runner).unwrap();
+    assert!(
+        verify_source_checkout(&root.join("templates"), &commit, &tree, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("checkout root differs")
+    );
+    fs::write(
+        root.join("templates/rust-api/ignored-extra.txt"),
+        "ignored payload\n",
+    )
+    .unwrap();
+    assert!(fixture_git(&root, &["status", "--porcelain", "--untracked-files=all"]).is_empty());
+    assert!(
+        verify_source_checkout(&root, &commit, &tree, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("absent from HEAD")
+    );
+}
+
+#[test]
+fn assembler_requires_the_external_notice_digest_before_downstream_inputs_or_staging() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    source_checkout_fixture(&root);
+    for name in ["Apache-2.0.txt", "moby-profiles.NOTICE"] {
+        write_atomic(
+            &root.join(format!("runtime/licenses/{name}")),
+            b"Runtime license\n",
+            0o644,
+        )
+        .unwrap();
+    }
+    fs::write(root.join("toolchains.env"), format!("DEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\n", "a".repeat(64))).unwrap();
+    let notices = temp.path().join("notices");
+    fs::create_dir(&notices).unwrap();
+    let receipt_path = notices.join("notice-set.json");
+    fs::write(&receipt_path, b"{\"producer\":\"original\"}\n").unwrap();
+    let producer_digest = digest(fs::read(&receipt_path).unwrap());
+    fs::write(&receipt_path, b"changed and no longer valid JSON\n").unwrap();
+    let mut options = AssemblyOptions {
+        root,
+        engine: temp.path().join("missing-engine"),
+        npm_inputs: temp.path().join("missing-inputs"),
+        notices,
+        notice_set_sha256: producer_digest,
+        output: temp.path().join("unpublished"),
+        source_commit: String::new(),
+        source_tree: String::new(),
+        build_run: String::new(),
+        local: true,
+    };
+    let runner = ProcessRunner::new().unwrap();
+    assert!(
+        assemble(&options, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("producer notice-set digest")
+    );
+    options.notice_set_sha256.clear();
+    assert!(
+        assemble(&options, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid producer notice-set digest")
+    );
+    assert!(!options.output.exists());
+    assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".devkit-build-set-")
+    }));
 }

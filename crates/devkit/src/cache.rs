@@ -230,7 +230,7 @@ impl<'a> ReleaseCache<'a> {
         ))?;
         let target = self.engine_path(&pin)?;
         if exists(&target)? {
-            verify_engine(&target, &pin)?;
+            verify_cached_engine(&target, &pin)?;
             return Ok(());
         }
         let parent = target
@@ -245,7 +245,7 @@ impl<'a> ReleaseCache<'a> {
         let payload = stage.path().join("payload");
         fs::create_dir(&payload)?;
         write_atomic(&payload.join("devkit"), &release.bytes("devkit")?, 0o755)?;
-        verify_engine(&payload.join("devkit"), &pin)?;
+        verify_cached_engine(&payload.join("devkit"), &pin)?;
         release.recheck()?;
         self.runner.check_cancelled()?;
         let destination = target.parent().unwrap();
@@ -256,7 +256,7 @@ impl<'a> ReleaseCache<'a> {
             match fs::hard_link(payload.join("devkit"), &target) {
                 Ok(()) => sync_directory(destination)?,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_engine(&target, &pin)?;
+                    verify_cached_engine(&target, &pin)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -271,7 +271,7 @@ impl<'a> ReleaseCache<'a> {
             exists(&target)?,
             "The accepted native engine is unavailable; run make setup"
         );
-        verify_engine(&target, pin)?;
+        verify_cached_engine(&target, pin)?;
         Ok(target)
     }
     pub fn fetch(&self, url: &str, output: &Path, maximum: u64) -> Result<()> {

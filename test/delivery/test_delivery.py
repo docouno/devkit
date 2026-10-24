@@ -372,6 +372,26 @@ class ReleaseFixture:
 
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
+    def test_cached_engine_permissions_refuse_before_lifecycle_writes(self):
+        self.create()
+        accepted = self.manifest["files"]["devkit"]["sha256"]
+        cached = self.root / "cache/engines/x86_64-unknown-linux-musl" / self.version / accepted / "devkit"
+        before = digest(cached)
+        for mode in (0o644, 0o645):
+            with self.subTest(mode=oct(mode)):
+                cached.chmod(mode)
+                target = self.root / f"not-created-{mode:o}"
+                try:
+                    result = self.cli("init", target, "--app", "api=rust-api", "--name", "project",
+                                      "--release-root", RELEASE, "--package-source", "local", "--json", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(json_result(result)["ok"])
+                    self.assertFalse(target.exists())
+                    self.assertEqual(cached.stat().st_mode & 0o7777, mode)
+                    self.assertEqual(digest(cached), before)
+                finally:
+                    cached.chmod(0o755)
+
     def test_native_metadata_accepts_relative_project_roots_without_sdk(self):
         target = self.create()
         nested = target / "nested"

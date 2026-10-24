@@ -7,7 +7,14 @@ use crate::{
 };
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::Path, process::Command};
+use std::{
+    ffi::CString,
+    fs,
+    io::Read,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    path::Path,
+    process::Command,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePin {
@@ -54,11 +61,30 @@ pub fn file_digest(path: &Path) -> Result<String> {
 
 pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
     pin.validate()?;
+    let path = project_root(path)?;
     ensure!(
-        file_digest(path)? == pin.sha256,
+        fs::symlink_metadata(&path)?.is_file(),
+        "Native engine must be a regular file"
+    );
+    let encoded = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: one live C path; faccessat evaluates the current effective user's
+    // execution permission, including ACLs. A 0700 npm installation is valid.
+    ensure!(
+        unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                encoded.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0,
+        "Native engine is not executable by the current user"
+    );
+    ensure!(
+        file_digest(&path)? == pin.sha256,
         "Native engine checksum differs from accepted pin"
     );
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(&path)?;
     ensure!(
         bytes.len() >= 64
             && &bytes[..7] == b"\x7fELF\x02\x01\x01"
@@ -101,6 +127,18 @@ pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Engine-cache files are published with one canonical mode. Unlike a source
+/// npm tree, this private copy is never restricted by npm's install umask.
+pub fn verify_cached_engine(path: &Path, pin: &EnginePin) -> Result<()> {
+    let path = project_root(path)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o7777 == 0o755,
+        "Cached native engine mode differs from canonical 0755; restore the accepted executable before retrying"
+    );
+    verify_engine(&path, pin)
 }
 
 pub fn engine_build_info(path: &Path, runner: &ProcessRunner) -> Result<BuildInfo> {

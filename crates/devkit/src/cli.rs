@@ -362,7 +362,7 @@ fn dispatch_accepted(globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let path = safe_path(&root, name)?;
     ensure!(
         state.managed.get(name) == identity(&path)?.as_ref(),
-        "Managed toolchain pin conflict"
+        "Managed file conflict: {name}"
     );
     let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
     ensure!(
@@ -428,6 +428,7 @@ fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<bool> {
                     "--source-tree",
                     "--build-run",
                     "--notices",
+                    "--notice-set-sha256",
                     "--local",
                 ],
                 &[],
@@ -444,6 +445,7 @@ fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<bool> {
                     npm_inputs: options.required_path("--npm-inputs")?,
                     output: options.required_path("--output")?,
                     notices: options.required_path("--notices")?,
+                    notice_set_sha256: options.required("--notice-set-sha256")?.to_owned(),
                     source_commit: options.required("--source-commit")?.to_owned(),
                     source_tree: options.required("--source-tree")?.to_owned(),
                     build_run: options.required("--build-run")?.to_owned(),
