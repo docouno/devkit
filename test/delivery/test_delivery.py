@@ -671,7 +671,7 @@ class NpxTests(ReleaseFixture, unittest.TestCase):
         self.assertEqual(after["version"], before["version"])
         self.assertIn("apps/extra", after["components"])
 
-    def test_real_terminal_add_rust_application_uses_only_compose_inventory(self):
+    def test_real_terminal_add_rust_application_uses_only_compose_prerequisite_and_inventory(self):
         target = self.create()
         original = (target / "apps/api/src/lib.rs").read_bytes()
         original_make = (target / "Makefile").read_bytes()
@@ -702,8 +702,13 @@ class NpxTests(ReleaseFixture, unittest.TestCase):
         self.assertEqual((target / "apps/api/src/lib.rs").read_bytes(), original)
         self.assertEqual((target / "Makefile").read_bytes(), original_make)
         commands = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertTrue(commands)
-        self.assertTrue(all(argv[0] == "compose" and "config" in argv for argv in commands), commands)
+        version = ["compose", "version", "--short"]
+        def inventory(argv):
+            return argv[:1] == ["compose"] and argv[-4:] == [
+                "config", "--no-env-resolution", "--format", "json"]
+        self.assertIn(version, commands)
+        self.assertTrue(any(inventory(argv) for argv in commands), commands)
+        self.assertTrue(all(argv == version or inventory(argv) for argv in commands), commands)
         EVIDENCE.append({"case": "real-pty-add-rust", "dockerArgv": commands,
                          "acceptedReleaseIdentity": self.identity,
                          "existingCodeAndMakePreserved": True})
