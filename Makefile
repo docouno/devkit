@@ -8,7 +8,7 @@ include tooling/author.mk
 	test-env test-npm-inputs build build-fixtures npm-lock npm-inputs notices pack pack-local verify verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
-	@printf '%s\n' 'Devkit author workspace (Linux x86_64 + Docker Compose + Python 3)' \
+	@printf '%s\n' 'Devkit author workspace (Linux x86_64 + Docker Compose >=5.0.0 + Python 3)' \
 	  'make setup          Prepare pinned SDK images, native engine and npm dependencies' \
 	  'make fix-format     Apply source formatting explicitly' \
 	  'make check          Rust fmt/Clippy and env declarations/lint/format/shell checks' \

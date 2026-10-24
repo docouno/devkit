@@ -1,10 +1,44 @@
 use devkit::{
     model::ProjectState,
     projections::render_app_compose_value,
-    runtime::{ToolPins, bind_mount, development_components},
+    runtime::{ToolPins, bind_mount, development_components, validate_compose_version},
 };
 use serde_json::json;
 use std::path::Path;
+#[test]
+fn compose_requires_fixed_stable_env_resolution_and_accepts_desktop_packaging() {
+    for version in [
+        "5.0.0",
+        "v5.0.0\n",
+        "5.6.0",
+        "v5.6.0-desktop.1",
+        "6.0.0+build.1",
+    ] {
+        validate_compose_version(version).unwrap();
+    }
+    for version in [
+        "2.38.2",
+        "v2.40.3",
+        "5.0.0-rc.2",
+        "5.6.0-beta.1",
+        "5.0",
+        "05.0.0",
+        "5.0.0-desktop.01",
+        "5.0.0 trailing",
+        "5.0.0\n2.38.2",
+        "snapshot-regression",
+        "",
+        "18446744073709551616.0.0",
+    ] {
+        assert!(
+            validate_compose_version(version)
+                .unwrap_err()
+                .to_string()
+                .contains("Compose >=5.0.0"),
+            "{version}"
+        );
+    }
+}
 fn state(version: &str) -> ProjectState {
     serde_json::from_value(json!({"schemaVersion":2,"version":version,"releaseIdentity":"0".repeat(64),"generation":"00000000-0000-4000-8000-000000000000","packageMode":"registry","managed":{},"components":{
 "apps/web":{"role":"app","toolchain":"node","toolingProfile":"web","origin":{"template":"react-web","version":version},"toolDependencies":{},"dependencies":[],"development":{"owner":"managed","kind":"compose","service":"web"}},
