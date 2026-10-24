@@ -98,7 +98,10 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             "Cargo.toml",
             "[package]\nname = \"fixture-api\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
         ),
-        ("Cargo.lock", "version = 4\n"),
+        (
+            "Cargo.lock",
+            "version = 4\n\n[[package]]\nname = \"fixture-api\"\nversion = \"1.0.0\"\n",
+        ),
         ("rustfmt.toml", "edition = \"2024\"\n"),
         ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.99.1\"\n"),
         ("src/main.rs", "fn main() {}\n"),
@@ -218,6 +221,11 @@ fn public_schema2_update_preserves_unknown_fields_and_product_bytes() {
     put(&target,"apps/api/Cargo.toml",b"[package]\nname=\"custom\"\nversion=\"2.3.4\"\nedition=\"2024\"\n[package.metadata.product]\nfeature=true\n");
     put(
         &target,
+        "apps/api/Cargo.lock",
+        b"version = 4\n\n[[package]]\nname = \"custom\"\nversion = \"2.3.4\"\n",
+    );
+    put(
+        &target,
         "Makefile",
         b"include .devkit/runtime/devkit.mk\nbuild-api: custom\ncustom:\n\t@true\n",
     );
@@ -230,6 +238,7 @@ fn public_schema2_update_preserves_unknown_fields_and_product_bytes() {
     let names = [
         "apps/api/src/main.rs",
         "apps/api/Cargo.toml",
+        "apps/api/Cargo.lock",
         "Makefile",
         "compose.yaml",
         ".env",
