@@ -84,6 +84,37 @@ def archive_json(path, prefix, name):
         return json.loads(raw), raw
 
 
+def verify_tag_source(version, index, download, scratch):
+    api = "https://api.github.com/repos/docouno/devkit/git"
+    require(VERSION.fullmatch(version) and re.fullmatch(r"[a-f0-9]{40}", index["sourceCommit"])
+            and re.fullmatch(r"[a-f0-9]{40}", index["sourceTree"]), "Invalid frozen Git source identity")
+    reference = json.loads(download(f"{api}/ref/tags/v{version}", scratch / "git-reference.json",
+                                    4 * 1024 * 1024))
+    require(reference["ref"] == f"refs/tags/v{version}", "GitHub returned a different release reference")
+    target = reference["object"]
+    chain = []
+    seen = set()
+    while target.get("type") == "tag":
+        identity = target.get("sha")
+        require(isinstance(identity, str) and re.fullmatch(r"[a-f0-9]{40}", identity),
+                "Invalid annotated tag identity")
+        require(identity not in seen and len(chain) < 8, "Cyclic or excessive annotated tag chain")
+        seen.add(identity)
+        tag = json.loads(download(f"{api}/tags/{identity}", scratch / f"git-tag-{len(chain)}.json",
+                                  4 * 1024 * 1024))
+        require(tag["sha"] == identity, "GitHub annotated tag identity differs")
+        chain.append(identity)
+        target = tag["object"]
+    require(target.get("type") == "commit" and target.get("sha") == index["sourceCommit"],
+            "Public Git tag commit differs from the frozen source commit")
+    commit = json.loads(download(f"{api}/commits/{index['sourceCommit']}", scratch / "git-commit.json",
+                                 4 * 1024 * 1024))
+    require(commit["sha"] == index["sourceCommit"] and commit["tree"]["sha"] == index["sourceTree"],
+            "Public Git commit tree differs from the frozen source tree")
+    return {"reference": reference["ref"], "annotatedTags": chain,
+            "commit": commit["sha"], "tree": commit["tree"]["sha"]}
+
+
 def main():
     def interrupted(signum, _frame):
         raise InterruptedError(f"Public verification interrupted by signal {signum}")
@@ -221,6 +252,8 @@ def main():
                                       scratch / "github-release.json", 4 * 1024 * 1024))
         require(release["immutable"] is True and release["draft"] is False,
                 "Public target release is not immutable")
+        require(release["tag_name"] == f"v{target}", "GitHub release tag name differs")
+        git_source = verify_tag_source(target, index, download, scratch)
         gh_assets = {asset["name"]: asset for asset in release["assets"]}
         require(set(gh_assets) == set(assets) | {"release-index.json"}, "GitHub asset set differs")
         for name, data in {**assets, "release-index.json": raw_index}.items():
@@ -229,7 +262,8 @@ def main():
         proofs.append({"version": target, "releaseIdentity": index["releaseIdentity"],
                        "sourceCommit": index["sourceCommit"], "sourceTree": index["sourceTree"],
                        "buildRun": index["buildRun"], "indexSha256": sha256(raw_index),
-                       "tarAndNpmCanonicalPayloadEqual": True, "packages": npm_proofs})
+                       "gitSource": git_source, "tarAndNpmCanonicalPayloadEqual": True,
+                       "packages": npm_proofs})
 
         spec = importlib.util.spec_from_file_location("devkit_packaged_verification", REPO / "test/packaged/verify.py")
         require(spec is not None and spec.loader is not None, "Packaged verifier unavailable")
