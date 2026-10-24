@@ -1,4 +1,47 @@
 # Docker argv and mounts only. Process ownership/cancellation stays in native Rust.
+# Freeze operator data before Make exports command-line variables to $(shell).
+ifneq ($(origin target),undefined)
+override target := $(value target)
+endif
+ifneq ($(origin output),undefined)
+override output := $(value output)
+endif
+ifneq ($(origin build_set),undefined)
+override build_set := $(value build_set)
+endif
+ifneq ($(origin previous),undefined)
+override previous := $(value previous)
+endif
+ifneq ($(origin release),undefined)
+override release := $(value release)
+endif
+ifneq ($(origin legacy_archive),undefined)
+override legacy_archive := $(value legacy_archive)
+endif
+ifneq ($(origin template),undefined)
+override template := $(value template)
+endif
+ifneq ($(origin version),undefined)
+override version := $(value version)
+endif
+ifneq ($(origin from_version),undefined)
+override from_version := $(value from_version)
+endif
+ifneq ($(origin build_id),undefined)
+override build_id := $(value build_id)
+endif
+ifneq ($(origin build_run),undefined)
+override build_run := $(value build_run)
+endif
+ifneq ($(origin expected_index_sha256),undefined)
+override expected_index_sha256 := $(value expected_index_sha256)
+endif
+ifneq ($(origin DEVKIT_AUTHOR_CARGO_HOME),undefined)
+override DEVKIT_AUTHOR_CARGO_HOME := $(value DEVKIT_AUTHOR_CARGO_HOME)
+endif
+ifneq ($(origin DEVKIT_AUTHOR_RUST_IMAGE),undefined)
+override DEVKIT_AUTHOR_RUST_IMAGE := $(value DEVKIT_AUTHOR_RUST_IMAGE)
+endif
 export DEVKIT_AUTHOR_ROOT := $(CURDIR)
 export DEVKIT_AUTHOR_UID := $(shell id -u)
 export DEVKIT_AUTHOR_GID := $(shell id -g)
@@ -6,21 +49,32 @@ export DEVKIT_AUTHOR_NODE_IMAGE := $(DEVKIT_NODE_IMAGE)
 export DEVKIT_NODE_VERSION
 export DEVKIT_RUST_VERSION
 author_recipe_sha := $(word 1,$(shell sha256sum tooling/native.Dockerfile))
-export DEVKIT_AUTHOR_RUST_IMAGE ?= devkit-author-rust:$(author_recipe_sha)
-export DEVKIT_AUTHOR_CARGO_HOME ?= $(CURDIR)/.artifacts/author/cargo-home
+override DEVKIT_AUTHOR_RUST_IMAGE := $(if $(filter undefined,$(origin DEVKIT_AUTHOR_RUST_IMAGE)),devkit-author-rust:$(author_recipe_sha),$(value DEVKIT_AUTHOR_RUST_IMAGE))
+export DEVKIT_AUTHOR_RUST_IMAGE
+override DEVKIT_AUTHOR_CARGO_HOME := $(if $(filter undefined,$(origin DEVKIT_AUTHOR_CARGO_HOME)),$(CURDIR)/.artifacts/author/cargo-home,$(value DEVKIT_AUTHOR_CARGO_HOME))
+export DEVKIT_AUTHOR_CARGO_HOME
 export DEVKIT_AUTHOR_TARGET := $(CURDIR)/.artifacts/author/target
 export DEVKIT_AUTHOR_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit
-export DEVKIT_RELEASE_VERSION := $(or $(version),$(strip $(file <VERSION)))
-export DEVKIT_FROM_VERSION := $(or $(from_version),0.2.1)
-export DEVKIT_BUILD_ID := $(or $(build_id),$(shell cat /proc/sys/kernel/random/uuid))
-export DEVKIT_BUILD_RUN := $(or $(build_run),local-author)
-export DEVKIT_ASSEMBLY_OUTPUT := $(output)
-export DEVKIT_BUILD_SET := $(build_set)
-export DEVKIT_VERIFY_RELEASE := $(release)
-export DEVKIT_VERIFY_PREVIOUS := $(previous)
-export DEVKIT_LEGACY_ARCHIVE := $(legacy_archive)
-export DEVKIT_INIT_TARGET := $(target)
-export DEVKIT_INIT_TEMPLATE := $(or $(template),node-api)
+export DEVKIT_RELEASE_VERSION := $(if $(filter undefined,$(origin version)),$(strip $(file <VERSION)),$(value version))
+export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.2.1,$(value from_version))
+export DEVKIT_BUILD_ID := $(if $(filter undefined,$(origin build_id)),$(shell cat /proc/sys/kernel/random/uuid),$(value build_id))
+export DEVKIT_BUILD_RUN := $(if $(filter undefined,$(origin build_run)),local-author,$(value build_run))
+export DEVKIT_ASSEMBLY_OUTPUT := $(value output)
+export DEVKIT_BUILD_SET := $(value build_set)
+export DEVKIT_VERIFY_RELEASE := $(value release)
+export DEVKIT_VERIFY_PREVIOUS := $(value previous)
+export DEVKIT_LEGACY_ARCHIVE := $(value legacy_archive)
+export DEVKIT_INIT_TARGET := $(value target)
+export DEVKIT_INIT_TEMPLATE := $(if $(filter undefined,$(origin template)),node-api,$(value template))
+
+ifneq ($(origin release),undefined)
+export DEVKIT_VERIFY_ENGINE := $(value release)/devkit
+else
+export DEVKIT_VERIFY_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/release/devkit
+author_blackbox_build := build
+endif
+
+export DEVKIT_EXPECTED_INDEX_SHA256 := $(value expected_index_sha256)
 
 define author_node
 	@test -x "$$DEVKIT_AUTHOR_ENGINE" || { printf '%s\n' 'Native author engine is missing. Run make setup.' >&2; exit 1; }
@@ -58,7 +112,7 @@ define author_rust
 	    --label "io.docouno.devkit.invocation=$$token" \
 	    --user "$$DEVKIT_AUTHOR_UID:$$DEVKIT_AUTHOR_GID" --network none --read-only --memory 2g --cpus 2 \
 	    --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,exec,mode=1777 \
-	    --volume "$$DEVKIT_AUTHOR_ROOT:/workspace:ro,z" \
+	    --volume "$$DEVKIT_AUTHOR_ROOT:/workspace:$(or $(2),ro),z" \
 	    --volume "$$DEVKIT_AUTHOR_CARGO_HOME:/cargo:z" --volume "$$DEVKIT_AUTHOR_TARGET:/target:z" \
 	    --volume "$$DEVKIT_AUTHOR_ROOT/.artifacts:/workspace/.artifacts:z" \
 	    --workdir /workspace --env HOME=/tmp/devkit-author-home --env CARGO_HOME=/cargo \

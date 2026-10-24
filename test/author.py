@@ -2,6 +2,8 @@
 """Exercise the actual author Make glue in a path containing literal Make syntax."""
 from __future__ import annotations
 import json
+import argparse
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +17,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--data-only", action="store_true")
+    modes.add_argument("--engine-only", action="store_true")
+    args = parser.parse_args()
+    if args.engine_only:
+        engine = Path(os.environ['DEVKIT_VERIFY_ENGINE'])
+        assert engine.is_file() and not engine.is_symlink() and os.access(engine, os.X_OK), 'Expected a regular executable black-box engine'
+        data = engine.read_bytes()
+        assert data[:4] == b'\x7fELF', 'Black-box tests require the native ELF'
+        sha = hashlib.sha256(data).hexdigest()
+        if os.environ.get('DEVKIT_BUILD_SET'):
+            build_set = Path(os.environ['DEVKIT_BUILD_SET'])
+            index = json.loads((build_set / 'release-index.json').read_text())
+            identity = index['files'][index['engine']]
+            assert sha == identity['sha256'] and len(data) == identity['size'], 'Selected black-box engine differs from the frozen build set'
+            assert hashlib.sha256((engine.parent / 'release.json').read_bytes()).hexdigest() == index['releaseIdentity'], 'Selected release differs from the frozen build set'
+            assert hashlib.sha256((build_set / index['engine']).read_bytes()).hexdigest() == sha, 'Frozen engine asset differs from its index'
+        print('Black-box engine: ' + json.dumps(dict(path=str(engine.resolve()), sha256=sha)))
+        return
     engine = Path(os.environ.get('DEVKIT_AUTHOR_ENGINE', ROOT / '.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit')).resolve()
     assert engine.is_file(), 'Run make setup'
     proof = ROOT / '.artifacts/author/probes' / uuid.uuid4().hex
@@ -25,6 +47,35 @@ def main():
         (root / 'tooling').mkdir(parents=True)
         for name in ('Makefile', 'toolchains.env', 'VERSION', 'tooling/author.mk', 'tooling/native.Dockerfile'):
             shutil.copy2(ROOT / name, root / name)
+        # GNU Make command-line values are recursive by default. Treat every
+        # operator path/argument as data, including literal Make function syntax.
+        fields = {'target': 'DEVKIT_INIT_TARGET', 'output': 'DEVKIT_ASSEMBLY_OUTPUT',
+            'build_set': 'DEVKIT_BUILD_SET', 'previous': 'DEVKIT_VERIFY_PREVIOUS',
+            'release': 'DEVKIT_VERIFY_RELEASE', 'legacy_archive': 'DEVKIT_LEGACY_ARCHIVE',
+            'template': 'DEVKIT_INIT_TEMPLATE', 'version': 'DEVKIT_RELEASE_VERSION',
+            'from_version': 'DEVKIT_FROM_VERSION', 'build_id': 'DEVKIT_BUILD_ID',
+            'build_run': 'DEVKIT_BUILD_RUN', 'expected_index_sha256': 'DEVKIT_EXPECTED_INDEX_SHA256',
+            'DEVKIT_AUTHOR_CARGO_HOME': 'DEVKIT_AUTHOR_CARGO_HOME',
+            'DEVKIT_AUTHOR_RUST_IMAGE': 'DEVKIT_AUTHOR_RUST_IMAGE'}
+        program = 'import json,os; print(json.dumps({k:os.environ[k] for k in ' + repr(list(fields.values())) + '}))'
+        with (root / 'Makefile').open('a') as makefile:
+            makefile.write("\n.PHONY: inspect-author-data\ninspect-author-data:\n\t@python3 -c " + "'" + program.replace("'", "'\"'\"'") + "'\n")
+        marker = Path('/tmp') / ('devkit-make-eval-' + uuid.uuid4().hex)
+        values = {key: '/tmp/literal $(literal)-$(shell touch ' + str(marker) + ')-tail ' for key in fields}
+        try:
+            result = subprocess.run(['make', '--no-print-directory', 'inspect-author-data', *[key + '=' + value for key, value in values.items()]],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, result.stdout + result.stderr
+            actual = json.loads(result.stdout)
+            assert actual == {env: values[key] for key, env in fields.items()}, actual
+            assert not marker.exists(), 'GNU Make evaluated a data argument'
+            rows.append(dict(name='literal-command-line-data', passed=True, fields=fields))
+        finally:
+            marker.unlink(missing_ok=True)
+        if args.data_only:
+            (proof / 'receipt.json').write_text(json.dumps(dict(passed=True, cases=rows, implicitMakeEvaluation=False), indent=2) + '\n')
+            print(f'PASS literal Make operator data; {proof}')
+            return
         local_engine = root / '.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit'
         local_engine.parent.mkdir(parents=True)
         shutil.copy2(engine, local_engine)

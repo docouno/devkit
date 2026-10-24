@@ -800,8 +800,8 @@ build: simulate-update
         self.make("setup")
         manifest = self.root / ".devkit/manifest.json"
         checksum = self.root / ".devkit/runtime.sha256"
-        guard = self.root / ".devkit/runtime/guard.sh"
-        originals = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in (manifest, checksum, guard)}
+        loader = self.root / ".devkit/runtime/devkit.sh"
+        originals = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in (manifest, checksum, loader)}
         def restore():
             for path, (content, mode) in originals.items():
                 path.write_bytes(content)
@@ -813,9 +813,9 @@ build: simulate-update
                 state = json.loads(manifest.read_text())
                 try:
                     if case in ("omitted-and-changed", "incomplete-table"):
-                        checksum.write_text("".join(line for line in checksum.read_text().splitlines(True) if not line.endswith("/guard.sh\n")))
+                        checksum.write_text("".join(line for line in checksum.read_text().splitlines(True) if not line.endswith("/devkit.sh\n")))
                         if case == "omitted-and-changed":
-                            guard.write_text(guard.read_text() + "\n# benign drift\n")
+                            loader.write_text(loader.read_text() + "\n# benign drift\n")
                             self.assertEqual(manifest.read_bytes(), originals[manifest][0])
                         else:
                             state["managed"][".devkit/runtime.sha256"]["sha256"] = hashlib.sha256(checksum.read_bytes()).hexdigest()
@@ -824,7 +824,7 @@ build: simulate-update
                     elif case == "managed-symlink-parent":
                         nested.rename(saved_parent)
                         nested.symlink_to(saved_parent, target_is_directory=True)
-                    elif case == "mode": guard.chmod(0o644 if originals[guard][1] == 0o755 else 0o755)
+                    elif case == "mode": loader.chmod(0o644 if originals[loader][1] == 0o755 else 0o755)
                     else:
                         if case == "unsafe-path": state["managed"]["../outside"] = {"sha256": "0" * 64, "mode": 0o644}
                         else: state[case] = {"version": "9.9.9", "schema": 2, "generation": "initial", "packageMode": "other", "releaseIdentity": "bad"}[case]
