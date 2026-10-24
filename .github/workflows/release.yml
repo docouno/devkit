@@ -73,12 +73,12 @@ jobs:
           ref: ${{ inputs.source_commit }}
           persist-credentials: false
           fetch-depth: 0
-      - name: Prepare pinned author SDKs
-        run: make setup
       - name: Verify source admission and performance failure guards
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
+      - name: Prepare pinned author SDKs
+        run: make setup
       - name: Build the author-only controller
         run: |
           set -euo pipefail

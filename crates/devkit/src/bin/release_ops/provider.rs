@@ -57,7 +57,10 @@ fn npm_response(output: ProcessOutput) -> Result<Option<Value>> {
 }
 
 pub(super) fn require_event_source(source: &str, event_sha: Option<&str>) -> Result<()> {
-    ensure!(source_hash(source), "Publication requires an exact source SHA");
+    ensure!(
+        source_hash(source),
+        "Publication requires an exact source SHA"
+    );
     ensure!(
         event_sha == Some(source),
         "Frozen source must equal the authentic workflow GITHUB_SHA for npm provenance. To retry a historical release after main moves, rerun its original run: gh run rerun ORIGINAL_RUN_ID --failed; do not dispatch it from a newer commit"
