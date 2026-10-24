@@ -62,11 +62,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--previous-native", help="Also upgrade a genuine older public native project")
     args = parser.parse_args()
     build_set = args.build_set.resolve()
     raw_index = (build_set / "release-index.json").read_bytes()
     index = json.loads(raw_index)
     require(index["publicationEligible"] is True, "Public README gate requires the eligible frozen set")
+    native_upgrade = None
+    if args.previous_native is not None:
+        native_spec = importlib.util.spec_from_file_location("readme_native_upgrade", REPO / "test/public/native_upgrade.py")
+        native_upgrade = importlib.util.module_from_spec(native_spec)
+        native_spec.loader.exec_module(native_upgrade)
+        native_upgrade.validate_versions(args.previous_native, index["version"])
     readme = (REPO / "README.md").read_text()
     package = "@docouno/devkit@" + index["version"]
     for example in (f"npx {package} init my-product --app web=react-web",
@@ -96,6 +103,7 @@ def main():
     root = products / "my-product"
     success = False
     error = None
+    native_upgrade_summary = None
     started = time.monotonic()
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -162,6 +170,9 @@ def main():
         require(module.source_snapshot(root) == before, "Same-version README update/recovery changed product inputs")
         require(not helper.forbidden_log.exists(), "README Make/native flow attempted a host language SDK")
         helper.run("readme-author-help", ["make", "help"], cwd=REPO)
+        if native_upgrade is not None:
+            native_upgrade_summary = native_upgrade.verify(
+                helper, module, index, args.previous_native, environment, products)
         success = True
     except BaseException as failure:
         error = str(failure)
@@ -181,6 +192,7 @@ def main():
                        "standaloneWebStatePreservingHmr": success,
                        "hostLanguageSDKAttemptedForNativeCommands": helper.forbidden_log.exists(),
                        "readmeSha256": digest(readme.encode()), "results": helper.results,
+                       "nativeUpgrade": native_upgrade_summary,
                        "seconds": time.monotonic() - started, "diagnostics": str(helper.receipt),
                        "limits": ["Clean recover is a no-op; actual interrupted recovery and packaged ELF/ASAR are proven by the separate full public matrices"]}
             args.output.write_text(json.dumps(receipt, indent=2) + "\n")

@@ -12,11 +12,11 @@ on:
         required: true
         type: string
       previous_env:
-        description: Expected previous @docouno/env latest (or none)
+        description: Expected previous stable @docouno/env latest; bootstrap new names separately
         required: true
         type: string
       previous_cli:
-        description: Expected previous @docouno/devkit latest (initially 0.0.0-stage)
+        description: Expected previous stable @docouno/devkit latest; stage placeholders are not a baseline
         required: true
         type: string
       previous_github:
@@ -252,7 +252,17 @@ jobs:
       - name: Anonymous public pinned npx and README entry checks
         run: python3 test/public/npx.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/npx-pinned.json" --transport-output "$PWD/.artifacts/release-proof/transport-cold.json"
       - name: Execute the actual principal README project flow
-        run: python3 test/public/readme.py --build-set "$PWD/.artifacts/frozen" --output "$PWD/.artifacts/release-proof/readme.json"
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          root = Path.cwd()
+          command = ['python3', 'test/public/readme.py', '--build-set', str(root / '.artifacts/frozen'), '--output', str(root / '.artifacts/release-proof/readme.json')]
+          previous = os.environ['PREVIOUS_ENV']
+          if tuple(map(int, previous.split('.'))) >= (0, 3, 0):
+              command += ['--previous-native', previous]
+          subprocess.run(command, check=True, timeout=3600)
+          PY
       - name: Persist compact public proof before changing selectors
         env:
           GH_TOKEN: ${{ github.token }}
