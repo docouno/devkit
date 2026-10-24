@@ -883,20 +883,35 @@ const PERFORMANCE_TRACE_COLUMNS: &[&str] = &[
     "instrumentedOutsideToolSeconds",
 ];
 fn validate_performance_trace(value: &Value) -> Result<()> {
-    let measurements = value["measurements"].as_array().context("Performance measurements missing")?;
+    let measurements = value["measurements"]
+        .as_array()
+        .context("Performance measurements missing")?;
     let columns = value.get("traceColumns");
     if columns.is_none() && measurements.iter().all(|m| !m["trace"].is_array()) {
         // Historical schema1 proofs carry trace objects without a column list.
         return Ok(());
     }
-    ensure!(columns == Some(&json!(PERFORMANCE_TRACE_COLUMNS)), "Invalid performance trace columns");
+    ensure!(
+        columns == Some(&json!(PERFORMANCE_TRACE_COLUMNS)),
+        "Invalid performance trace columns"
+    );
     for measurement in measurements {
-        let row = measurement["trace"].as_array().context("Performance trace row missing")?;
-        ensure!(row.len() == PERFORMANCE_TRACE_COLUMNS.len(), "Invalid performance trace row width");
+        let row = measurement["trace"]
+            .as_array()
+            .context("Performance trace row missing")?;
+        ensure!(
+            row.len() == PERFORMANCE_TRACE_COLUMNS.len(),
+            "Invalid performance trace row width"
+        );
         for (index, value) in row.iter().enumerate() {
             ensure!(
-                if index < 8 { value.as_u64().is_some() } else { value.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0) },
-                "Invalid performance trace value: {}", PERFORMANCE_TRACE_COLUMNS[index]
+                if index < 8 {
+                    value.as_u64().is_some()
+                } else {
+                    value.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0)
+                },
+                "Invalid performance trace value: {}",
+                PERFORMANCE_TRACE_COLUMNS[index]
             );
         }
     }
@@ -1101,7 +1116,10 @@ fn proof_from_files(c: &Contract, run: &str, paths: &BTreeMap<String, PathBuf>) 
 }
 fn proof_body(old: &str, proof: &Proof) -> Result<String> {
     let raw = serde_json::to_string(proof)?;
-    ensure!(raw.len() <= 40000, "Compact public proof exceeds release-body budget");
+    ensure!(
+        raw.len() <= 40000,
+        "Compact public proof exceeds release-body budget"
+    );
     let replacement = format!(
         "Public verification: passed. Receipt SHA256 `{}`.\n{PROOF_OPEN}{raw}{PROOF_CLOSE}",
         digest(raw.as_bytes())
@@ -1114,10 +1132,16 @@ fn proof_body(old: &str, proof: &Proof) -> Result<String> {
             "Public verification: passed. Receipt SHA256 `{}`.\n",
             digest(previous.as_bytes())
         );
-        let prefix = prefix.strip_suffix(&owned)
+        let prefix = prefix
+            .strip_suffix(&owned)
             .filter(|base| base.is_empty() || base.ends_with('\n'))
             .unwrap_or(prefix);
-        Ok(format!("{prefix}{replacement}{suffix}"))
+        let separator = if prefix.is_empty() || prefix.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        Ok(format!("{prefix}{separator}{replacement}{suffix}"))
     } else {
         let separator = if old.ends_with('\n') { "" } else { "\n" };
         Ok(format!("{old}{separator}{replacement}\n"))
@@ -1157,9 +1181,19 @@ fn record_proof(
     );
     Ok(())
 }
-fn record_latest(remote: &mut impl Remote, set: &FrozenSet, c: &Contract, bytes: &[u8]) -> Result<()> {
-    let release = remote.release(&c.tag())?.context("Public release missing")?;
-    ensure!(release.contract()? == *c, "Durable release contract differs");
+fn record_latest(
+    remote: &mut impl Remote,
+    set: &FrozenSet,
+    c: &Contract,
+    bytes: &[u8],
+) -> Result<()> {
+    let release = remote
+        .release(&c.tag())?
+        .context("Public release missing")?;
+    ensure!(
+        release.contract()? == *c,
+        "Durable release contract differs"
+    );
     let selectors = remote.selectors()?;
     ensure!(
         selectors.environment.as_deref() == Some(&c.version)
@@ -1168,10 +1202,15 @@ fn record_latest(remote: &mut impl Remote, set: &FrozenSet, c: &Contract, bytes:
         "Unqualified npx proof requires completed promotion"
     );
     let mut proof: Proof = serde_json::from_str(block(
-        release.body.as_deref().unwrap_or_default(), PROOF_OPEN, PROOF_CLOSE,
+        release.body.as_deref().unwrap_or_default(),
+        PROOF_OPEN,
+        PROOF_CLOSE,
     )?)?;
     proof.post_promotion_npx = Some(gate_from_receipt(
-        "npx-latest", bytes, serde_json::from_slice(bytes)?, c,
+        "npx-latest",
+        bytes,
+        serde_json::from_slice(bytes)?,
+        c,
     )?);
     record_proof(remote, set, c, &proof)
 }
