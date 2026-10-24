@@ -65,15 +65,15 @@ Use `register --help` to adopt an existing component without replacing its sourc
 
 ## Development
 
-| Command | Purpose |
-| --- | --- |
-| `make setup` | Prepare accepted images and dependencies |
-| `make check` | Check source, types, formatting, lint and applicable native gates |
-| `make test` | Run the registered components' native test suites |
-| `make build` | Build the registered components |
-| `make dev app=web` | Start one application's development service |
-| `make status` | Show services and their local ports |
-| `make down` | Stop services while preserving data volumes |
+| Command            | Purpose                                                           |
+| ------------------ | ----------------------------------------------------------------- |
+| `make setup`       | Prepare accepted images and dependencies                          |
+| `make check`       | Check source, types, formatting, lint and applicable native gates |
+| `make test`        | Run the registered components' native test suites                 |
+| `make build`       | Build the registered components                                   |
+| `make dev app=web` | Start one application's development service                       |
+| `make status`      | Show services and their local ports                               |
+| `make down`        | Stop services while preserving data volumes                       |
 
 Use `app=NAME` or `package=NAME` for setup, check, fix, test and build. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
 
