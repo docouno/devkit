@@ -1273,10 +1273,8 @@ fn timed_provider_reads_preserve_nonzero_output_and_enforce_deadlines() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
-#[test]
-fn durable_performance_summary_bounds_the_actual_twenty_four_case_shape() {
-    let f = Fixture::new();
-    let mut raw = json!({"schemaVersion":1,"success":true,"version":"0.3.0","sourceCommit":f.contract.source_commit,"sourceTree":f.contract.source_tree,"indexSha256":f.contract.index_sha256,"measurements":[],"fixtures":[],"commands":[],"definitions":{"warm":"two warmups, alternating old/new, plain samples","cold":"actual public transport required separately"}});
+fn generated_performance(c: &Contract) -> Value {
+    let mut raw = json!({"schemaVersion":1,"success":true,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256,"measurements":[],"fixtures":[],"commands":[],"definitions":{"warm":"two warmups, alternating old/new, plain samples","cold":"actual public transport required separately"}});
     for index in 0..24 {
         raw["measurements"].as_array_mut().unwrap().push(json!({
             "name":format!("large-closure-doctor-native-{index}"),"shape":"large-closure","side":"native","operation":"doctor","componentCount":20,
@@ -1287,9 +1285,16 @@ fn durable_performance_summary_bounds_the_actual_twenty_four_case_shape() {
         }));
     }
     for _ in 0..8 {
-        raw["fixtures"].as_array_mut().unwrap().push(json!({"shape":"large-closure","side":"native","componentCount":20,"localTransitiveCrates":80,"version":"0.3.0","releaseIdentity":"a".repeat(64),"inputSnapshotSha256":"b".repeat(64),"inputFiles":800,"inputBytes":100000,"rustImageId":"c".repeat(64),"productInputSha256":"d".repeat(64),"sourceUnchanged":true,"root":"/private/product"}));
+        raw["fixtures"].as_array_mut().unwrap().push(json!({"shape":"large-closure","side":"native","componentCount":20,"localTransitiveCrates":80,"version":c.version,"releaseIdentity":"a".repeat(64),"inputSnapshotSha256":"b".repeat(64),"inputFiles":800,"inputBytes":100000,"rustImageId":"c".repeat(64),"productInputSha256":"d".repeat(64),"sourceUnchanged":true,"root":"/private/product"}));
     }
     raw["commands"] = json!([{"stdout":"z".repeat(200000)}]);
+    raw
+}
+
+#[test]
+fn durable_performance_summary_bounds_the_actual_twenty_four_case_shape() {
+    let f = Fixture::new();
+    let raw = generated_performance(&f.contract);
     let full = serde_json::to_vec(&raw).unwrap();
     let compact = compact_gate("performance", raw).unwrap();
     validate_gate("performance", &compact, &f.contract).unwrap();
@@ -1311,4 +1316,241 @@ fn durable_performance_summary_bounds_the_actual_twenty_four_case_shape() {
             && !text.contains("sampleOrder")
     );
     assert_eq!(compact["measurements"].as_array().unwrap().len(), 24);
+}
+
+fn read_proof(remote: &Fake) -> Proof {
+    serde_json::from_str(block(remote.release.as_ref().unwrap().body.as_deref().unwrap(), PROOF_OPEN, PROOF_CLOSE).unwrap()).unwrap()
+}
+
+fn npx_receipt(c: &Contract, mode: &str) -> Value {
+    json!({"schemaVersion":1,"success":true,"error":null,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256,"selectorMode":mode,"ignoreScripts":true,"authenticationUsed":false,"umasks":["022","077"],"durationSeconds":4.944376594999994,"harnessSha256":"d".repeat(64),"diagnostics":"/home/runner/work/project/project/.artifacts/release-proof/npx-public-diagnostics","cases":["022","077"].map(|mask| json!({"umask":mask,"registrySpec":if mode == "latest" {CLI.to_owned()} else {format!("{CLI}@{}",c.version)},"files":310,"engineSha256":"e".repeat(64),"sameVersionRequests":0,"canonicalReleaseIdentity":"f".repeat(64),"bareCiDiagnostic":true,"nativeImportNetwork":"none"}))})
+}
+
+fn assert_trace_facts(original: &Value, compact: &Value) {
+    assert_eq!(compact["traceColumns"], json!(PERFORMANCE_TRACE_COLUMNS));
+    let rows = compact["measurements"].as_array().unwrap();
+    assert_eq!(rows.len(), 24);
+    for (index, row) in rows.iter().enumerate() {
+        for (column, name) in PERFORMANCE_TRACE_COLUMNS.iter().enumerate() {
+            assert_eq!(row["trace"][column], original["measurements"][index]["trace"][*name]);
+        }
+        for key in ["name","shape","side","operation","componentCount","sampleCount","medianSeconds","p95Seconds","minSeconds","maxSeconds","inputsBytesAndModesUnchanged"] {
+            assert_eq!(row[key], original["measurements"][index][key]);
+        }
+    }
+}
+
+#[test]
+fn performance_projection_preserves_trace_values_and_rejects_ambiguous_columns() {
+    let f = Fixture::new();
+    let original = varied_performance(&f.contract);
+    let compact = compact_gate("performance", original.clone()).unwrap();
+    assert_trace_facts(&original, &compact);
+    for key in ["comparisons","definitions","limits","harness","admissionChecks","host","tools","baseline","releaseIdentity","buildRun"] {
+        assert_eq!(compact[key], original[key]);
+    }
+    assert_eq!(compact["comparisons"].as_array().unwrap().len(), 14);
+    assert_eq!(compact["fixtures"].as_array().unwrap().len(), 8);
+    for (index, fixture) in original["fixtures"].as_array().unwrap().iter().enumerate() {
+        let mut expected = fixture.clone();
+        expected.as_object_mut().unwrap().remove("root");
+        assert_eq!(compact["fixtures"][index], expected);
+    }
+    validate_gate("performance", &original, &f.contract).unwrap(); // Historical object traces.
+    validate_gate("performance", &compact, &f.contract).unwrap();
+    let corruptions = ["missing-header","missing-column","extra-column","duplicate-column","reordered-column","missing-value","extra-value","bad-count","bad-timing"];
+    for corruption in corruptions {
+        let mut invalid = compact.clone();
+        match corruption {
+            "missing-header" => { invalid.as_object_mut().unwrap().remove("traceColumns"); },
+            "missing-column" => { invalid["traceColumns"].as_array_mut().unwrap().pop(); },
+            "extra-column" => invalid["traceColumns"].as_array_mut().unwrap().push(json!("unknown")),
+            "duplicate-column" => invalid["traceColumns"][1] = invalid["traceColumns"][0].clone(),
+            "reordered-column" => invalid["traceColumns"].as_array_mut().unwrap().swap(0, 1),
+            "missing-value" => { invalid["measurements"][0]["trace"].as_array_mut().unwrap().pop(); },
+            "extra-value" => invalid["measurements"][0]["trace"].as_array_mut().unwrap().push(json!(0)),
+            "bad-count" => invalid["measurements"][0]["trace"][0] = json!(0.5),
+            "bad-timing" => invalid["measurements"][0]["trace"][8] = json!(-1),
+            _ => unreachable!(),
+        }
+        assert!(validate_gate("performance", &invalid, &f.contract).is_err(), "{corruption}");
+    }
+}
+
+#[test]
+fn proof_updates_replace_only_the_owned_line_and_preserve_all_surrounding_notes() {
+    let f = Fixture::native_update();
+    let set = f.set();
+    let mut remote = f.remote();
+    stage(&mut remote, &set, &f.contract).unwrap();
+    publish(&mut remote, &set, &f.contract).unwrap();
+    remote.proof(&f.contract);
+    let proof = read_proof(&remote);
+    let raw = serde_json::to_string(&proof).unwrap();
+    let user_line = format!("User quotation: Public verification: passed. Receipt SHA256 `{}`.\n", digest(raw.as_bytes()));
+    let prefix = format!("{}\nManual notes and whitespace stay here.  \n{user_line}", f.contract.body().unwrap());
+    let suffix = "\n\n## Operator notes\nPreserve this after the proof.\n";
+    remote.release.as_mut().unwrap().body = Some(format!("{prefix}{PROOF_OPEN}{raw}{PROOF_CLOSE}{suffix}"));
+    record_proof(&mut remote, &set, &f.contract, &proof).unwrap();
+    let first = remote.release.as_ref().unwrap().body.clone().unwrap();
+    assert!(first.starts_with(&prefix) && first.ends_with(suffix));
+    for _ in 0..3 {
+        record_proof(&mut remote, &set, &f.contract, &proof).unwrap();
+        assert_eq!(remote.release.as_ref().unwrap().body.as_deref(), Some(first.as_str()));
+    }
+    assert_eq!(first.lines().filter(|line| line.starts_with("Public verification: passed.")).count(), 1);
+    assert_eq!(remote.selectors, f.contract.previous);
+    assert_eq!(remote.release.as_ref().unwrap().contract().unwrap(), f.contract);
+    // A line with another digest is not ours to remove.
+    let unowned = format!("Public verification: passed. Receipt SHA256 `{}`.\n", "0".repeat(64));
+    let old = format!("{prefix}{unowned}{PROOF_OPEN}{raw}{PROOF_CLOSE}{suffix}");
+    assert!(proof_body(&old, &proof).unwrap().starts_with(&format!("{prefix}{unowned}")));
+    for malformed in [format!("{prefix}{PROOF_CLOSE}"), format!("{first}{PROOF_OPEN}"), format!("{first}{PROOF_CLOSE}")] {
+        remote.release.as_mut().unwrap().body = Some(malformed);
+        let before = remote.mutations.len();
+        assert!(record_proof(&mut remote, &set, &f.contract, &proof).is_err());
+        assert_eq!(remote.mutations.len(), before);
+    }
+}
+
+fn varied_performance(c: &Contract) -> Value {
+    let mut raw = generated_performance(c);
+    for measurement in raw["measurements"].as_array_mut().unwrap() {
+        for (key, value) in [("medianSeconds",0.123_456_789_012_345_66),("p95Seconds",0.4567890123456789),("minSeconds",0.1111111111111111),("maxSeconds",0.49999999999999994)] {
+            measurement[key] = json!(value);
+        }
+        for key in &PERFORMANCE_TRACE_COLUMNS[8..] { measurement["trace"][*key] = json!(0.123_456_789_012_345_66); }
+    }
+    raw["comparisons"] = json!((0..14).map(|i| {
+        let mut comparison = json!({"shape":format!("component-shape-{i}"),"operation":"describe-vs-doctor","nativeToBaselineMedianRatio":0.123_456_789_012_345_66,"nativeFaster":true});
+        if i % 4 == 0 {
+            comparison["scopeDifference"] = json!("Native describe admits the full graph without SDK readiness; baseline doctor includes Docker and image readiness.");
+        }
+        comparison
+    }).collect::<Vec<_>>());
+    raw["definitions"] = json!(["warm","latency","hostProcesses","containers","tooling","cold","inputs","fixture"].map(|key| (key.to_owned(), format!("{key}: Plain warm measurements alternate old and new release factories with two warmups. Instrumented tracing is a separate diagnostic run; source, mode and product identities are unchanged. Raw samples and complete diagnostics remain in the original receipt."))).into_iter().collect::<BTreeMap<_,_>>());
+    raw["limits"] = json!({"minimumSamples":30,"warmups":2,"p95":"nearest-rank ceil(0.95*n)","requireNativeControlContainers":0,"requireNativeDescribeDockerCalls":0,"requireBuildToolContainersPerComponent":1,"support":"Linux x86_64 with local Docker Compose; host language SDK excluded","setupAndLockResolution":"Prepared outside measurement; required ecosystem checks remain enabled"});
+    raw["host"] = json!({"system":"Linux","machine":"x86_64","kernel":"6.17.0-generic","cpuCount":4,"cpuModel":"Synthetic server processor with extended descriptive model metadata ".repeat(4)});
+    raw["tools"] = json!({"traceImageId":format!("sha256:{}", "a".repeat(64)),"traceRecipeSha256":"b".repeat(64),"straceVersion":"strace -- version 6.1","straceFiles":["strace","libc.so.6","liblzma.so.5","libunwind.so.8","libunwind-ptrace.so.0","libunwind-x86_64.so.8","ld-linux-x86-64.so.2"].map(|key| (key.to_owned(),"c".repeat(64))).into_iter().collect::<BTreeMap<_,_>>()});
+    raw["harness"] = json!(["verify.py","test_harness.py","measure.py"].map(|key| (key.to_owned(),"d".repeat(64))).into_iter().collect::<BTreeMap<_,_>>());
+    raw["admissionChecks"] = json!([{"case":"refuse-source-edits","exitCode":1,"sourceUnchanged":true},{"case":"refuse-missing-cache","exitCode":1,"sourceUnchanged":true}]);
+    raw["buildRun"] = json!(c.build_run);
+    raw["releaseIdentity"] = json!("e".repeat(64));
+    raw["baseline"] = json!({"version":"0.2.1","source":"/home/runner/work/project/project/.artifacts/legacy/devkit-0.2.1","publicArchiveUrl":"https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz","archiveSha256":"f".repeat(64),"releaseIdentity":"a".repeat(64)});
+    raw
+}
+
+#[test]
+fn complete_generated_proof_compacts_latest_and_retains_all_required_facts_with_headroom() {
+    let f = Fixture::native_update();
+    let c = &f.contract;
+    let set = f.set();
+    let mut remote = f.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    let mut proof = read_proof(&remote);
+    let raw_performance = varied_performance(c);
+    let performance_bytes = serde_json::to_vec_pretty(&raw_performance).unwrap();
+    proof.gates.insert("performance".into(), gate_from_receipt("performance", &performance_bytes, raw_performance.clone(), c).unwrap());
+    proof.gates.get_mut("readme").unwrap().summary["exampleResults"] = json!((0..56).map(|index| json!({"label":format!("README example {index}: accepted source state"),"passed":true,"durationSeconds":0.123_456_789_012_345_66,"exitCode":0})).collect::<Vec<_>>());
+    proof.gates.get_mut("npx-pinned").unwrap().summary = compact_gate("npx-pinned", npx_receipt(c, "pinned")).unwrap();
+    for old in ["0.2.0","0.2.1"] {
+        let summary = &mut proof.gates.get_mut(&format!("public-{old}")).unwrap().summary;
+        let identity = &mut summary["identities"][0];
+        identity["version"] = json!(c.version);
+        identity["releaseIdentity"] = json!(set.index.release_identity);
+        identity["buildRun"] = json!(c.build_run);
+        identity["gitSource"] = json!({"commit":c.source_commit,"tree":c.source_tree});
+        identity["tarAndNpmCanonicalPayloadEqual"] = json!(true);
+        identity["packages"] = json!([ENVIRONMENT,CLI].map(|name| json!({"name":name,"version":c.version,"integrity":format!("sha512-{}", "a".repeat(88)),"shasum":"b".repeat(40)})));
+        summary["limits"] = json!(["Actual public legacy factory; source and complete package identities verified","No host language SDK and no authenticated downloads"]);
+        summary["consumerReceiptSha256"] = json!("c".repeat(64));
+    }
+    proof.validate(c).unwrap();
+    assert_trace_facts(&raw_performance, &proof.gates["performance"].summary);
+    let latest = npx_receipt(c, "latest");
+    let bytes = serde_json::to_vec_pretty(&latest).unwrap();
+    let mut old_path = proof.clone();
+    old_path.gates.get_mut("performance").unwrap().summary.as_object_mut().unwrap().remove("traceColumns");
+    for (index, measurement) in old_path.gates.get_mut("performance").unwrap().summary["measurements"].as_array_mut().unwrap().iter_mut().enumerate() {
+        measurement["trace"] = selected(&raw_performance["measurements"][index]["trace"], PERFORMANCE_TRACE_COLUMNS);
+    }
+    old_path.post_promotion_npx = Some(Gate {sha256:digest(&bytes),bytes:bytes.len() as u64,summary:latest.clone()});
+    let before = serde_json::to_vec(&old_path).unwrap().len();
+    println!("Generated original final proof: {before} bytes");
+    assert!(before > 40000);
+    assert!(proof_body(&c.body().unwrap(), &old_path).unwrap_err().to_string().contains("exceeds release-body budget"));
+    record_proof(&mut remote, &set, c, &proof).unwrap();
+    promote(&mut remote, &set, c).unwrap();
+    record_latest(&mut remote, &set, c, &bytes).unwrap();
+    let saved = read_proof(&remote);
+    saved.validate(c).unwrap();
+    let gate = saved.post_promotion_npx.as_ref().unwrap();
+    assert_eq!(gate.sha256, digest(&bytes));
+    assert_eq!(gate.bytes, bytes.len() as u64);
+    assert_ne!(gate.sha256, digest(&serde_json::to_vec(&gate.summary).unwrap()));
+    for key in ["schemaVersion","success","version","sourceCommit","sourceTree","indexSha256","selectorMode","ignoreScripts","authenticationUsed","umasks","cases","durationSeconds","harnessSha256"] {
+        assert_eq!(gate.summary[key], latest[key]);
+    }
+    assert_eq!(gate.summary["cases"].as_array().unwrap().len(), 2);
+    assert!(gate.summary.get("diagnostics").is_none());
+    assert_eq!(gate.summary, compact_gate("npx-latest", latest).unwrap());
+    assert_eq!(saved.gates["readme"].summary["nativeUpgrade"], proof.gates["readme"].summary["nativeUpgrade"]);
+    for (name, original) in &proof.gates { assert_eq!(serde_json::to_value(&saved.gates[name]).unwrap(), serde_json::to_value(original).unwrap()); }
+    let after = serde_json::to_vec(&saved).unwrap().len();
+    println!("Generated compact final proof: {after} bytes");
+    assert!(after < 37000, "Expected several KB of proof headroom, got {after}");
+    let body = remote.release.as_ref().unwrap().body.clone().unwrap();
+    record_latest(&mut remote, &set, c, &bytes).unwrap();
+    assert_eq!(remote.release.as_ref().unwrap().body.as_deref(), Some(body.as_str()));
+    assert_eq!(body.lines().filter(|line| line.starts_with("Public verification: passed.")).count(), 1);
+    let mut too_large = saved;
+    too_large.gates.get_mut("readme").unwrap().summary["unknownFutureFact"] = json!("x".repeat(40000));
+    let writes = remote.mutations.len();
+    assert!(record_proof(&mut remote, &set, c, &too_large).is_err());
+    assert_eq!(remote.mutations.len(), writes);
+}
+
+#[test]
+#[ignore = "explicit operator-supplied retained public receipts; local read-only"]
+fn actual_retained_proof_compaction_readonly() {
+    let root = PathBuf::from(std::env::var("DEVKIT_PROOF_PROBE_DIRECTORY").expect("explicit receipt directory required"));
+    let mut proof: Proof = files::read_json(&root.join("compact.json")).unwrap();
+    let previous = proof.gates["readme"].summary["nativeUpgrade"]["fromVersion"].as_str().unwrap().to_owned();
+    let c = Contract {schema_version:1,repository:REPO.into(),version:proof.version.clone(),source_commit:proof.source_commit.clone(),source_tree:proof.source_tree.clone(),index_sha256:proof.index_sha256.clone(),build_run:proof.publication_run.clone(),previous:Selectors{environment:Some(previous.clone()),cli:Some(previous.clone()),github:Some(format!("v{previous}"))}};
+    proof.validate(&c).unwrap();
+    let bytes = read_bounded(&root.join("npx-latest.json"), 16 * 1024 * 1024).unwrap();
+    let latest: Value = serde_json::from_slice(&bytes).unwrap();
+    let before_pre = serde_json::to_vec(&proof).unwrap().len();
+    proof.post_promotion_npx = Some(Gate {sha256:digest(&bytes),bytes:bytes.len() as u64,summary:latest.clone()});
+    let before_final = serde_json::to_vec(&proof).unwrap().len();
+    assert!(proof_body(&c.body().unwrap(), &proof).is_err());
+    proof.post_promotion_npx = Some(gate_from_receipt("npx-latest", &bytes, latest, &c).unwrap());
+    let latest_only = serde_json::to_vec(&proof).unwrap().len();
+    let old_performance = proof.gates["performance"].summary.clone();
+    let compact = compact_gate("performance", old_performance.clone()).unwrap();
+    assert_trace_facts(&old_performance, &compact);
+    for key in ["comparisons","fixtures","definitions","limits","harness","admissionChecks","host","tools","baseline","releaseIdentity","buildRun"] {
+        assert_eq!(compact[key], old_performance[key]);
+    }
+    proof.gates.get_mut("performance").unwrap().summary = compact;
+    proof.validate(&c).unwrap();
+    let after_final = serde_json::to_vec(&proof).unwrap().len();
+    let body = proof_body(&c.body().unwrap(), &proof).unwrap();
+    assert!(after_final < 36000);
+    assert_eq!(proof_body(&body, &proof).unwrap(), body);
+    assert_eq!(proof.post_promotion_npx.as_ref().unwrap().sha256, digest(&bytes));
+    let mut stress = proof.clone();
+    let performance = &mut stress.gates.get_mut("performance").unwrap().summary;
+    performance["host"]["cpuModel"] = json!("Synthetic server processor with extended model metadata ".repeat(5));
+    for measurement in performance["measurements"].as_array_mut().unwrap() {
+        for (key, value) in [("medianSeconds",0.123_456_789_012_345_66),("p95Seconds",0.4567890123456789),("minSeconds",0.1111111111111111),("maxSeconds",0.49999999999999994)] { measurement[key] = json!(value); }
+        for index in 8..11 { measurement["trace"][index] = json!(0.123_456_789_012_345_66); }
+    }
+    stress.validate(&c).unwrap();
+    let stress_bytes = serde_json::to_vec(&stress).unwrap().len();
+    let stress_body = proof_body(&c.body().unwrap(), &stress).unwrap();
+    assert!(stress_bytes < 37000);
+    println!("{}", json!({"preProofBytes":before_pre,"oldFinalProofBytes":before_final,"latestOnlyCompactBytes":latest_only,"finalProofBytes":after_final,"finalProofHeadroom":40000-after_final,"renderedNotesBytes":body.len(),"stressProofBytes":stress_bytes,"stressRenderedNotesBytes":stress_body.len(),"latestRawReceiptSha256":digest(&bytes),"latestRawReceiptBytes":bytes.len(),"traceValuesPreserved":24*11,"comparisons":proof.gates["performance"].summary["comparisons"].as_array().unwrap().len(),"fixtures":proof.gates["performance"].summary["fixtures"].as_array().unwrap().len(),"nativeUpgradePreserved":true}));
 }
