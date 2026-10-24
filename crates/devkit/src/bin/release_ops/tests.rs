@@ -509,7 +509,7 @@ impl Remote for Fake {
             acknowledged,
             pending,
             |name| started[name] + elapsed.get(),
-            |_| self.selectors(),
+            |_, _| self.selectors(),
             |duration| {
                 pauses.set(pauses.get() + 1);
                 elapsed.set(elapsed.get() + duration);

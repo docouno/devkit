@@ -20,7 +20,7 @@ pub(super) fn wait_latest(
     acknowledged: &BTreeMap<String, String>,
     pending: Option<&str>,
     elapsed: impl Fn(&str) -> Duration,
-    mut read: impl FnMut(Duration) -> Result<Selectors>,
+    mut read: impl FnMut(Duration, Option<&str>) -> Result<Selectors>,
     pause: impl FnMut(Duration) -> Result<()>,
 ) -> Result<Selectors> {
     ensure!(
@@ -58,7 +58,12 @@ pub(super) fn wait_latest(
             }
         },
         |remaining| {
-            let snapshot = read(remaining)?;
+            let pending_channel = waiting
+                .borrow()
+                .iter()
+                .max_by_key(|name| elapsed(name))
+                .cloned();
+            let snapshot = read(remaining, pending_channel.as_deref())?;
             // A read of another channel must not hide a conflicting/newer
             // selector while an acknowledged npm write is still propagating.
             guard_selectors(&snapshot, contract)?;
@@ -343,7 +348,7 @@ mod latest_tests {
             &acknowledged(),
             Some(ENVIRONMENT),
             |_| elapsed.get(),
-            |remaining| {
+            |remaining, _pending| {
                 reads.borrow_mut().push(remaining.as_secs());
                 elapsed.set(elapsed.get() + Duration::from_secs(3));
                 Ok(if reads.borrow().len() < 3 {
@@ -375,7 +380,7 @@ mod latest_tests {
             &acknowledged(),
             Some(ENVIRONMENT),
             |_| elapsed.get(),
-            |remaining| {
+            |remaining, _pending| {
                 assert_eq!(remaining, BUDGET);
                 reads.set(reads.get() + 1);
                 elapsed.set(Duration::from_secs(355));
@@ -402,7 +407,7 @@ mod latest_tests {
                 &acknowledged(),
                 Some(ENVIRONMENT),
                 |_| elapsed.get(),
-                |remaining| {
+                |remaining, _pending| {
                     assert_eq!(remaining, Duration::from_secs(5));
                     elapsed.set(late);
                     Ok(visible(&c))
@@ -424,7 +429,7 @@ mod latest_tests {
                 &acknowledged(),
                 Some(ENVIRONMENT),
                 |_| Duration::ZERO,
-                |_| {
+                |_, _| {
                     reads.set(reads.get() + 1);
                     bail!("{kind}")
                 },
@@ -440,7 +445,7 @@ mod latest_tests {
             &acknowledged(),
             Some(ENVIRONMENT),
             |_| Duration::ZERO,
-            |_| {
+            |_, _| {
                 reads.set(reads.get() + 1);
                 Ok(c.previous.clone())
             },
@@ -482,7 +487,7 @@ mod latest_tests {
                     &acknowledged(),
                     Some(ENVIRONMENT),
                     |_| Duration::ZERO,
-                    |_| {
+                    |_, _| {
                         reads.set(reads.get() + 1);
                         Ok(snapshot.clone())
                     },
@@ -509,7 +514,7 @@ mod latest_tests {
                     &acknowledged,
                     Some(ENVIRONMENT),
                     |_| Duration::ZERO,
-                    |_| panic!("Invalid acknowledgement must not read"),
+                    |_, _| panic!("Invalid acknowledgement must not read"),
                     |_| panic!("Invalid acknowledgement must not pause"),
                 )
                 .is_err()
@@ -536,7 +541,7 @@ mod latest_tests {
                         Duration::ZERO
                     }
             },
-            |remaining| {
+            |remaining, _pending| {
                 reads.borrow_mut().push(remaining.as_secs());
                 elapsed.set(elapsed.get() + Duration::from_secs(5));
                 let mut snapshot = visible(&c);
@@ -570,7 +575,7 @@ mod latest_tests {
                 &acknowledged,
                 None,
                 |_| elapsed.get(),
-                |remaining| {
+                |remaining, _pending| {
                     assert_eq!(remaining, BUDGET);
                     reads.set(reads.get() + 1);
                     elapsed.set(elapsed.get() + Duration::from_secs(3));
@@ -593,5 +598,51 @@ mod latest_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_stale_older_channel_selects_its_original_deadline_for_the_next_request() {
+        let c = contract();
+        let mut acknowledged = acknowledged();
+        acknowledged.insert(CLI.into(), "0.3.0".into());
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = RefCell::new(Vec::new());
+        wait_latest(
+            &c,
+            &acknowledged,
+            Some(CLI),
+            |name| {
+                elapsed.get()
+                    + if name == ENVIRONMENT {
+                        Duration::from_secs(300)
+                    } else {
+                        Duration::ZERO
+                    }
+            },
+            |remaining, pending| {
+                reads
+                    .borrow_mut()
+                    .push((remaining.as_secs(), pending.unwrap().to_owned()));
+                elapsed.set(elapsed.get() + Duration::from_secs(3));
+                Ok(if reads.borrow().len() == 1 {
+                    c.previous.clone()
+                } else {
+                    Selectors {
+                        environment: Some(c.version.clone()),
+                        cli: Some(c.version.clone()),
+                        ..c.previous.clone()
+                    }
+                })
+            },
+            |duration| {
+                elapsed.set(elapsed.get() + duration);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *reads.borrow(),
+            [(360, CLI.to_owned()), (47, ENVIRONMENT.to_owned())]
+        );
     }
 }

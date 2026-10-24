@@ -410,9 +410,40 @@ fn request_timeout(deadline: Option<Instant>, now: Instant) -> Result<Duration> 
     }
 }
 
+fn selector_read_deadline(pending_started: Option<Instant>, now: Instant) -> Instant {
+    let cap = now + Duration::from_secs(180);
+    pending_started.map_or(cap, |started| (started + readiness::BUDGET).min(cap))
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn callback_delay_cannot_restart_the_acknowledged_channel_deadline() {
+        let acknowledged = Instant::now();
+        // The waiter calculated its allowance before a scheduler/callback
+        // delay. The adapter must use the original Instant, not now+allowance.
+        let delayed = acknowledged + Duration::from_secs(355);
+        let deadline = selector_read_deadline(Some(acknowledged), delayed);
+        assert_eq!(deadline, acknowledged + readiness::BUDGET);
+        assert_eq!(
+            request_timeout(Some(deadline), delayed).unwrap(),
+            Duration::from_secs(5)
+        );
+        let expired = acknowledged + Duration::from_secs(361);
+        assert!(
+            request_timeout(
+                Some(selector_read_deadline(Some(acknowledged), expired)),
+                expired
+            )
+            .is_err()
+        );
+        assert_eq!(
+            selector_read_deadline(None, expired),
+            expired + Duration::from_secs(180)
+        );
+    }
 
     #[test]
     fn every_request_uses_fresh_remaining_time_with_the_existing_cap() {
@@ -552,10 +583,11 @@ impl Remote for GhNpm {
             acknowledged,
             pending,
             |name| self.latest_read_started[name].elapsed(),
-            |remaining| {
-                self.selectors_before(Some(
-                    Instant::now() + remaining.min(Duration::from_secs(180)),
-                ))
+            |_remaining, pending| {
+                self.selectors_before(Some(selector_read_deadline(
+                    pending.map(|name| self.latest_read_started[name]),
+                    Instant::now(),
+                )))
             },
             |duration| readiness::pause(&runner, duration),
         )
