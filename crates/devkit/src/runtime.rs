@@ -13,6 +13,27 @@ use std::{
 };
 
 pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+/// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
+/// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
+pub fn validate_compose_version(value: &str) -> Result<()> {
+    static COMPOSE_VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-desktop\.(0|[1-9][0-9]*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$").unwrap()
+    });
+    let value = value.trim();
+    let supported = COMPOSE_VERSION.captures(value).is_some_and(|parts| {
+        let numbers: Option<Vec<u64>> = (1..=3).map(|i| parts[i].parse().ok()).collect();
+        numbers.is_some_and(|v| (v[0], v[1], v[2]) >= (5, 0, 0))
+    });
+    ensure!(
+        supported,
+        "Docker Compose >=5.0.0 is required; found {value:?}. Install a supported stable Compose release (older versions resolve inactive service env files during admission)."
+    );
+    Ok(())
+}
+fn require_compose(runner: &ProcessRunner, docker: &mut Command) -> Result<()> {
+    let output = runner.capture(docker.args(["compose", "version", "--short"]))?;
+    validate_compose_version(output.text()?)
+}
 #[derive(Clone, Debug)]
 pub struct RuntimeRequest {
     pub root: PathBuf,
@@ -354,8 +375,7 @@ impl<'a> PreparedContext<'a> {
         Ok(c)
     }
     fn prerequisite(&self) -> Result<()> {
-        self.runner
-            .capture(self.docker().args(["compose", "version"]))?;
+        require_compose(self.runner, &mut self.docker())?;
         let info = self
             .runner
             .capture(self.docker().args(["info", "--format", "{{.OSType}}"]))?;
@@ -1244,6 +1264,7 @@ pub struct DockerComposeNormalizer {
 }
 impl ComposeNormalizer for DockerComposeNormalizer {
     fn normalize(&self, snapshot: &Path, entrypoints: &[String]) -> Result<Value> {
+        require_compose(&self.runner, &mut Command::new("docker"))?;
         let mut command = Command::new("docker");
         command
             .args(["compose", "--project-directory"])

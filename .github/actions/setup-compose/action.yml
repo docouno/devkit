@@ -1,0 +1,23 @@
+name: Set up pinned Docker Compose
+description: Install a verified Compose plugin on an ephemeral Linux x86_64 Actions runner
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        test "${GITHUB_ACTIONS:-}" = true
+        test "$(uname -s):$(uname -m)" = Linux:x86_64
+        version=5.6.0
+        compose_dir=$(mktemp -d "${RUNNER_TEMP:?}/devkit-compose.XXXXXX")
+        trap 'rm -rf "$compose_dir"' EXIT
+        curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+          --max-time 180 --max-filesize 32663526 --output "$compose_dir/docker-compose" \
+          "https://github.com/docker/compose/releases/download/v$version/docker-compose-linux-x86_64"
+        test "$(stat -c %s "$compose_dir/docker-compose")" = 32663526
+        printf '%s\n' '40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a  docker-compose' > "$compose_dir/checksums.txt"
+        (cd "$compose_dir" && sha256sum --check checksums.txt)
+        sudo install -D -m 0755 "$compose_dir/docker-compose" /usr/local/lib/docker/cli-plugins/docker-compose
+        test "$(docker compose version --short)" = "$version"
+        mkdir "$compose_dir/anonymous-home"
+        test "$(env -u DOCKER_CONFIG HOME="$compose_dir/anonymous-home" docker compose version --short)" = "$version"

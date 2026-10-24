@@ -202,6 +202,73 @@ def accept_runtime(root, native=False):
     seal_runtime(root)
 
 
+def write_rust_fixture(root):
+    runtime = root / ".devkit/runtime"
+    shutil.copytree(RUNTIME_SOURCE, runtime)
+    recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
+    (runtime / "toolchains.env").write_text(
+        f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
+        f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
+        f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
+        f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+    (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
+    shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
+    accept_runtime(root, native=True)
+    return recipe
+
+
+class ComposeCompatibilityTests(unittest.TestCase):
+    def test_runtime_and_lifecycle_refuse_old_compose_before_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-compose-compat-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            write_rust_fixture(root)
+            fake = base / "bin"
+            fake.mkdir()
+            docker = fake / "docker"
+            docker.write_text('''#!/usr/bin/python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+with pathlib.Path(os.environ['COMPAT_DOCKER_LOG']).open('a') as log:
+    log.write(json.dumps(argv)+'\\n')
+if argv == ['compose', 'version', '--short']:
+    print(os.environ['COMPAT_COMPOSE_VERSION'])
+elif argv == ['info', '--format', '{{.OSType}}']:
+    print('linux')
+elif argv[0] == 'compose' and 'config' in argv:
+    print(json.dumps({'services': {'api': {}}}))
+elif argv[0] == 'compose' and 'ps' in argv:
+    print('COMPAT_STATUS_READY')
+else:
+    print('unexpected Docker query: '+repr(argv), file=sys.stderr)
+    sys.exit(90)
+''')
+            docker.chmod(0o755)
+            log = base / "docker.jsonl"
+            for version in ("2.38.2", "5.0.0", "v5.6.0-desktop.1"):
+                for surface, argv in (
+                        ("runtime", [str(ENGINE), "task", "status", "--root", str(root)]),
+                        ("lifecycle", [str(FIXTURE), str(root), "--compose-inventory"])):
+                    with self.subTest(version=version, surface=surface):
+                        log.write_text("")
+                        environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
+                                           COMPAT_DOCKER_LOG=str(log), COMPAT_COMPOSE_VERSION=version)
+                        result = run(*argv, check=False, env=environment)
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        if version == "2.38.2":
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("Compose >=5.0.0", result.stderr)
+                            self.assertEqual(calls, [["compose", "version", "--short"]],
+                                             "unsupported Compose reached configuration or daemon queries")
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            if surface == "runtime":
+                                self.assertIn("COMPAT_STATUS_READY", result.stdout)
+                            else:
+                                self.assertEqual(json.loads(result.stdout)["services"], ["api"])
+                                self.assertTrue(any("config" in call for call in calls))
+
+
 class DoctorSnapshotTests(unittest.TestCase):
     def test_doctor_rechecks_admitted_snapshot_after_external_query(self):
         # Real admission and CLI, with only Docker's read-only query boundary
@@ -209,17 +276,7 @@ class DoctorSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="devkit-doctor-snapshot-") as temporary:
             base = Path(temporary)
             root = base / "checkout with space"
-            runtime = root / ".devkit/runtime"
-            shutil.copytree(RUNTIME_SOURCE, runtime)
-            recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
-            (runtime / "toolchains.env").write_text(
-                f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
-                f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
-                f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
-                f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
-            (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
-            shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
-            accept_runtime(root, native=True)
+            recipe = write_rust_fixture(root)
             (root / ".devkit/state").mkdir(exist_ok=True)
             (root / ".devkit/state/rust-image").write_text("sha256:" + "a"*64 + "\n")
             fake = base / "bin"
@@ -230,7 +287,7 @@ import os, pathlib, sys, time
 argv = sys.argv[1:]
 base = pathlib.Path(os.environ['DOCTOR_SNAPSHOT_BASE'])
 if argv[:2] == ['compose', 'version']:
-    print('Docker Compose version snapshot-regression')
+    print('v5.0.0')
 elif argv[:2] == ['info', '--format']:
     print('linux')
 elif argv[:2] == ['image', 'inspect']:

@@ -2,7 +2,7 @@
 
 A shared development environment for independent TypeScript and Rust repositories. Create applications from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
-Requires Linux x86_64, a local Docker Engine with Compose v2, and GNU Make. Node.js is needed only for the optional npm entry point.
+Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer, and GNU Make. Node.js is needed only for the optional npm entry point.
 
 ## Create a project
 

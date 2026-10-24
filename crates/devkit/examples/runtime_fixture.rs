@@ -4,6 +4,16 @@ use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
 fn main() -> Result<()> {
     let root = PathBuf::from(std::env::args_os().nth(1).expect("fixture root"));
+    if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--compose-inventory")) {
+        let inventory = devkit::compose::admit_compose_inventory(
+            &root,
+            &devkit::runtime::DockerComposeNormalizer {
+                runner: devkit::processes::ProcessRunner::new()?,
+            },
+        )?;
+        println!("{}", serde_json::to_string(&inventory)?);
+        return Ok(());
+    }
     let mut state: ProjectState = read_json(&root.join(".devkit/manifest.json"))?;
     let dependencies = derive_component_dependencies(&root, &state)?;
     for (path, deps) in dependencies {
