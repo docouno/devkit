@@ -341,11 +341,14 @@ class Gate:
         self.run(case["name"] + "-host-trace",
                  [*self.strace, "-f", "-c", "-e", "trace=execve,execveat", "-o", summary_file,
                   "--", *case["argv"]], cwd=root, timeout=600)
+        summary_text = summary_file.read_text()
         case["trace"] = {
             "dockerCliCalls": len(records), "oneShotContainers": sum(counts.values()),
             "controlContainers": counts["control"], "toolContainers": counts["tool"],
             "otherContainers": counts["other"], "dockerLog": str(logfile),
-            "hostExecSummary": str(summary_file), **exec_counts(summary_file.read_text()),
+            "dockerRecords": records,
+            "hostExecSummary": str(summary_file),
+            "hostExecSummaryText": summary_text, **exec_counts(summary_text),
             "instrumentedTotalSeconds": result["seconds"],
             "instrumentedToolContainerSeconds": tool_seconds,
             "instrumentedOutsideToolSeconds": result["seconds"] - tool_seconds,

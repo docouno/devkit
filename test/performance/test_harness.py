@@ -193,6 +193,8 @@ finally:
         gate.trace(case)
         self.assertEqual(case["trace"]["dockerCliCalls"], len(records))
         self.assertEqual(case["trace"]["oneShotContainers"], 0)
+        self.assertEqual([entry["argv"] for entry in case["trace"]["dockerRecords"]], records)
+        self.assertEqual(case["trace"]["hostExecSummaryText"], " 100.00 0.01 5 4 execve\n")
 
 
 if __name__ == "__main__":
