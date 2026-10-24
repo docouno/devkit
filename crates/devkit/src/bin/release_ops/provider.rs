@@ -113,6 +113,7 @@ pub(super) struct GhNpm {
     scratch: tempfile::TempDir,
     gh_executable: PathBuf,
     release_ids: BTreeMap<String, u64>,
+    latest_read_started: BTreeMap<String, Instant>,
 }
 impl GhNpm {
     pub(super) fn new(runner: ProcessRunner) -> Result<Self> {
@@ -123,6 +124,7 @@ impl GhNpm {
             scratch,
             gh_executable: PathBuf::from("gh"),
             release_ids: BTreeMap::new(),
+            latest_read_started: BTreeMap::new(),
         })
     }
     fn execute(&self, command: &mut Command, limit: usize) -> Result<ProcessOutput> {
@@ -198,6 +200,15 @@ impl GhNpm {
         Ok(release)
     }
     fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Option<Value>> {
+        self.api_before(method, path, body, None)
+    }
+    fn api_before(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Value>> {
         ensure!(
             path.starts_with("repos/docouno/devkit/"),
             "Unexpected GitHub API scope"
@@ -227,7 +238,7 @@ impl GhNpm {
         let output = self.runner.run_with_timeout(
             &mut command,
             OutputMode::Capture(4 * 1024 * 1024),
-            Duration::from_secs(180),
+            request_timeout(deadline, Instant::now())?,
         )?;
         drop(input);
         github_response(output, method, path)
@@ -268,9 +279,6 @@ impl GhNpm {
                 "--fetch-timeout=90000",
             ]);
         command
-    }
-    fn npm_json(&self, spec: &str, field: Option<&str>) -> Result<Option<Value>> {
-        self.npm_json_before(spec, field, None)
     }
     fn npm_json_before(
         &self,
@@ -352,6 +360,42 @@ impl GhNpm {
             bytes: read_bounded(&path, 128 * 1024 * 1024)?,
         }))
     }
+    fn selectors_before(&self, deadline: Option<Instant>) -> Result<Selectors> {
+        let latest = |name| -> Result<Option<String>> {
+            self.npm_json_before(name, Some("dist-tags"), deadline)?
+                .map(|value| {
+                    let tags = value
+                        .as_object()
+                        .context("Npm dist-tags must be an object")?;
+                    tags.get("latest")
+                        .map(|v| v.as_str().map(str::to_owned).context("Invalid npm latest"))
+                        .transpose()
+                })
+                .transpose()
+                .map(Option::flatten)
+        };
+        let environment = latest(ENVIRONMENT)?;
+        let cli = latest(CLI)?;
+        let github = self
+            .api_before(
+                "GET",
+                &format!("repos/{REPO}/releases/latest"),
+                None,
+                deadline,
+            )?
+            .map(|value| {
+                value["tag_name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("GitHub latest tag missing")
+            })
+            .transpose()?;
+        Ok(Selectors {
+            environment,
+            cli,
+            github,
+        })
+    }
 }
 
 fn request_timeout(deadline: Option<Instant>, now: Instant) -> Result<Duration> {
@@ -362,15 +406,44 @@ fn request_timeout(deadline: Option<Instant>, now: Instant) -> Result<Duration> 
             .checked_duration_since(now)
             .filter(|value| !value.is_zero())
             .map(|remaining| remaining.min(maximum))
-            .context(
-                "Npm publication read deadline expired; retry against the original frozen set",
-            ),
+            .context("Release read deadline expired; retry against the original frozen set"),
     }
+}
+
+fn selector_read_deadline(pending_started: Option<Instant>, now: Instant) -> Instant {
+    let cap = now + Duration::from_secs(180);
+    pending_started.map_or(cap, |started| (started + readiness::BUDGET).min(cap))
 }
 
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn callback_delay_cannot_restart_the_acknowledged_channel_deadline() {
+        let acknowledged = Instant::now();
+        // The waiter calculated its allowance before a scheduler/callback
+        // delay. The adapter must use the original Instant, not now+allowance.
+        let delayed = acknowledged + Duration::from_secs(355);
+        let deadline = selector_read_deadline(Some(acknowledged), delayed);
+        assert_eq!(deadline, acknowledged + readiness::BUDGET);
+        assert_eq!(
+            request_timeout(Some(deadline), delayed).unwrap(),
+            Duration::from_secs(5)
+        );
+        let expired = acknowledged + Duration::from_secs(361);
+        assert!(
+            request_timeout(
+                Some(selector_read_deadline(Some(acknowledged), expired)),
+                expired
+            )
+            .is_err()
+        );
+        assert_eq!(
+            selector_read_deadline(None, expired),
+            expired + Duration::from_secs(180)
+        );
+    }
 
     #[test]
     fn every_request_uses_fresh_remaining_time_with_the_existing_cap() {
@@ -490,40 +563,42 @@ impl Remote for GhNpm {
         Ok(())
     }
     fn selectors(&mut self) -> Result<Selectors> {
-        let latest = |name| -> Result<Option<String>> {
-            self.npm_json(name, Some("dist-tags"))?
-                .map(|value| {
-                    let tags = value
-                        .as_object()
-                        .context("Npm dist-tags must be an object")?;
-                    tags.get("latest")
-                        .map(|v| v.as_str().map(str::to_owned).context("Invalid npm latest"))
-                        .transpose()
-                })
-                .transpose()
-                .map(Option::flatten)
-        };
-        let environment = latest(ENVIRONMENT)?;
-        let cli = latest(CLI)?;
-        let github = self
-            .api("GET", &format!("repos/{REPO}/releases/latest"), None)?
-            .map(|value| {
-                value["tag_name"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .context("GitHub latest tag missing")
-            })
-            .transpose()?;
-        Ok(Selectors {
-            environment,
-            cli,
-            github,
-        })
+        self.selectors_before(None)
+    }
+    fn selectors_after_latest(
+        &mut self,
+        contract: &Contract,
+        acknowledged: &BTreeMap<String, String>,
+        pending: Option<&str>,
+    ) -> Result<Selectors> {
+        ensure!(
+            acknowledged
+                .keys()
+                .all(|name| self.latest_read_started.contains_key(name)),
+            "Latest visibility wait requires a successful npm write"
+        );
+        let runner = self.runner.clone();
+        readiness::wait_latest(
+            contract,
+            acknowledged,
+            pending,
+            |name| self.latest_read_started[name].elapsed(),
+            |_remaining, pending| {
+                self.selectors_before(Some(selector_read_deadline(
+                    pending.map(|name| self.latest_read_started[name]),
+                    Instant::now(),
+                )))
+            },
+            |duration| readiness::pause(&runner, duration),
+        )
     }
     fn npm_latest(&mut self, name: &str, version: &str) -> Result<()> {
         let mut command = self.npm();
         command.args(["dist-tag", "add", &format!("{name}@{version}"), "latest"]);
         self.execute(&mut command, 64 * 1024)?;
+        self.latest_read_started
+            .entry(name.into())
+            .or_insert_with(Instant::now);
         Ok(())
     }
     fn edit_release(
