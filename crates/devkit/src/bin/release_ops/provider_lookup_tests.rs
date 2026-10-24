@@ -261,7 +261,7 @@ fn observed_or_created_release_id_cannot_be_silently_replaced() {
 }
 
 #[test]
-#[ignore = "explicit operator-supplied existing draft; authenticated read-only"]
+#[ignore = "explicit operator-supplied existing release; authenticated read-only"]
 fn actual_existing_release_lookup_readonly() {
     let tag = std::env::var("DEVKIT_RELEASE_PROBE_TAG").expect("explicit release tag required");
     let expected_id: u64 = std::env::var("DEVKIT_RELEASE_PROBE_ID")
@@ -278,6 +278,13 @@ fn actual_existing_release_lookup_readonly() {
     assert_eq!(first.id, expected_id);
     let contract = first.contract().unwrap();
     assert_eq!(contract.index_sha256, expected_index_hash);
+    if let Some(body) = first.body.as_deref()
+        && body.contains(PROOF_OPEN)
+    {
+        let proof: Proof =
+            serde_json::from_str(block(body, PROOF_OPEN, PROOF_CLOSE).unwrap()).unwrap();
+        proof.validate(&contract).unwrap();
+    }
     let asset = first
         .assets
         .iter()

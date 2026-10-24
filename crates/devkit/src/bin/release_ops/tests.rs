@@ -6,22 +6,34 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_version("0.3.0")
+    }
+    fn native_update() -> Self {
+        let mut fixture = Self::with_version("0.3.1");
+        fixture.contract.previous = Selectors {
+            environment: Some("0.3.0".into()),
+            cli: Some("0.3.0".into()),
+            github: Some("v0.3.0".into()),
+        };
+        fixture
+    }
+    fn with_version(version: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         for name in [
-            "devkit-x86_64-unknown-linux-musl",
-            "devkit-0.3.0.tar.gz",
-            "release.json",
-            "install.sh",
-            "bootstrap.sh",
-            "checksums.txt",
-            "docouno-env-0.3.0.tgz",
-            "docouno-devkit-0.3.0.tgz",
+            "devkit-x86_64-unknown-linux-musl".to_owned(),
+            format!("devkit-{version}.tar.gz"),
+            "release.json".into(),
+            "install.sh".into(),
+            "bootstrap.sh".into(),
+            "checksums.txt".into(),
+            format!("docouno-env-{version}.tgz"),
+            format!("docouno-devkit-{version}.tgz"),
         ] {
             let bytes = format!("frozen {name}");
-            fs::write(directory.path().join(name), &bytes).unwrap();
+            fs::write(directory.path().join(&name), &bytes).unwrap();
             files.insert(
-                name.into(),
+                name,
                 devkit::distribution::AssetIdentity {
                     sha256: digest(bytes.as_bytes()),
                     size: bytes.len() as u64,
@@ -30,16 +42,20 @@ impl Fixture {
         }
         let mut packages = BTreeMap::new();
         for (kind, name, archive) in [
-            ("environment", ENVIRONMENT, "docouno-env-0.3.0.tgz"),
-            ("cli", CLI, "docouno-devkit-0.3.0.tgz"),
+            (
+                "environment",
+                ENVIRONMENT,
+                format!("docouno-env-{version}.tgz"),
+            ),
+            ("cli", CLI, format!("docouno-devkit-{version}.tgz")),
         ] {
-            let bytes = fs::read(directory.path().join(archive)).unwrap();
+            let bytes = fs::read(directory.path().join(&archive)).unwrap();
             packages.insert(
                 kind.into(),
                 NpmArtifact {
                     name: name.into(),
-                    version: "0.3.0".into(),
-                    archive: archive.into(),
+                    version: version.into(),
+                    archive,
                     integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(&bytes))),
                     shasum: format!("{:x}", Sha1::digest(&bytes)),
                 },
@@ -47,7 +63,7 @@ impl Fixture {
         }
         let index = ReleaseIndex {
             schema_version: 1,
-            version: "0.3.0".into(),
+            version: version.into(),
             target: devkit::distribution::TARGET.into(),
             source_commit: "a".repeat(40),
             source_tree: "b".repeat(40),
@@ -55,7 +71,7 @@ impl Fixture {
             publication_eligible: true,
             release_identity: files["release.json"].sha256.clone(),
             engine: "devkit-x86_64-unknown-linux-musl".into(),
-            archive: "devkit-0.3.0.tar.gz".into(),
+            archive: format!("devkit-{version}.tar.gz"),
             packages,
             files,
         };
@@ -64,7 +80,7 @@ impl Fixture {
             .unwrap()
             .contract(Selectors {
                 environment: Some("0.2.1".into()),
-                cli: Some("0.0.0-stage".into()),
+                cli: Some("0.2.1".into()),
                 github: Some("v0.2.1".into()),
             })
             .unwrap();
@@ -85,6 +101,10 @@ impl Fixture {
             mutations: Vec::new(),
             fault: None,
             tag: None,
+            visibility_lag: 0,
+            pending_reads: BTreeMap::new(),
+            readiness_pauses: 0,
+            corrupt_publish_bytes: false,
         }
     }
 }
@@ -263,6 +283,10 @@ struct Fake {
     mutations: Vec<String>,
     fault: Option<String>,
     tag: Option<(String, String)>,
+    visibility_lag: usize,
+    pending_reads: BTreeMap<String, usize>,
+    readiness_pauses: usize,
+    corrupt_publish_bytes: bool,
 }
 impl Fake {
     fn hit(&mut self, label: &str) -> Result<()> {
@@ -311,6 +335,10 @@ impl Fake {
                 summary["authenticationUsed"] = json!(false);
                 summary["hostLanguageSDKAttemptedForNativeCommands"] = json!(false);
                 summary["readmeSha256"] = json!("d".repeat(64));
+                if native_upgrade_from(c).is_some() {
+                    summary["nativeUpgrade"] =
+                        native_upgrade(c, &digest(&self.assets["release.json"]));
+                }
             }
             gates.insert(
                 name.into(),
@@ -390,11 +418,34 @@ impl Remote for Fake {
         self.hit(&format!("upload:{name}"))
     }
     fn npm_version(&mut self, name: &str, _version: &str) -> Result<Option<PublishedNpm>> {
+        if let Some(remaining) = self.pending_reads.get_mut(name)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Ok(None);
+        }
         Ok(self.npm.get(name).map(|n| PublishedNpm {
             integrity: n.integrity.clone(),
             shasum: n.shasum.clone(),
             bytes: n.bytes.clone(),
         }))
+    }
+    fn npm_after_publish(&mut self, name: &str, version: &str) -> Result<PublishedNpm> {
+        let elapsed = std::cell::Cell::new(std::time::Duration::ZERO);
+        let pauses = std::cell::Cell::new(0);
+        let result = readiness::wait(
+            name,
+            version,
+            || elapsed.get(),
+            |_remaining| self.npm_version(name, version),
+            |duration| {
+                pauses.set(pauses.get() + 1);
+                elapsed.set(elapsed.get() + duration);
+                Ok(())
+            },
+        );
+        self.readiness_pauses += pauses.get();
+        result
     }
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()> {
         ensure!(
@@ -402,7 +453,10 @@ impl Remote for Fake {
             "Registry write before complete durable GitHub staging"
         );
         ensure!(
-            tag == "candidate-0.3.0",
+            tag == format!(
+                "candidate-{}",
+                self.release.as_ref().unwrap().contract()?.version
+            ),
             "Would expose latest before public proof"
         );
         let name = if path
@@ -426,6 +480,10 @@ impl Remote for Fake {
                 bytes,
             },
         );
+        if self.corrupt_publish_bytes {
+            self.npm.get_mut(name).unwrap().bytes.push(0);
+        }
+        self.pending_reads.insert(name.into(), self.visibility_lag);
         self.hit(&format!("npm:{name}"))
     }
     fn selectors(&mut self) -> Result<Selectors> {
@@ -511,6 +569,253 @@ fn existing_incomplete_draft_checks_selectors_before_any_asset_mutation() {
         assert_eq!(remote.mutations.len(), before);
         assert_eq!(remote.assets, assets_before);
     }
+}
+
+#[test]
+fn publication_waits_for_exact_version_without_repeating_the_write() {
+    let fixture = Fixture::new();
+    let set = fixture.set();
+    let mut remote = fixture.remote();
+    stage(&mut remote, &set, &fixture.contract).unwrap();
+    remote.visibility_lag = 2;
+    publish(&mut remote, &set, &fixture.contract).unwrap();
+    for name in [ENVIRONMENT, CLI] {
+        assert_eq!(
+            remote
+                .mutations
+                .iter()
+                .filter(|op| *op == &format!("npm:{name}"))
+                .count(),
+            1
+        );
+    }
+    assert!(remote.release.as_ref().unwrap().immutable);
+    assert_eq!(remote.selectors, fixture.contract.previous);
+    assert_eq!(remote.readiness_pauses, 4);
+}
+
+#[test]
+fn publication_timeout_never_writes_another_package_or_public_release() {
+    let fixture = Fixture::new();
+    let set = fixture.set();
+    let mut remote = fixture.remote();
+    stage(&mut remote, &set, &fixture.contract).unwrap();
+    let before = remote.mutations.len();
+    remote.visibility_lag = usize::MAX;
+    let error = publish(&mut remote, &set, &fixture.contract).unwrap_err();
+    assert!(format!("{error:#}").contains("within 360s"));
+    assert_eq!(remote.mutations[before..], ["npm:@docouno/env"]);
+    assert!(remote.release.as_ref().unwrap().draft);
+    assert_eq!(remote.selectors, fixture.contract.previous);
+    assert_eq!(remote.readiness_pauses, 36);
+}
+
+#[test]
+fn first_visible_mismatching_bytes_stop_before_any_more_mutations() {
+    let fixture = Fixture::new();
+    let set = fixture.set();
+    let mut remote = fixture.remote();
+    stage(&mut remote, &set, &fixture.contract).unwrap();
+    let before = remote.mutations.len();
+    remote.corrupt_publish_bytes = true;
+    let error = publish(&mut remote, &set, &fixture.contract).unwrap_err();
+    assert!(error.to_string().contains("bytes/SRI differ"));
+    assert_eq!(remote.mutations[before..], ["npm:@docouno/env"]);
+    assert_eq!(remote.readiness_pauses, 0);
+    assert!(remote.release.as_ref().unwrap().draft);
+}
+
+#[test]
+fn new_package_and_placeholder_baselines_refuse_before_any_write() {
+    for previous in [None, Some("0.0.0-stage"), Some("0.3.0"), Some("0.4.0")] {
+        for environment in [false, true] {
+            let mut fixture = Fixture::new();
+            if environment {
+                fixture.contract.previous.environment = previous.map(str::to_owned);
+            } else {
+                fixture.contract.previous.cli = previous.map(str::to_owned);
+            }
+            let set = fixture.set();
+            let mut remote = fixture.remote();
+            assert!(
+                stage(&mut remote, &set, &fixture.contract).is_err(),
+                "Accepted {previous:?} as a new release baseline"
+            );
+            assert!(remote.mutations.is_empty());
+        }
+    }
+}
+
+#[test]
+fn publication_checks_predecessors_even_with_a_complete_legacy_draft() {
+    for previous in [None, Some("0.0.0-stage"), Some("0.3.0")] {
+        for environment in [false, true] {
+            let fixture = Fixture::new();
+            let set = fixture.set();
+            let mut remote = fixture.remote();
+            stage(&mut remote, &set, &fixture.contract).unwrap();
+            let mut historical = fixture.contract.clone();
+            if environment {
+                historical.previous.environment = previous.map(str::to_owned);
+            } else {
+                historical.previous.cli = previous.map(str::to_owned);
+            }
+            remote.release.as_mut().unwrap().body = Some(historical.body().unwrap());
+            remote.selectors = historical.previous.clone();
+            let before = remote.mutations.len();
+            assert!(publish(&mut remote, &set, &historical).is_err());
+            assert_eq!(remote.mutations.len(), before);
+            assert!(remote.npm.is_empty());
+        }
+    }
+}
+
+#[test]
+fn historical_placeholder_contract_is_still_readable() {
+    let fixture = Fixture::new();
+    let mut historical = fixture.contract.clone();
+    historical.previous.cli = Some("0.0.0-stage".into());
+    assert_eq!(
+        Contract::from_body(&historical.body().unwrap()).unwrap(),
+        historical
+    );
+    assert!(guard_npm_predecessors(&historical.previous, &historical.version).is_err());
+    assert!(guard_npm_predecessors(&fixture.contract.previous, &fixture.contract.version).is_ok());
+}
+
+fn native_upgrade(c: &Contract, identity: &str) -> Value {
+    json!({
+        "fromVersion": c.previous.environment,
+        "toVersion": c.version,
+        "fromReleaseIdentity": "e".repeat(64),
+        "toReleaseIdentity": identity,
+        "acceptedOldAfterFreshCliAdd": true,
+        "oldEngineVersionVerified": true,
+        "newEngineVersionVerified": true,
+        "productInputsPreserved": true,
+        "previewReadonly": true,
+        "checksPassed": true,
+        "sameVersionNoop": true,
+        "hostSdkAttempts": 0
+    })
+}
+
+#[test]
+fn native_readme_requires_every_bound_upgrade_assertion() {
+    let fixture = Fixture::native_update();
+    let set = fixture.set();
+    let c = &fixture.contract;
+    let mut remote = fixture.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    let proof: Proof = serde_json::from_str(
+        block(
+            remote.release.as_ref().unwrap().body.as_deref().unwrap(),
+            PROOF_OPEN,
+            PROOF_CLOSE,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let original = proof.gates["readme"].summary.clone();
+    validate_gate("readme", &original, c).unwrap();
+    let mut variants = vec![Value::Null, json!({})];
+    for (key, value) in [
+        ("fromVersion", json!("0.2.1")),
+        ("toVersion", json!("0.4.0")),
+        ("fromReleaseIdentity", json!("bad")),
+        ("toReleaseIdentity", json!("bad")),
+        (
+            "fromReleaseIdentity",
+            original["nativeUpgrade"]["toReleaseIdentity"].clone(),
+        ),
+        ("hostSdkAttempts", json!(1)),
+        ("hostSdkAttempts", json!(false)),
+    ] {
+        let mut value_copy = original["nativeUpgrade"].clone();
+        value_copy[key] = value;
+        variants.push(value_copy);
+    }
+    for key in [
+        "acceptedOldAfterFreshCliAdd",
+        "oldEngineVersionVerified",
+        "newEngineVersionVerified",
+        "productInputsPreserved",
+        "previewReadonly",
+        "checksPassed",
+        "sameVersionNoop",
+    ] {
+        let mut value = original["nativeUpgrade"].clone();
+        value[key] = json!(false);
+        variants.push(value);
+    }
+    for native in variants {
+        let mut changed = original.clone();
+        changed["nativeUpgrade"] = native;
+        assert!(validate_gate("readme", &changed, c).is_err());
+    }
+    let mut raw = original.clone();
+    raw["results"] = json!([]);
+    let compact = compact_gate("readme", raw).unwrap();
+    assert_eq!(compact["nativeUpgrade"], original["nativeUpgrade"]);
+    validate_gate("readme", &compact, c).unwrap();
+}
+
+#[test]
+fn native_upgrade_target_binding_blocks_proof_and_promotion_before_writes() {
+    for invalid in [
+        Value::Null,
+        native_upgrade(&Fixture::native_update().contract, &"f".repeat(64)),
+    ] {
+        let fixture = Fixture::native_update();
+        let set = fixture.set();
+        let c = &fixture.contract;
+        let mut remote = fixture.remote();
+        stage(&mut remote, &set, c).unwrap();
+        publish(&mut remote, &set, c).unwrap();
+        remote.proof(c);
+        let mut proof: Proof = serde_json::from_str(
+            block(
+                remote.release.as_ref().unwrap().body.as_deref().unwrap(),
+                PROOF_OPEN,
+                PROOF_CLOSE,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        proof.gates.get_mut("readme").unwrap().summary["nativeUpgrade"] = invalid;
+        let before = remote.mutations.len();
+        assert!(record_proof(&mut remote, &set, c, &proof).is_err());
+        assert_eq!(remote.mutations.len(), before);
+        remote.release.as_mut().unwrap().body = Some(format!(
+            "{}{PROOF_OPEN}{}{PROOF_CLOSE}",
+            c.body().unwrap(),
+            serde_json::to_string(&proof).unwrap()
+        ));
+        assert!(promote(&mut remote, &set, c).is_err());
+        assert_eq!(remote.mutations.len(), before);
+        assert_eq!(remote.selectors, c.previous);
+    }
+    let fixture = Fixture::native_update();
+    let set = fixture.set();
+    let mut remote = fixture.remote();
+    stage(&mut remote, &set, &fixture.contract).unwrap();
+    publish(&mut remote, &set, &fixture.contract).unwrap();
+    remote.proof(&fixture.contract);
+    let proof: Proof = serde_json::from_str(
+        block(
+            remote.release.as_ref().unwrap().body.as_deref().unwrap(),
+            PROOF_OPEN,
+            PROOF_CLOSE,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    record_proof(&mut remote, &set, &fixture.contract, &proof).unwrap();
+    promote(&mut remote, &set, &fixture.contract).unwrap();
+    assert_eq!(remote.selectors.environment.as_deref(), Some("0.3.1"));
+    assert_eq!(remote.selectors.cli.as_deref(), Some("0.3.1"));
 }
 
 #[test]

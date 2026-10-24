@@ -18,7 +18,7 @@ help:
 	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished preview' \
 	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/old/payload legacy_archive=/absolute/0.2.1.tar.gz' \
 	  'make verify-bootstrap build_set=/absolute/set legacy_archive=/absolute/0.2.1.tar.gz' \
-	  'make verify-public from_version=0.2.1 version=0.3.0 expected_index_sha256=SHA256' \
+	  'make verify-public from_version=0.2.1 version=0.3.1 expected_index_sha256=SHA256' \
 	  'make init release=/absolute/set/payload target=/absolute/new/project' \
 	  'Ordinary checks use cached SDKs. Only setup prepares images and dependencies.'
 setup: bootstrap

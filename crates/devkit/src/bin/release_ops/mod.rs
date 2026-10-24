@@ -1,5 +1,6 @@
 //! A bounded release state machine, with provider operations at one seam.
 mod provider;
+mod readiness;
 #[cfg(test)]
 mod tests;
 
@@ -370,6 +371,7 @@ trait Remote {
     ) -> Result<()>;
     fn upload_asset(&mut self, release: &RemoteRelease, path: &Path) -> Result<()>;
     fn npm_version(&mut self, name: &str, version: &str) -> Result<Option<PublishedNpm>>;
+    fn npm_after_publish(&mut self, name: &str, version: &str) -> Result<PublishedNpm>;
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()>;
     fn selectors(&mut self) -> Result<Selectors>;
     fn npm_latest(&mut self, name: &str, version: &str) -> Result<()>;
@@ -458,22 +460,40 @@ fn check_npm(
     }
     Ok(existing)
 }
+fn guard_npm_predecessors(previous: &Selectors, version: &str) -> Result<()> {
+    let target = stable(version)?;
+    for (label, previous) in [(ENVIRONMENT, &previous.environment), (CLI, &previous.cli)] {
+        let message = format!(
+            "Normal releases require an existing stable predecessor for {label}; bootstrap a new package separately, not through a stage placeholder"
+        );
+        let previous = previous.as_deref().context(message.clone())?;
+        let predecessor = stable(previous).context(message)?;
+        ensure!(
+            predecessor < target,
+            "Previous {label} version must be older than the target release"
+        );
+    }
+    Ok(())
+}
 fn guard_selectors(current: &Selectors, contract: &Contract) -> Result<()> {
-    let target = stable(&contract.version)?;
+    guard_current_selectors(current, &contract.previous, &contract.version)
+}
+fn guard_current_selectors(current: &Selectors, previous: &Selectors, version: &str) -> Result<()> {
+    let target = stable(version)?;
     for (label, current, previous, github) in [
         (
             "environment",
             &current.environment,
-            &contract.previous.environment,
+            &previous.environment,
             false,
         ),
-        ("CLI", &current.cli, &contract.previous.cli, false),
-        ("GitHub", &current.github, &contract.previous.github, true),
+        ("CLI", &current.cli, &previous.cli, false),
+        ("GitHub", &current.github, &previous.github, true),
     ] {
         let expected_target = if github {
-            contract.tag()
+            format!("v{version}")
         } else {
-            contract.version.clone()
+            version.to_owned()
         };
         ensure!(
             current.as_deref() == Some(&expected_target) || current == previous,
@@ -498,6 +518,7 @@ fn guard_selectors(current: &Selectors, contract: &Contract) -> Result<()> {
 }
 fn stage(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Result<()> {
     contract.check_index(set)?;
+    guard_npm_predecessors(&contract.previous, &contract.version)?;
     check_source(remote, contract)?;
     guard_selectors(&remote.selectors()?, contract)?;
     let existing = check_npm(remote, set, false)?;
@@ -546,6 +567,7 @@ fn stage(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Resu
 }
 fn publish(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Result<()> {
     contract.check_index(set)?;
+    guard_npm_predecessors(&contract.previous, &contract.version)?;
     check_source(remote, contract)?;
     let release = remote
         .release(&contract.tag())?
@@ -564,8 +586,19 @@ fn publish(remote: &mut impl Remote, set: &FrozenSet, contract: &Contract) -> Re
             let frozen = set.operation_copy(&package.archive, directory.path())?;
             remote.publish_npm(&frozen, &format!("candidate-{}", contract.version))?;
             // A successful request is not proof that the registry stores our bytes.
-            let value = remote.npm_version(&package.name, &package.version)?.context("Published npm version is not readable yet; retry against the original frozen set")?;
+            let value = remote
+                .npm_after_publish(&package.name, &package.version)
+                .with_context(|| {
+                    format!(
+                        "Could not verify published {}@{}; retry against the original frozen set",
+                        package.name, package.version
+                    )
+                })?;
             verify_npm_bytes(package, &value.integrity, &value.shasum, &value.bytes)?;
+            eprintln!(
+                "Verified frozen npm archive {}@{}",
+                package.name, package.version
+            );
         }
     }
     check_npm(remote, set, true)?;
@@ -610,6 +643,66 @@ struct Gate {
     sha256: String,
     bytes: u64,
     summary: Value,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeUpgrade {
+    from_version: String,
+    to_version: String,
+    from_release_identity: String,
+    to_release_identity: String,
+    accepted_old_after_fresh_cli_add: bool,
+    old_engine_version_verified: bool,
+    new_engine_version_verified: bool,
+    product_inputs_preserved: bool,
+    preview_readonly: bool,
+    checks_passed: bool,
+    same_version_noop: bool,
+    host_sdk_attempts: u64,
+}
+fn native_upgrade_from(c: &Contract) -> Option<&str> {
+    c.previous
+        .environment
+        .as_deref()
+        .filter(|previous| stable(previous).is_ok_and(|version| version >= [0, 3, 0]))
+}
+fn validate_native_upgrade(
+    readme: &Value,
+    c: &Contract,
+    target_identity: Option<&str>,
+) -> Result<()> {
+    let Some(previous) = native_upgrade_from(c) else {
+        return Ok(());
+    };
+    let upgrade: NativeUpgrade = serde_json::from_value(readme["nativeUpgrade"].clone())
+        .context("Actual native-to-native upgrade proof is missing or malformed")?;
+    ensure!(
+        upgrade.from_version == previous
+            && upgrade.to_version == c.version
+            && stable(&upgrade.from_version)? < stable(&upgrade.to_version)?
+            && SHA256_RE.is_match(&upgrade.from_release_identity)
+            && SHA256_RE.is_match(&upgrade.to_release_identity)
+            && upgrade.from_release_identity != upgrade.to_release_identity,
+        "Native upgrade version/release identities differ"
+    );
+    ensure!(
+        upgrade.accepted_old_after_fresh_cli_add
+            && upgrade.old_engine_version_verified
+            && upgrade.new_engine_version_verified
+            && upgrade.product_inputs_preserved
+            && upgrade.preview_readonly
+            && upgrade.checks_passed
+            && upgrade.same_version_noop
+            && upgrade.host_sdk_attempts == 0,
+        "Actual native-to-native upgrade checks are incomplete"
+    );
+    if let Some(target) = target_identity {
+        ensure!(
+            upgrade.to_release_identity == target,
+            "Native upgrade target differs from the frozen release identity"
+        );
+    }
+    Ok(())
 }
 impl Proof {
     fn validate(&self, contract: &Contract) -> Result<()> {
@@ -757,6 +850,7 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
                         .is_some_and(|sha| SHA256_RE.is_match(sha)),
                 "Actual public README flow is incomplete"
             );
+            validate_native_upgrade(value, c, None)?;
         }
     }
     Ok(())
@@ -785,6 +879,7 @@ fn compact_gate(name: &str, value: Value) -> Result<Value> {
                 "standaloneWebStatePreservingHmr",
                 "hostLanguageSDKAttemptedForNativeCommands",
                 "readmeSha256",
+                "nativeUpgrade",
                 "seconds",
                 "limits",
             ],
@@ -977,6 +1072,11 @@ fn record_proof(
 ) -> Result<()> {
     c.check_index(set)?;
     proof.validate(c)?;
+    validate_native_upgrade(
+        &proof.gates["readme"].summary,
+        c,
+        Some(&set.index.release_identity),
+    )?;
     let release = remote
         .release(&c.tag())?
         .context("Public release missing")?;
@@ -1034,6 +1134,11 @@ fn promote(remote: &mut impl Remote, set: &FrozenSet, c: &Contract) -> Result<()
         PROOF_CLOSE,
     )?)?;
     proof.validate(c)?;
+    validate_native_upgrade(
+        &proof.gates["readme"].summary,
+        c,
+        Some(&set.index.release_identity),
+    )?;
     check_remote_assets(remote, &release, set, true)?;
     check_npm(remote, set, true)?;
     guard_selectors(&remote.selectors()?, c)?;
@@ -1087,7 +1192,7 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self> {
         let mut args = std::env::args().skip(1);
-        let command = args.next().context("Usage: devkit-release inspect|stage|publish|record-proof|promote|hydrate --root PATH --version X.Y.Z --source-commit SHA --source-tree SHA --previous-env VERSION|none --previous-cli VERSION|none --previous-github vVERSION|none [--build-set PATH] [--output PATH]")?;
+        let command = args.next().context("Usage: devkit-release inspect|stage|publish|record-proof|promote|hydrate --root PATH --version X.Y.Z --source-commit SHA --source-tree SHA --previous-env STABLE_VERSION --previous-cli STABLE_VERSION --previous-github vVERSION|none [--build-set PATH] [--output PATH]")?;
         let mut values = BTreeMap::new();
         let allowed = [
             "--root",
@@ -1225,6 +1330,9 @@ fn run_args(args: Args) -> Result<()> {
                 json!({"state":if complete {"restored"} else {"incomplete"},"contract":c,"originalRunId":c.build_run_id()?,"originalAttempt":c.build_run.rsplit_once('/').context("Original build attempt missing")?.1.parse::<u64>()?})
             );
         } else {
+            let previous = args.previous()?;
+            guard_npm_predecessors(&previous, args.get("--version")?)?;
+            guard_current_selectors(&remote.selectors()?, &previous, args.get("--version")?)?;
             for name in [ENVIRONMENT, CLI] {
                 ensure!(
                     remote.npm_version(name, args.get("--version")?)?.is_none(),

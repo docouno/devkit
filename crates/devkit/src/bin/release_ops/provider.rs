@@ -2,7 +2,10 @@
 //! nor persisted here. Public registry reads use a clean, private npm context.
 use super::*;
 use devkit::processes::{OutputMode, ProcessOutput};
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 #[cfg(test)]
 #[path = "provider_lookup_tests.rs"]
@@ -267,6 +270,14 @@ impl GhNpm {
         command
     }
     fn npm_json(&self, spec: &str, field: Option<&str>) -> Result<Option<Value>> {
+        self.npm_json_before(spec, field, None)
+    }
+    fn npm_json_before(
+        &self,
+        spec: &str,
+        field: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Value>> {
         let mut command = self.npm();
         command.args(["view", spec]);
         if let Some(field) = field {
@@ -276,11 +287,17 @@ impl GhNpm {
         let output = self.runner.run_with_timeout(
             &mut command,
             OutputMode::Capture(4 * 1024 * 1024),
-            Duration::from_secs(180),
+            request_timeout(deadline, Instant::now())?,
         )?;
         npm_response(output)
     }
-    fn fetch(&self, url: &str, maximum: u64, output: &Path) -> Result<()> {
+    fn fetch_before(
+        &self,
+        url: &str,
+        maximum: u64,
+        output: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let mut command = Command::new(std::env::current_exe()?);
         command
             .args([
@@ -292,8 +309,87 @@ impl GhNpm {
                 "--output",
             ])
             .arg(output);
-        self.execute(&mut command, 8192)?;
+        self.runner.checked_with_timeout(
+            &mut command,
+            OutputMode::Capture(8192),
+            request_timeout(deadline, Instant::now())?,
+        )?;
         Ok(())
+    }
+    fn npm_version_before(
+        &self,
+        name: &str,
+        version: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<PublishedNpm>> {
+        let Some(value) = self.npm_json_before(&format!("{name}@{version}"), None, deadline)?
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            value["name"] == name && value["version"] == version,
+            "Registry returned another package/version"
+        );
+        let dist = &value["dist"];
+        let url = dist["tarball"]
+            .as_str()
+            .context("Npm tarball URL missing")?;
+        let uri: ureq::http::Uri = url.parse()?;
+        ensure!(
+            uri.scheme_str() == Some("https")
+                && uri.authority().map(|a| a.as_str()) == Some("registry.npmjs.org"),
+            "Npm tarball must originate at the public npm registry"
+        );
+        let directory = tempfile::tempdir_in(self.scratch.path())?;
+        let path = directory.path().join("package.tgz");
+        self.fetch_before(url, 128 * 1024 * 1024, &path, deadline)?;
+        Ok(Some(PublishedNpm {
+            integrity: dist["integrity"]
+                .as_str()
+                .context("Npm SRI missing")?
+                .into(),
+            shasum: dist["shasum"].as_str().context("Npm SHA1 missing")?.into(),
+            bytes: read_bounded(&path, 128 * 1024 * 1024)?,
+        }))
+    }
+}
+
+fn request_timeout(deadline: Option<Instant>, now: Instant) -> Result<Duration> {
+    let maximum = Duration::from_secs(180);
+    match deadline {
+        None => Ok(maximum),
+        Some(deadline) => deadline
+            .checked_duration_since(now)
+            .filter(|value| !value.is_zero())
+            .map(|remaining| remaining.min(maximum))
+            .context(
+                "Npm publication read deadline expired; retry against the original frozen set",
+            ),
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn every_request_uses_fresh_remaining_time_with_the_existing_cap() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(360);
+        assert_eq!(
+            request_timeout(None, start).unwrap(),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            request_timeout(Some(deadline), start).unwrap(),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            request_timeout(Some(deadline), start + Duration::from_secs(353)).unwrap(),
+            Duration::from_secs(7)
+        );
+        assert!(request_timeout(Some(deadline), deadline).is_err());
+        assert!(request_timeout(Some(deadline), deadline + Duration::from_secs(1)).is_err());
     }
 }
 impl Remote for GhNpm {
@@ -367,34 +463,19 @@ impl Remote for GhNpm {
         Ok(())
     }
     fn npm_version(&mut self, name: &str, version: &str) -> Result<Option<PublishedNpm>> {
-        let Some(value) = self.npm_json(&format!("{name}@{version}"), None)? else {
-            return Ok(None);
-        };
-        ensure!(
-            value["name"] == name && value["version"] == version,
-            "Registry returned another package/version"
-        );
-        let dist = &value["dist"];
-        let url = dist["tarball"]
-            .as_str()
-            .context("Npm tarball URL missing")?;
-        let uri: ureq::http::Uri = url.parse()?;
-        ensure!(
-            uri.scheme_str() == Some("https")
-                && uri.authority().map(|a| a.as_str()) == Some("registry.npmjs.org"),
-            "Npm tarball must originate at the public npm registry"
-        );
-        let directory = tempfile::tempdir_in(self.scratch.path())?;
-        let path = directory.path().join("package.tgz");
-        self.fetch(url, 128 * 1024 * 1024, &path)?;
-        Ok(Some(PublishedNpm {
-            integrity: dist["integrity"]
-                .as_str()
-                .context("Npm SRI missing")?
-                .into(),
-            shasum: dist["shasum"].as_str().context("Npm SHA1 missing")?.into(),
-            bytes: read_bounded(&path, 128 * 1024 * 1024)?,
-        }))
+        self.npm_version_before(name, version, None)
+    }
+    fn npm_after_publish(&mut self, name: &str, version: &str) -> Result<PublishedNpm> {
+        let started = Instant::now();
+        let deadline = started + readiness::BUDGET;
+        let runner = self.runner.clone();
+        readiness::wait(
+            name,
+            version,
+            || started.elapsed(),
+            |_remaining| self.npm_version_before(name, version, Some(deadline)),
+            |duration| readiness::pause(&runner, duration),
+        )
     }
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()> {
         let mut command = self.npm();
