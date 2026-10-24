@@ -1,188 +1,186 @@
+// Author-only npm/registry checks. Project lifecycle is the native Rust fixture.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
-import { tmpdir } from 'node:os';
-import { withRegistry, canonicalizeLock } from '/fixture/registry.js';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { join } from 'node:path';
+import { npmEnvironment } from '../tooling/npm-inputs/npm.mjs';
 
 const read = (path) => JSON.parse(readFileSync(path, 'utf8'));
-const hash = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
-async function installedEnvironment(app) {
-  // A new process avoids Node's resolution cache after npm changes hoisting.
-  const program = `
-    const {existsSync, readFileSync} = require('node:fs');
-    const {createRequire} = require('node:module');
-    const {dirname, join} = require('node:path');
-    let root = dirname(createRequire(join(process.argv[1], 'package.json')).resolve('@docouno/env/eslint'));
-    while (root !== dirname(root)) {
-      const file = join(root, 'package.json');
-      if (existsSync(file)) {
-        const manifest = JSON.parse(readFileSync(file, 'utf8'));
-        if (manifest.name === '@docouno/env') {
-          process.stdout.write(JSON.stringify({root, manifest}));
-          process.exit(0);
-        }
-      }
-      root = dirname(root);
-    }
-    throw Error('Resolved environment export has no package metadata');
-  `;
-  const result = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', program, app], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '',
-      stderr = '';
-    child.stdout.on('data', (bytes) => {
-      stdout += bytes;
-    });
-    child.stderr.on('data', (bytes) => {
-      stderr += bytes;
-    });
-    child.once('error', reject);
-    child.once('close', (code) =>
-      code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)),
-    );
-  });
-  return result;
-}
-const workspace = mkdtempSync(join(tmpdir(), 'devkit-registry-'));
-const cleanEnvironment = Object.fromEntries(
-  Object.entries(process.env).filter(([key]) => !/^npm_|^NODE_/i.test(key)),
-);
-let serial = 0;
-async function command(args, cwd, registry, expectedFailure) {
-  const result = await new Promise((resolve, reject) => {
-    const child = spawn('npm', args, {
-      cwd,
-      env: {
-        ...cleanEnvironment,
-        CI: 'true',
-        npm_config_registry: registry,
-        npm_config_cache: join(workspace, `fresh-cache-${serial++}`),
-        npm_config_userconfig: '/dev/null',
-        npm_config_audit: 'false',
-        npm_config_fund: 'false',
-        npm_config_update_notifier: 'false',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let output = '';
-    child.stdout.on('data', (bytes) => {
-      output += bytes;
-    });
-    child.stderr.on('data', (bytes) => {
-      output += bytes;
-    });
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal, output }));
-  });
-  process.stdout.write(`npm ${args.join(' ')}: ${result.code}\n${result.output}\n`);
-  assert.equal(result.signal, null);
-  if (expectedFailure) {
-    assert.notEqual(result.code, 0);
-    assert.match(result.output, expectedFailure);
-  } else {
-    assert.equal(result.code, 0);
-  }
-}
-
+const sri = (bytes) => `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+const mode = process.argv[2];
 const releases = ['/release-v1', '/release-v2'];
 const metadata = releases.map((root) => read(join(root, 'release.json')));
 assert.notEqual(metadata[0].version, metadata[1].version);
-const entries = metadata.map((release, index) => ({
-  manifest: read(join(releases[index], 'templates/node-api/package.json')),
-  archive: join(releases[index], release.environment.archive),
-}));
-// The registry metadata must be the actual packed environment manifest, rather
-// than a template's dependencies or a hand-maintained resolver substitute.
-for (let index = 0; index < entries.length; index++) {
-  const bytes = await new Promise((resolve, reject) => {
-    const child = spawn('tar', ['-xOf', entries[index].archive, 'package/package.json']);
-    let output = '';
-    child.stdout.on('data', (chunk) => {
-      output += chunk;
-    });
-    child.once('error', reject);
-    child.once('close', (code) => (code === 0 ? resolve(output) : reject(new Error('tar failed'))));
+const proof = '/proof';
+if (mode === 'serve') {
+  const entries = releases.map((root, index) => {
+    const archive = readFileSync(join(root, metadata[index].environment.archive));
+    const packed = spawnSync(
+      'tar',
+      ['-xOf', join(root, metadata[index].environment.archive), 'package/package.json'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(packed.status, 0, packed.stderr);
+    const manifest = JSON.parse(packed.stdout);
+    assert.equal(manifest.name, '@docouno/env');
+    assert.equal(manifest.version, metadata[index].version);
+    assert.equal(sri(archive), metadata[index].environment.integrity);
+    return { manifest, archive, path: `/@docouno/env/-/env-${manifest.version}.tgz` };
   });
-  entries[index].manifest = JSON.parse(bytes);
-  assert.equal(entries[index].manifest.version, metadata[index].version);
-}
-
-try {
-  await withRegistry(entries, async (registry, requests) => {
-    const { initProject } = await import('/release-v1/cli/project.js');
-    const { updateProject } = await import('/release-v2/cli/project-update.js');
-    const target = join(workspace, 'consumer');
-    await initProject(releases[0], target, {
-      apps: [{ name: 'main', template: 'node-api' }],
-      packageMode: 'registry',
-      registry,
+  let origin = '',
+    count = 0;
+  const requests = [];
+  const server = createServer({ requestTimeout: 15000, headersTimeout: 5000 }, (req, res) => {
+    try {
+      if (++count > 8192 || (req.url?.length ?? 0) > 4096) {
+        res.writeHead(429).end();
+        return;
+      }
+      if (!['GET', 'HEAD'].includes(req.method)) {
+        res.writeHead(405).end();
+        return;
+      }
+      const url = new URL(req.url, 'http://fixture.invalid');
+      const path = decodeURIComponent(url.pathname);
+      requests.push(path);
+      writeFileSync(join(proof, 'requests.json'), JSON.stringify(requests));
+      let body,
+        type = 'application/json';
+      const entry = entries.find((item) => item.path === path);
+      if (entry) {
+        body = entry.archive;
+        type = 'application/octet-stream';
+      } else if (
+        path === '/@docouno/env' ||
+        entries.some((item) => path === `/@docouno/env/${item.manifest.version}`)
+      ) {
+        const versions = Object.fromEntries(
+          entries.map((item) => [
+            item.manifest.version,
+            {
+              ...item.manifest,
+              dist: {
+                tarball: origin + item.path,
+                integrity: sri(item.archive),
+                shasum: createHash('sha1').update(item.archive).digest('hex'),
+              },
+            },
+          ]),
+        );
+        body = JSON.stringify(
+          path === '/@docouno/env'
+            ? { name: '@docouno/env', 'dist-tags': { latest: metadata[1].version }, versions }
+            : versions[path.slice('/@docouno/env/'.length)],
+        );
+      } else if (path.startsWith('/@docouno/')) {
+        res.writeHead(404).end();
+        return;
+      } else {
+        res
+          .writeHead(302, { location: `https://registry.npmjs.org${url.pathname}${url.search}` })
+          .end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': type, 'content-length': Buffer.byteLength(body) });
+      res.end(req.method === 'HEAD' ? undefined : body);
+    } catch {
+      res.writeHead(400).end();
+    }
+  });
+  server.maxConnections = 16;
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  origin = `http://127.0.0.1:${server.address().port}`;
+  writeFileSync(join(proof, 'registry-url'), `${origin}/`);
+  const stop = () => {
+    server.closeAllConnections();
+    server.close();
+  };
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
+} else {
+  const registry = readFileSync(join(proof, 'registry-url'), 'utf8');
+  const target = '/consumer';
+  const env = npmEnvironment(join(proof, `npm-${mode}`), registry);
+  delete env.npm_config_workspaces;
+  function npm(args, cwd = target, expected) {
+    const result = spawnSync('npm', args, {
+      cwd,
+      env,
+      encoding: 'utf8',
+      timeout: 180000,
+      maxBuffer: 8 * 1024 * 1024,
     });
-    const app = join(target, 'apps/main');
-    const lockPath = join(target, 'package-lock.json');
-    const canonicalLock = readFileSync(lockPath);
-    assert.doesNotMatch(canonicalLock.toString(), /127\.0\.0\.1|localhost|file:|\/workspace\//);
-    assert.equal(
-      read(join(app, 'package.json')).devDependencies['@docouno/env'],
-      metadata[0].version,
+    process.stdout.write(
+      `npm ${args.join(' ')}: ${result.status}\n${result.stdout}${result.stderr}\n`,
     );
-    await command(['ci', '--include=dev', '--strict-peer-deps'], target, registry);
-    assert.deepEqual(readFileSync(lockPath), canonicalLock);
-    await command(['run', '--workspace=apps/main', 'check'], target, registry);
-    await command(['run', '--workspace=apps/main', 'build'], target, registry);
-    assert.equal((await installedEnvironment(app)).manifest.version, metadata[0].version);
-
-    const sourcePath = join(app, 'src/greeting.ts');
-    const sourceHash = hash(sourcePath);
-    await updateProject(releases[1], target, { registry });
-    assert.equal(hash(sourcePath), sourceHash);
-    assert.equal(read(join(target, '.devkit/manifest.json')).version, metadata[1].version);
-    assert.equal(
-      read(join(app, 'package.json')).devDependencies['@docouno/env'],
-      metadata[1].version,
+    if (expected) {
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout + result.stderr, expected);
+    } else {
+      assert.equal(result.status, 0, result.error?.message);
+    }
+  }
+  const lock = join(target, 'package-lock.json');
+  // The private registry seam can produce fixture origins after native npm
+  // resolution. Restore only that exact origin, as the former registry test did.
+  // The public CLI never supplies this override and is tested after publication.
+  if (mode === 'second') {
+    const value = read(lock);
+    for (const entry of Object.values(value.packages)) {
+      if (typeof entry.resolved === 'string' && entry.resolved.startsWith(registry)) {
+        entry.resolved = `https://registry.npmjs.org/${entry.resolved.slice(registry.length)}`;
+      }
+    }
+    writeFileSync(lock, `${JSON.stringify(value, null, 2)}\n`);
+  }
+  const original = readFileSync(lock);
+  assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|file:|\/workspace\//);
+  if (mode === 'first' || mode === 'second') {
+    npm(['ci', '--include=dev', '--strict-peer-deps']);
+    assert.deepEqual(readFileSync(lock), original);
+    npm(['run', '--workspace=apps/main', 'check']);
+    npm(['run', '--workspace=apps/main', 'build']);
+    const probe = spawnSync(
+      'node',
+      [
+        '--input-type=module',
+        '-e',
+        `import {createRequire} from 'node:module'; import {readFileSync} from 'node:fs'; import {dirname,join} from 'node:path'; const r=createRequire('/consumer/apps/main/package.json'); let p=dirname(r.resolve('@docouno/env/eslint')); process.stdout.write(readFileSync(join(p,'../package.json'),'utf8'));`,
+      ],
+      { cwd: target, env, encoding: 'utf8', timeout: 10000 },
     );
-    writeFileSync(
-      lockPath,
-      `${JSON.stringify(canonicalizeLock(read(lockPath), registry), null, 2)}\n`,
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.equal(JSON.parse(probe.stdout).version, metadata[mode === 'first' ? 0 : 1].version);
+  } else if (mode === 'negative') {
+    const value = read(lock);
+    const locations = Object.keys(value.packages).filter((p) =>
+      p.endsWith('node_modules/@docouno/env'),
     );
-    const upgradedLock = readFileSync(lockPath);
-    assert.doesNotMatch(upgradedLock.toString(), /127\.0\.0\.1|localhost|file:|\/workspace\//);
-    await command(['ci', '--include=dev', '--strict-peer-deps'], target, registry);
-    assert.deepEqual(readFileSync(lockPath), upgradedLock);
-    await command(['run', '--workspace=apps/main', 'check'], target, registry);
-    await command(['run', '--workspace=apps/main', 'build'], target, registry);
-    assert.equal((await installedEnvironment(app)).manifest.version, metadata[1].version);
-
-    const corrupt = read(lockPath);
-    const location = relative(target, (await installedEnvironment(app)).root);
-    assert(!location.startsWith('..'), 'Environment resolved outside the consumer');
-    assert(corrupt.packages[location], 'Installed environment is absent from native lock');
-    corrupt.packages[location].integrity = `sha512-${Buffer.alloc(64).toString('base64')}`;
-    writeFileSync(lockPath, JSON.stringify(corrupt));
-    await command(
-      ['ci', '--include=dev', '--strict-peer-deps', '--fetch-retries=0'],
-      target,
-      registry,
-      /EINTEGRITY/,
-    );
-    writeFileSync(lockPath, upgradedLock);
-    await command(
+    assert.equal(locations.length, 1);
+    value.packages[locations[0]].integrity = `sha512-${Buffer.alloc(64).toString('base64')}`;
+    writeFileSync(lock, JSON.stringify(value));
+    npm(['ci', '--include=dev', '--strict-peer-deps', '--fetch-retries=0'], target, /EINTEGRITY/);
+    writeFileSync(lock, original);
+    npm(
       ['install', '--package-lock-only', '--ignore-scripts', '@docouno/env@99.99.99'],
-      app,
-      registry,
+      join(target, 'apps/main'),
       /ETARGET|No matching version/,
     );
-    for (const release of metadata) {
-      assert(requests.includes(`/@docouno/env/-/env-${release.version}.tgz`));
+    const unknown = await fetch(registry + '@docouno/unsupplied');
+    assert.equal(unknown.status, 404);
+    const requests = read(join(proof, 'requests.json'));
+    for (const item of metadata) {
+      assert(requests.includes(`/@docouno/env/-/env-${item.version}.tgz`));
     }
     assert(requests.some((path) => !path.startsWith('/@docouno/')));
-    process.stdout.write(
-      `PASS: canonical registry init/update/ci, real exports/gates, integrity and missing-version negatives; ${requests.length} fixture requests.\n`,
-    );
-  });
-} finally {
-  rmSync(workspace, { recursive: true, force: true });
+  } else {
+    throw Error('Expected serve, first, second or negative');
+  }
+  assert(existsSync(lock));
+  process.stdout.write(`PASS ${mode}\n`);
 }

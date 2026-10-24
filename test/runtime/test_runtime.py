@@ -19,11 +19,11 @@ PINS = dict(line.split("=", 1) for line in (REPO / "toolchains.env").read_text()
             if line and not line.startswith("#"))
 IMAGE = PINS["DEVKIT_NODE_IMAGE"]
 NODE_VERSION = PINS["DEVKIT_NODE_VERSION"]
-VERSION = (REPO / "VERSION").read_text().strip()
+VERSION = "0.3.0"
 LABEL = "io.docouno.devkit.invocation"
 RUNTIME_SOURCE = REPO / "runtime"
-CLI_SOURCE = REPO / ".artifacts/cli"
-BUNDLE_SOURCE = REPO / ".artifacts/runtime-project.mjs"
+ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
+FIXTURE = Path(os.environ.get("DEVKIT_TEST_FIXTURE", ENGINE.parent / "examples/runtime_fixture")).resolve()
 
 
 def env():
@@ -31,6 +31,7 @@ def env():
     for key in list(result):
         if key.startswith(("COMPOSE_", "DEVKIT_")) or key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
             result.pop(key)
+    result["DEVKIT_ENGINE_PATH"] = str(ENGINE)
     return result
 
 
@@ -60,11 +61,11 @@ def fixture_tool(root, script):
     """Use the real compiled project helpers, without host Node or a fake admission oracle."""
     token = uuid.uuid4().hex
     name = "devkit-runtime-fixture-" + token
-    return run("bash", str(RUNTIME_SOURCE / "guard.sh"), name, token, "--",
+    return run(str(ENGINE), "internal", "guard", name, token, "--",
                "docker", "run", "--pull", "never", "--rm", "--init", "--name", name,
                "--label", f"{LABEL}={token}", "--network", "none",
                "--user", f"{os.getuid()}:{os.getgid()}",
-               "--volume", f"{root}:/fixture:z", "--volume", f"{CLI_SOURCE}:/author:ro,z",
+               "--volume", f"{root}:/fixture:z",
                "--workdir", "/fixture", "--env", "npm_config_cache=/tmp/npm-cache",
                "--env", "npm_config_userconfig=/dev/null", IMAGE,
                "node", "--input-type=module", "-e", script, timeout=35)
@@ -73,7 +74,6 @@ def fixture_tool(root, script):
 def write_fixture(root, apps=("main",), packages=()):
     runtime = root / ".devkit/runtime"
     shutil.copytree(RUNTIME_SOURCE, runtime)
-    shutil.copy2(BUNDLE_SOURCE, runtime / "project.mjs")
     (runtime / "toolchains.env").write_text(
         f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
         f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
@@ -121,7 +121,22 @@ if (fs.existsSync('SLOW')) {
 
 
 def seal_runtime(root):
-    """Accept known fixture bytes; validation still uses the shipped project.mjs."""
+    """Accept known fixture bytes; the same native engine verifies admission."""
+    runtime = root / ".devkit/runtime"
+    engine_sha = hashlib.sha256(ENGINE.read_bytes()).hexdigest()
+    loader = runtime / "devkit.sh"
+    source = loader.read_text()
+    if "@@DEVKIT_MODE@@" in source:
+        for key, value in {"@@DEVKIT_MODE@@": "project", "@@DEVKIT_VERSION@@": VERSION,
+                           "@@DEVKIT_ENGINE_SHA256@@": engine_sha,
+                           "@@DEVKIT_ENGINE_TARGET@@": "x86_64-unknown-linux-musl"}.items():
+            assert source.count(key) == 1
+            source = source.replace(key, value)
+        loader.write_text(source)
+    pins = runtime / "toolchains.env"
+    source = pins.read_text()
+    if "DEVKIT_ENGINE_SHA256=" not in source:
+        pins.write_text(source + f"DEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n")
     def identity(path):
         return {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "mode": path.stat().st_mode & 0o777}
     managed = {str(path.relative_to(root)): identity(path)
@@ -145,7 +160,7 @@ def seal_runtime(root):
 def accept_runtime(root, native=False):
     state_path = root / ".devkit/manifest.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {
-        "schemaVersion": 2, "version": VERSION, "generation": str(uuid.uuid4()), "packageMode": "registry"}
+        "schemaVersion": 2, "version": VERSION, "generation": str(uuid.uuid4()), "packageMode": "registry", "releaseIdentity": "0"*64, "managed": {}}
     previous = state.get("components", {})
     components = {}
     for area in ("apps", "packages"):
@@ -168,59 +183,185 @@ def accept_runtime(root, native=False):
                 components[name].setdefault("development", {"owner": "project", "kind": "compose", "service": path.name})
     state["components"] = components
     state_path.write_text(json.dumps(state) + "\n")
-    # These fixtures exercise built-in Node gates, so an explicitly accepted empty
-    # tool profile avoids registry work. Native membership and locks remain real.
-    script = r'''
-import fs from 'node:fs';
-import {spawnSync} from 'node:child_process';
-import {renderProjectMake, renderAppCompose} from '/author/project-integration.js';
-import {collectNativeInputClosure, deriveComponentDependencies} from '/author/native-workspace.js';
-import {renderWorkspaceCompose} from '/author/workspace-compose.js';
-const root='/fixture', file=root+'/.devkit/manifest.json';
-const state=JSON.parse(fs.readFileSync(file));
-const nodes=Object.entries(state.components).filter(([,c])=>c.toolchain==='node').map(([p])=>p).sort();
-if (NATIVE) {
-  if(nodes.length) {
-    const rootFile=root+'/package.json';
-    const manifest=fs.existsSync(rootFile)?JSON.parse(fs.readFileSync(rootFile)):{name:'runtime-fixture',version:'1.0.0',private:true};
-    manifest.workspaces=nodes;fs.writeFileSync(rootFile,JSON.stringify(manifest)+'\n');
-    for(const p of nodes)fs.rmSync(root+'/'+p+'/package-lock.json',{force:true});
-    const result=spawnSync('npm',['install','--package-lock-only','--ignore-scripts','--include=dev','--strict-peer-deps','--offline','--no-audit','--no-fund'],{cwd:root,encoding:'utf8'});
-    if(result.status!==0)throw Error(result.stdout+'\n'+result.stderr);
-  } else {fs.rmSync(root+'/package.json',{force:true});fs.rmSync(root+'/package-lock.json',{force:true});}
-}
-for(const [name,deps] of Object.entries(deriveComponentDependencies(root,state)))state.components[name].dependencies=deps;
-fs.writeFileSync(file,JSON.stringify(state)+'\n');
-fs.writeFileSync(root+'/.devkit/tooling-profiles.json',JSON.stringify({schemaVersion:1,version:state.version,packageMode:state.packageMode,profiles:Object.fromEntries(Object.values(state.components).map(c=>[c.toolingProfile,c.toolDependencies]))})+'\n');
-fs.writeFileSync(root+'/.devkit/project.mk',renderProjectMake(state));
-fs.writeFileSync(root+'/.devkit/compose.apps.yaml',renderAppCompose(state));
-fs.writeFileSync(root+'/.devkit/compose.workspace.json',renderWorkspaceCompose(state,collectNativeInputClosure(root,state)));
-'''.replace("NATIVE", "true" if native else "false")
-    fixture_tool(root, script)
+    # Native npm owns fixture locks; Rust fixture helper renders the actual
+    # production projections. No Node metadata/admission implementation is used.
+    nodes = sorted(name for name, c in components.items() if c["toolchain"] == "node")
+    if native:
+        if nodes:
+            root_file = root / "package.json"
+            manifest = json.loads(root_file.read_text()) if root_file.exists() else {"name":"runtime-fixture","version":"1.0.0","private":True}
+            manifest["workspaces"] = nodes
+            root_file.write_text(json.dumps(manifest)+"\n")
+            for name in nodes:
+                (root / name / "package-lock.json").unlink(missing_ok=True)
+            fixture_tool(root, "import {spawnSync} from 'node:child_process';const r=spawnSync('npm',['install','--package-lock-only','--ignore-scripts','--include=dev','--strict-peer-deps','--offline','--no-audit','--no-fund'],{stdio:'inherit'});process.exit(r.status??1)")
+        else:
+            (root / "package.json").unlink(missing_ok=True)
+            (root / "package-lock.json").unlink(missing_ok=True)
+    run(str(FIXTURE), str(root))
     seal_runtime(root)
+
+
+def write_rust_fixture(root):
+    runtime = root / ".devkit/runtime"
+    shutil.copytree(RUNTIME_SOURCE, runtime)
+    recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
+    (runtime / "toolchains.env").write_text(
+        f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
+        f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
+        f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
+        f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+    (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
+    shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
+    accept_runtime(root, native=True)
+    return recipe
+
+
+class ComposeCompatibilityTests(unittest.TestCase):
+    def test_runtime_and_lifecycle_refuse_old_compose_before_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-compose-compat-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            write_rust_fixture(root)
+            fake = base / "bin"
+            fake.mkdir()
+            docker = fake / "docker"
+            docker.write_text('''#!/usr/bin/python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+with pathlib.Path(os.environ['COMPAT_DOCKER_LOG']).open('a') as log:
+    log.write(json.dumps(argv)+'\\n')
+if argv == ['compose', 'version', '--short']:
+    print(os.environ['COMPAT_COMPOSE_VERSION'])
+elif argv == ['info', '--format', '{{.OSType}}']:
+    print('linux')
+elif argv[0] == 'compose' and 'config' in argv:
+    print(json.dumps({'services': {'api': {}}}))
+elif argv[0] == 'compose' and 'ps' in argv:
+    print('COMPAT_STATUS_READY')
+else:
+    print('unexpected Docker query: '+repr(argv), file=sys.stderr)
+    sys.exit(90)
+''')
+            docker.chmod(0o755)
+            log = base / "docker.jsonl"
+            for version in ("2.38.2", "5.0.0", "v5.6.0-desktop.1"):
+                for surface, argv in (
+                        ("runtime", [str(ENGINE), "task", "status", "--root", str(root)]),
+                        ("lifecycle", [str(FIXTURE), str(root), "--compose-inventory"])):
+                    with self.subTest(version=version, surface=surface):
+                        log.write_text("")
+                        environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
+                                           COMPAT_DOCKER_LOG=str(log), COMPAT_COMPOSE_VERSION=version)
+                        result = run(*argv, check=False, env=environment)
+                        calls = [json.loads(line) for line in log.read_text().splitlines()]
+                        if version == "2.38.2":
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("Compose >=5.0.0", result.stderr)
+                            self.assertEqual(calls, [["compose", "version", "--short"]],
+                                             "unsupported Compose reached configuration or daemon queries")
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            if surface == "runtime":
+                                self.assertIn("COMPAT_STATUS_READY", result.stdout)
+                            else:
+                                self.assertEqual(json.loads(result.stdout)["services"], ["api"])
+                                self.assertTrue(any("config" in call for call in calls))
+
+
+class DoctorSnapshotTests(unittest.TestCase):
+    def test_doctor_rechecks_admitted_snapshot_after_external_query(self):
+        # Real admission and CLI, with only Docker's read-only query boundary
+        # controlled. This regression needs neither a daemon nor prepared images.
+        with tempfile.TemporaryDirectory(prefix="devkit-doctor-snapshot-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            recipe = write_rust_fixture(root)
+            (root / ".devkit/state").mkdir(exist_ok=True)
+            (root / ".devkit/state/rust-image").write_text("sha256:" + "a"*64 + "\n")
+            fake = base / "bin"
+            fake.mkdir()
+            docker = fake / "docker"
+            docker.write_text('''#!/usr/bin/python3
+import os, pathlib, sys, time
+argv = sys.argv[1:]
+base = pathlib.Path(os.environ['DOCTOR_SNAPSHOT_BASE'])
+if argv[:2] == ['compose', 'version']:
+    print('v5.0.0')
+elif argv[:2] == ['info', '--format']:
+    print('linux')
+elif argv[:2] == ['image', 'inspect']:
+    if (base/'armed').exists():
+        (base/'ready').write_text('admission finished before image query')
+        deadline = time.monotonic() + 5
+        while not (base/'go').exists():
+            if time.monotonic() > deadline:
+                sys.exit(89)
+            time.sleep(.01)
+    print(os.environ['DOCTOR_SNAPSHOT_RECIPE'])
+else:
+    print('unexpected Docker query: '+repr(argv), file=sys.stderr)
+    sys.exit(90)
+''')
+            docker.chmod(0o755)
+            environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
+                               DOCTOR_SNAPSHOT_BASE=str(base), DOCTOR_SNAPSHOT_RECIPE=recipe)
+            argv = [str(ENGINE), "task", "doctor", "--root", str(root)]
+            baseline = run(*argv, env=environment, timeout=12)
+            self.assertIn("accepted components verified", baseline.stdout)
+            evidence = {"engineSha256": hashlib.sha256(ENGINE.read_bytes()).hexdigest(),
+                        "baseline": {"code": baseline.returncode, "stdout": baseline.stdout}, "cases": []}
+            for mutation in ("native-lock", "manifest-generation"):
+                with self.subTest(mutation=mutation):
+                    for name in ("ready", "go"):
+                        (base / name).unlink(missing_ok=True)
+                    (base / "armed").touch()
+                    path = root / ("apps/api/Cargo.lock" if mutation == "native-lock" else ".devkit/manifest.json")
+                    original = path.read_bytes()
+                    child = subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    try:
+                        wait_until(lambda: (base / "ready").exists() or child.poll() is not None, timeout=5)
+                        self.assertTrue((base / "ready").exists(), "doctor exited before the query barrier")
+                        if mutation == "native-lock":
+                            path.write_bytes(original+b"\n")
+                        else:
+                            state = json.loads(original)
+                            state["generation"] = "11111111-1111-4111-8111-111111111111"
+                            path.write_text(json.dumps(state)+"\n")
+                        self.assertNotEqual(path.read_bytes(), original)
+                        (base / "go").touch()
+                        stdout, stderr = child.communicate(timeout=12)
+                        evidence["cases"].append({"mutation": mutation, "code": child.returncode,
+                                                  "stdout": stdout, "stderr": stderr})
+                        self.assertNotEqual(child.returncode, 0, "doctor reported stale success after admitted input changed")
+                        self.assertNotIn("accepted components verified", stdout)
+                        self.assertIn("changed", stderr.lower())
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate(timeout=5)
+                        path.write_bytes(original)
+                        (base / "armed").unlink(missing_ok=True)
+            print("Doctor snapshot evidence: " + json.dumps(evidence), flush=True)
 
 
 class RuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        global RUNTIME_SOURCE, CLI_SOURCE, BUNDLE_SOURCE
+        global RUNTIME_SOURCE
         run("docker", "image", "inspect", IMAGE)
         run("docker", "compose", "version")
-        if not BUNDLE_SOURCE.is_file() or not (CLI_SOURCE / "project-integration.js").is_file():
-            raise AssertionError("Run make build to create the real bundled runtime/project helpers")
+        if not ENGINE.is_file() or not FIXTURE.is_file():
+            raise AssertionError("Build the native devkit and runtime_fixture example first")
         cls.capture = tempfile.TemporaryDirectory(prefix="devkit-runtime-source-")
         captured = Path(cls.capture.name)
         shutil.copytree(RUNTIME_SOURCE, captured / "runtime")
-        shutil.copytree(CLI_SOURCE, captured / "cli")
-        shutil.copy2(BUNDLE_SOURCE, captured / "runtime-project.mjs")
         RUNTIME_SOURCE = captured / "runtime"
-        CLI_SOURCE = captured / "cli"
-        BUNDLE_SOURCE = captured / "runtime-project.mjs"
         records = [(str(path.relative_to(RUNTIME_SOURCE)), hashlib.sha256(path.read_bytes()).hexdigest())
                    for path in sorted(RUNTIME_SOURCE.rglob("*")) if path.is_file()]
         print("Runtime test source: " + json.dumps({
             "runtime": hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest(),
-            "projectBundle": hashlib.sha256(BUNDLE_SOURCE.read_bytes()).hexdigest(),
+            "nativeEngine": hashlib.sha256(ENGINE.read_bytes()).hexdigest(),
             "nodeImage": IMAGE}), flush=True)
 
     @classmethod
@@ -362,9 +503,9 @@ class RuntimeTests(unittest.TestCase):
         before = pins.read_text()
         pins.write_text(before.replace("DEVKIT_NODE_VERSION=" + NODE_VERSION, "DEVKIT_NODE_VERSION=0.0.1"))
         seal_runtime(self.root)
-        mismatch = self.make("check", check=False)
+        mismatch = self.make("setup", check=False)
         self.assertNotEqual(mismatch.returncode, 0)
-        self.assertIn("Unexpected control Node version", mismatch.stderr)
+        self.assertIn("Unexpected Node version", mismatch.stderr)
         self.assertNotIn("GATE main check", mismatch.stdout)
         pins.write_text(before)
         profiles = self.root / ".devkit/tooling-profiles.json"
@@ -430,6 +571,8 @@ build: simulate-update
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("native script apps/main:test", result.stderr)
         self.assertFalse((self.root / ".devkit/state/node-workspace.lock").exists())
+        package["scripts"]["test"] = "node gate.cjs test"
+        path.write_text(json.dumps(package))
         pins = self.root / ".devkit/runtime/toolchains.env"
         pins.write_text(pins.read_text().replace(IMAGE, "node:missing@sha256:" + "a" * 64))
         accept_runtime(self.root)
@@ -556,13 +699,13 @@ build: simulate-update
         import fcntl
         with lock.open("w") as file:
             fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertIn("another devkit operation", self.make("doctor", check=False).stderr)
+            self.assertIn("Another devkit operation", self.make("doctor", check=False).stderr)
         (self.root / "apps/main/Cargo.toml").write_text("[package]\n")
         ambiguous = self.make("doctor", check=False)
         self.assertNotEqual(ambiguous.returncode, 0, ambiguous.stdout + ambiguous.stderr)
         self.assertIn("Ambiguous native", ambiguous.stderr)
         (self.root / ".devkit/runtime/toolchains.env").write_text("DEVKIT_VERSION=tampered\n")
-        self.assertIn("managed toolkit files differ", self.make("doctor", check=False).stderr)
+        self.assertIn("Managed file conflict", self.make("doctor", check=False).stderr)
 
     def test_writable_symlink_paths_and_unexpected_types_never_mutate_sentinels(self):
         write_fixture(self.root)
@@ -595,7 +738,7 @@ build: simulate-update
                 try:
                     result = self.make("check", check=False)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("symlink runtime path", result.stderr)
+                    self.assertIn("symlink", result.stderr)
                     self.assertEqual(sentinel.read_text(), "IMPORTANT\n")
                     self.assertEqual((outside / "task.lock").read_text(), "OUTSIDE LOCK\n")
                     self.assertEqual((source / "result").read_text(), "SOURCE\n")
@@ -608,14 +751,14 @@ build: simulate-update
         dist = self.root / "apps/main/dist"
         shutil.rmtree(dist)
         dist.write_text("DO NOT REPLACE\n")
-        self.assertIn("expected directory", self.make("check", check=False).stderr)
+        self.assertIn("Expected directory", self.make("check", check=False).stderr)
         self.assertEqual(dist.read_text(), "DO NOT REPLACE\n")
         dist.unlink()
         dist.mkdir()
         lock = self.root / ".devkit/state/task.lock"
         lock.unlink()
         os.mkfifo(lock)
-        self.assertIn("expected regular file", self.make("doctor", check=False).stderr)
+        self.assertIn("regular file", self.make("doctor", check=False).stderr)
 
     def test_nontruncating_lock_and_every_pending_object_blocks(self):
         write_fixture(self.root)
@@ -714,8 +857,8 @@ build: simulate-update
         self.make("setup")
         manifest = self.root / ".devkit/manifest.json"
         checksum = self.root / ".devkit/runtime.sha256"
-        guard = self.root / ".devkit/runtime/guard.sh"
-        originals = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in (manifest, checksum, guard)}
+        loader = self.root / ".devkit/runtime/devkit.sh"
+        originals = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in (manifest, checksum, loader)}
         def restore():
             for path, (content, mode) in originals.items():
                 path.write_bytes(content)
@@ -727,9 +870,9 @@ build: simulate-update
                 state = json.loads(manifest.read_text())
                 try:
                     if case in ("omitted-and-changed", "incomplete-table"):
-                        checksum.write_text("".join(line for line in checksum.read_text().splitlines(True) if not line.endswith("/guard.sh\n")))
+                        checksum.write_text("".join(line for line in checksum.read_text().splitlines(True) if not line.endswith("/devkit.sh\n")))
                         if case == "omitted-and-changed":
-                            guard.write_text(guard.read_text() + "\n# benign drift\n")
+                            loader.write_text(loader.read_text() + "\n# benign drift\n")
                             self.assertEqual(manifest.read_bytes(), originals[manifest][0])
                         else:
                             state["managed"][".devkit/runtime.sha256"]["sha256"] = hashlib.sha256(checksum.read_bytes()).hexdigest()
@@ -738,7 +881,7 @@ build: simulate-update
                     elif case == "managed-symlink-parent":
                         nested.rename(saved_parent)
                         nested.symlink_to(saved_parent, target_is_directory=True)
-                    elif case == "mode": guard.chmod(0o644 if originals[guard][1] == 0o755 else 0o755)
+                    elif case == "mode": loader.chmod(0o644 if originals[loader][1] == 0o755 else 0o755)
                     else:
                         if case == "unsafe-path": state["managed"]["../outside"] = {"sha256": "0" * 64, "mode": 0o644}
                         else: state[case] = {"version": "9.9.9", "schema": 2, "generation": "initial", "packageMode": "other", "releaseIdentity": "bad"}[case]
@@ -748,9 +891,9 @@ build: simulate-update
                     self.assertNotEqual(result.returncode, 0, case)
                     self.assertNotIn("GATE main check", result.stdout)
                     self.assertTrue(any(message in result.stderr.lower() for message in (
-                        "managed file conflict", "checksum table", "unlisted or nonregular", "symlink",
+                        "managed file conflict", "checksum table", "unlisted or nonregular", "unlisted runtime", "symlink",
                         "version differs", "schemaversion", "identity/generation", "packagemode",
-                        "releaseidentity", "unsafe", "invalid project")), result.stderr)
+                        "releaseidentity", "unsafe", "invalid project", "unknown variant")), result.stderr)
                 finally:
                     extra.unlink(missing_ok=True)
                     if nested.is_symlink():
@@ -793,54 +936,113 @@ build: simulate-update
         seal_runtime(self.root)
         rejected = self.make("check", check=False)
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Make registration is stale", rejected.stderr)
+        self.assertIn("Make registration projection is stale", rejected.stderr)
 
-    def test_control_service_has_only_readonly_root_and_no_network_or_dependencies(self):
+    def test_metadata_is_native_and_requires_no_docker_or_dependencies(self):
         write_fixture(self.root)
-        helper = self.root / ".devkit/runtime/project.mjs"
-        helper.write_text("await new Promise(resolve => setTimeout(resolve, 25000));\n" + helper.read_text())
-        accept_runtime(self.root)
-        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
-        proc = subprocess.Popen(["make", "--no-print-directory", "-C", str(self.root), "doctor"],
-            env=env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        name = None
-        try:
-            def ready():
-                nonlocal name
-                names = run("docker", "container", "ls", "--filter", "label=io.docouno.devkit.checkout=" + project,
-                            "--filter", "label=io.docouno.devkit.role=control", "--format", "{{.Names}}").stdout.splitlines()
-                if not names: return False
-                name = names[0]
-                found = container(name)
-                if found is None: return False
-                self.resources.append(name)
-                self.tokens[name] = found["Config"]["Labels"][LABEL]
-                return True
-            wait_until(ready)
-            found = container(name)
-            self.assertEqual(found["HostConfig"]["NetworkMode"], "none")
-            self.assertTrue(found["HostConfig"]["ReadonlyRootfs"])
-            self.assertEqual([(mount["Destination"], mount["RW"]) for mount in found["Mounts"]], [("/workspace", False)])
-            self.assertEqual(found["Config"]["User"], f"{os.getuid()}:{os.getgid()}")
-            self.assertFalse((self.root / "apps/main/node_modules").exists())
-            self.assertFalse((self.root / "node_modules").exists())
-            self.assertFalse((self.root / ".devkit/cache").exists())
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.communicate(timeout=12)
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIsNone(container(name))
-        finally:
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.communicate(timeout=12)
+        e = env()
+        e["DOCKER_HOST"] = "unix:///nonexistent-devkit-test-docker.sock"
+        result = run(str(ENGINE), "describe", "--root", str(self.root), env=e)
+        self.assertEqual(json.loads(result.stdout)["version"], VERSION)
+        self.assertFalse((self.root / "node_modules").exists())
+        self.assertFalse((self.root / ".devkit/cache").exists())
 
     def guard(self, name, argv):
-        return subprocess.Popen(["bash", str(RUNTIME_SOURCE / "guard.sh"), name, self.token, "--", *argv],
+        return subprocess.Popen([str(ENGINE), "internal", "guard", name, self.token, "--", *argv],
             env=env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
 
     def task_argv(self, name, code):
         return ["docker", "run", "--pull", "never", "--rm", "--init", "--name", name,
                 "--label", f"{LABEL}={self.token}", IMAGE, "node", "-e", code]
+
+    def test_exec_repairs_stale_lock_invalidates_receipt_and_preserves_exact_argv(self):
+        write_fixture(self.root)
+        self.make("setup")
+        receipt = self.root / ".devkit/state/node-workspace.lock"
+        (self.root / "package-lock.json").write_text("invalid native lock\n")
+        self.assertNotEqual(self.make("check", check=False).returncode, 0)
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--",
+            "npm", "install", "--package-lock-only", "--ignore-scripts", "--offline", "--strict-peer-deps")
+        self.assertFalse(receipt.exists())
+        self.make("setup")
+        args = ["space value", "$literal", ";", "$(not-a-shell)", "quote'\"value"]
+        result = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--",
+                     "node", "-e", "process.stdout.write(JSON.stringify(process.argv.slice(1)))", *args)
+        self.assertEqual(json.loads(result.stdout), args)
+        before = receipt.read_bytes()
+        result = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--",
+                     "node", "-e", "require('node:fs').writeFileSync('/workspace/node_modules/ILLEGAL','bad')", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(receipt.read_bytes(), before)
+        self.assertFalse((self.root / "node_modules/ILLEGAL").exists())
+        self.assertIn("GATE main check", self.make("check").stdout)
+        result = self.make("exec", "app=main", "command=node -e 'process.stdout.write(process.argv[1])' 'with spaces'")
+        self.assertEqual(result.stdout, "with spaces")
+        literal = "$HOME;$(touch NEVER_EVALUATE)"
+        result = self.make("exec", "app=main", "command=node -e 'process.stdout.write(process.argv[1])' '" + literal + "'")
+        self.assertEqual(result.stdout, literal)
+        self.assertFalse((self.root / "NEVER_EVALUATE").exists())
+        result = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--", "node", "-e", "process.exit(42)", check=False)
+        self.assertEqual(result.returncode, 42)
+        self.assertFalse(receipt.exists())
+
+    def test_exec_cargo_add_uses_native_toolchain_without_accepting_integration(self):
+        write_fixture(self.root)
+        shutil.rmtree(self.root / "apps/main")
+        app = self.root / "apps/main"
+        # This std-only program must not retain the HTTP template library/tests.
+        shutil.copytree(REPO / "templates/rust-api", app, ignore=shutil.ignore_patterns("target", "tests", "lib.rs"))
+        (app / "Cargo.toml").write_text('[package]\nname="exec-api"\nversion="0.1.0"\nedition="2024"\n')
+        (app / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname="exec-api"\nversion="0.1.0"\n')
+        (app / "src/main.rs").write_text('fn main() { println!("native exec"); }\n')
+        accept_runtime(self.root, native=True)
+        (app / "Cargo.lock").unlink()
+        helper = app / "vendor helper"
+        (helper / "src").mkdir(parents=True)
+        (helper / "Cargo.toml").write_text('[package]\nname="exec-helper"\nversion="0.1.0"\nedition="2024"\n')
+        (helper / "src/lib.rs").write_text('pub fn value() -> u8 { 1 }\n')
+        before = (self.root / ".devkit/manifest.json").read_bytes()
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--prepare", "--", "cargo", "add", "--offline", "--path", "vendor helper", timeout=180)
+        self.assertIn("exec-helper", (app / "Cargo.toml").read_text())
+        self.assertTrue((app / "Cargo.lock").exists())
+        self.assertEqual((self.root / ".devkit/manifest.json").read_bytes(), before)
+        self.make("setup", timeout=180)
+        self.make("build", timeout=180)
+
+    def test_node_receipt_ignores_rust_config_changes_but_node_config_stales_it(self):
+        write_fixture(self.root, ("main", "api"))
+        shutil.rmtree(self.root / "apps/api")
+        shutil.copytree(REPO / "templates/rust-api", self.root / "apps/api", ignore=shutil.ignore_patterns("target"))
+        accept_runtime(self.root, native=True)
+        self.make("setup", "app=main")
+        receipt = self.root / ".devkit/state/node-workspace.lock"
+        before = receipt.read_bytes()
+        config = self.root / "apps/api/rustfmt.toml"
+        config.write_text(config.read_text()+"\nmax_width=90\n")
+        cargo = self.root / "apps/api/.cargo"
+        cargo.mkdir(exist_ok=True)
+        (cargo / "config.toml").write_text("[build]\njobs=1\n")
+        self.assertIn("GATE main check", self.make("check", "app=main").stdout)
+        self.assertEqual(receipt.read_bytes(), before)
+        (self.root / ".npmrc").write_text("fund=false\n")
+        self.assertIn("dependencies are absent/stale", self.make("check", "app=main", check=False).stderr)
+        self.assertEqual(receipt.read_bytes(), before)
+
+    def test_status_logs_down_need_no_images_node_modules_or_native_lock(self):
+        write_fixture(self.root)
+        state_path = self.root / ".devkit/manifest.json"
+        state = json.loads(state_path.read_text())
+        state["components"]["apps/main"]["development"]["owner"] = "managed"
+        state_path.write_text(json.dumps(state))
+        accept_runtime(self.root)
+        pins = self.root / ".devkit/runtime/toolchains.env"
+        pins.write_text(pins.read_text().replace(IMAGE, "node:missing@sha256:"+"a"*64))
+        seal_runtime(self.root)
+        (self.root / "package-lock.json").unlink()
+        for command in ("status", "logs", "down"):
+            self.make(command)
+        self.assertFalse((self.root / "node_modules").exists())
+        self.assertFalse((self.root / ".devkit/cache").exists())
 
     def test_guard_preserves_native_failure(self):
         name = self.owned_name()
@@ -943,11 +1145,10 @@ wait
         e = env()
         e["PATH"] = str(fake) + os.pathsep + e["PATH"]
         e["FAKE_FAILURE"] = str(failed)
-        result = run("bash", str(RUNTIME_SOURCE / "guard.sh"), name, self.token, "--",
+        result = run(str(ENGINE), "internal", "guard", name, self.token, "--",
                      "touch", str(failed), env=e, check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot verify cleanup", result.stderr)
-        self.assertIn("cleanup incomplete", result.stderr)
+        self.assertIn("cannot verify cleanup", result.stderr.lower())
 
     def test_make_cancellation_reaches_guard_and_own_processes(self):
         write_fixture(self.root)

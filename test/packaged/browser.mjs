@@ -140,22 +140,33 @@ try {
   if (mode.includes('desktop') && before.bridge.join(',') !== 'getCapabilities,greet')
     throw new Error('Unexpected desktop bridge');
   const name = process.env.PROBE_NAME;
+  const standalone = mode === 'standalone-web';
+  if (standalone && (await evaluate(`Boolean(document.querySelector('.api-panel'))`)))
+    throw new Error('Standalone web unexpectedly exposes API controls');
   await evaluate(
     `(() => { const input=document.getElementById('name'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(name)}); input.dispatchEvent(new Event('input',{bubbles:true})); })()`,
   );
   await evaluate(
     `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Increment').click()`,
   );
-  await evaluate(
-    `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Ask API').click()`,
-  );
+  if (!standalone)
+    await evaluate(
+      `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Ask API').click()`,
+    );
   let initial;
   for (let n = 0; n < 200; n += 1) {
     initial = await readState();
-    if (initial.apiGreeting === 'Hello, ' + name + '!' && initial.counter === 'Clicks: 1') break;
+    if (
+      (standalone || initial.apiGreeting === 'Hello, ' + name + '!') &&
+      initial.counter === 'Clicks: 1'
+    )
+      break;
     await delay(100);
   }
-  if (initial.apiGreeting !== 'Hello, ' + name + '!' || initial.counter !== 'Clicks: 1')
+  if (
+    (!standalone && initial.apiGreeting !== 'Hello, ' + name + '!') ||
+    initial.counter !== 'Clicks: 1'
+  )
     throw new Error('Greeting or local interaction failed: ' + JSON.stringify(initial));
   await writeFile(output + '/ready.json', JSON.stringify({ mode, initial }, null, 2));
   let after = initial;
