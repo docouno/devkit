@@ -105,6 +105,8 @@ impl Fixture {
             pending_reads: BTreeMap::new(),
             readiness_pauses: 0,
             corrupt_publish_bytes: false,
+            selector_reads: std::collections::VecDeque::new(),
+            latest_read_elapsed: BTreeMap::new(),
         }
     }
 }
@@ -287,6 +289,8 @@ struct Fake {
     pending_reads: BTreeMap<String, usize>,
     readiness_pauses: usize,
     corrupt_publish_bytes: bool,
+    selector_reads: std::collections::VecDeque<Result<Selectors>>,
+    latest_read_elapsed: BTreeMap<String, std::time::Duration>,
 }
 impl Fake {
     fn hit(&mut self, label: &str) -> Result<()> {
@@ -487,7 +491,36 @@ impl Remote for Fake {
         self.hit(&format!("npm:{name}"))
     }
     fn selectors(&mut self) -> Result<Selectors> {
-        Ok(self.selectors.clone())
+        self.selector_reads
+            .pop_front()
+            .unwrap_or_else(|| Ok(self.selectors.clone()))
+    }
+    fn selectors_after_latest(
+        &mut self,
+        contract: &Contract,
+        acknowledged: &BTreeMap<String, String>,
+        pending: Option<&str>,
+    ) -> Result<Selectors> {
+        let started = self.latest_read_elapsed.clone();
+        let elapsed = std::cell::Cell::new(std::time::Duration::ZERO);
+        let pauses = std::cell::Cell::new(0);
+        let result = readiness::wait_latest(
+            contract,
+            acknowledged,
+            pending,
+            |name| started[name] + elapsed.get(),
+            |_| self.selectors(),
+            |duration| {
+                pauses.set(pauses.get() + 1);
+                elapsed.set(elapsed.get() + duration);
+                Ok(())
+            },
+        );
+        for duration in self.latest_read_elapsed.values_mut() {
+            *duration += elapsed.get();
+        }
+        self.readiness_pauses += pauses.get();
+        result
     }
     fn npm_latest(&mut self, name: &str, version: &str) -> Result<()> {
         if name == ENVIRONMENT {
@@ -495,7 +528,11 @@ impl Remote for Fake {
         } else {
             self.selectors.cli = Some(version.into());
         }
-        self.hit(&format!("latest:{name}"))
+        self.hit(&format!("latest:{name}"))?;
+        self.latest_read_elapsed
+            .entry(name.into())
+            .or_insert(std::time::Duration::ZERO);
+        Ok(())
     }
     fn edit_release(
         &mut self,
@@ -947,7 +984,188 @@ fn promotion_requires_all_public_gates_and_resumes_every_partial_channel_write()
         let before = remote.mutations.len();
         promote(&mut remote, &set, &f.contract).unwrap();
         assert_eq!(remote.mutations.len(), before);
+        for label in [
+            "latest:@docouno/env",
+            "latest:@docouno/devkit",
+            "latest:github",
+        ] {
+            assert_eq!(
+                remote
+                    .mutations
+                    .iter()
+                    .filter(|value| value.as_str() == label)
+                    .count(),
+                1
+            );
+        }
     }
+}
+
+#[test]
+fn acknowledged_npm_writes_wait_through_stale_reads_including_the_final_snapshot() {
+    let f = Fixture::native_update();
+    let set = f.set();
+    let c = &f.contract;
+    let mut remote = f.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    let previous = c.previous.clone();
+    let environment = Selectors {
+        environment: Some(c.version.clone()),
+        ..previous.clone()
+    };
+    let npm = Selectors {
+        cli: Some(c.version.clone()),
+        ..environment.clone()
+    };
+    let complete = Selectors {
+        github: Some(c.tag()),
+        ..npm.clone()
+    };
+    remote.selector_reads.extend([
+        Ok(previous.clone()), // Pre-write snapshot.
+        Ok(previous.clone()), // Successful env ack is not visible yet.
+        Ok(previous.clone()), // A subsequent independent registry read is still stale.
+        Ok(environment),
+        Ok(previous.clone()), // An older env read can recur during CLI readiness.
+        Ok(npm),
+        Ok(Selectors {
+            github: Some(c.tag()),
+            ..previous
+        }), // Final read after GH write.
+        Ok(complete.clone()),
+    ]);
+    let before = remote.mutations.len();
+    promote(&mut remote, &set, c).unwrap();
+    assert_eq!(remote.selectors, complete);
+    assert_eq!(remote.readiness_pauses, 4);
+    assert!(remote.selector_reads.is_empty());
+    assert_eq!(
+        &remote.mutations[before..],
+        [
+            "latest:@docouno/env",
+            "latest:@docouno/devkit",
+            "latest:github"
+        ]
+    );
+    promote(&mut remote, &set, c).unwrap();
+    assert_eq!(remote.mutations.len(), before + 3);
+}
+
+#[test]
+fn selector_read_fault_after_successful_write_stops_and_resume_never_repeats_that_write() {
+    for kind in ["authorization", "transport", "malformed JSON"] {
+        let f = Fixture::native_update();
+        let set = f.set();
+        let c = &f.contract;
+        let mut remote = f.remote();
+        stage(&mut remote, &set, c).unwrap();
+        publish(&mut remote, &set, c).unwrap();
+        remote.proof(c);
+        remote
+            .selector_reads
+            .extend([Ok(c.previous.clone()), Err(anyhow::anyhow!(kind))]);
+        let before = remote.mutations.len();
+        assert_eq!(promote(&mut remote, &set, c).unwrap_err().to_string(), kind);
+        assert_eq!(&remote.mutations[before..], ["latest:@docouno/env"]);
+        assert_eq!(remote.readiness_pauses, 0);
+        promote(&mut remote, &set, c).unwrap();
+        assert_eq!(
+            &remote.mutations[before..],
+            [
+                "latest:@docouno/env",
+                "latest:@docouno/devkit",
+                "latest:github"
+            ]
+        );
+    }
+}
+
+#[test]
+fn selector_wait_exhaustion_stops_before_other_mutations_and_resumes_visible_original_bytes() {
+    let f = Fixture::native_update();
+    let set = f.set();
+    let c = &f.contract;
+    let mut remote = f.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    remote
+        .selector_reads
+        .extend((0..40).map(|_| Ok(c.previous.clone())));
+    let before = remote.mutations.len();
+    let original = remote.assets.clone();
+    let error = promote(&mut remote, &set, c).unwrap_err();
+    assert!(error.to_string().contains("within 360s"));
+    assert_eq!(remote.readiness_pauses, 36);
+    assert_eq!(remote.selector_reads.len(), 3); // Initial read + 36 bounded attempts.
+    assert_eq!(&remote.mutations[before..], ["latest:@docouno/env"]);
+    remote.selector_reads.clear(); // Registry has now exposed the acknowledged write.
+    promote(&mut remote, &set, c).unwrap();
+    assert_eq!(remote.assets, original);
+    assert_eq!(
+        &remote.mutations[before..],
+        [
+            "latest:@docouno/env",
+            "latest:@docouno/devkit",
+            "latest:github"
+        ]
+    );
+}
+
+#[test]
+fn unexpected_selector_after_successful_write_never_polls_or_promotes_other_channels() {
+    for pointer in [None, Some("malformed"), Some("0.3.2"), Some("0.2.9")] {
+        let f = Fixture::native_update();
+        let set = f.set();
+        let c = &f.contract;
+        let mut remote = f.remote();
+        stage(&mut remote, &set, c).unwrap();
+        publish(&mut remote, &set, c).unwrap();
+        remote.proof(c);
+        let mut unexpected = c.previous.clone();
+        unexpected.environment = pointer.map(str::to_owned);
+        remote
+            .selector_reads
+            .extend([Ok(c.previous.clone()), Ok(unexpected)]);
+        let before = remote.mutations.len();
+        assert!(promote(&mut remote, &set, c).is_err());
+        assert_eq!(remote.readiness_pauses, 0);
+        assert_eq!(&remote.mutations[before..], ["latest:@docouno/env"]);
+    }
+}
+
+#[test]
+fn github_only_staleness_does_not_gain_a_retry_policy() {
+    let f = Fixture::native_update();
+    let set = f.set();
+    let c = &f.contract;
+    let mut remote = f.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    let npm = Selectors {
+        environment: Some(c.version.clone()),
+        cli: Some(c.version.clone()),
+        ..c.previous.clone()
+    };
+    remote.selector_reads.extend([
+        Ok(c.previous.clone()),
+        Ok(Selectors {
+            environment: Some(c.version.clone()),
+            ..c.previous.clone()
+        }),
+        Ok(npm.clone()),
+        Ok(npm),
+    ]);
+    assert!(
+        promote(&mut remote, &set, c)
+            .unwrap_err()
+            .to_string()
+            .contains("Selectors did not converge")
+    );
+    assert_eq!(remote.readiness_pauses, 0);
 }
 
 #[test]

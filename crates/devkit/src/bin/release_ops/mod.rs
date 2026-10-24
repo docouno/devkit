@@ -374,6 +374,12 @@ trait Remote {
     fn npm_after_publish(&mut self, name: &str, version: &str) -> Result<PublishedNpm>;
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()>;
     fn selectors(&mut self) -> Result<Selectors>;
+    fn selectors_after_latest(
+        &mut self,
+        contract: &Contract,
+        acknowledged: &BTreeMap<String, String>,
+        pending: Option<&str>,
+    ) -> Result<Selectors>;
     fn npm_latest(&mut self, name: &str, version: &str) -> Result<()>;
     fn edit_release(
         &mut self,
@@ -1120,6 +1126,7 @@ fn record_proof(
 }
 fn promote(remote: &mut impl Remote, set: &FrozenSet, c: &Contract) -> Result<()> {
     c.check_index(set)?;
+    guard_npm_predecessors(&c.previous, &c.version)?;
     check_source(remote, c)?;
     let release = remote
         .release(&c.tag())?
@@ -1141,32 +1148,22 @@ fn promote(remote: &mut impl Remote, set: &FrozenSet, c: &Contract) -> Result<()
     )?;
     check_remote_assets(remote, &release, set, true)?;
     check_npm(remote, set, true)?;
-    guard_selectors(&remote.selectors()?, c)?;
+    let mut current = remote.selectors()?;
+    guard_selectors(&current, c)?;
+    let mut acknowledged = BTreeMap::new();
     for (name, environment) in [(ENVIRONMENT, true), (CLI, false)] {
-        let current = remote.selectors()?;
-        guard_selectors(&current, c)?;
         let pointer = if environment {
             &current.environment
         } else {
             &current.cli
         };
         if pointer.as_deref() != Some(&c.version) {
+            let predecessor = pointer.clone().context("Npm latest predecessor missing")?;
             remote.npm_latest(name, &c.version)?;
+            acknowledged.insert(name.into(), predecessor);
+            current = remote.selectors_after_latest(c, &acknowledged, Some(name))?;
         }
-        let after = remote.selectors()?;
-        guard_selectors(&after, c)?;
-        ensure!(
-            if environment {
-                after.environment
-            } else {
-                after.cli
-            }
-            .as_deref()
-                == Some(&c.version),
-            "Npm latest promotion did not persist"
-        );
     }
-    let current = remote.selectors()?;
     guard_selectors(&current, c)?;
     if release.prerelease || current.github.as_deref() != Some(&c.tag()) {
         remote.edit_release(
@@ -1175,7 +1172,15 @@ fn promote(remote: &mut impl Remote, set: &FrozenSet, c: &Contract) -> Result<()
             Some(true),
         )?;
     }
-    let after = remote.selectors()?;
+    // GitHub's final read also includes npm selectors. Once npm acknowledged a
+    // write, a stale predecessor at this boundary uses the same visibility
+    // budget rather than turning a successful promotion into a false failure.
+    let after = if acknowledged.is_empty() {
+        remote.selectors()?
+    } else {
+        remote.selectors_after_latest(c, &acknowledged, None)?
+    };
+    guard_selectors(&after, c)?;
     ensure!(
         after.environment.as_deref() == Some(&c.version)
             && after.cli.as_deref() == Some(&c.version)
