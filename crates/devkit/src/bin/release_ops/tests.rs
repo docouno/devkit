@@ -14,10 +14,7 @@ fn release_notes_select_only_the_requested_version() {
         release_notes(changelog, "0.3.2").unwrap(),
         "### Fixed\n\n- Reliable publishing."
     );
-    assert_eq!(
-        release_notes(changelog, "0.3.1").unwrap(),
-        "Older changes."
-    );
+    assert_eq!(release_notes(changelog, "0.3.1").unwrap(), "Older changes.");
     for invalid in [
         "## [0.3.20]\nWrong version.\n",
         "## [0.3.2]\n\n## [0.3.1]\nOlder changes.\n",

@@ -56,7 +56,9 @@ fn release_notes<'a>(changelog: &'a str, version: &str) -> Result<&'a str> {
         );
         found = Some(notes);
     }
-    found.context(format!("Add a nonempty [{version}] entry to CHANGELOG.md before releasing"))
+    found.context(format!(
+        "Add a nonempty [{version}] entry to CHANGELOG.md before releasing"
+    ))
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -1168,8 +1170,7 @@ fn proof_body(old: &str, proof: &Proof) -> Result<String> {
             .filter(|base| base.is_empty() || base.ends_with('\n'));
         let (prefix, suffix) = match owned_prefix {
             Some(base)
-                if base.ends_with(VERIFICATION_OPEN)
-                    && suffix.starts_with(VERIFICATION_CLOSE) =>
+                if base.ends_with(VERIFICATION_OPEN) && suffix.starts_with(VERIFICATION_CLOSE) =>
             {
                 (
                     base.strip_suffix(VERIFICATION_OPEN).unwrap(),
