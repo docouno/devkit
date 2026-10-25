@@ -29,8 +29,35 @@ const CONTRACT_OPEN: &str = "<!-- devkit-release-contract-v1\n";
 const CONTRACT_CLOSE: &str = "\nend-devkit-release-contract -->";
 const PROOF_OPEN: &str = "<!-- devkit-public-proof-v1\n";
 const PROOF_CLOSE: &str = "\nend-devkit-public-proof -->";
+const VERIFICATION_OPEN: &str = "<details>\n<summary>Build and verification</summary>\n\n";
+const VERIFICATION_CLOSE: &str = "\n</details>";
 const ENVIRONMENT: &str = "@docouno/env";
 const CLI: &str = "@docouno/devkit";
+
+fn release_notes<'a>(changelog: &'a str, version: &str) -> Result<&'a str> {
+    stable(version)?;
+    let key = format!("[{version}]");
+    let mut found = None;
+    for section in changelog.split("\n## ") {
+        let (heading, notes) = section.split_once('\n').unwrap_or((section, ""));
+        let heading = heading.strip_prefix("## ").unwrap_or(heading);
+        if heading.split_whitespace().next() != Some(key.as_str()) {
+            continue;
+        }
+        ensure!(found.is_none(), "Duplicate changelog entry for {version}");
+        let notes = notes.trim();
+        ensure!(!notes.is_empty(), "Empty changelog entry for {version}");
+        ensure!(notes.len() <= 12000, "Changelog entry is too large");
+        ensure!(
+            !notes.contains("<!-- devkit-")
+                && !notes.contains(VERIFICATION_OPEN)
+                && !notes.contains(VERIFICATION_CLOSE),
+            "Changelog entry contains reserved release metadata"
+        );
+        found = Some(notes);
+    }
+    found.context(format!("Add a nonempty [{version}] entry to CHANGELOG.md before releasing"))
+}
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -144,8 +171,12 @@ impl Contract {
         format!("v{}", self.version)
     }
     fn body(&self) -> Result<String> {
+        let notes = release_notes(
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md")),
+            &self.version,
+        )?;
         Ok(format!(
-            "Devkit {} for Linux x86_64 and local Docker Compose.\n\nUpgrade 0.2 projects using the new npm CLI or this release's install.sh; older versioned bootstrap scripts retain their original behavior.\n\n{CONTRACT_OPEN}{}{CONTRACT_CLOSE}\n",
+            "{notes}\n\n[Usage and upgrade instructions](https://github.com/docouno/devkit/blob/v{}/README.md).\n\n{CONTRACT_OPEN}{}{CONTRACT_CLOSE}\n",
             self.version,
             serde_json::to_string(self)?
         ))
@@ -1121,7 +1152,7 @@ fn proof_body(old: &str, proof: &Proof) -> Result<String> {
         "Compact public proof exceeds release-body budget"
     );
     let replacement = format!(
-        "Public verification: passed. Receipt SHA256 `{}`.\n{PROOF_OPEN}{raw}{PROOF_CLOSE}",
+        "{VERIFICATION_OPEN}Public verification: passed. Receipt SHA256 `{}`.\n{PROOF_OPEN}{raw}{PROOF_CLOSE}{VERIFICATION_CLOSE}",
         digest(raw.as_bytes())
     );
     if old.contains(PROOF_OPEN) || old.contains(PROOF_CLOSE) {
@@ -1132,10 +1163,22 @@ fn proof_body(old: &str, proof: &Proof) -> Result<String> {
             "Public verification: passed. Receipt SHA256 `{}`.\n",
             digest(previous.as_bytes())
         );
-        let prefix = prefix
+        let owned_prefix = prefix
             .strip_suffix(&owned)
-            .filter(|base| base.is_empty() || base.ends_with('\n'))
-            .unwrap_or(prefix);
+            .filter(|base| base.is_empty() || base.ends_with('\n'));
+        let (prefix, suffix) = match owned_prefix {
+            Some(base)
+                if base.ends_with(VERIFICATION_OPEN)
+                    && suffix.starts_with(VERIFICATION_CLOSE) =>
+            {
+                (
+                    base.strip_suffix(VERIFICATION_OPEN).unwrap(),
+                    suffix.strip_prefix(VERIFICATION_CLOSE).unwrap(),
+                )
+            }
+            Some(base) => (base, suffix),
+            None => (prefix, suffix),
+        };
         let separator = if prefix.is_empty() || prefix.ends_with('\n') {
             ""
         } else {
