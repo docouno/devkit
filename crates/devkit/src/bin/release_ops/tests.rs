@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn current_release_requires_versioned_notes() {
+    let changelog = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
+    let version = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../VERSION")).trim();
+    assert!(!release_notes(changelog, version).unwrap().is_empty());
+}
+
+#[test]
+fn release_notes_select_only_the_requested_version() {
+    let changelog = "# Changelog\n\n## [Unreleased]\n\nFuture work.\n\n## [0.3.2] - 2026-10-24\n\n### Fixed\n\n- Reliable publishing.\n\n## [0.3.1] - 2026-10-24\n\nOlder changes.\n";
+    assert_eq!(
+        release_notes(changelog, "0.3.2").unwrap(),
+        "### Fixed\n\n- Reliable publishing."
+    );
+    assert_eq!(release_notes(changelog, "0.3.1").unwrap(), "Older changes.");
+    for invalid in [
+        "## [0.3.20]\nWrong version.\n",
+        "## [0.3.2]\n\n## [0.3.1]\nOlder changes.\n",
+        "## [0.3.2]\nFirst.\n\n## [0.3.2]\nDuplicate.\n",
+        "## [0.3.2]\n<!-- devkit-public-proof-v1\nFake metadata.\n",
+    ] {
+        assert!(release_notes(invalid, "0.3.2").is_err());
+    }
+}
+
+#[test]
+fn release_body_uses_changelog_and_collapses_only_verification() {
+    let f = Fixture::native_update();
+    let body = f.contract.body().unwrap();
+    assert!(body.contains("Wait for newly published npm versions"));
+    assert!(!body.contains("Compact verification receipts"));
+    assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
+    let set = f.set();
+    let mut remote = f.remote();
+    stage(&mut remote, &set, &f.contract).unwrap();
+    publish(&mut remote, &set, &f.contract).unwrap();
+    remote.proof(&f.contract);
+    let proof = read_proof(&remote);
+    record_proof(&mut remote, &set, &f.contract, &proof).unwrap();
+    let saved = remote.release.as_ref().unwrap().body.clone().unwrap();
+    assert!(saved.starts_with(&body));
+    assert_eq!(saved.matches(VERIFICATION_OPEN).count(), 1);
+    assert_eq!(saved.matches(VERIFICATION_CLOSE).count(), 1);
+    let details = saved.find(VERIFICATION_OPEN).unwrap();
+    assert!(details > saved.find("Wait for newly published npm versions").unwrap());
+    assert!(saved.find("Public verification: passed.").unwrap() > details);
+    for _ in 0..3 {
+        record_proof(&mut remote, &set, &f.contract, &proof).unwrap();
+        assert_eq!(
+            remote.release.as_ref().unwrap().body.as_deref(),
+            Some(saved.as_str())
+        );
+    }
+    assert_eq!(read_proof(&remote).index_sha256, proof.index_sha256);
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     contract: Contract,

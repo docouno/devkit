@@ -113,6 +113,8 @@ Use `--help` for command options. Complete arguments run without prompts; `--non
 
 Run `make help` for author commands. Releases are built, tested and published through [GitHub Actions](https://github.com/docouno/devkit/actions/workflows/release.yml).
 
+Before releasing a version, add its changes to [CHANGELOG.md](https://github.com/docouno/devkit/blob/main/CHANGELOG.md). The release workflow uses that version's entry as its description; build and verification metadata stays in a collapsed section.
+
 ## License
 
 [MIT](LICENSE). Distributed binaries include third-party notices.
