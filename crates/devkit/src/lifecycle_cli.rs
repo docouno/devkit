@@ -38,6 +38,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     let allowed: &[&str] = match command {
         "init" => &[
             "--app",
+            "--package",
             "--preset",
             "--template",
             "--name",
@@ -45,23 +46,49 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--to",
             "--release-root",
         ],
-        "add-app" => &["--name", "--template", "--use", "--release-root"],
-        "add-package" => &["--name", "--template", "--release-root"],
-        "register" => &["--app", "--package", "--profile", "--release-root"],
-        "update" => &["--to", "--preview", "--package-source", "--release-root"],
+        "add-app" => &[
+            "--name",
+            "--template",
+            "--use",
+            "--reconcile-lock",
+            "--release-root",
+        ],
+        "add-package" => &[
+            "--name",
+            "--template",
+            "--use",
+            "--reconcile-lock",
+            "--release-root",
+        ],
+        "register" => &[
+            "--app",
+            "--package",
+            "--profile",
+            "--reconcile-lock",
+            "--release-root",
+        ],
+        "sync" => &["--preview", "--reconcile-lock", "--release-root"],
+        "update" => &[
+            "--to",
+            "--preview",
+            "--reconcile-lock",
+            "--package-source",
+            "--release-root",
+        ],
         "recover" => &[],
         _ => unreachable!(),
     };
-    let mut options = Options::parse(
-        args,
-        allowed,
-        if command == "init" { &["--app"] } else { &[] },
-        &["--preview"],
-    )?;
+    let repeat: &[&str] = match command {
+        "init" => &["--app", "--package"],
+        "add-app" | "add-package" => &["--use"],
+        _ => &[],
+    };
+    let mut options = Options::parse(args, allowed, repeat, &["--preview", "--reconcile-lock"])?;
     let missing = match command {
         "init" => {
             options.target.is_none()
                 || !(options.flag("--app")
+                    || options.flag("--package")
                     || options.flag("--preset")
                     || options.flag("--template"))
         }
@@ -70,7 +97,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             !(options.flag("--app") || options.flag("--package")) || !options.flag("--profile")
         }
         "update" => !options.flag("--to"),
-        "recover" => false,
+        "sync" | "recover" => false,
         _ => unreachable!(),
     };
     if missing {
@@ -145,6 +172,33 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                     .collect::<Result<Vec<_>>>()?,
             )
         };
+        let packages = options.all("--package")?;
+        let packages = if packages.is_empty() {
+            None
+        } else {
+            Some(
+                packages
+                    .iter()
+                    .map(|entry| {
+                        let (name, template) = entry
+                            .split_once('=')
+                            .context("Expected --package NAME=TEMPLATE")?;
+                        slug(name)?;
+                        let t = catalog::template(template)?;
+                        ensure!(
+                            t.role == Role::Library,
+                            "Template {} does not create a library; use --app for applications",
+                            t.id
+                        );
+                        Ok(ComponentSpec {
+                            name: name.to_owned(),
+                            template: template.to_owned(),
+                            uses: Vec::new(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         let release = cache.acquire(version, None, source.as_deref(), globals.offline)?;
         let state = project::init_project(
             &release.root,
@@ -152,6 +206,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             &InitOptions {
                 template: options.value("--template")?.map(str::to_owned),
                 apps,
+                packages,
                 preset: options.value("--preset")?.map(str::to_owned),
                 package_mode: mode,
                 name: options.value("--name")?.map(str::to_owned),
@@ -165,18 +220,59 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             &format!("Created {} with Devkit {}. Run make setup.", root.display(), state.version));
         return Ok(());
     }
-    let old = crate::state::read_project_state(&root)?;
-    let version = if command == "update" {
-        options.required("--to")?
+    let (old, release) = if command == "update" {
+        ensure!(
+            exists(&safe_path(&root, crate::state::MANIFEST_PATH)?)?,
+            "Missing project manifest"
+        );
+        let target_version = options.required("--to")?;
+        let release = cache.acquire(target_version, None, source.as_deref(), globals.offline)?;
+        if !crate::cache::legacy(&release.manifest.version)
+            && SemVer::parse(&release.manifest.version)? > SemVer::parse(env!("CARGO_PKG_VERSION"))?
+        {
+            let target_engine = safe_path(&release.root, "devkit")?;
+            let target_sha = crate::delivery::file_digest(&target_engine)?;
+            ensure!(
+                std::env::var("DEVKIT_UPDATE_DELEGATED").ok().as_deref()
+                    != Some(target_sha.as_str()),
+                "Forward update delegation did not converge"
+            );
+            runner.check_cancelled()?;
+            let mut delegated = std::process::Command::new(&target_engine);
+            globals.write_flags(&mut delegated);
+            delegated
+                .arg("update")
+                .arg(&root)
+                .arg("--to")
+                .arg(&release.manifest.version);
+            if let Some(src) = &source {
+                delegated.arg("--release-root").arg(src);
+            }
+            if let Some(ps) = options.value("--package-source")? {
+                delegated.arg("--package-source").arg(ps);
+            }
+            if options.flag("--preview") {
+                delegated.arg("--preview");
+            }
+            if options.flag("--reconcile-lock") {
+                delegated.arg("--reconcile-lock");
+            }
+            delegated.env("DEVKIT_UPDATE_DELEGATED", &target_sha);
+            use std::os::unix::process::CommandExt;
+            return Err(delegated.exec()).context("Cannot execute target release engine");
+        }
+        let old = crate::state::read_project_state(&root)?;
+        (old, release)
     } else {
-        &old.version
+        let old = crate::state::read_project_state(&root)?;
+        let release = cache.acquire(
+            &old.version,
+            Some(old.release_identity.as_str()),
+            source.as_deref(),
+            globals.offline,
+        )?;
+        (old, release)
     };
-    let expected = if command == "update" {
-        None
-    } else {
-        Some(old.release_identity.as_str())
-    };
-    let release = cache.acquire(version, expected, source.as_deref(), globals.offline)?;
     let inventory = if command == "add-app" {
         Some(admit_compose_inventory(
             &root,
@@ -191,10 +287,12 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         package_mode: mode,
         compose_inventory: inventory.as_ref(),
         preview: options.flag("--preview"),
+        reconcile_lock: options.flag("--reconcile-lock"),
         hooks: Some(&cancellation),
         ..Default::default()
     };
     let outcome = match command {
+        "sync" => project::sync_project(&release.root, &root, &update, &DockerNpmResolver)?,
         "update" => project::update_project(&release.root, &root, &update, &DockerNpmResolver)?,
         "register" => {
             ensure!(
@@ -222,14 +320,14 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             slug(name)?;
             let template = options.required("--template")?;
             catalog::template(template)?;
-            let uses = options
-                .value("--use")?
-                .map(|v| {
-                    slug(v)?;
-                    Ok::<_, anyhow::Error>(vec![v.to_owned()])
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let mut uses = Vec::new();
+            let mut seen_uses = std::collections::BTreeSet::new();
+            for u in options.all("--use")? {
+                slug(&u)?;
+                if seen_uses.insert(u.clone()) {
+                    uses.push(u);
+                }
+            }
             project::add_project_component(
                 &release.root,
                 &root,
@@ -250,22 +348,50 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         _ => unreachable!(),
     };
     runner.check_cancelled()?;
-    if options.flag("--preview") && !globals.json {
-        for file in &outcome.files {
+    if !globals.json {
+        if options.flag("--preview") {
+            for file in &outcome.files {
+                println!(
+                    "{} {}",
+                    if file.before.is_none() {
+                        "A"
+                    } else if file.after.is_none() {
+                        "D"
+                    } else {
+                        "M"
+                    },
+                    file.path
+                );
+            }
+        }
+        if let Some(rec) = &outcome.lock_reconciliation {
             println!(
-                "{} {}",
-                if file.before.is_none() {
-                    "A"
-                } else if file.after.is_none() {
-                    "D"
-                } else {
-                    "M"
-                },
-                file.path
+                "Lock reconciliation ({}): {} changed, {} added, {} removed",
+                rec.strategy.as_str(),
+                rec.changed_packages.len(),
+                rec.added_count,
+                rec.removed_count
             );
+            for item in rec.changed_packages.iter().take(10) {
+                println!(
+                    "  {}: {} -> {}",
+                    item.name, item.before_version, item.after_version
+                );
+            }
         }
     }
-    let message = if !outcome.applied && !outcome.no_op {
+    let mut message = if command == "sync" {
+        if !outcome.applied && !outcome.no_op {
+            format!(
+                "Preview for devkit sync: {} changed files. No changes applied.",
+                outcome.files.len()
+            )
+        } else if outcome.no_op {
+            "Project projections and native lock are already synchronized; no changes.".to_owned()
+        } else {
+            "Synchronized project projections and native lock. Review git diff, then run make setup.".to_owned()
+        }
+    } else if !outcome.applied && !outcome.no_op {
         format!(
             "Preview for Devkit {}: {} changed files. No update applied.",
             outcome.state.version,
@@ -282,7 +408,35 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             outcome.state.version
         )
     };
-    globals.emit(command, json!({"root":root,"version":outcome.state.version,"releaseIdentity":outcome.state.release_identity,"generation":outcome.state.generation,"applied":outcome.applied,"noOp":outcome.no_op,"files":outcome.files}), &message);
+    let mut payload = json!({
+        "root": root,
+        "version": outcome.state.version,
+        "releaseIdentity": outcome.state.release_identity,
+        "generation": outcome.state.generation,
+        "applied": outcome.applied,
+        "noOp": outcome.no_op,
+        "files": outcome.files,
+    });
+    if let Some(rec) = &outcome.lock_reconciliation {
+        payload["lockReconciliation"] = serde_json::to_value(rec)?;
+    }
+    if command == "update" {
+        let migrations = project::applicable_migrations(&old, &release)?;
+        if !migrations.is_empty() {
+            message += &format!(
+                "\n\nMigration notes ({} -> {}):",
+                old.version, outcome.state.version
+            );
+            for m in &migrations {
+                message += &format!(
+                    "\n  - [{}] {}: {}\n    local: {}\n    url:   {}",
+                    m.severity, m.title, m.summary, m.local_path, m.url
+                );
+            }
+        }
+        payload["migrations"] = serde_json::to_value(&migrations)?;
+    }
+    globals.emit(command, payload, &message);
     Ok(())
 }
 
@@ -293,7 +447,11 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                 prompt.ask("Project directory", Some("my-project"))?,
             ));
         }
-        if !(options.flag("--app") || options.flag("--preset") || options.flag("--template")) {
+        if !(options.flag("--app")
+            || options.flag("--package")
+            || options.flag("--preset")
+            || options.flag("--template"))
+        {
             loop {
                 let template = prompt.choose(
                     "Application template",
@@ -303,28 +461,48 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                         "React web",
                         "Electron React",
                         "Full stack: Rust API + shared React web and Electron",
+                        "Design system: React UI library + playground",
+                        "TypeScript library (packages/*)",
+                        "React UI library (packages/*)",
                     ],
                 )?;
-                if template == 4 {
+                if template == 4 || template == 5 {
                     ensure!(
-                        !options.flag("--app"),
-                        "The full-stack preset is selected on its own"
+                        !options.flag("--app") && !options.flag("--package"),
+                        "A preset must be selected on its own"
                     );
-                    options.set("--preset", "fullstack-desktop");
+                    options.set(
+                        "--preset",
+                        if template == 4 {
+                            "fullstack-desktop"
+                        } else {
+                            "design-system"
+                        },
+                    );
                     break;
                 }
-                let name = prompt.ask(
-                    "Application name",
-                    Some(["api", "api", "web", "desktop"][template]),
-                )?;
-                slug(&name)?;
-                options.add(
-                    "--app",
-                    format!(
-                        "{name}={}",
-                        ["node-api", "rust-api", "react-web", "electron-react"][template]
-                    ),
-                );
+                if template >= 6 {
+                    let pkg_idx = template - 6;
+                    let name = prompt.ask("Package name", Some(["lib", "ui"][pkg_idx]))?;
+                    slug(&name)?;
+                    options.add(
+                        "--package",
+                        format!("{name}={}", ["ts-library", "react-ui"][pkg_idx]),
+                    );
+                } else {
+                    let name = prompt.ask(
+                        "Application name",
+                        Some(["api", "api", "web", "desktop"][template]),
+                    )?;
+                    slug(&name)?;
+                    options.add(
+                        "--app",
+                        format!(
+                            "{name}={}",
+                            ["node-api", "rust-api", "react-web", "electron-react"][template]
+                        ),
+                    );
+                }
                 if !["y", "yes"].contains(
                     &prompt
                         .ask("Add another application? y/N", Some("n"))?
@@ -365,8 +543,18 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
         }
         if !options.flag("--template") {
             if command == "add-package" {
-                eprintln!("Package template: react-client");
-                options.set("--template", "react-client");
+                let selected = prompt.choose(
+                    "Package template",
+                    &[
+                        "TypeScript library",
+                        "React UI library",
+                        "React shared client",
+                    ],
+                )?;
+                options.set(
+                    "--template",
+                    ["ts-library", "react-ui", "react-client"][selected],
+                );
             } else {
                 let selected = prompt.choose(
                     "Application template",
@@ -389,7 +577,7 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
             let profiles: &[&str] = if options.flag("--app") {
                 &["node", "web", "electron", "rust"]
             } else {
-                &["react-library", "rust"]
+                &["ts-library", "react-ui", "react-library", "rust"]
             };
             let selected = prompt.choose("Tooling profile", profiles)?;
             options.set("--profile", profiles[selected]);

@@ -123,73 +123,127 @@ try {
     if (value.exceptionDetails) throw new Error(JSON.stringify(value.exceptionDetails));
     return value.result.value;
   };
-  const readState = () =>
-    evaluate(
-      `({heading:document.querySelector('h1')?.textContent,text:document.body?.innerText||'',counter:document.querySelector('[data-testid=count]')?.textContent,apiGreeting:document.querySelector('[role=status]')?.textContent,node:typeof process,require:typeof require,url:location.href,bridge:Object.keys(window.desktop||{})})`,
-    );
-  let before;
-  for (let n = 0; n < 200; n += 1) {
-    before = await readState();
-    if (before.heading === process.env.PROBE_HEADING) break;
-    await delay(100);
-  }
-  if (before.heading !== process.env.PROBE_HEADING)
-    throw new Error('Unexpected initial UI: ' + JSON.stringify(before));
-  if (before.node !== 'undefined' || before.require !== 'undefined')
-    throw new Error('Node globals leaked to renderer');
-  if (mode.includes('desktop') && before.bridge.join(',') !== 'getCapabilities,greet')
-    throw new Error('Unexpected desktop bridge');
-  const name = process.env.PROBE_NAME;
-  const standalone = mode === 'standalone-web';
-  if (standalone && (await evaluate(`Boolean(document.querySelector('.api-panel'))`)))
-    throw new Error('Standalone web unexpectedly exposes API controls');
-  await evaluate(
-    `(() => { const input=document.getElementById('name'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(name)}); input.dispatchEvent(new Event('input',{bubbles:true})); })()`,
-  );
-  await evaluate(
-    `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Increment').click()`,
-  );
-  if (!standalone)
-    await evaluate(
-      `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Ask API').click()`,
-    );
-  let initial;
-  for (let n = 0; n < 200; n += 1) {
-    initial = await readState();
-    if (
-      (standalone || initial.apiGreeting === 'Hello, ' + name + '!') &&
-      initial.counter === 'Clicks: 1'
-    )
-      break;
-    await delay(100);
-  }
-  if (
-    (!standalone && initial.apiGreeting !== 'Hello, ' + name + '!') ||
-    initial.counter !== 'Clicks: 1'
-  )
-    throw new Error('Greeting or local interaction failed: ' + JSON.stringify(initial));
-  await writeFile(output + '/ready.json', JSON.stringify({ mode, initial }, null, 2));
-  let after = initial;
-  if (process.env.PROBE_HMR_HEADING) {
-    for (let n = 0; n < 400; n += 1) {
-      after = await readState();
-      if (after.heading === process.env.PROBE_HMR_HEADING) break;
+  if (mode === 'design-system-web') {
+    const readDs = () =>
+      evaluate(
+        `({heading:document.querySelector('h1')?.textContent,buttons:Array.from(document.querySelectorAll('button')).map(b=>({text:b.textContent?.trim(),hmr:b.getAttribute('data-hmr')})),node:typeof process,require:typeof require})`,
+      );
+    let before;
+    for (let n = 0; n < 200; n += 1) {
+      before = await readDs();
+      if (before.heading === process.env.PROBE_HEADING) break;
       await delay(100);
     }
-    if (after.heading !== process.env.PROBE_HMR_HEADING || after.counter !== 'Clicks: 1')
-      throw new Error('HMR did not preserve live state: ' + JSON.stringify(after));
+    if (before.heading !== process.env.PROBE_HEADING)
+      throw new Error('Unexpected design-system initial UI: ' + JSON.stringify(before));
+    if (before.node !== 'undefined' || before.require !== 'undefined')
+      throw new Error('Node globals leaked to renderer');
+    await evaluate(
+      `Array.from(document.querySelectorAll('button')).find(button=>button.textContent.includes('Increment')).click()`,
+    );
+    let initial;
+    for (let n = 0; n < 200; n += 1) {
+      initial = await readDs();
+      if (initial.buttons.some((b) => b.text === 'Increment (1)')) break;
+      await delay(100);
+    }
+    if (!initial.buttons.some((b) => b.text === 'Increment (1)'))
+      throw new Error('Design-system interaction failed: ' + JSON.stringify(initial));
+    await writeFile(output + '/ready.json', JSON.stringify({ mode, initial }, null, 2));
+    let after = initial;
+    if (process.env.PROBE_HMR_MARKER) {
+      for (let n = 0; n < 400; n += 1) {
+        after = await readDs();
+        if (after.buttons.some((b) => b.hmr === process.env.PROBE_HMR_MARKER)) break;
+        await delay(100);
+      }
+      if (
+        !after.buttons.some((b) => b.hmr === process.env.PROBE_HMR_MARKER) ||
+        !after.buttons.some((b) => b.text === 'Increment (1)')
+      ) {
+        throw new Error('Design-system HMR failed or lost state: ' + JSON.stringify(after));
+      }
+    }
+    await delay(300);
+    const layout = await send('Page.getLayoutMetrics');
+    const size = layout.cssContentSize;
+    const screenshot = await send('Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 1 },
+    });
+    await writeFile(output + '/screenshot.png', Buffer.from(screenshot.data, 'base64'));
+    await writeFile(output + '/result.json', JSON.stringify({ mode, initial, after }, null, 2));
+    console.log(JSON.stringify({ mode, initial, after }));
+  } else {
+    const readState = () =>
+      evaluate(
+        `({heading:document.querySelector('h1')?.textContent,text:document.body?.innerText||'',counter:document.querySelector('[data-testid=count]')?.textContent,apiGreeting:document.querySelector('[role=status]')?.textContent,node:typeof process,require:typeof require,url:location.href,bridge:Object.keys(window.desktop||{})})`,
+      );
+    let before;
+    for (let n = 0; n < 200; n += 1) {
+      before = await readState();
+      if (before.heading === process.env.PROBE_HEADING) break;
+      await delay(100);
+    }
+    if (before.heading !== process.env.PROBE_HEADING)
+      throw new Error('Unexpected initial UI: ' + JSON.stringify(before));
+    if (before.node !== 'undefined' || before.require !== 'undefined')
+      throw new Error('Node globals leaked to renderer');
+    if (mode.includes('desktop') && before.bridge.join(',') !== 'getCapabilities,greet')
+      throw new Error('Unexpected desktop bridge');
+    const name = process.env.PROBE_NAME;
+    const standalone = mode === 'standalone-web';
+    if (standalone && (await evaluate(`Boolean(document.querySelector('.api-panel'))`)))
+      throw new Error('Standalone web unexpectedly exposes API controls');
+    await evaluate(
+      `(() => { const input=document.getElementById('name'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(name)}); input.dispatchEvent(new Event('input',{bubbles:true})); })()`,
+    );
+    await evaluate(
+      `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Increment').click()`,
+    );
+    if (!standalone)
+      await evaluate(
+        `Array.from(document.querySelectorAll('button')).find(button=>button.textContent==='Ask API').click()`,
+      );
+    let initial;
+    for (let n = 0; n < 200; n += 1) {
+      initial = await readState();
+      if (
+        (standalone || initial.apiGreeting === 'Hello, ' + name + '!') &&
+        initial.counter === 'Clicks: 1'
+      )
+        break;
+      await delay(100);
+    }
+    if (
+      (!standalone && initial.apiGreeting !== 'Hello, ' + name + '!') ||
+      initial.counter !== 'Clicks: 1'
+    )
+      throw new Error('Greeting or local interaction failed: ' + JSON.stringify(initial));
+    await writeFile(output + '/ready.json', JSON.stringify({ mode, initial }, null, 2));
+    let after = initial;
+    if (process.env.PROBE_HMR_HEADING) {
+      for (let n = 0; n < 400; n += 1) {
+        after = await readState();
+        if (after.heading === process.env.PROBE_HMR_HEADING) break;
+        await delay(100);
+      }
+      if (after.heading !== process.env.PROBE_HMR_HEADING || after.counter !== 'Clicks: 1')
+        throw new Error('HMR did not preserve live state: ' + JSON.stringify(after));
+    }
+    await delay(300);
+    const layout = await send('Page.getLayoutMetrics');
+    const size = layout.cssContentSize;
+    const screenshot = await send('Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 1 },
+    });
+    await writeFile(output + '/screenshot.png', Buffer.from(screenshot.data, 'base64'));
+    await writeFile(output + '/result.json', JSON.stringify({ mode, initial, after }, null, 2));
+    console.log(JSON.stringify({ mode, initial, after }));
   }
-  await delay(300);
-  const layout = await send('Page.getLayoutMetrics');
-  const size = layout.cssContentSize;
-  const screenshot = await send('Page.captureScreenshot', {
-    format: 'png',
-    captureBeyondViewport: true,
-    clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 1 },
-  });
-  await writeFile(output + '/screenshot.png', Buffer.from(screenshot.data, 'base64'));
-  await writeFile(output + '/result.json', JSON.stringify({ mode, initial, after }, null, 2));
-  console.log(JSON.stringify({ mode, initial, after }));
 } catch (error) {
   failure = error;
   console.error(error);

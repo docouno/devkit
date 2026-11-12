@@ -5,14 +5,46 @@ const dependencyFields = [
   'optionalDependencies',
   'peerDependencies',
 ];
+const registryRangePattern = /^[~^<>=*v\d][0-9A-Za-z.*+~^<>=| -]*$/;
+const npmPackagePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+
+export function parseRegistryDependencySpec(spec, label) {
+  if (typeof spec !== 'string' || spec.length === 0 || spec.length > 256) {
+    throw new Error(`Source/local dependency is not an accepted registry range: ${label}`);
+  }
+  if (spec.startsWith('npm:')) {
+    const rest = spec.slice(4);
+    if (!rest) {
+      throw new Error(`Invalid npm: alias dependency specifier: ${label}`);
+    }
+    const splitAt = rest.startsWith('@') ? rest.indexOf('@', 1) : rest.indexOf('@');
+    const targetName = splitAt === -1 ? rest : rest.slice(0, splitAt);
+    const innerSpec = splitAt === -1 ? undefined : rest.slice(splitAt + 1);
+    if (
+      !npmPackagePattern.test(targetName) ||
+      targetName.includes('..') ||
+      (innerSpec !== undefined &&
+        (!innerSpec ||
+          /^(?:npm:|file:|link:|workspace:|git|github:|http:|https:|\/|\.\/|\.\.\/|~$|~\/)/i.test(
+            innerSpec,
+          ) ||
+          !registryRangePattern.test(innerSpec)))
+    ) {
+      throw new Error(`Source/local dependency is not an accepted registry range: ${label}`);
+    }
+    return { kind: 'alias', targetName, innerSpec };
+  }
+  if (!registryRangePattern.test(spec)) {
+    throw new Error(`Source/local dependency is not an accepted registry range: ${label}`);
+  }
+  return { kind: 'range', spec };
+}
 
 export function assertRegistryDependencies(value) {
   for (const field of dependencyFields) {
     for (const [name, spec] of Object.entries(object(value[field] ?? {}, field))) {
       packageName(`node_modules/${name}`);
-      if (typeof spec !== 'string' || !/^[~^<>=*v\d][0-9A-Za-z.*+~^<>=| -]*$/.test(spec)) {
-        throw new Error(`Source/local dependency is not an accepted registry range: ${name}`);
-      }
+      parseRegistryDependencySpec(spec, name);
     }
   }
 }
@@ -71,14 +103,77 @@ export function registryUrl(name, version) {
   return `https://registry.npmjs.org/${name}/-/${name.slice(name.lastIndexOf('/') + 1)}-${version}.tgz`;
 }
 
-function identity(location, value, allowMissing) {
+function resolveLockedLocation(entries, from, depName) {
+  let directory = from;
+  for (;;) {
+    const candidate = directory
+      ? `${directory}/node_modules/${depName}`
+      : `node_modules/${depName}`;
+    if (Object.hasOwn(entries, candidate)) {
+      return candidate;
+    }
+    if (!directory) {
+      return undefined;
+    }
+    const slash = directory.lastIndexOf('/');
+    directory = slash === -1 ? '' : directory.slice(0, slash);
+  }
+}
+
+function collectAliasTargets(entries) {
+  const aliasTargets = new Map();
+  const nonAliasLocations = new Set();
+  for (const [from, rawEntry] of Object.entries(entries)) {
+    const entry = object(rawEntry, from || 'canonical lock root');
+    for (const field of dependencyFields) {
+      for (const [depName, spec] of Object.entries(object(entry[field] ?? {}, field))) {
+        packageName(`node_modules/${depName}`);
+        const parsed = parseRegistryDependencySpec(spec, depName);
+        const resolvedLoc = resolveLockedLocation(entries, from, depName);
+        if (!resolvedLoc) {
+          continue;
+        }
+        if (parsed.kind === 'alias') {
+          const previous = aliasTargets.get(resolvedLoc);
+          if (
+            (previous !== undefined && previous !== parsed.targetName) ||
+            (nonAliasLocations.has(resolvedLoc) && parsed.targetName !== packageName(resolvedLoc))
+          ) {
+            throw new Error(`Conflicting alias target identity at ${resolvedLoc}`);
+          }
+          aliasTargets.set(resolvedLoc, parsed.targetName);
+        } else {
+          const previous = aliasTargets.get(resolvedLoc);
+          if (previous !== undefined && previous !== packageName(resolvedLoc)) {
+            throw new Error(`Conflicting alias target identity at ${resolvedLoc}`);
+          }
+          nonAliasLocations.add(resolvedLoc);
+        }
+      }
+    }
+  }
+  return aliasTargets;
+}
+
+function identity(location, value, allowMissing, aliasTargets) {
   const record = object(value, location),
-    name = packageName(location);
+    slotName = packageName(location),
+    aliasTarget = aliasTargets?.get(location),
+    effectiveName = aliasTarget ?? slotName;
   exactVersion(record.version);
-  if (record.link || record.inBundle || (record.name !== undefined && record.name !== name)) {
+  if (
+    record.link ||
+    record.inBundle ||
+    (aliasTarget !== undefined
+      ? record.name !== aliasTarget
+      : record.name !== undefined && record.name !== slotName)
+  ) {
     throw new Error(`Unsupported canonical registry identity: ${location}`);
   }
-  if (record.resolved !== undefined && record.resolved !== registryUrl(name, record.version)) {
+  if (
+    record.resolved !== undefined &&
+    record.resolved !== registryUrl(effectiveName, record.version)
+  ) {
     throw new Error(`Canonical resolved identity conflict: ${location}`);
   }
   if (record.integrity !== undefined && !validIntegrity(record.integrity)) {
@@ -87,7 +182,7 @@ function identity(location, value, allowMissing) {
   if (!allowMissing && (record.resolved === undefined || record.integrity === undefined)) {
     throw new Error(`Incomplete canonical registry identity: ${location}`);
   }
-  return { record, name };
+  return { record, name: effectiveName };
 }
 
 function packages(value) {
@@ -104,12 +199,13 @@ function packages(value) {
 export async function hydrateLockIdentities(value, fetchDist) {
   const lock = structuredClone(value),
     entries = packages(lock),
+    aliasTargets = collectAliasTargets(entries),
     requests = new Map();
   for (const [location, value] of Object.entries(entries)) {
     if (!location) {
       continue;
     }
-    const { record, name } = identity(location, value, true);
+    const { record, name } = identity(location, value, true, aliasTargets);
     if (record.resolved !== undefined && record.integrity !== undefined) {
       continue;
     }
@@ -133,10 +229,11 @@ export async function hydrateLockIdentities(value, fetchDist) {
 }
 
 export function assertCanonicalLock(value) {
-  const entries = packages(value);
+  const entries = packages(value),
+    aliasTargets = collectAliasTargets(entries);
   for (const [location, entry] of Object.entries(entries)) {
     if (location) {
-      identity(location, entry, false);
+      identity(location, entry, false, aliasTargets);
     }
     assertRegistryDependencies(entry);
   }
@@ -211,7 +308,7 @@ export function assertSelectedIdentities(previous, next, version, integrity) {
     const actual = after[location];
     if (
       !actual ||
-      ['version', 'resolved', 'integrity'].some((field) => actual[field] !== record[field])
+      ['name', 'version', 'resolved', 'integrity'].some((field) => actual[field] !== record[field])
     ) {
       throw new Error(`npm changed a selected external identity: ${location}`);
     }

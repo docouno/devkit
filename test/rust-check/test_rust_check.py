@@ -187,11 +187,23 @@ class RustCheckTests(unittest.TestCase):
         self.assertIn(diagnostic, result.stdout + result.stderr)
 
     def test_native_unit_and_doctest_execute(self):
-        result = self.helper("check")
+        result = self.helper("test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("2 non-ignored, 0 ignored; discovery may include compile-only doctests", result.stdout)
         self.assertIn("tests::value_is_one ... ok", result.stdout)
         self.assertIn("Doc-tests devkit_probe", result.stderr)
+
+        # check validates fmt, clippy, and test --list without executing test bodies.
+        self.source(
+            'pub fn value() -> u8 {\n    1\n}\n\n'
+            '#[cfg(test)]\nmod tests {\n    #[test]\n    fn panics_in_test_mode() {\n'
+            '        panic!("only in test");\n    }\n}\n'
+        )
+        check_result = self.helper("check")
+        self.assertEqual(check_result.returncode, 0, check_result.stdout + check_result.stderr)
+        self.assertIn("1 non-ignored, 0 ignored; discovery may include compile-only doctests", check_result.stdout)
+        self.assertNotIn("panics_in_test_mode ... FAILED", check_result.stdout + check_result.stderr)
+        self.assert_failure(self.helper("test"), "only in test")
 
     def test_no_run_only_is_compile_validation_without_execution_claim(self):
         self.source('//! ```no_run\n//! panic!("This must never execute");\n//! ```\n')
@@ -202,11 +214,12 @@ class RustCheckTests(unittest.TestCase):
         self.assertNotIn("runnable", result.stdout + result.stderr)
 
     def test_empty_and_all_ignored_native_cases_fail(self):
-        for source in ("", "#[test]\n#[ignore]\nfn ignored() {}\n",
+        for source in ("\n", "#[test]\n#[ignore]\nfn ignored() {}\n",
                        '//! ```ignore\n//! panic!("ignored");\n//! ```\n'):
             with self.subTest(source=source):
                 self.source(source)
-                self.assert_failure(self.helper(), "no non-ignored native Rust test cases found")
+                self.assert_failure(self.helper("check"), "no non-ignored native Rust test cases found")
+                self.assert_failure(self.helper("test"), "no non-ignored native Rust test cases found")
 
     def test_failed_native_unit_and_doctest_stay_red(self):
         for source, diagnostic in (("#[test]\nfn broken() { panic!(\"unit regression\"); }\n", "broken ... FAILED"),

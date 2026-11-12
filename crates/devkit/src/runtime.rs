@@ -3,7 +3,7 @@ use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
 use anyhow::{Context, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -43,6 +43,7 @@ pub struct RuntimeRequest {
     pub package: Option<String>,
     pub expected_manifest: Option<String>,
     pub headless: bool,
+    pub package_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
 }
@@ -56,6 +57,7 @@ impl RuntimeRequest {
             package: None,
             expected_manifest: None,
             headless: false,
+            package_aggregate: false,
             follow: false,
             tail: 100,
         }
@@ -270,6 +272,7 @@ impl ToolAdmission {
 #[derive(Clone, Copy)]
 enum TaskAccess {
     Finite,
+    PackageLibrary,
     Fix,
     ExecReadOnly,
     ExecWrite,
@@ -280,6 +283,7 @@ struct ContainerTask<'a> {
     image: &'a str,
     argv: &'a [OsString],
     network: &'a str,
+    forward_npm_secrets: bool,
     access: TaskAccess,
     inputs: Option<&'a InputIdentitySet>,
 }
@@ -530,12 +534,20 @@ impl<'a> PreparedContext<'a> {
             image,
             argv,
             network,
+            forward_npm_secrets,
             access,
             inputs,
         } = task;
         let write_root = matches!(access, TaskAccess::ExecWrite);
         let fix = matches!(access, TaskAccess::Fix);
-        let readonly_deps = matches!(access, TaskAccess::ExecReadOnly);
+        let package_release_dir = if matches!(access, TaskAccess::PackageLibrary) {
+            Some(format!(
+                "{}/release",
+                component.context("PackageLibrary requires a component")?
+            ))
+        } else {
+            None
+        };
         let root = &self.admission.root;
         let mut writes = BTreeSet::new();
         if let Some(inputs) = inputs {
@@ -615,7 +627,11 @@ impl<'a> PreparedContext<'a> {
             ]);
         }
         for path in &writes {
-            let readonly = readonly_deps && path.ends_with("node_modules");
+            let readonly = match access {
+                TaskAccess::PackageLibrary => package_release_dir.as_deref() != Some(path.as_str()),
+                TaskAccess::ExecReadOnly => path.ends_with("node_modules"),
+                _ => false,
+            };
             c.args([
                 "--mount",
                 &bind_mount(
@@ -647,6 +663,7 @@ impl<'a> PreparedContext<'a> {
                 .map(|p| format!("/workspace/{p}"))
                 .unwrap_or_else(|| "/workspace".into()),
         ]);
+        let cargo_jobs = resolve_cargo_build_jobs()?;
         for value in [
             "HOME=/tmp/devkit-home",
             "CI=true",
@@ -659,10 +676,10 @@ impl<'a> PreparedContext<'a> {
             "ELECTRON_CACHE=/cache/electron",
             "CARGO_HOME=/cache/cargo",
             "RUSTUP_AUTO_INSTALL=0",
-            "CARGO_BUILD_JOBS=2",
         ] {
             c.args(["--env", value]);
         }
+        c.args(["--env", &format!("CARGO_BUILD_JOBS={cargo_jobs}")]);
         c.args([
             "--env",
             &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
@@ -672,6 +689,35 @@ impl<'a> PreparedContext<'a> {
                 component.unwrap_or(".")
             ),
         ]);
+        if profile != ToolingProfile::Rust {
+            let node_dirs: Vec<String> = self
+                .admission
+                .state
+                .components
+                .iter()
+                .filter(|(_, c)| c.toolchain == Toolchain::Node)
+                .map(|(p, _)| p.clone())
+                .collect();
+            let npmrc_policy = crate::native::parse_and_admit_npmrc(root, &node_dirs)?;
+            if network != "none" && forward_npm_secrets {
+                crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
+                for var in &npmrc_policy.required_env_vars {
+                    c.args(["--env", var]);
+                }
+                if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
+                    c.args([
+                        "--mount",
+                        &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
+                        "--env",
+                        "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                    ]);
+                }
+            } else {
+                for var in &npmrc_policy.required_env_vars {
+                    c.args(["--env", &format!("{var}=devkit-offline-unused")]);
+                }
+            }
+        }
         if component.is_some_and(|p| {
             self.admission.state.components[p]
                 .development
@@ -776,6 +822,54 @@ fn node_argv(ctx: &PreparedContext<'_>, argv: Vec<OsString>) -> Vec<OsString> {
     ]
     .concat()
 }
+fn npmrc_ignores_scripts(root: &Path) -> Result<bool> {
+    let path = input_path(root, ".npmrc")?;
+    if !exists(&path)? {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(text.lines().any(|raw| {
+        let line = raw.trim();
+        !line.is_empty()
+            && !line.starts_with(['#', ';'])
+            && line
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim() == "ignore-scripts" && v.trim() == "true")
+    }))
+}
+
+fn manifest_install_hooks(root: &Path, manifest_rel: &str) -> Result<Vec<&'static str>> {
+    let path = input_path(root, manifest_rel)?;
+    if !exists(&path)? {
+        return Ok(Vec::new());
+    }
+    let pkg: Value = read_json(&path)?;
+    let mut hooks = Vec::new();
+    if let Some(scripts) = pkg.get("scripts").and_then(Value::as_object) {
+        for hook in ["preinstall", "install", "postinstall", "prepare"] {
+            if scripts
+                .get(hook)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                hooks.push(hook);
+            }
+        }
+    }
+    Ok(hooks)
+}
+
+fn component_is_public_library(root: &Path, path: &str, c: &ComponentState) -> Result<bool> {
+    if matches!(
+        c.tooling_profile,
+        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+    ) {
+        let manifest: Value = read_json(&input_path(root, format!("{path}/package.json"))?)?;
+        Ok(manifest.get("private") == Some(&Value::Bool(false)))
+    } else {
+        Ok(false)
+    }
+}
 pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     if request.command == "help" {
         print!("{HELP}");
@@ -797,6 +891,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             "logs",
             "status",
             "snapshot",
+            "dev-snapshot",
             "package-snapshot"
         ]
         .contains(&request.command.as_str()),
@@ -824,20 +919,71 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     };
     let target = tool.target(&request)?;
     let mut ctx = PreparedContext::new(tool, runner)?;
-    if ["snapshot", "package-snapshot"].contains(&request.command.as_str()) {
-        if request.command == "package-snapshot" {
+    if ["snapshot", "dev-snapshot", "package-snapshot"].contains(&request.command.as_str()) {
+        if request.command == "dev-snapshot" {
             ensure!(
                 request.package.is_none(),
-                "package selects a desktop app, not a library"
+                "Development requires an app selector"
             );
             ensure!(
                 ctx.admission
                     .state
                     .components
                     .values()
-                    .any(|c| c.tooling_profile == ToolingProfile::Electron),
-                "No desktop component is registered"
+                    .any(|c| c.role == Role::App),
+                "Project has no runnable apps; add a playground or app with devkit add-app"
             );
+        } else if request.command == "package-snapshot" {
+            if let Some(pkg) = &request.package {
+                let pkg_path = format!("packages/{pkg}");
+                let c = &ctx.admission.state.components[&pkg_path];
+                ensure!(
+                    matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ),
+                    "Package {pkg_path} uses internal profile {} and cannot be packaged as a tarball",
+                    c.tooling_profile
+                );
+                ensure!(
+                    component_is_public_library(&ctx.admission.root, &pkg_path, c)?,
+                    "Package {pkg_path} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                );
+            } else if let Some(app) = &request.app {
+                let app_path = format!("apps/{app}");
+                ensure!(
+                    ctx.admission.state.components[&app_path].tooling_profile
+                        == ToolingProfile::Electron,
+                    "Application {app_path} is not a desktop Electron app"
+                );
+            } else {
+                let mut any_packageable = false;
+                let mut hint_slug: Option<String> = None;
+                for (path, c) in &ctx.admission.state.components {
+                    if c.tooling_profile == ToolingProfile::Electron {
+                        any_packageable = true;
+                        break;
+                    }
+                    if matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ) {
+                        if hint_slug.is_none() {
+                            hint_slug = path.rsplit('/').next().map(str::to_owned);
+                        }
+                        if component_is_public_library(&ctx.admission.root, path, c)? {
+                            any_packageable = true;
+                            break;
+                        }
+                    }
+                }
+                if !any_packageable {
+                    let slug_hint = hint_slug.as_deref().unwrap_or("<name>");
+                    anyhow::bail!(
+                        "No packageable components found; set \"private\": false in packages/{slug_hint}/package.json and run devkit sync, or add an Electron app"
+                    );
+                }
+            }
         }
         return Ok(());
     }
@@ -870,14 +1016,49 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 vec![
                     "npm".into(),
                     "ci".into(),
+                    "--ignore-scripts".into(),
                     "--include=dev".into(),
                     "--strict-peer-deps".into(),
                 ],
             ),
             network: "bridge",
+            forward_npm_secrets: true,
             access: TaskAccess::Finite,
             inputs: Some(&full.native.inputs),
         })?;
+        if !npmrc_ignores_scripts(&ctx.admission.root)? {
+            for (path, c) in &full.state.components {
+                if c.toolchain != Toolchain::Node {
+                    continue;
+                }
+                for hook in
+                    manifest_install_hooks(&ctx.admission.root, &format!("{path}/package.json"))?
+                {
+                    ctx.task(ContainerTask {
+                        component: Some(path),
+                        profile: c.tooling_profile,
+                        image: &ctx.admission.pins.node_image,
+                        argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                        network: "none",
+                        forward_npm_secrets: false,
+                        access: TaskAccess::Finite,
+                        inputs: Some(&full.native.inputs),
+                    })?;
+                }
+            }
+            for hook in manifest_install_hooks(&ctx.admission.root, "package.json")? {
+                ctx.task(ContainerTask {
+                    component: None,
+                    profile: ToolingProfile::Node,
+                    image: &ctx.admission.pins.node_image,
+                    argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                    network: "none",
+                    forward_npm_secrets: false,
+                    access: TaskAccess::Finite,
+                    inputs: Some(&full.native.inputs),
+                })?;
+            }
+        }
         for (path, c) in &full.state.components {
             if c.tooling_profile == ToolingProfile::Electron {
                 ctx.task(ContainerTask {
@@ -896,6 +1077,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                         ],
                     ),
                     network: "bridge",
+                    forward_npm_secrets: false,
                     access: TaskAccess::Finite,
                     inputs: Some(&full.native.inputs),
                 })?;
@@ -955,6 +1137,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 command.into(),
             ],
             network: if setup { "bridge" } else { "none" },
+            forward_npm_secrets: false,
             access: if command == "fix" {
                 TaskAccess::Fix
             } else {
@@ -970,10 +1153,39 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         } else {
             ctx.admission.pins.node_image.clone()
         };
-        ensure!(
-            command != "package" || component.tooling_profile == ToolingProfile::Electron,
-            "package is defined for desktop applications"
-        );
+        let mut access = if command == "fix" {
+            TaskAccess::Fix
+        } else {
+            TaskAccess::Finite
+        };
+        if command == "package" {
+            match component.tooling_profile {
+                ToolingProfile::Electron => {}
+                ToolingProfile::TsLibrary | ToolingProfile::ReactUi => {
+                    if !component_is_public_library(&ctx.admission.root, &target, &component)? {
+                        if request.package_aggregate {
+                            full.recheck()?;
+                            runner.check_cancelled()?;
+                            drop(lock);
+                            return Ok(());
+                        }
+                        anyhow::bail!(
+                            "Package {target} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                        );
+                    }
+                    access = TaskAccess::PackageLibrary;
+                }
+                _ => {
+                    if component.role == Role::Library {
+                        anyhow::bail!(
+                            "Package {target} uses internal profile {} and cannot be packaged as a tarball",
+                            component.tooling_profile
+                        );
+                    }
+                    anyhow::bail!("Application {target} is not a desktop Electron app");
+                }
+            }
+        }
         if !setup {
             ctx.task(ContainerTask {
                 component: Some(&target),
@@ -981,11 +1193,8 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 image: &image,
                 argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), command.into()]),
                 network: "none",
-                access: if command == "fix" {
-                    TaskAccess::Fix
-                } else {
-                    TaskAccess::Finite
-                },
+                forward_npm_secrets: false,
+                access,
                 inputs: Some(&full.native.inputs),
             })?;
         }
@@ -1055,6 +1264,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         image: &image,
         argv: &request.argv,
         network: &request.network,
+        forward_npm_secrets: request.network != "none",
         access: if request.write {
             TaskAccess::ExecWrite
         } else {
@@ -1078,7 +1288,6 @@ fn run_service(
     ctx: &mut PreparedContext<'_>,
 ) -> Result<()> {
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
-    let mut command = ctx.compose()?;
     let selected = if let Some(path) = target {
         let c = &ctx.admission.state.components[path];
         ensure!(
@@ -1089,6 +1298,19 @@ fn run_service(
     } else {
         None
     };
+    if selected.is_none()
+        && !ctx
+            .admission
+            .state
+            .components
+            .values()
+            .any(|c| c.role == Role::App)
+        && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none()
+    {
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        return Ok(());
+    }
+    let mut command = ctx.compose()?;
     // Existing recorded derived image IDs allow interpolation; never inspect or
     // acquire tool images for service status/logs/down.
     for kind in ["rust", "desktop"] {
@@ -1247,11 +1469,59 @@ fn run_development(
             .map(move |o| format!("{p}/{o}"))
     }))?;
     ctx.dirs([".devkit/cache/cargo".into()])?;
+    let npm_env_overlay_path =
+        safe_path(&ctx.admission.root, ".devkit/state/compose.npm-env.json")?;
+    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(&ctx.admission.root)?;
+    let mut attach_npm_env_overlay = false;
+    if !npmrc_policy.required_env_vars.is_empty() {
+        let mut services_map = serde_json::Map::new();
+        for (path, c) in &full.state.components {
+            if c.role != Role::App || c.toolchain != Toolchain::Node {
+                continue;
+            }
+            let svc_name = service_name(path, c);
+            let existing_env = model
+                .get("services")
+                .and_then(|s| s.get(svc_name))
+                .and_then(|svc| svc.get("environment"));
+            let mut env_map = serde_json::Map::new();
+            for var in &npmrc_policy.required_env_vars {
+                let already_defined = match existing_env {
+                    Some(Value::Object(map)) => map.contains_key(var),
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|entry| entry == var || entry.starts_with(&format!("{var}="))),
+                    _ => false,
+                };
+                if !already_defined {
+                    env_map.insert(var.clone(), json!("devkit-offline-unused"));
+                }
+            }
+            if !env_map.is_empty() {
+                services_map.insert(svc_name.to_owned(), json!({ "environment": env_map }));
+            }
+        }
+        if !services_map.is_empty() {
+            write_atomic(
+                &npm_env_overlay_path,
+                &json_bytes(&json!({ "services": services_map }))?,
+                0o644,
+            )?;
+            attach_npm_env_overlay = true;
+        }
+    }
+    if !attach_npm_env_overlay && identity(&npm_env_overlay_path)?.is_some() {
+        remove_file(&npm_env_overlay_path)?;
+    }
     let mut command = ctx.compose()?;
+    if attach_npm_env_overlay {
+        command.arg("--file").arg(&npm_env_overlay_path);
+    }
     for f in &overlays {
         command.arg("--file").arg(f.path());
     }
-    command.args(["up", "-d", "--wait", "--pull", "never", &service]);
+    command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
     full.recheck()?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     ctx.runner.checked(&mut command, OutputMode::Inherit)?;
@@ -1302,5 +1572,105 @@ impl ComposeNormalizer for DockerComposeNormalizer {
         ]);
         let output = self.runner.capture(&mut command)?;
         Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+fn parse_cargo_jobs_env(var_name: &str, raw: &std::ffi::OsStr) -> Result<usize> {
+    let text = raw
+        .to_str()
+        .with_context(|| format!("Invalid {var_name}: expected UTF-8 integer in 1..=256"))?;
+    let jobs: usize = text.trim().parse().with_context(|| {
+        format!("Invalid {var_name} value '{text}'; expected an integer in 1..=256")
+    })?;
+    ensure!(
+        (1..=256).contains(&jobs),
+        "Invalid {var_name} value '{text}'; expected an integer in 1..=256"
+    );
+    Ok(jobs)
+}
+
+fn resolve_cargo_build_jobs_from(
+    devkit_jobs: Option<&std::ffi::OsStr>,
+    cargo_jobs: Option<&std::ffi::OsStr>,
+    ci: Option<&std::ffi::OsStr>,
+    available_cpus: Option<usize>,
+) -> Result<usize> {
+    if let Some(raw) = devkit_jobs {
+        return parse_cargo_jobs_env("DEVKIT_CARGO_BUILD_JOBS", raw);
+    }
+    if let Some(raw) = cargo_jobs {
+        return parse_cargo_jobs_env("CARGO_BUILD_JOBS", raw);
+    }
+    let cpus = available_cpus.unwrap_or(2).max(1);
+    let is_ci = ci
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| matches!(v.trim(), "true" | "1"));
+    Ok(if is_ci { cpus.min(4) } else { cpus.min(8) })
+}
+
+pub fn resolve_cargo_build_jobs() -> Result<usize> {
+    let devkit_jobs = std::env::var_os("DEVKIT_CARGO_BUILD_JOBS");
+    let cargo_jobs = std::env::var_os("CARGO_BUILD_JOBS");
+    let ci = std::env::var_os("CI");
+    let available = std::thread::available_parallelism().ok().map(usize::from);
+    resolve_cargo_build_jobs_from(
+        devkit_jobs.as_deref(),
+        cargo_jobs.as_deref(),
+        ci.as_deref(),
+        available,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_cargo_build_jobs_from;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn cargo_build_jobs_prioritizes_overrides_caps_defaults_and_rejects_invalid_bounds() {
+        assert_eq!(
+            resolve_cargo_build_jobs_from(
+                Some(OsStr::new("12")),
+                Some(OsStr::new("3")),
+                Some(OsStr::new("true")),
+                Some(16),
+            )
+            .unwrap(),
+            12
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(
+                None,
+                Some(OsStr::new("6")),
+                Some(OsStr::new("1")),
+                Some(16),
+            )
+            .unwrap(),
+            6
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, Some(OsStr::new("true")), Some(16)).unwrap(),
+            4
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, Some(OsStr::new("1")), Some(16)).unwrap(),
+            4
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, None, Some(16)).unwrap(),
+            8
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, None, None).unwrap(),
+            2
+        );
+        for bad in ["", "0", "257", "abc", "-1"] {
+            assert!(
+                resolve_cargo_build_jobs_from(Some(OsStr::new(bad)), None, None, Some(4)).is_err()
+            );
+            assert!(
+                resolve_cargo_build_jobs_from(None, Some(OsStr::new(bad)), None, Some(4)).is_err()
+            );
+        }
     }
 }

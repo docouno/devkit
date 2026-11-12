@@ -1,0 +1,7 @@
+{
+  "extends": "@docouno/env/tsconfig/browser.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx"]
+}

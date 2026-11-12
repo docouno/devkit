@@ -1,7 +1,10 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ESLint } from 'eslint';
 import ts from 'typescript';
+import { verifyPackableComponent } from './pack.js';
 import { relativeList, within } from './paths.js';
 import { workspaceContext, workspaceImportErrors } from './workspace.js';
 
@@ -117,7 +120,7 @@ function importLiterals(source) {
   return values;
 }
 
-export async function verifyProject(directory = process.cwd()) {
+export async function verifyProject(directory = process.cwd(), verifyOptions = {}) {
   const errors = [];
   let root;
   let options;
@@ -289,6 +292,22 @@ export async function verifyProject(directory = process.cwd()) {
     }
   }
 
+  if (parsedConfigs === options.typecheckConfigs.length) {
+    for (const entryName of fs.readdirSync(root).sort()) {
+      if (!/\.[cm]?ts$/iu.test(entryName) || /\.d\.[cm]?ts$/iu.test(entryName)) {
+        continue;
+      }
+      const fullEntry = path.join(root, entryName);
+      if (fs.lstatSync(fullEntry).isFile() && !checked.has(path.resolve(fullEntry))) {
+        add(
+          entryName,
+          'root-ts-coverage',
+          `Root TypeScript file ${entryName} is not covered by devkit.typecheckConfigs (${options.typecheckConfigs.join(', ')}); include it in tsconfig.json or a declared tsconfig.*.json.`,
+        );
+      }
+    }
+  }
+
   let eslint;
   try {
     eslint = new ESLint({ cwd: root });
@@ -389,6 +408,26 @@ export async function verifyProject(directory = process.cwd()) {
         'source-config',
         error instanceof Error ? error.message : 'Cannot verify source configuration.',
       );
+    }
+  }
+  if (verifyOptions.pack === true) {
+    const tempPackDir = path.join(os.tmpdir(), `devkit-pack-verify-${crypto.randomUUID()}`);
+    try {
+      const packCheck = await verifyPackableComponent(root, {
+        outputDir: tempPackDir,
+        allowPrivateLocalDeps: true,
+      });
+      for (const message of packCheck.errors) {
+        add('package.json', 'pack-verification', message);
+      }
+    } catch (error) {
+      add(
+        'package.json',
+        'pack-verification',
+        error instanceof Error ? error.message : 'Unable to verify component package output.',
+      );
+    } finally {
+      fs.rmSync(tempPackDir, { recursive: true, force: true });
     }
   }
   return result();

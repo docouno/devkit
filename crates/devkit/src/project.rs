@@ -65,7 +65,9 @@ fn project_readme(name: &str, state: &ProjectState) -> String {
     }
     text += &format!(
         "\nApplication source, the root Makefile and `compose.yaml` belong to this project. \
-         Shared code lives in `packages/` and is consumed through its native public interfaces.\n\n\
+         Shared code lives in `packages/` and is consumed through its native public interfaces. \
+         See [.devkit/runtime/GUIDE.md](.devkit/runtime/GUIDE.md) for daily commands, \
+         ownership boundaries, dependency workflows and library packaging.\n\n\
          Use the [Devkit CLI](https://github.com/docouno/devkit/blob/v{}/README.md) to add \
          components or explicitly accept an environment update. A newer CLI does not update \
          this project's accepted environment automatically.\n",
@@ -84,6 +86,7 @@ pub struct ComponentSpec {
 pub struct InitOptions<'a> {
     pub template: Option<String>,
     pub apps: Option<Vec<ComponentSpec>>,
+    pub packages: Option<Vec<ComponentSpec>>,
     pub preset: Option<String>,
     pub package_mode: Option<PackageMode>,
     pub name: Option<String>,
@@ -97,6 +100,7 @@ pub struct UpdateOptions<'a> {
     pub compose_inventory: Option<&'a ComposeInventory>,
     pub hooks: Option<&'a dyn MutationHooks>,
     pub preview: bool,
+    pub reconcile_lock: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct FileChange {
@@ -111,10 +115,88 @@ pub struct MutationOutcome {
     pub files: Vec<FileChange>,
     pub applied: bool,
     pub no_op: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_reconciliation: Option<LockReconciliationReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicableMigration {
+    pub id: String,
+    pub version: String,
+    pub severity: MigrationSeverity,
+    pub title: String,
+    pub summary: String,
+    pub profiles: Vec<String>,
+    pub doc_path: String,
+    pub anchor: String,
+    pub local_path: String,
+    pub url: String,
+}
+
+pub fn applicable_migrations(
+    old: &ProjectState,
+    release: &AdmittedRelease,
+) -> Result<Vec<ApplicableMigration>> {
+    let old_ver = SemVer::parse(&old.version)?;
+    let target_ver = SemVer::parse(&release.manifest.version)?;
+    if old_ver >= target_ver {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for m in &release.manifest.migrations {
+        let m_ver = SemVer::parse(&m.version)?;
+        if !(old_ver < m_ver && m_ver <= target_ver) {
+            continue;
+        }
+        let matches_profile = m.profiles.is_empty()
+            || old.components.values().any(|c| {
+                m.profiles.iter().any(|p| p == c.tooling_profile.as_str())
+                    && SemVer::parse(&c.origin.version).is_ok_and(|orig| orig < m_ver)
+            });
+        if !matches_profile {
+            continue;
+        }
+        let local_doc = safe_path(&release.root, &m.doc_path)?;
+        out.push(ApplicableMigration {
+            id: m.id.clone(),
+            version: m.version.clone(),
+            severity: m.severity,
+            title: m.title.clone(),
+            summary: m.summary.clone(),
+            profiles: m.profiles.clone(),
+            doc_path: m.doc_path.clone(),
+            anchor: m.anchor.clone(),
+            local_path: format!("{}#{}", local_doc.display(), m.anchor),
+            url: format!(
+                "https://github.com/docouno/devkit/blob/v{}/{}#{}",
+                release.manifest.version, m.doc_path, m.anchor
+            ),
+        });
+    }
+    Ok(out)
 }
 
 /// Only native npm chooses dependency versions. The project core owns staging,
 /// field ownership, graph preservation and commit, never npm's resolver policy.
+fn is_reconcilable_lock_conflict(err: &anyhow::Error) -> bool {
+    if crate::processes::exit_code(err) >= 128 {
+        return false;
+    }
+    let detail = format!("{err:#}");
+    [
+        "ERESOLVE",
+        "ETARGET",
+        "EBADENGINE",
+        "EOVERRIDE",
+        "conflicting peer dependency",
+        "unable to resolve dependency tree",
+        "No matching version found",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+}
+
 pub trait LockResolver {
     fn regenerate(
         &self,
@@ -122,6 +204,34 @@ pub trait LockResolver {
         release: &AdmittedRelease,
         registry: Option<&str>,
     ) -> Result<()>;
+
+    fn regenerate_reconciled(
+        &self,
+        root: &Path,
+        release: &AdmittedRelease,
+        registry: Option<&str>,
+    ) -> Result<ReconcileStrategy> {
+        let npmrc_policy = parse_manifest_npmrc_policy(root)?;
+        verify_required_npm_env_vars(&npmrc_policy)?;
+        resolve_ca_cert_path()?;
+        let lock_path = safe_path(root, "package-lock.json")?;
+        let seeded_backup = fs::read(&lock_path)?;
+        match self.regenerate(root, release, registry) {
+            Ok(()) => return Ok(ReconcileStrategy::Seeded),
+            Err(err) if !is_reconcilable_lock_conflict(&err) => return Err(err),
+            Err(_) => {}
+        }
+        write_atomic(&lock_path, &seeded_backup, 0o644)?;
+        prune_dev_lock_packages(&lock_path)?;
+        match self.regenerate(root, release, registry) {
+            Ok(()) => return Ok(ReconcileStrategy::PruneDev),
+            Err(err) if !is_reconcilable_lock_conflict(&err) => return Err(err),
+            Err(_) => {}
+        }
+        remove_file(&lock_path)?;
+        self.regenerate(root, release, registry)?;
+        Ok(ReconcileStrategy::CleanFallback)
+    }
 }
 pub struct DockerNpmResolver;
 impl LockResolver for DockerNpmResolver {
@@ -148,6 +258,9 @@ impl LockResolver for DockerNpmResolver {
         }
         let image = image.context("Missing digest-pinned Node image")?;
         let root = project_root(root)?;
+        let npmrc_policy = parse_manifest_npmrc_policy(&root)?;
+        verify_required_npm_env_vars(&npmrc_policy)?;
+        let ca_cert = resolve_ca_cert_path()?;
         let meta = fs::metadata(&root)?;
         let token = uuid::Uuid::new_v4().to_string();
         // Docker's --mount value is CSV; quoting keeps spaces and commas in the
@@ -182,6 +295,21 @@ impl LockResolver for DockerNpmResolver {
             "--tmpfs",
             "/tmp:mode=1777",
         ]);
+        if let Some(ca_path) = &ca_cert {
+            let ca_mount = format!(
+                "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
+                ca_path
+                    .to_str()
+                    .context("Non-UTF8 DEVKIT_CA_CERT path")?
+                    .replace('"', "\"\"")
+            );
+            command.args([
+                "--mount",
+                &ca_mount,
+                "--env",
+                "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+            ]);
+        }
         for value in [
             "HOME=/tmp/devkit-home",
             "npm_config_cache=/tmp/npm-cache",
@@ -193,6 +321,9 @@ impl LockResolver for DockerNpmResolver {
             "npm_config_install_links=false",
         ] {
             command.args(["--env", value]);
+        }
+        for var in &npmrc_policy.required_env_vars {
+            command.args(["--env", var]);
         }
         if let Some(registry) = registry {
             command.args(["--env", &format!("npm_config_registry={registry}")]);
@@ -211,7 +342,27 @@ impl LockResolver for DockerNpmResolver {
         let runner = ProcessRunner::new()?;
         let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
         owned.label = "org.docouno.devkit.operation".into();
-        runner.run_owned(&mut command, OutputMode::Stderr, &owned)?;
+        let output =
+            runner.run_owned(&mut command, OutputMode::Capture(16 * 1024 * 1024), &owned)?;
+        if output.code != 0 {
+            let mut combined = output.stderr;
+            combined.extend_from_slice(&output.stdout);
+            let excerpt = if combined.len() <= 16_384 {
+                String::from_utf8_lossy(&combined).into_owned()
+            } else {
+                let head = String::from_utf8_lossy(&combined[..8_192]);
+                let tail = String::from_utf8_lossy(&combined[combined.len() - 8_192..]);
+                format!("{head}\n...[truncated]...\n{tail}")
+            };
+            return Err(crate::processes::failure(
+                output.code,
+                format!(
+                    "npm lockfile resolution failed (exit {}): {}",
+                    output.code,
+                    excerpt.trim()
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -343,27 +494,41 @@ pub fn render_component(
         "Component path already exists: {path}"
     );
     ensure!(
-        spec.uses.len() <= 1
-            && (spec.uses.is_empty() || ["react-web", "electron-react"].contains(&definition.id)),
-        "This template supports one shared client binding"
+        spec.uses.is_empty() || definition.toolchain == Toolchain::Node,
+        "--use is supported for Node.js components"
     );
-    let client = spec
-        .uses
-        .first()
-        .map(|n| component_path(Role::Library, n))
-        .transpose()?;
-    let client_name = if let Some(client) = &client {
+    let mut resolved_uses = Vec::new();
+    let mut seen_use_paths = BTreeSet::new();
+    for use_slug in &spec.uses {
+        let dep_path = component_path(Role::Library, use_slug)?;
+        ensure!(dep_path != path, "Component cannot --use itself: {path}");
+        if !seen_use_paths.insert(dep_path.clone()) {
+            continue;
+        }
+        let dep_comp = components
+            .get(&dep_path)
+            .with_context(|| format!("Unknown workspace package for --use: {dep_path}"))?;
         ensure!(
-            components
-                .get(client)
-                .is_some_and(|c| c.tooling_profile == ToolingProfile::ReactLibrary),
-            "Shared client is not a registered React library: {client}"
+            dep_comp.role == Role::Library && dep_comp.toolchain == Toolchain::Node,
+            "Target of --use must be a registered Node.js library: {dep_path}"
         );
-        let m = native_manifest(destination, client)?;
-        text(m.get("name").context("Client name")?, "client package name")?.to_string()
-    } else {
-        String::new()
-    };
+        let m = native_manifest(destination, &dep_path)?;
+        let dep_pkg_name = text(
+            m.get("name").context("Workspace package name")?,
+            "workspace package name",
+        )?
+        .to_string();
+        resolved_uses.push((dep_path, dep_comp.tooling_profile, dep_pkg_name));
+    }
+    let shared_clients: Vec<&str> = resolved_uses
+        .iter()
+        .filter(|(_, p, _)| *p == ToolingProfile::ReactLibrary)
+        .map(|(_, _, n)| n.as_str())
+        .collect();
+    ensure!(
+        shared_clients.len() <= 1,
+        "At most one react-client shared client binding is supported per component"
+    );
     let prefix = format!("templates/{}/", definition.id);
     for (name, id) in &release.manifest.files {
         if let Some(suffix) = name.strip_prefix(&prefix) {
@@ -377,36 +542,55 @@ pub fn render_component(
             )?;
         }
     }
-    if client.is_some() {
-        let variant = format!("{prefix}variants/shared/");
-        let descriptor: Value =
-            serde_json::from_slice(&release.bytes(&format!("{variant}variant.json"))?)?;
-        for remove in descriptor["remove"]
-            .as_array()
-            .context("Variant requires explicit remove list")?
+    let variant_spec = if let Some(&client_pkg) = shared_clients.first()
+        && ["react-web", "electron-react"].contains(&definition.id)
+    {
+        Some(("shared", "__DEVKIT_CLIENT_PACKAGE__", client_pkg))
+    } else if definition.id == "react-web"
+        && let Some((_, _, ui_pkg)) = resolved_uses
+            .iter()
+            .find(|(_, p, _)| *p == ToolingProfile::ReactUi)
+    {
+        Some(("design-system", "__DEVKIT_UI_PACKAGE__", ui_pkg.as_str()))
+    } else {
+        None
+    };
+    if let Some((variant_name, token, replacement)) = variant_spec {
+        let variant = format!("{prefix}variants/{variant_name}/");
+        if release
+            .manifest
+            .files
+            .contains_key(&format!("{variant}variant.json"))
         {
-            let p = safe_path(
-                destination,
-                &format!("{path}/{}", text(remove, "removed path")?),
-            )?;
-            if exists(&p)? {
-                if p.is_dir() {
-                    fs::remove_dir_all(p)?;
-                } else {
-                    remove_file(&p)?;
+            let descriptor: Value =
+                serde_json::from_slice(&release.bytes(&format!("{variant}variant.json"))?)?;
+            for remove in descriptor["remove"]
+                .as_array()
+                .context("Variant requires explicit remove list")?
+            {
+                let p = safe_path(
+                    destination,
+                    &format!("{path}/{}", text(remove, "removed path")?),
+                )?;
+                if exists(&p)? {
+                    if p.is_dir() {
+                        fs::remove_dir_all(p)?;
+                    } else {
+                        remove_file(&p)?;
+                    }
                 }
             }
-        }
-        let files_prefix = format!("{variant}files/");
-        for (name, id) in &release.manifest.files {
-            if let Some(suffix) = name.strip_prefix(&files_prefix) {
-                let bytes = String::from_utf8(release.bytes(name)?)?
-                    .replace("__DEVKIT_CLIENT_PACKAGE__", &client_name);
-                write_atomic(
-                    &safe_path(destination, &format!("{path}/{suffix}"))?,
-                    bytes.as_bytes(),
-                    id.mode,
-                )?;
+            let files_prefix = format!("{variant}files/");
+            for (name, id) in &release.manifest.files {
+                if let Some(suffix) = name.strip_prefix(&files_prefix) {
+                    let bytes =
+                        String::from_utf8(release.bytes(name)?)?.replace(token, replacement);
+                    write_atomic(
+                        &safe_path(destination, &format!("{path}/{suffix}"))?,
+                        bytes.as_bytes(),
+                        id.mode,
+                    )?;
+                }
             }
         }
     }
@@ -442,11 +626,20 @@ pub fn render_component(
     for (name, value) in &state.tool_dependencies {
         deps.insert(name.clone(), json!(value));
     }
-    if let Some(client) = &client {
-        deps.insert(
-            client_name,
-            json!(format!("file:{}", local_relative(&path, client))),
-        );
+    if !resolved_uses.is_empty() {
+        if !manifest.get("dependencies").is_some_and(Value::is_object) {
+            manifest["dependencies"] = json!({});
+        }
+        let prod_deps = manifest
+            .get_mut("dependencies")
+            .and_then(Value::as_object_mut)
+            .context("Template dependencies must be an object")?;
+        for (dep_path, _, dep_pkg_name) in &resolved_uses {
+            prod_deps.insert(
+                dep_pkg_name.clone(),
+                json!(format!("file:{}", local_relative(&path, dep_path))),
+            );
+        }
     }
     write_native(destination, &path, &manifest)?;
     let mut lock: Value = read_json(&safe_path(
@@ -652,17 +845,18 @@ pub fn init_project(
     options: &InitOptions<'_>,
     resolver: &dyn LockResolver,
 ) -> Result<ProjectState> {
+    let has_components = options.apps.is_some() || options.packages.is_some();
     ensure!(
         [
             options.template.is_some(),
-            options.apps.is_some(),
+            has_components,
             options.preset.is_some()
         ]
         .into_iter()
         .filter(|v| *v)
         .count()
             == 1,
-        "Choose exactly one of --app, --preset or --template"
+        "Choose exactly one of --app/--package, --preset or --template"
     );
     let release = admit_release(release_root)?;
     let target = project_root(target)?;
@@ -695,27 +889,46 @@ pub fn init_project(
         uses: vec![],
     };
     let specs = if let Some(preset) = &options.preset {
-        ensure!(preset == "fullstack-desktop", "Unknown preset: {preset}");
-        vec![
-            (Role::Library, app("client", "react-client")),
-            (Role::App, app("api", "rust-api")),
-            (
-                Role::App,
-                ComponentSpec {
-                    uses: vec!["client".to_string()],
-                    ..app("web", "react-web")
-                },
-            ),
-            (
-                Role::App,
-                ComponentSpec {
-                    uses: vec!["client".to_string()],
-                    ..app("desktop", "electron-react")
-                },
-            ),
-        ]
-    } else if let Some(apps) = &options.apps {
-        apps.iter().cloned().map(|a| (Role::App, a)).collect()
+        match preset.as_str() {
+            "fullstack-desktop" => vec![
+                (Role::Library, app("client", "react-client")),
+                (Role::App, app("api", "rust-api")),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["client".to_string()],
+                        ..app("web", "react-web")
+                    },
+                ),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["client".to_string()],
+                        ..app("desktop", "electron-react")
+                    },
+                ),
+            ],
+            "design-system" => vec![
+                (Role::Library, app("ui", "react-ui")),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["ui".to_string()],
+                        ..app("playground", "react-web")
+                    },
+                ),
+            ],
+            _ => anyhow::bail!("Unknown preset: {preset}"),
+        }
+    } else if has_components {
+        let mut v = Vec::new();
+        if let Some(pkgs) = &options.packages {
+            v.extend(pkgs.iter().cloned().map(|p| (Role::Library, p)));
+        }
+        if let Some(apps) = &options.apps {
+            v.extend(apps.iter().cloned().map(|a| (Role::App, a)));
+        }
+        v
     } else if options.template.as_deref() == Some("mixed") {
         vec![
             (Role::App, app("api", "rust-api")),
@@ -723,24 +936,17 @@ pub fn init_project(
         ]
     } else {
         let t = template(options.template.as_deref().unwrap())?;
-        vec![(
-            Role::App,
-            app(
-                if t.id == "node-api" {
-                    "main"
-                } else if t.id == "rust-api" {
-                    "api"
-                } else {
-                    "web"
-                },
-                t.id,
-            ),
-        )]
+        let default_slug = match t.id {
+            "node-api" => "main",
+            "rust-api" => "api",
+            "ts-library" => "lib",
+            "react-ui" => "ui",
+            "react-client" => "client",
+            _ => "web",
+        };
+        vec![(t.role, app(default_slug, t.id))]
     };
-    ensure!(
-        specs.iter().any(|(r, _)| *r == Role::App),
-        "Init requires an application"
-    );
+    ensure!(!specs.is_empty(), "Init requires at least one component");
     let stage = tempfile::Builder::new()
         .prefix(".devkit-init-")
         .tempdir_in(parent)?;
@@ -760,7 +966,9 @@ pub fn init_project(
             seeds.push(seed);
         }
     }
-    if options.preset.is_some() || options.template.as_deref() == Some("mixed") {
+    if options.preset.as_deref() == Some("fullstack-desktop")
+        || options.template.as_deref() == Some("mixed")
+    {
         for path in ["apps/web", "apps/desktop"] {
             if let Some(c) = state.components.get_mut(path)
                 && let Some(d) = &mut c.development
@@ -1016,7 +1224,11 @@ fn mutate(
             &spec.name,
         )?;
     }
-    if change.is_none() && old.release_identity == release.identity && mode == old.package_mode {
+    if change.is_none()
+        && !options.reconcile_lock
+        && old.release_identity == release.identity
+        && mode == old.package_mode
+    {
         match assert_native_components(root, old)
             .and_then(|()| assert_projections(root, old, &snapshot.inputs))
         {
@@ -1028,6 +1240,7 @@ fn mutate(
                     files: vec![],
                     applied: false,
                     no_op: true,
+                    lock_reconciliation: None,
                 });
             }
             Err(e) if e.to_string().contains("projection is stale") => {}
@@ -1159,9 +1372,28 @@ fn mutate(
                 remove_file(&safe_path(&staged_root, name)?)?;
             }
         }
+        let mut lock_reconciliation = None;
         if let Some(product) = product {
-            resolver.regenerate(&staged_root, &release, options.registry)?;
-            assert_product_graphs_preserved(&product, &read_native_graph(&staged_root)?)?;
+            if options.reconcile_lock {
+                let strategy =
+                    resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
+                let after_graph = read_native_graph(&staged_root)?;
+                assert_direct_product_roots_preserved(&product, &after_graph)?;
+                lock_reconciliation = Some(compute_reconciliation_report(
+                    strategy,
+                    &product.graph,
+                    &after_graph,
+                ));
+            } else {
+                resolver.regenerate(&staged_root, &release, options.registry)?;
+                let after_graph = read_native_graph(&staged_root)?;
+                assert_product_graphs_preserved(&product, &after_graph).map_err(|err| {
+                    crate::cli::error(
+                        "PRODUCT_GRAPH_DRIFT",
+                        format_product_graph_drift(&product, &after_graph, &err),
+                    )
+                })?;
+            }
         }
         for (path, _) in node_components(&next) {
             remove_file(&safe_path(
@@ -1238,6 +1470,312 @@ fn mutate(
             files,
             applied: !options.preview,
             no_op: false,
+            lock_reconciliation,
+        })
+    })();
+    if !exists(&safe_path(root, PENDING_PATH)?)?
+        && let Err(cleanup) = cleanup_unpublished_stage(root, &stage)
+    {
+        return match result {
+            Ok(_) => {
+                Err(cleanup.context("Operation completed but recovery stage cleanup was blocked"))
+            }
+            Err(error) => Err(error.context(format!("Recovery stage retained: {cleanup}"))),
+        };
+    }
+    result
+}
+
+fn collect_external_deps(
+    manifest: &Fields,
+    packages: &Packages,
+    state: &ProjectState,
+    location: &str,
+) -> Result<BTreeMap<(String, String), String>> {
+    let mut external = BTreeMap::new();
+    for field in DEPENDENCY_FIELDS {
+        for (name, value) in dependency_table(manifest, field)? {
+            let spec = text(&value, &format!("{location}:{name}"))?;
+            let parsed = parse_npm_dependency_spec(spec)?;
+            if matches!(parsed, NpmDepSpec::LocalFile(_)) {
+                continue;
+            }
+            if matches!(parsed, NpmDepSpec::RegistryRange(_))
+                && let Ok(Some(target)) = locked_dependency(packages, location, &name)
+                && state.components.contains_key(&target)
+            {
+                continue;
+            }
+            external.insert((field.to_owned(), name), spec.to_owned());
+        }
+    }
+    Ok(external)
+}
+
+fn external_deps_changed(
+    staged_root: &Path,
+    state: &ProjectState,
+    old_lock: &Value,
+    seeded_packages: &Packages,
+) -> Result<bool> {
+    let raw_old = object(
+        old_lock
+            .get("packages")
+            .context("Missing native lock packages")?,
+        "native lock packages",
+    )?;
+    let mut old_packages: Packages = BTreeMap::new();
+    for (loc, val) in raw_old {
+        old_packages.insert(loc.clone(), object(val, loc)?.clone());
+    }
+    let mut locations = vec![String::new()];
+    for (path, _) in node_components(state) {
+        locations.push(path.clone());
+    }
+    for location in locations {
+        let Some(old_record) = old_packages.get(&location) else {
+            return Ok(true);
+        };
+        let current_manifest = native_manifest(staged_root, &location)?;
+        let before = collect_external_deps(old_record, &old_packages, state, &location)?;
+        let after = collect_external_deps(&current_manifest, seeded_packages, state, &location)?;
+        if before != after {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn npmrc_registries_drifted(policy: &NpmrcPolicy, packages: &Packages) -> bool {
+    if policy.default_registry.is_none() && policy.scoped_registries.is_empty() {
+        return false;
+    }
+    for (location, record) in packages {
+        if !location.contains("node_modules/") || record.get("link") == Some(&Value::Bool(true)) {
+            continue;
+        }
+        let Some(resolved) = record.get("resolved").and_then(Value::as_str) else {
+            continue;
+        };
+        if resolved.starts_with("file:") {
+            continue;
+        }
+        let pkg_name = record
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| location.rsplit("node_modules/").next().unwrap_or(""));
+        let expected_registry = if let Some(rest) = pkg_name.strip_prefix('@')
+            && let Some((scope, _)) = rest.split_once('/')
+            && let Some(scoped) = policy.scoped_registries.get(scope)
+        {
+            Some(scoped.as_str())
+        } else {
+            policy.default_registry.as_deref()
+        };
+        if let Some(prefix) = expected_registry {
+            let normalized = prefix.trim_end_matches('/');
+            if !resolved.starts_with(normalized) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn sync_project(
+    release_root: &Path,
+    target: &Path,
+    options: &UpdateOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
+    let release = admit_release(release_root)?;
+    let lock = CheckoutLock::acquire(target)?;
+    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let root = &snapshot.root;
+    let old = &snapshot.state;
+    let mut next = old.clone();
+    ensure!(
+        release.identity == old.release_identity && release.manifest.version == old.version,
+        "Sync requires the exact accepted release"
+    );
+    ensure!(
+        options.package_mode.is_none() || options.package_mode == Some(old.package_mode),
+        "Sync does not change package mode"
+    );
+    verify_old_tools(root, &next)?;
+    if !node_components(old).is_empty() {
+        assert_package_lock_mode(root)?;
+        let manifest = native_manifest(root, "")?;
+        let expected = node_components(old)
+            .iter()
+            .map(|(p, _)| (*p).clone())
+            .collect::<Vec<_>>();
+        ensure!(
+            manifest.get("workspaces") == Some(&json!(expected)),
+            "Root npm workspace membership conflicts with accepted registration"
+        );
+    }
+    let stage_name = format!(".devkit/state/update-{}", uuid::Uuid::new_v4());
+    let stage = safe_path(root, &stage_name)?;
+    create_dir_all_durable(&stage)?;
+    let staged_root = stage.join("project");
+    let result: Result<MutationOutcome> = (|| {
+        copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
+        let staged_closure = collect_native_input_closure(&staged_root, &next)?;
+        let npmrc_policy = parse_and_admit_npmrc(&staged_root, &staged_closure.directories)?;
+        sync_node_workspace(&staged_root, &next, None)?;
+        let mut lock_reconciliation = None;
+        if !node_components(&next).is_empty() {
+            let old_lock: Value = read_json(&safe_path(&staged_root, "package-lock.json")?)?;
+            let (before_graph, retained_product) =
+                capture_retained_product_graph(&staged_root, &next, &old_lock)?;
+            seed_workspace_lock(
+                &staged_root,
+                &next,
+                &[LockSeed {
+                    prefix: String::new(),
+                    lock: old_lock.clone(),
+                }],
+            )?;
+            let seeded_packages = package_lock(&staged_root)?;
+            let mut needs_resolver = options.reconcile_lock
+                || external_deps_changed(&staged_root, &next, &old_lock, &seeded_packages)?
+                || npmrc_registries_drifted(&npmrc_policy, &seeded_packages);
+            if !needs_resolver {
+                let offline_ok = read_native_graph(&staged_root)
+                    .and_then(|_| derive_component_dependencies(&staged_root, &next))
+                    .is_ok();
+                if !offline_ok {
+                    needs_resolver = true;
+                }
+            }
+            if needs_resolver {
+                if options.reconcile_lock {
+                    let strategy =
+                        resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
+                    let after_graph = read_native_graph(&staged_root)?;
+                    let expected_current = capture_product_graph(&staged_root, &next)?;
+                    assert_direct_product_roots_preserved(&expected_current, &after_graph)?;
+                    lock_reconciliation = Some(compute_reconciliation_report(
+                        strategy,
+                        &before_graph,
+                        &after_graph,
+                    ));
+                } else {
+                    resolver.regenerate(&staged_root, &release, options.registry)?;
+                    let after_graph = read_native_graph(&staged_root)?;
+                    assert_retained_product_graph_preserved(&retained_product, &after_graph)
+                        .map_err(|err| {
+                            crate::cli::error(
+                                "PRODUCT_GRAPH_DRIFT",
+                                format_product_graph_drift(&retained_product, &after_graph, &err),
+                            )
+                        })?;
+                }
+            } else {
+                let after_graph = read_native_graph(&staged_root)?;
+                assert_retained_product_graph_preserved(&retained_product, &after_graph).map_err(
+                    |err| {
+                        crate::cli::error(
+                            "PRODUCT_GRAPH_DRIFT",
+                            format_product_graph_drift(&retained_product, &after_graph, &err),
+                        )
+                    },
+                )?;
+            }
+            for (path, _) in node_components(&next) {
+                remove_file(&safe_path(
+                    &staged_root,
+                    &format!("{path}/package-lock.json"),
+                )?)?;
+            }
+        }
+        let deps = derive_component_dependencies(&staged_root, &next)?;
+        for (path, c) in &mut next.components {
+            c.dependencies = deps[path].clone();
+        }
+        next.managed = write_managed(&release, &staged_root, &next)?;
+        for name in old.managed.keys() {
+            if !next.managed.contains_key(name) {
+                remove_file(&safe_path(&staged_root, name)?)?;
+            }
+        }
+        validate_project_state(&next)?;
+        assert_native_components(&staged_root, &next)?;
+        let mut paths = old
+            .managed
+            .keys()
+            .chain(next.managed.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        paths.extend([
+            MANIFEST_PATH.to_string(),
+            "package.json".to_string(),
+            "package-lock.json".to_string(),
+        ]);
+        for (path, _) in node_components(&next) {
+            paths.insert(format!("{path}/package.json"));
+            paths.insert(format!("{path}/package-lock.json"));
+        }
+        let mut any_changed = next != *old;
+        if !any_changed {
+            for name in &paths {
+                if name == MANIFEST_PATH {
+                    continue;
+                }
+                if identity(&safe_path(root, name)?)? != identity(&safe_path(&staged_root, name)?)?
+                {
+                    any_changed = true;
+                    break;
+                }
+            }
+        }
+        if !any_changed {
+            if let Some(h) = options.hooks {
+                h.after_stage()?;
+            }
+            release.recheck()?;
+            snapshot.recheck()?;
+            return Ok(MutationOutcome {
+                state: old.clone(),
+                files: vec![],
+                applied: false,
+                no_op: true,
+                lock_reconciliation,
+            });
+        }
+        next.generation = uuid::Uuid::new_v4().to_string();
+        write_json(&safe_path(&staged_root, MANIFEST_PATH)?, &next)?;
+        let tx = PreparedTransaction::prepare(root, &stage_name, &staged_root, &paths, vec![])?;
+        let files = tx
+            .journal
+            .files
+            .iter()
+            .map(|f| FileChange {
+                path: f.path.clone(),
+                before: f.before.clone(),
+                after: f.after.clone(),
+            })
+            .collect();
+        let preflight = || {
+            release.recheck()?;
+            snapshot.recheck()?;
+            Ok(())
+        };
+        if options.preview {
+            if let Some(h) = options.hooks {
+                h.after_stage()?;
+            }
+            preflight()?;
+        } else {
+            tx.commit(root, options.hooks, &preflight)?;
+        }
+        Ok(MutationOutcome {
+            state: next.clone(),
+            files,
+            applied: !options.preview,
+            no_op: false,
+            lock_reconciliation,
         })
     })();
     if !exists(&safe_path(root, PENDING_PATH)?)?

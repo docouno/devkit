@@ -7,18 +7,19 @@
     "node": "^24.22.1"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck && npm test",
-    "format:check": "prettier --check src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
-    "lint": "eslint --no-ignore --max-warnings 0 src eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
+    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run --config vitest.config.mjs",
-    "fix": "prettier --write src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs && eslint --no-ignore --max-warnings 0 --fix src eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs && prettier --write src tsconfig.json tsconfig.node.json tsconfig.test.json eslint.config.mjs prettier.config.mjs vitest.config.mjs electron.vite.config.cjs electron-builder.config.cjs",
-    "build": "npm run typecheck && electron-vite build",
+    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "build": "electron-vite build",
     "dev": "electron-vite dev",
     "package": "electron-builder --config electron-builder.config.cjs --linux dir --publish never && tar -czf release/app-linux.tar.gz -C release/linux-unpacked ."
   },
   "devDependencies": {
-    "@docouno/env": "0.3.2",
+    "@docouno/env": "0.4.0",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "24.19.2",

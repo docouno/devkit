@@ -40,6 +40,122 @@ pub fn version(value: &str) -> Result<&str> {
     );
     Ok(value)
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrereleaseId {
+    Numeric(u64),
+    AlphaNumeric(String),
+}
+impl Ord for PrereleaseId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Numeric(a), Self::Numeric(b)) => a.cmp(b),
+            (Self::Numeric(_), Self::AlphaNumeric(_)) => std::cmp::Ordering::Less,
+            (Self::AlphaNumeric(_), Self::Numeric(_)) => std::cmp::Ordering::Greater,
+            (Self::AlphaNumeric(a), Self::AlphaNumeric(b)) => a.cmp(b),
+        }
+    }
+}
+impl PartialOrd for PrereleaseId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemVer {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub prerelease: Vec<PrereleaseId>,
+}
+impl SemVer {
+    pub fn parse(value: &str) -> Result<Self> {
+        ensure!(
+            !value.is_empty() && value.len() <= 128,
+            "Invalid SemVer version: {value}"
+        );
+        let (without_build, build) = match value.split_once('+') {
+            Some((left, right)) => (left, Some(right)),
+            None => (value, None),
+        };
+        if let Some(build) = build {
+            ensure!(
+                !build.is_empty()
+                    && build.split('.').all(|part| {
+                        !part.is_empty()
+                            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    }),
+                "Invalid SemVer build metadata: {value}"
+            );
+        }
+        let (core, pre_raw) = match without_build.split_once('-') {
+            Some((left, right)) => (left, Some(right)),
+            None => (without_build, None),
+        };
+        let parts: Vec<&str> = core.split('.').collect();
+        ensure!(parts.len() == 3, "Invalid SemVer version: {value}");
+        let parse_num = |s: &str| -> Result<u64> {
+            ensure!(
+                !s.is_empty()
+                    && (s == "0" || !s.starts_with('0'))
+                    && s.bytes().all(|b| b.is_ascii_digit()),
+                "Invalid SemVer numeric identifier: {value}"
+            );
+            s.parse::<u64>()
+                .with_context(|| format!("SemVer numeric overflow: {value}"))
+        };
+        let major = parse_num(parts[0])?;
+        let minor = parse_num(parts[1])?;
+        let patch = parse_num(parts[2])?;
+        let mut prerelease = Vec::new();
+        if let Some(pre) = pre_raw {
+            ensure!(!pre.is_empty(), "Invalid SemVer prerelease: {value}");
+            for part in pre.split('.') {
+                ensure!(
+                    !part.is_empty()
+                        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                    "Invalid SemVer prerelease identifier: {value}"
+                );
+                if part.bytes().all(|b| b.is_ascii_digit()) {
+                    ensure!(
+                        part == "0" || !part.starts_with('0'),
+                        "Invalid SemVer leading zero in prerelease: {value}"
+                    );
+                    prerelease
+                        .push(PrereleaseId::Numeric(part.parse::<u64>().with_context(
+                            || format!("SemVer prerelease overflow: {value}"),
+                        )?));
+                } else {
+                    prerelease.push(PrereleaseId::AlphaNumeric(part.to_owned()));
+                }
+            }
+        }
+        Ok(Self {
+            major,
+            minor,
+            patch,
+            prerelease,
+        })
+    }
+}
+impl Ord for SemVer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => self.prerelease.cmp(&other.prerelease),
+                },
+            )
+    }
+}
+impl PartialOrd for SemVer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 pub fn slug(value: &str) -> Result<&str> {
     ensure!(
         value.len() <= 63 && SLUG_RE.is_match(value),

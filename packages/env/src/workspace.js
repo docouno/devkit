@@ -1,13 +1,64 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
+import { builtinModules, createRequire } from 'node:module';
 import ts from 'typescript';
 import { within } from './paths.js';
 
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const canonical = (file) => (fs.existsSync(file) ? fs.realpathSync(file) : path.resolve(file));
 const depFields = ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies'];
+const runtimeDepFields = ['dependencies', 'optionalDependencies', 'peerDependencies'];
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const builtinSet = new Set([
+  ...builtinModules,
+  ...builtinModules.map((mod) => (mod.startsWith('node:') ? mod.slice(5) : mod)),
+]);
+
+function barePackageName(specifier) {
+  if (
+    !specifier ||
+    specifier.startsWith('.') ||
+    specifier.startsWith('#') ||
+    path.isAbsolute(specifier) ||
+    specifier.includes(':') ||
+    builtinSet.has(specifier)
+  ) {
+    return null;
+  }
+  const segments = specifier.split('/');
+  const name = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
+  if (!name || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/u.test(name) || builtinSet.has(name)) {
+    return null;
+  }
+  return name;
+}
+
+function pairedRuntimePackages(pkgName) {
+  if (!pkgName.startsWith('@types/')) {
+    return [];
+  }
+  const rest = pkgName.slice('@types/'.length);
+  if (!rest) {
+    return [];
+  }
+  const sep = rest.indexOf('__');
+  if (sep > 0) {
+    return [`@${rest.slice(0, sep)}/${rest.slice(sep + 2)}`, rest];
+  }
+  return [rest];
+}
+
+function isNonTestLibrarySource(componentRoot, file) {
+  const rel = path.relative(componentRoot, canonical(file)).split(path.sep).join('/');
+  if (!rel.startsWith('src/')) {
+    return false;
+  }
+  if (/\.(?:test|spec)\.[^/]+$/iu.test(rel)) {
+    return false;
+  }
+  const parts = rel.split('/');
+  return !parts.includes('__tests__') && !parts.includes('__mocks__');
+}
 
 export function workspaceContext(componentRoot) {
   if (!['apps', 'packages'].includes(path.basename(path.dirname(componentRoot)))) {
@@ -45,15 +96,61 @@ export function workspaceContext(componentRoot) {
   }
   const manifest = read(path.join(componentRoot, 'package.json'));
   const declared = new Set(depFields.flatMap((field) => Object.keys(manifest[field] ?? {})));
-  const owner = (file) => {
-    const actual = canonical(file);
+  const runtimeDependencies = new Set(
+    runtimeDepFields.flatMap((field) => Object.keys(manifest[field] ?? {})),
+  );
+  const devDependencies = new Set(Object.keys(manifest.devDependencies ?? {}));
+  const isPublicLibrary = current.role === 'library' && manifest.private === false;
+  const owner = (candidate) => {
+    const actual = canonical(candidate);
     return components.find(
       (entry) =>
         within(entry.root, actual) &&
         !path.relative(entry.root, actual).split(path.sep).includes('node_modules'),
     );
   };
-  return { projectRoot, components, current, declared, owner };
+  return {
+    projectRoot,
+    components,
+    current,
+    declared,
+    runtimeDependencies,
+    devDependencies,
+    isPublicLibrary,
+    owner,
+  };
+}
+
+function isPureTypeImportClause(clause) {
+  if (!clause) {
+    return false;
+  }
+  if (clause.isTypeOnly) {
+    return true;
+  }
+  if (clause.name) {
+    return false;
+  }
+  if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+    return (
+      clause.namedBindings.elements.length > 0 &&
+      clause.namedBindings.elements.every((element) => element.isTypeOnly)
+    );
+  }
+  return false;
+}
+
+function isPureTypeExportDeclaration(node) {
+  if (node.isTypeOnly) {
+    return true;
+  }
+  if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+    return (
+      node.exportClause.elements.length > 0 &&
+      node.exportClause.elements.every((element) => element.isTypeOnly)
+    );
+  }
+  return false;
 }
 
 function imports(source, options) {
@@ -64,29 +161,32 @@ function imports(source, options) {
     ts.sys,
     options,
   );
-  const add = (node, override) => {
+  const add = (node, override, typeOnly = false) => {
     if (node && ts.isStringLiteralLike(node)) {
       result.push({
         specifier: node.text,
         mode: override ?? ts.getModeForUsageLocation(source, node, options),
+        typeOnly,
       });
     }
   };
   const visit = (node) => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      add(node.moduleSpecifier);
+    if (ts.isImportDeclaration(node)) {
+      add(node.moduleSpecifier, undefined, isPureTypeImportClause(node.importClause));
+    } else if (ts.isExportDeclaration(node)) {
+      add(node.moduleSpecifier, undefined, isPureTypeExportDeclaration(node));
     } else if (
       ts.isImportEqualsDeclaration(node) &&
       ts.isExternalModuleReference(node.moduleReference)
     ) {
-      add(node.moduleReference.expression, ts.ModuleKind.CommonJS);
+      add(node.moduleReference.expression, ts.ModuleKind.CommonJS, Boolean(node.isTypeOnly));
     } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
-      add(node.argument.literal);
+      add(node.argument.literal, undefined, true);
     } else if (ts.isCallExpression(node) && node.arguments[0]) {
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-        add(node.arguments[0], ts.ModuleKind.ESNext);
+        add(node.arguments[0], ts.ModuleKind.ESNext, false);
       } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
-        add(node.arguments[0], ts.ModuleKind.CommonJS);
+        add(node.arguments[0], ts.ModuleKind.CommonJS, false);
       }
     }
     ts.forEachChild(node, visit);
@@ -146,17 +246,8 @@ function resolveAsset(specifier, file, options, mode) {
 }
 
 function installedPackage(file, specifier) {
-  if (
-    specifier.startsWith('.') ||
-    specifier.startsWith('#') ||
-    path.isAbsolute(specifier) ||
-    specifier.includes(':')
-  ) {
-    return null;
-  }
-  const segments = specifier.split('/');
-  const name = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
-  if (!name || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/u.test(name)) {
+  const name = barePackageName(specifier);
+  if (!name) {
     return null;
   }
   for (const directory of createRequire(file).resolve.paths(name) ?? []) {
@@ -181,7 +272,36 @@ export function workspaceImportErrors(context, file, text, compilerOptions) {
   }
   const errors = [];
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
-  for (const { specifier, mode } of imports(source, compilerOptions)) {
+  const checkLibraryDeps =
+    context.current.role === 'library' && isNonTestLibrarySource(context.current.root, file);
+  const displayFile = path.relative(context.projectRoot, canonical(file)).split(path.sep).join('/');
+
+  for (const { specifier, mode, typeOnly } of imports(source, compilerOptions)) {
+    if (checkLibraryDeps) {
+      const barePkg = barePackageName(specifier);
+      if (barePkg) {
+        if (!typeOnly) {
+          if (!context.runtimeDependencies.has(barePkg)) {
+            errors.push(
+              `Library source file ${displayFile} imports "${barePkg}" at runtime, but it is not declared in dependencies, peerDependencies, or optionalDependencies.`,
+            );
+            continue;
+          }
+        } else if (context.isPublicLibrary) {
+          const paired = pairedRuntimePackages(barePkg);
+          const allowed =
+            context.runtimeDependencies.has(barePkg) ||
+            paired.some((candidate) => context.runtimeDependencies.has(candidate));
+          if (!allowed) {
+            errors.push(
+              `Library source file ${displayFile} imports types from "${barePkg}", which is not declared in dependencies, peerDependencies, or optionalDependencies of a public library.`,
+            );
+            continue;
+          }
+        }
+      }
+    }
+
     const resolved = ts.resolveModuleName(
       specifier,
       file,

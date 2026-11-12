@@ -1,0 +1,24 @@
+.devkit-ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  border: 1px solid #1e293b;
+  background-color: #0f172a;
+  color: #f8fafc;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.devkit-ui-button[data-variant='secondary'] {
+  background-color: #ffffff;
+  color: #0f172a;
+  border-color: #cbd5e1;
+}

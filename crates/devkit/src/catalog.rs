@@ -31,6 +31,18 @@ pub fn template(value: &str) -> Result<Template> {
             Toolchain::Node,
             ToolingProfile::ReactLibrary,
         ),
+        "ts-library" => (
+            "ts-library",
+            Role::Library,
+            Toolchain::Node,
+            ToolingProfile::TsLibrary,
+        ),
+        "react-ui" => (
+            "react-ui",
+            Role::Library,
+            Toolchain::Node,
+            ToolingProfile::ReactUi,
+        ),
         _ => bail!("Unknown component template: {value}"),
     };
     Ok(Template {
@@ -46,12 +58,16 @@ pub fn profile_template(profile: ToolingProfile) -> &'static str {
         ToolingProfile::Web => "react-web",
         ToolingProfile::Electron => "electron-react",
         ToolingProfile::ReactLibrary => "react-client",
+        ToolingProfile::TsLibrary => "ts-library",
+        ToolingProfile::ReactUi => "react-ui",
         ToolingProfile::Rust => "rust-api",
     }
 }
 pub fn profile_allows(profile: ToolingProfile, role: Role) -> bool {
     match profile {
-        ToolingProfile::ReactLibrary => role == Role::Library,
+        ToolingProfile::ReactLibrary | ToolingProfile::TsLibrary | ToolingProfile::ReactUi => {
+            role == Role::Library
+        }
         ToolingProfile::Rust => true,
         _ => role == Role::App,
     }
@@ -93,7 +109,9 @@ pub fn node_components(state: &ProjectState) -> Vec<(&String, &ComponentState)> 
 pub fn profile_outputs(profile: ToolingProfile) -> &'static [&'static str] {
     match profile {
         ToolingProfile::Rust => &["target"],
-        ToolingProfile::Electron => &["dist", "release"],
+        ToolingProfile::Electron | ToolingProfile::TsLibrary | ToolingProfile::ReactUi => {
+            &["dist", "release"]
+        }
         _ => &["dist"],
     }
 }

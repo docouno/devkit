@@ -5,6 +5,7 @@ export DEVKIT_PACKAGE := $(package)
 export DEVKIT_FOLLOW := $(follow)
 export DEVKIT_TAIL := $(tail)
 export DEVKIT_HEADLESS := $(or $(headless),0)
+export DEVKIT_PACKAGE_AGGREGATE := 0
 export DEVKIT_TARGET_COMPONENT :=
 export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.json 2>/dev/null))
 
@@ -33,17 +34,18 @@ setup check fix test build:
 
 dev up: $(addprefix dev-,$(devkit_selected_apps))
 dev up:
-	@exec sh $(devkit_loader) snapshot
-package: $(if $(strip $(package)),,$(addprefix package-,$(if $(strip $(app)),$(app),$(DEVKIT_DESKTOP_APPS))))
+	@exec sh $(devkit_loader) dev-snapshot
+package: export DEVKIT_PACKAGE_AGGREGATE := $(if $(strip $(app)$(package)),0,1)
+package: $(if $(strip $(app)),$(addprefix package-,$(app)),$(if $(strip $(package)),$(addprefix package/packages/,$(package)),$(addprefix package-,$(DEVKIT_DESKTOP_APPS)) $(addprefix package/packages/,$(DEVKIT_PACKAGEABLE_PACKAGES))))
 	@exec sh $(devkit_loader) package-snapshot
 setup-node-workspace:
 	@exec sh $(devkit_loader) setup-node
 setup-node-workspace: export DEVKIT_TARGET_COMPONENT :=
 
 .PHONY: $(foreach command,setup check fix test build dev package,$(addprefix $(command)-,$(DEVKIT_REGISTERED_APPS)))
-.PHONY: $(foreach command,setup check fix test build,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))
+.PHONY: $(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))
 $(foreach command,setup check fix test build dev package,$(addprefix $(command)-,$(DEVKIT_REGISTERED_APPS))): export DEVKIT_TARGET_COMPONENT = apps/$*
-$(foreach command,setup check fix test build,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES))): export DEVKIT_TARGET_COMPONENT = packages/$*
+$(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES))): export DEVKIT_TARGET_COMPONENT = packages/$*
 
 $(addprefix setup-,$(DEVKIT_REGISTERED_APPS)): setup-%:
 	@exec sh $(devkit_loader) setup
@@ -70,6 +72,8 @@ $(addprefix test/packages/,$(DEVKIT_REGISTERED_PACKAGES)): test/packages/%:
 	@exec sh $(devkit_loader) test
 $(addprefix build/packages/,$(DEVKIT_REGISTERED_PACKAGES)): build/packages/%:
 	@exec sh $(devkit_loader) build
+$(addprefix package/packages/,$(DEVKIT_REGISTERED_PACKAGES)): package/packages/%:
+	@exec sh $(devkit_loader) package
 
 # command= uses shellwords syntax without expansions. Exact argv: devkit exec -- ...
 export DEVKIT_EXEC_COMMAND := $(value command)

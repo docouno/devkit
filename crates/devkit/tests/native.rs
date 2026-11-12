@@ -11,7 +11,7 @@ use devkit::{
     native::{
         admit_native_components, assert_input_identities, assert_native_components,
         assert_npmrc_compatibility, collect_native_input_closure, derive_component_dependencies,
-        package_lock, valid_integrity,
+        package_lock, parse_and_admit_npmrc, valid_integrity,
     },
     project::{
         ComponentSpec, InitOptions, LockResolver, UpdateOptions, init_project,
@@ -89,6 +89,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
                 integrity: environment_integrity,
             },
             files: file_map(&release).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();
@@ -164,6 +165,7 @@ fn manifest(name: &str, deps: Value, library: bool) -> Value {
     let mut value = json!({"name":name,"version":"1.0.0","dependencies":deps,
         "scripts":{"check":"check","fix":"fix","test":"test","build":"build","dev":"dev"}});
     if library {
+        value["private"] = json!(true);
         value["exports"] = json!({".":"./src/index.ts"});
     }
     value
@@ -2570,4 +2572,382 @@ fn pinned_cargo_metadata_proves_patch_inputs_and_outside_refusal() {
             "unsupportedLocalForms":["source.directory","source.local-registry","git=file:","resolver.lockfile-path"]
         })).unwrap();
     }
+}
+
+#[test]
+fn npm_alias_admission_validates_target_name_and_rejects_spoofed_or_nested_specs() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = state(&[("apps/main", "node"), ("packages/shared", "node")]);
+    let mut alias_artifact = artifact("string-width", json!({"name": "string-width"}));
+    alias_artifact["version"] = json!("4.2.3");
+    alias_artifact["resolved"] =
+        json!("https://registry.npmjs.org/string-width/-/string-width-4.2.3.tgz");
+    let mut scoped_artifact = json!({
+        "name": "@acme/core",
+        "version": "1.2.0",
+        "resolved": "https://registry.npmjs.org/@acme/core/-/core-1.2.0.tgz",
+        "integrity": sri(2),
+    });
+    node_project(
+        root,
+        &state,
+        &[
+            (
+                "apps/main",
+                manifest(
+                    "@test/main",
+                    json!({
+                        "string-width-cjs": "npm:string-width@^4.2.0",
+                        "scoped-alias": "npm:@acme/core@^1.2.0"
+                    }),
+                    false,
+                ),
+            ),
+            ("packages/shared", manifest("@test/shared", json!({}), true)),
+        ],
+        json!({
+            "node_modules/string-width-cjs": alias_artifact,
+            "node_modules/scoped-alias": scoped_artifact,
+        }),
+    );
+    assert_native_components(root, &state).unwrap();
+    let before = capture_product_graph(root, &state).unwrap();
+    assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).unwrap();
+
+    // Changing the target package under the same alias key & version must fail BOTH
+    // native admission and product graph preservation.
+    let original_lock: Value = read_json(&root.join("package-lock.json")).unwrap();
+    let mut spoofed_lock = original_lock.clone();
+    spoofed_lock["packages"]["node_modules/string-width-cjs"]["name"] = json!("evil-pkg");
+    spoofed_lock["packages"]["node_modules/string-width-cjs"]["resolved"] =
+        json!("https://registry.npmjs.org/evil-pkg/-/evil-pkg-4.2.3.tgz");
+    put_json(root, "package-lock.json", &spoofed_lock);
+    assert!(
+        assert_native_components(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("must resolve to registry package string-width")
+    );
+    put_json(root, "package-lock.json", &original_lock);
+
+    // Changing both manifest alias target and lockfile node name changes product identity.
+    let mut renamed_manifest = manifest(
+        "@test/main",
+        json!({
+            "string-width-cjs": "npm:other-width@^4.2.0",
+            "scoped-alias": "npm:@acme/core@^1.2.0"
+        }),
+        false,
+    );
+    put_json(root, "apps/main/package.json", &renamed_manifest);
+    let mut renamed_lock = original_lock.clone();
+    renamed_lock["packages"]["apps/main"] = renamed_manifest.clone();
+    renamed_lock["packages"]["node_modules/string-width-cjs"]["name"] = json!("other-width");
+    renamed_lock["packages"]["node_modules/string-width-cjs"]["resolved"] =
+        json!("https://registry.npmjs.org/other-width/-/other-width-4.2.3.tgz");
+    put_json(root, "package-lock.json", &renamed_lock);
+    assert!(assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).is_err());
+
+    // Alias cannot target a registered local workspace component.
+    renamed_manifest["dependencies"] = json!({"@test/shared": "npm:@test/shared@1.0.0"});
+    put_json(root, "apps/main/package.json", &renamed_manifest);
+    renamed_lock["packages"]["apps/main"] = renamed_manifest.clone();
+    put_json(root, "package-lock.json", &renamed_lock);
+    assert!(assert_native_components(root, &state).is_err());
+
+    // Invalid inner specs under npm: must fail closed.
+    for bad_spec in [
+        "npm:a@npm:b@1.0.0",
+        "npm:file:../shared",
+        "npm:pkg@file:../shared",
+        "npm:pkg@https://example.com/pkg.tgz",
+        "npm:pkg@workspace:*",
+        "npm:",
+    ] {
+        let m = manifest("@test/main", json!({"bad": bad_spec}), false);
+        put_json(root, "apps/main/package.json", &m);
+        let mut l = original_lock.clone();
+        l["packages"]["apps/main"] = m;
+        l["packages"]["node_modules/bad"] = scoped_artifact.clone();
+        put_json(root, "package-lock.json", &l);
+        assert!(
+            assert_native_components(root, &state).is_err(),
+            "expected {bad_spec} to be rejected"
+        );
+    }
+    let _ = &mut scoped_artifact;
+}
+
+#[test]
+fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = state(&[("apps/main", "node")]);
+    node_project(
+        root,
+        &state,
+        &[(
+            "apps/main",
+            manifest("@test/main", json!({"@corp/sdk": "^1.0.0"}), false),
+        )],
+        json!({
+            "node_modules/@corp/sdk": {
+                "version": "1.0.0",
+                "resolved": "https://gitlab.example.com/api/v4/projects/12/packages/npm/@corp/sdk/-/@corp/sdk-1.0.0.tgz",
+                "integrity": sri(3),
+            }
+        }),
+    );
+    put(
+        root,
+        ".npmrc",
+        "# Private GitLab npm registry\n\
+         package-lock=true\n\
+         strict-peer-deps=true\n\
+         ignore-scripts=true\n\
+         @corp:registry=https://gitlab.example.com/api/v4/projects/12/packages/npm/\n\
+         //gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n\
+         //gitlab.example.com/api/v4/projects/12/packages/npm/:always-auth=true\n",
+    );
+    let closure = collect_native_input_closure(root, &state).unwrap();
+    let policy = parse_and_admit_npmrc(root, &closure.directories).unwrap();
+    assert_eq!(
+        policy.scoped_registries.get("corp").map(String::as_str),
+        Some("https://gitlab.example.com/api/v4/projects/12/packages/npm/")
+    );
+    assert!(policy.required_env_vars.contains("GITLAB_NPM_TOKEN"));
+    assert_native_components(root, &state).unwrap();
+
+    // IPv6 HTTPS registry and nerf-dart token expansion symmetry.
+    put(
+        root,
+        ".npmrc",
+        "@corp:registry=https://[fd00::1]:8443/api/v4/projects/12/packages/npm/\n\
+         //[fd00::1]:8443/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+    );
+    let ipv6_policy = parse_and_admit_npmrc(root, &closure.directories).unwrap();
+    assert_eq!(
+        ipv6_policy
+            .scoped_registries
+            .get("corp")
+            .map(String::as_str),
+        Some("https://[fd00::1]:8443/api/v4/projects/12/packages/npm/")
+    );
+
+    for bad_npmrc in [
+        "//gitlab.example.com:0/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+        "//gitlab.example.com:99999/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+        "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=glpat-secret-literal\n",
+        "_authToken=${NPM_TOKEN}\n",
+        "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${LD_PRELOAD}\n",
+        "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${NODE_OPTIONS}\n",
+        "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${DEVKIT_CA_CERT}\n",
+        "strict-ssl=false\n",
+        "cafile=/etc/ssl/cert.pem\n",
+        "@corp:registry=http://gitlab.example.com/api/v4/packages/npm/\n",
+        "@corp:registry=https://user:token@gitlab.example.com/api/v4/packages/npm/\n",
+    ] {
+        put(root, ".npmrc", bad_npmrc);
+        assert!(
+            parse_and_admit_npmrc(root, &closure.directories).is_err(),
+            "expected .npmrc to be rejected: {bad_npmrc}"
+        );
+    }
+
+    // Restore valid .npmrc and verify credentials/queries in package-lock.json resolved URLs fail closed.
+    put(
+        root,
+        ".npmrc",
+        "@corp:registry=https://gitlab.example.com/api/v4/projects/12/packages/npm/\n\
+         //gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+    );
+    for bad_resolved in [
+        "https://user:token@gitlab.example.com/api/v4/projects/12/packages/npm/@corp/sdk/-/sdk-1.0.0.tgz",
+        "https://gitlab.example.com/api/v4/projects/12/packages/npm/@corp/sdk/-/sdk-1.0.0.tgz?private_token=secret",
+        "http://gitlab.example.com/api/v4/projects/12/packages/npm/@corp/sdk/-/sdk-1.0.0.tgz",
+    ] {
+        let mut lock: Value = read_json(&root.join("package-lock.json")).unwrap();
+        lock["packages"]["node_modules/@corp/sdk"]["resolved"] = json!(bad_resolved);
+        put_json(root, "package-lock.json", &lock);
+        assert!(
+            assert_native_components(root, &state).is_err(),
+            "expected resolved URL to be rejected: {bad_resolved}"
+        );
+    }
+}
+
+#[test]
+fn publishable_library_contract_enforces_private_exports_files_semver_and_public_deps() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut st = state(&[
+        ("apps/web", "node"),
+        ("packages/internal", "node"),
+        ("packages/core", "node"),
+        ("packages/ui", "node"),
+    ]);
+    st.version = "0.4.0".into();
+    st.components
+        .get_mut("packages/core")
+        .unwrap()
+        .tooling_profile = ToolingProfile::TsLibrary;
+    st.components
+        .get_mut("packages/ui")
+        .unwrap()
+        .tooling_profile = ToolingProfile::ReactUi;
+    st.components.get_mut("packages/ui").unwrap().dependencies = vec!["packages/core".into()];
+    st.components.get_mut("apps/web").unwrap().dependencies = vec!["packages/ui".into()];
+
+    let valid_lib = |name: &str, deps: Value| -> Value {
+        json!({
+            "name": name,
+            "version": "1.2.0",
+            "private": false,
+            "type": "module",
+            "files": ["dist"],
+            "exports": {
+                ".": {
+                    "types": "./dist/index.d.mts",
+                    "default": "./dist/index.mjs"
+                },
+                "./package.json": "./package.json"
+            },
+            "dependencies": deps,
+            "scripts": {
+                "check": "devkit-verify",
+                "fix": "prettier --write .",
+                "test": "vitest run",
+                "build": "tsdown && devkit-verify --pack",
+                "package": "devkit-pack"
+            }
+        })
+    };
+
+    let base_web = manifest("@corp/app-web", json!({"@corp/ui": "^1.2.0"}), false);
+    let base_internal = manifest("@corp/internal", json!({}), true);
+    let base_core = valid_lib("@corp/core", json!({}));
+    let base_ui = valid_lib("@corp/ui", json!({"@corp/core": "^1.2.0"}));
+
+    let write_all = |web: &Value, internal: &Value, core: &Value, ui: &Value| {
+        node_project(
+            root,
+            &st,
+            &[
+                ("apps/web", web.clone()),
+                ("packages/internal", internal.clone()),
+                ("packages/core", core.clone()),
+                ("packages/ui", ui.clone()),
+            ],
+            json!({}),
+        );
+    };
+
+    write_all(&base_web, &base_internal, &base_core, &base_ui);
+    let admitted = admit_native_components(root, &st).unwrap();
+    assert_eq!(admitted.dependencies["packages/ui"], vec!["packages/core"]);
+    assert_eq!(admitted.dependencies["apps/web"], vec!["packages/ui"]);
+
+    // 1. Role::App cannot set "private": false (omitting "private" is valid, false is rejected).
+    let mut bad_web = base_web.clone();
+    bad_web["private"] = json!(false);
+    write_all(&bad_web, &base_internal, &base_core, &base_ui);
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot set \"private\": false")
+    );
+
+    // 2. Role::Library requires explicit boolean "private", and ReactLibrary requires "private": true.
+    let mut missing_priv = base_core.clone();
+    missing_priv.as_object_mut().unwrap().remove("private");
+    write_all(&base_web, &base_internal, &missing_priv, &base_ui);
+    assert!(assert_native_components(root, &st).is_err());
+
+    let mut bad_react_lib = base_internal.clone();
+    bad_react_lib["private"] = json!(false);
+    write_all(&base_web, &bad_react_lib, &base_core, &base_ui);
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("Internal react-library profile requires \"private\": true")
+    );
+
+    // 3. Publishable library validations on "private": false.
+    let mut unscoped_restricted = base_core.clone();
+    unscoped_restricted["name"] = json!("plain-core");
+    unscoped_restricted["publishConfig"] = json!({"access": "restricted"});
+    let mut ui_for_plain = base_ui.clone();
+    ui_for_plain["dependencies"] = json!({"plain-core": "^1.2.0"});
+    write_all(
+        &base_web,
+        &base_internal,
+        &unscoped_restricted,
+        &ui_for_plain,
+    );
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("Unscoped publishable library")
+    );
+
+    for (label, mutate) in [
+        (
+            "bad-semver",
+            (&|m: &mut Value| m["version"] = json!("01.2.0")) as &dyn Fn(&mut Value),
+        ),
+        ("empty-files", &|m: &mut Value| m["files"] = json!([])),
+        ("files-missing-dist", &|m: &mut Value| {
+            m["files"] = json!(["README.md"])
+        }),
+        ("files-leaks-src", &|m: &mut Value| {
+            m["files"] = json!(["dist", "src"])
+        }),
+        ("files-leaks-tests", &|m: &mut Value| {
+            m["files"] = json!(["dist", "tests"])
+        }),
+        ("files-leaks-parent", &|m: &mut Value| {
+            m["files"] = json!(["dist", "../secret"])
+        }),
+        ("files-leaks-dotenv", &|m: &mut Value| {
+            m["files"] = json!(["dist", ".env.production"])
+        }),
+        ("files-leaks-config", &|m: &mut Value| {
+            m["files"] = json!(["dist", "tsconfig.json"])
+        }),
+        ("string-exports", &|m: &mut Value| {
+            m["exports"] = json!("./dist/index.mjs")
+        }),
+        ("empty-exports", &|m: &mut Value| m["exports"] = json!({})),
+        ("src-exports", &|m: &mut Value| {
+            m["exports"] = json!({".": "./src/index.ts"})
+        }),
+        ("missing-package-script", &|m: &mut Value| {
+            m["scripts"].as_object_mut().unwrap().remove("package");
+        }),
+        ("file-dependency", &|m: &mut Value| {
+            m["dependencies"] = json!({"@corp/core": "file:../core"})
+        }),
+        ("private-workspace-dependency", &|m: &mut Value| {
+            m["dependencies"] = json!({"@corp/internal": "^1.0.0"})
+        }),
+        ("private-workspace-peer", &|m: &mut Value| {
+            m["peerDependencies"] = json!({"@corp/internal": "^1.0.0"})
+        }),
+    ] {
+        let mut candidate = base_ui.clone();
+        mutate(&mut candidate);
+        write_all(&base_web, &base_internal, &base_core, &candidate);
+        assert!(
+            assert_native_components(root, &st).is_err(),
+            "expected publishable library rejection for {label}"
+        );
+    }
+
+    // Restore valid state and confirm clean pass.
+    write_all(&base_web, &base_internal, &base_core, &base_ui);
+    assert_native_components(root, &st).unwrap();
 }

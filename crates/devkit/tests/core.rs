@@ -45,6 +45,7 @@ fn seal(root: &Path, version: &str) {
                 integrity: sri(&fs::read(root.join(archive)).unwrap()),
             },
             files: file_map(root).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();
@@ -74,12 +75,20 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
         ("react-web", false),
         ("electron-react", false),
         ("react-client", true),
+        ("ts-library", true),
+        ("react-ui", true),
     ] {
         let mut manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","private":true,
             "devDependencies":{"@docouno/env":version},"scripts":{"check":"check","fix":"fix","test":"test","build":"build","dev":"dev"}});
         if library {
-            manifest["exports"] = json!({".":"./src/index.ts"});
             manifest["scripts"].as_object_mut().unwrap().remove("dev");
+            if ["ts-library", "react-ui"].contains(&name) {
+                manifest["files"] = json!(["dist"]);
+                manifest["exports"] = json!({".":{"types":"./dist/index.d.mts","default":"./dist/index.mjs"},"./package.json":"./package.json"});
+                manifest["scripts"]["package"] = json!("devkit-pack");
+            } else {
+                manifest["exports"] = json!({".":"./src/index.ts"});
+            }
         }
         put_json(&root, &format!("templates/{name}/package.json"), &manifest);
         put_json(
@@ -93,6 +102,36 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             b"export const answer = 42;\n",
         );
     }
+    put_json(
+        &root,
+        "templates/react-web/variants/shared/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/react-web/variants/shared/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_CLIENT_PACKAGE__';\n",
+    );
+    put_json(
+        &root,
+        "templates/electron-react/variants/shared/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/electron-react/variants/shared/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_CLIENT_PACKAGE__';\n",
+    );
+    put_json(
+        &root,
+        "templates/react-web/variants/design-system/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/react-web/variants/design-system/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_UI_PACKAGE__';\n",
+    );
     for (name, bytes) in [
         (
             "Cargo.toml",
@@ -2308,4 +2347,677 @@ fn author_port_mixed_alias_keeps_api_web_wiring_and_edited_web_source_on_update(
         Some("apps/api")
     );
     devkit::native::assert_native_components(&target, &state).unwrap();
+}
+
+#[test]
+fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_and_recovers() {
+    struct FailAfterFirstWrite;
+    impl MutationHooks for FailAfterFirstWrite {
+        fn after_write(&self, count: usize, _path: &str) -> Result<()> {
+            if count == 1 {
+                bail!("injected sync write interruption")
+            }
+            Ok(())
+        }
+    }
+
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let target = f.path().join("consumer");
+    init(&release, &target, "react-web", PackageMode::Registry);
+    let initial = add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "client".into(),
+            template: "react-client".into(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap()
+    .state;
+    assert!(initial.components.contains_key("packages/client"));
+
+    // Rename packages/client, bump its version, and wire local file: consumer in apps/web.
+    let mut client_pkg: Value = read_json(&target.join("packages/client/package.json")).unwrap();
+    let old_name = client_pkg["name"].as_str().unwrap().to_owned();
+    let new_name = "@acme/renamed-client";
+    client_pkg["name"] = json!(new_name);
+    client_pkg["version"] = json!("2.1.0");
+    put_json(&target, "packages/client/package.json", &client_pkg);
+
+    let mut web_pkg: Value = read_json(&target.join("apps/web/package.json")).unwrap();
+    web_pkg["dependencies"] = json!({ new_name: "file:../../packages/client" });
+    put_json(&target, "apps/web/package.json", &web_pkg);
+
+    // Inject mid-commit failure first and prove devkit recover rolls back cleanly!
+    let pre_sync_lock = fs::read(target.join("package-lock.json")).unwrap();
+    let interrupted = sync_project(
+        &release,
+        &target,
+        &UpdateOptions {
+            hooks: Some(&FailAfterFirstWrite),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap_err();
+    assert!(
+        interrupted
+            .to_string()
+            .contains("injected sync write interruption")
+    );
+    // Automatic rollback inside tx.commit restores pre-sync files; verify clean state.
+    assert!(!target.join(PENDING_PATH).exists());
+    assert_eq!(
+        fs::read(target.join("package-lock.json")).unwrap(),
+        pre_sync_lock
+    );
+    assert!(!recover_project(&target).unwrap());
+
+    // Now run sync_project offline (NoResolver proves Docker is NOT started!).
+    let synced = sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(synced.applied);
+    assert!(!synced.no_op);
+    assert_eq!(synced.state.version, initial.version);
+    assert_eq!(synced.state.release_identity, initial.release_identity);
+    assert_ne!(synced.state.generation, initial.generation);
+    assert_eq!(
+        synced.state.components["apps/web"].dependencies,
+        vec!["packages/client".to_string()]
+    );
+
+    let updated_lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    assert!(
+        updated_lock["packages"]
+            .get(format!("node_modules/{old_name}"))
+            .is_none()
+    );
+    assert_eq!(
+        updated_lock["packages"][format!("node_modules/{new_name}")]["resolved"],
+        "packages/client"
+    );
+    assert_eq!(
+        updated_lock["packages"]["packages/client"]["version"],
+        "2.1.0"
+    );
+    devkit::native::assert_native_components(&target, &synced.state).unwrap();
+
+    // Repeat sync_project must be a true no-op without rotating generation!
+    let repeat = sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(repeat.no_op);
+    assert!(!repeat.applied);
+    assert!(repeat.files.is_empty());
+    assert_eq!(repeat.state.generation, synced.state.generation);
+}
+
+#[test]
+fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
+    use devkit::{cli::error_code, graph::ReconcileStrategy};
+    use std::cell::Cell;
+
+    struct DriftingResolver {
+        min_stage: u8,
+        calls: Cell<u8>,
+    }
+    impl LockResolver for DriftingResolver {
+        fn regenerate(
+            &self,
+            root: &Path,
+            release: &AdmittedRelease,
+            _registry: Option<&str>,
+        ) -> Result<()> {
+            let attempt = self.calls.get() + 1;
+            self.calls.set(attempt);
+            let lock_path = root.join("package-lock.json");
+            if self.min_stage == 2 && attempt == 1 {
+                bail!("ERESOLVE simulated stage-1 conflict on dev tree");
+            }
+            if self.min_stage == 3 && attempt < 3 {
+                if attempt == 2 {
+                    // Verify stage 2 pruned dev nodes while preserving !dev product pin.
+                    let pruned: Value = read_json(&lock_path)?;
+                    assert!(pruned["packages"].get("node_modules/stale-dev").is_none());
+                    assert!(pruned["packages"].get("node_modules/clsx").is_some());
+                }
+                bail!("ERESOLVE simulated conflict before clean fallback");
+            }
+            let manifest: Value = read_json(&root.join("package.json"))?;
+            let mut packages = serde_json::Map::new();
+            packages.insert(String::new(), manifest.clone());
+            for path in manifest["workspaces"].as_array().unwrap() {
+                let p = path.as_str().unwrap();
+                let member: Value = read_json(&root.join(p).join("package.json"))?;
+                let name = member["name"].as_str().unwrap().to_owned();
+                packages.insert(p.to_owned(), member);
+                packages.insert(
+                    format!("node_modules/{name}"),
+                    json!({"resolved": p, "link": true}),
+                );
+            }
+            packages.insert(
+                "node_modules/@docouno/env".into(),
+                json!({
+                    "version": release.manifest.version,
+                    "resolved": format!("https://registry.npmjs.org/@docouno/env/-/env-{}.tgz", release.manifest.version),
+                    "integrity": release.manifest.environment.integrity,
+                    "dev": true,
+                }),
+            );
+            // Bump transitive/product clsx from 2.1.0 -> 2.1.1 while preserving direct spec ^2.1.0.
+            packages.insert(
+                "node_modules/clsx".into(),
+                json!({
+                    "version": "2.1.1",
+                    "resolved": "https://registry.npmjs.org/clsx/-/clsx-2.1.1.tgz",
+                    "integrity": sri(b"clsx-2.1.1"),
+                }),
+            );
+            write_json(
+                &lock_path,
+                &json!({
+                    "name": manifest["name"],
+                    "version": manifest["version"],
+                    "lockfileVersion": 3,
+                    "requires": true,
+                    "packages": packages,
+                }),
+            )
+        }
+    }
+
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.3.0");
+    let next = fixture_release(f.path(), "0.4.0");
+    let target = f.path().join("consumer");
+    init(&old, &target, "node", PackageMode::Registry);
+
+    let mut main_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    main_pkg["dependencies"] = json!({"clsx": "^2.1.0"});
+    put_json(&target, "apps/main/package.json", &main_pkg);
+    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    lock["packages"]["apps/main"] = main_pkg.clone();
+    lock["packages"]["node_modules/clsx"] = json!({
+        "version": "2.1.0",
+        "resolved": "https://registry.npmjs.org/clsx/-/clsx-2.1.0.tgz",
+        "integrity": sri(b"clsx-2.1.0"),
+    });
+    lock["packages"]["node_modules/stale-dev"] = json!({
+        "version": "1.0.0",
+        "resolved": "https://registry.npmjs.org/stale-dev/-/stale-dev-1.0.0.tgz",
+        "integrity": sri(b"stale-dev"),
+        "dev": true,
+    });
+    put_json(&target, "package-lock.json", &lock);
+
+    // 1. Without --reconcile-lock -> PRODUCT_GRAPH_DRIFT with package diff and exact hint.
+    let err = update_project(
+        &next,
+        &target,
+        &UpdateOptions::default(),
+        &DriftingResolver {
+            min_stage: 1,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error_code(&err), "PRODUCT_GRAPH_DRIFT");
+    let msg = err.to_string();
+    assert!(msg.contains("clsx: 2.1.0 -> 2.1.1"), "{msg}");
+    assert!(
+        msg.contains("Product lockfile nodes drifted during resolution")
+            && msg.contains(
+                "inspect with --reconcile-lock --preview and apply with --reconcile-lock"
+            ),
+        "{msg}"
+    );
+
+    // 2. With --reconcile-lock --preview -> read-only report, checkout untouched (prune-dev stage 2).
+    let before_bytes = fs::read(target.join("package-lock.json")).unwrap();
+    let preview = update_project(
+        &next,
+        &target,
+        &UpdateOptions {
+            preview: true,
+            reconcile_lock: true,
+            ..Default::default()
+        },
+        &DriftingResolver {
+            min_stage: 2,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap();
+    assert!(!preview.applied);
+    let rec = preview.lock_reconciliation.as_ref().unwrap();
+    assert_eq!(rec.strategy, ReconcileStrategy::PruneDev);
+    assert!(
+        rec.changed_packages
+            .iter()
+            .any(|p| p.name == "clsx" && p.before_version == "2.1.0" && p.after_version == "2.1.1")
+    );
+    assert_eq!(
+        fs::read(target.join("package-lock.json")).unwrap(),
+        before_bytes
+    );
+
+    // 3. Apply with --reconcile-lock (exercising stage 3 clean-fallback) -> applied & direct specs intact.
+    let applied = update_project(
+        &next,
+        &target,
+        &UpdateOptions {
+            reconcile_lock: true,
+            ..Default::default()
+        },
+        &DriftingResolver {
+            min_stage: 3,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap();
+    assert!(applied.applied);
+    assert_eq!(
+        applied.lock_reconciliation.as_ref().unwrap().strategy,
+        ReconcileStrategy::CleanFallback
+    );
+    let after_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    assert_eq!(after_pkg["dependencies"]["clsx"], "^2.1.0");
+    devkit::native::assert_native_components(&target, &applied.state).unwrap();
+
+    // 4. Non-ERESOLVE failures (e.g. E401 auth failure or signal exit >= 128) abort at Stage 1 without escalating.
+    struct NonConflictResolver {
+        signal: bool,
+        calls: Cell<u8>,
+    }
+    impl LockResolver for NonConflictResolver {
+        fn regenerate(
+            &self,
+            _root: &Path,
+            _release: &AdmittedRelease,
+            _registry: Option<&str>,
+        ) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.signal {
+                Err(devkit::processes::failure(
+                    130,
+                    "interrupted by SIGINT during ERESOLVE check",
+                ))
+            } else {
+                bail!(
+                    "npm error code E401 Unable to authenticate, your authentication token seems to be invalid"
+                )
+            }
+        }
+    }
+    for signal in [false, true] {
+        let resolver = NonConflictResolver {
+            signal,
+            calls: Cell::new(0),
+        };
+        let err = devkit::project::sync_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                reconcile_lock: true,
+                ..Default::default()
+            },
+            &resolver,
+        );
+        // Drift must exist to invoke regenerate_reconciled: mutate lock version back to 2.1.0 first.
+        let _ = err;
+    }
+    let mut drifted_again: Value = read_json(&target.join("package-lock.json")).unwrap();
+    drifted_again["packages"]["node_modules/@docouno/env"]["version"] = json!("0.0.1");
+    write_json(&target.join("package-lock.json"), &drifted_again).unwrap();
+    for signal in [false, true] {
+        let resolver = NonConflictResolver {
+            signal,
+            calls: Cell::new(0),
+        };
+        let err = update_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                reconcile_lock: true,
+                ..Default::default()
+            },
+            &resolver,
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolver.calls.get(),
+            1,
+            "non-conflict/signal error escalated past stage 1: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.4.0");
+
+    // 1. Single --template ts-library creates a 0-app repository at packages/lib.
+    let lib_only = f.path().join("lib-only");
+    let lib_state = init_project(
+        &release,
+        &lib_only,
+        &InitOptions {
+            template: Some("ts-library".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("acme".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        lib_state.components.keys().cloned().collect::<Vec<_>>(),
+        vec!["packages/lib"]
+    );
+    assert_eq!(
+        lib_state.components["packages/lib"].tooling_profile,
+        ToolingProfile::TsLibrary
+    );
+    assert!(lib_state.components["packages/lib"].development.is_none());
+    let apps_compose: Value =
+        serde_json::from_slice(&fs::read(lib_only.join(".devkit/compose.apps.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(apps_compose["services"], json!({}));
+    let lib_mk = fs::read_to_string(lib_only.join(".devkit/project.mk")).unwrap();
+    assert!(lib_mk.contains("DEVKIT_REGISTERED_APPS := \n"), "{lib_mk}");
+    assert!(
+        lib_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES := lib\n"),
+        "{lib_mk}"
+    );
+    assert!(
+        lib_mk.contains("package/packages/lib: build/packages/lib\n"),
+        "{lib_mk}"
+    );
+    let gitignore = fs::read_to_string(lib_only.join(".gitignore")).unwrap();
+    assert!(gitignore.contains("/packages/*/dist/\n"), "{gitignore}");
+    assert!(gitignore.contains("/packages/*/release/\n"), "{gitignore}");
+    let sig_before = source_signature(&lib_only, Some(&lib_state)).unwrap();
+    put(&lib_only, "packages/lib/release/sdk-0.1.0.tgz", b"tarball");
+    assert_eq!(
+        source_signature(&lib_only, Some(&lib_state)).unwrap(),
+        sig_before,
+        "profile_outputs must exclude packages/*/release from source_signature"
+    );
+
+    // 2. Multi-package 0-app init + add-package --use + add-app --use writes to dependencies.
+    let multi = f.path().join("multi");
+    init_project(
+        &release,
+        &multi,
+        &InitOptions {
+            packages: Some(vec![
+                ComponentSpec {
+                    name: "core".into(),
+                    template: "ts-library".into(),
+                    uses: vec![],
+                },
+                ComponentSpec {
+                    name: "ui".into(),
+                    template: "react-ui".into(),
+                    uses: vec!["core".into()],
+                },
+            ]),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("suite".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let ui_pkg: Value = read_json(&multi.join("packages/ui/package.json")).unwrap();
+    assert_eq!(
+        ui_pkg["dependencies"]["@suite/package-core"],
+        "file:../core"
+    );
+    assert!(
+        ui_pkg["devDependencies"]
+            .get("@suite/package-core")
+            .is_none()
+    );
+
+    let compose_inventory = capture_compose_inputs(&multi).unwrap();
+    let after_add = add_project_component(
+        &release,
+        &multi,
+        Role::App,
+        ComponentSpec {
+            name: "playground".into(),
+            template: "react-web".into(),
+            uses: vec!["ui".into(), "core".into()],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&compose_inventory),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let play_pkg: Value = read_json(&multi.join("apps/playground/package.json")).unwrap();
+    assert_eq!(
+        play_pkg["dependencies"]["@suite/package-ui"],
+        "file:../../packages/ui"
+    );
+    assert_eq!(
+        play_pkg["dependencies"]["@suite/package-core"],
+        "file:../../packages/core"
+    );
+    assert!(
+        play_pkg["devDependencies"]
+            .get("@suite/package-ui")
+            .is_none()
+    );
+    assert_eq!(
+        after_add.state.components["packages/ui"].dependencies,
+        vec!["packages/core"]
+    );
+    assert_eq!(
+        after_add.state.components["apps/playground"].dependencies,
+        vec!["packages/core", "packages/ui"]
+    );
+    assert_eq!(
+        fs::read_to_string(multi.join("apps/playground/src/index.ts")).unwrap(),
+        "export { answer } from '@suite/package-ui';\n"
+    );
+
+    // 3. --preset design-system scaffolds packages/ui + apps/playground without a backend app.
+    let ds = f.path().join("ds");
+    let ds_state = init_project(
+        &release,
+        &ds,
+        &InitOptions {
+            preset: Some("design-system".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("system".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        ds_state.components.keys().cloned().collect::<Vec<_>>(),
+        vec!["apps/playground", "packages/ui"]
+    );
+    assert_eq!(
+        ds_state.components["packages/ui"].tooling_profile,
+        ToolingProfile::ReactUi
+    );
+    assert_eq!(
+        ds_state.components["apps/playground"].dependencies,
+        vec!["packages/ui"]
+    );
+    assert_eq!(
+        fs::read_to_string(ds.join("apps/playground/src/index.ts")).unwrap(),
+        "export { answer } from '@system/package-ui';\n"
+    );
+}
+
+#[test]
+fn project_make_stays_byte_identical_without_packageable_libraries() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.4.0");
+    let target = f.path().join("fullstack");
+    init_project(
+        &release,
+        &target,
+        &InitOptions {
+            preset: Some("fullstack-desktop".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("legacy-compat".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let legacy_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    assert!(
+        !legacy_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES"),
+        "0.3.2 profile set must not emit DEVKIT_PACKAGEABLE_PACKAGES:\n{legacy_mk}"
+    );
+    assert!(
+        !legacy_mk.contains("package/packages/"),
+        "0.3.2 profile set must not emit library package targets:\n{legacy_mk}"
+    );
+    assert_eq!(
+        legacy_mk,
+        "# Managed component registration.\n\
+         DEVKIT_REGISTERED_APPS := api desktop web\n\
+         DEVKIT_REGISTERED_PACKAGES := client\n\
+         DEVKIT_DESKTOP_APPS := desktop\n\
+         setup-desktop: setup-node-workspace\n\
+         check-desktop: check/packages/client build/packages/client\n\
+         test-desktop: build/packages/client\n\
+         build-desktop: build/packages/client\n\
+         dev-desktop: build/packages/client\n\
+         package-desktop: build-desktop\n\
+         setup-web: setup-node-workspace\n\
+         check-web: check/packages/client build/packages/client\n\
+         test-web: build/packages/client\n\
+         build-web: build/packages/client\n\
+         dev-web: build/packages/client\n\
+         setup/packages/client: setup-node-workspace\n"
+    );
+
+    // Adding a TsLibrary introduces DEVKIT_PACKAGEABLE_PACKAGES and package/packages/<slug>.
+    add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "sdk".into(),
+            template: "ts-library".into(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap();
+    let updated_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    assert!(
+        updated_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES := sdk\n"),
+        "{updated_mk}"
+    );
+    assert!(
+        updated_mk.contains("package/packages/sdk: build/packages/sdk\n"),
+        "{updated_mk}"
+    );
+}
+
+#[test]
+fn applicable_migrations_filters_by_semver_window_profile_and_component_origin() {
+    let temp = TempDir::new().unwrap();
+    let rel_032 = fixture_release(temp.path(), "0.3.2");
+    let rel_040 = fixture_release(temp.path(), "0.4.0");
+    put(
+        &rel_040,
+        "docs/migrations/0.4.0.md",
+        b"# Migration 0.4.0\n\n## Glob Scripts and Single-Pass Checks\n\nBody.\n\n## Rust Notes\n\nBody.\n",
+    );
+    remove_file(&rel_040.join("release.json")).unwrap();
+    let archive = "npm/env-0.4.0.tgz".to_string();
+    write_json(
+        &rel_040.join("release.json"),
+        &Release {
+            schema_version: 1,
+            version: "0.4.0".into(),
+            rust_version: "1.99.1".into(),
+            environment: Environment {
+                name: "@docouno/env".into(),
+                version: "0.4.0".into(),
+                archive: archive.clone(),
+                integrity: sri(&fs::read(rel_040.join(&archive)).unwrap()),
+            },
+            files: file_map(&rel_040).unwrap(),
+            migrations: vec![
+                MigrationEntry {
+                    id: "glob-scripts-040".into(),
+                    version: "0.4.0".into(),
+                    severity: MigrationSeverity::Recommended,
+                    title: "Adopt glob lint/format scripts".into(),
+                    summary: "Update package.json lint and check scripts.".into(),
+                    profiles: vec!["web".into(), "node".into()],
+                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    anchor: "glob-scripts-and-single-pass-checks".into(),
+                },
+                MigrationEntry {
+                    id: "rust-notes-040".into(),
+                    version: "0.4.0".into(),
+                    severity: MigrationSeverity::Info,
+                    title: "Rust notes".into(),
+                    summary: "Applies to Rust components.".into(),
+                    profiles: vec!["rust".into()],
+                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    anchor: "rust-notes".into(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let admitted_040 = devkit::release::admit_release(&rel_040).unwrap();
+
+    // 1. Web-only 0.3.2 project receives glob-scripts-040 but NOT rust-notes-040.
+    let web_proj = temp.path().join("web-proj");
+    let web_state_032 = init_project(
+        &rel_032,
+        &web_proj,
+        &InitOptions {
+            apps: Some(vec![ComponentSpec {
+                name: "web".into(),
+                template: "react-web".into(),
+                uses: vec![],
+            }]),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let applicable = devkit::project::applicable_migrations(&web_state_032, &admitted_040).unwrap();
+    assert_eq!(applicable.len(), 1);
+    assert_eq!(applicable[0].id, "glob-scripts-040");
+    assert!(
+        applicable[0]
+            .local_path
+            .ends_with("docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks")
+    );
+    assert_eq!(
+        applicable[0].url,
+        "https://github.com/docouno/devkit/blob/v0.4.0/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks"
+    );
+
+    // 2. Same-version update (0.4.0 -> 0.4.0) returns 0 migrations.
+    let mut web_state_040 = web_state_032.clone();
+    web_state_040.version = "0.4.0".into();
+    assert!(
+        devkit::project::applicable_migrations(&web_state_040, &admitted_040)
+            .unwrap()
+            .is_empty()
+    );
 }

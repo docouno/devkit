@@ -17,9 +17,24 @@ macro_rules! wire_enum {
 wire_enum!(PackageMode { Local => "local", Registry => "registry" });
 wire_enum!(Role { App => "app", Library => "library" });
 wire_enum!(Toolchain { Node => "node", Rust => "rust" });
-wire_enum!(ToolingProfile { Node => "node", Web => "web", Electron => "electron", ReactLibrary => "react-library", Rust => "rust" });
+wire_enum!(ToolingProfile { Node => "node", Web => "web", Electron => "electron", ReactLibrary => "react-library", TsLibrary => "ts-library", ReactUi => "react-ui", Rust => "rust" });
 wire_enum!(DevelopmentOwner { Managed => "managed", Project => "project" });
 wire_enum!(DevelopmentKind { Compose => "compose", Desktop => "desktop" });
+wire_enum!(MigrationSeverity { Info => "info", Recommended => "recommended", ActionRequired => "action-required" });
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationEntry {
+    pub id: String,
+    pub version: String,
+    pub severity: MigrationSeverity,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    pub doc_path: String,
+    pub anchor: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
@@ -35,6 +50,8 @@ pub struct Release {
     pub files: BTreeMap<String, FileIdentity>,
     pub environment: Environment,
     pub rust_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<MigrationEntry>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Environment {

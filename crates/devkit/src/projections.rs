@@ -29,6 +29,24 @@ pub fn render_project_make(state: &ProjectState) -> String {
         names(&|c| c.role == Role::Library),
         names(&|c| c.role == Role::App && c.tooling_profile == ToolingProfile::Electron)
     );
+    let has_packageable = state.components.values().any(|c| {
+        matches!(
+            c.tooling_profile,
+            ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+        )
+    });
+    if has_packageable {
+        result += &format!(
+            "DEVKIT_PACKAGEABLE_PACKAGES := {}\n",
+            names(&|c| {
+                c.role == Role::Library
+                    && matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    )
+            })
+        );
+    }
     for (path, c) in &state.components {
         if c.toolchain == Toolchain::Node {
             result += &format!("{}: setup-node-workspace\n", target("setup", path, c.role));
@@ -52,7 +70,10 @@ pub fn render_project_make(state: &ProjectState) -> String {
                 result += &format!("{}: {}\n", target(command, path, c.role), deps.join(" "));
             }
         }
-        if c.tooling_profile == ToolingProfile::Electron {
+        if matches!(
+            c.tooling_profile,
+            ToolingProfile::Electron | ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+        ) {
             result += &format!(
                 "{}: {}\n",
                 target("package", path, c.role),
@@ -246,17 +267,17 @@ pub fn assert_projections(
 ) -> Result<()> {
     ensure!(
         fs::read(safe_path(root, ".devkit/project.mk")?)? == render_project_make(state).as_bytes(),
-        "Component Make registration projection is stale; run the accepted devkit update"
+        "Component Make registration projection is stale; run devkit sync"
     );
     let apps: Value = read_json(&safe_path(root, ".devkit/compose.apps.yaml")?)?;
     ensure!(
         apps == render_app_compose_value(state)?,
-        "Development integration projection is stale; run the accepted devkit update"
+        "Development integration projection is stale; run devkit sync"
     );
     let workspace: Value = read_json(&safe_path(root, ".devkit/compose.workspace.json")?)?;
     ensure!(
         workspace == render_workspace_compose_value(state, inputs)?,
-        "Workspace mount projection is stale; run the accepted devkit update"
+        "Workspace mount projection is stale; run devkit sync"
     );
     Ok(())
 }

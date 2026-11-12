@@ -4,10 +4,10 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        digest, exists, identity, input_path, object, project_root, read_json, relative_name,
-        safe_path, sorted_entries, text,
+        SemVer, digest, exists, identity, input_path, object, project_root, read_json,
+        relative_name, safe_path, sorted_entries, text,
     },
-    model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain},
+    model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
 use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -40,6 +40,205 @@ pub fn valid_dependency_name(name: &str) -> bool {
         !name.contains('/') && ![".", ".."].contains(&name)
     }
 }
+pub fn valid_npm_scope(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope.len() <= 64
+        && !scope.contains("..")
+        && scope
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+pub fn valid_npm_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 214 || !valid_dependency_name(name) || name.contains("..") {
+        return false;
+    }
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    };
+    if let Some(scoped) = name.strip_prefix('@') {
+        scoped
+            .split_once('/')
+            .is_some_and(|(scope, pkg)| valid_npm_scope(scope) && valid_part(pkg))
+    } else {
+        valid_part(name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NpmDepSpec {
+    LocalFile(String),
+    Alias {
+        target_name: String,
+        inner_spec: Option<String>,
+    },
+    RegistryRange(String),
+}
+
+fn forbidden_registry_range_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    spec.is_empty()
+        || spec.trim().is_empty()
+        || spec.contains(['\0', '\n', '\r', '\t', '\\'])
+        || matches!(spec, "." | ".." | "~")
+        || ["/", "./", "../", "~/"]
+            .iter()
+            .any(|prefix| spec.starts_with(prefix))
+        || lower == "git"
+        || [
+            "npm:",
+            "file:",
+            "link:",
+            "workspace:",
+            "git:",
+            "git+",
+            "git@",
+            "github:",
+            "bitbucket:",
+            "gitlab:",
+            "http:",
+            "https:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+pub fn parse_npm_dependency_spec(spec: &str) -> Result<NpmDepSpec> {
+    ensure!(
+        !spec.is_empty() && !spec.contains(['\0', '\n', '\r', '\t']),
+        "Invalid empty or control-character npm dependency specifier"
+    );
+    if let Some(rest) = spec.strip_prefix("file:") {
+        ensure!(
+            !rest.is_empty() && !rest.contains('\\'),
+            "Invalid native local dependency path: {spec}"
+        );
+        return Ok(NpmDepSpec::LocalFile(rest.to_owned()));
+    }
+    if let Some(rest) = spec.strip_prefix("npm:") {
+        ensure!(!rest.is_empty(), "Empty npm: alias specifier");
+        let (target_name, inner_spec) = if let Some(scoped) = rest.strip_prefix('@') {
+            match scoped.find('@') {
+                Some(idx) => (&rest[..idx + 1], Some(&scoped[idx + 1..])),
+                None => (rest, None),
+            }
+        } else {
+            match rest.find('@') {
+                Some(idx) => (&rest[..idx], Some(&rest[idx + 1..])),
+                None => (rest, None),
+            }
+        };
+        ensure!(
+            valid_npm_package_name(target_name),
+            "Invalid npm: alias target package name: {spec}"
+        );
+        if let Some(inner) = inner_spec {
+            ensure!(
+                !forbidden_registry_range_spec(inner),
+                "Unsupported inner specifier in npm: alias: {spec}"
+            );
+        }
+        return Ok(NpmDepSpec::Alias {
+            target_name: target_name.to_owned(),
+            inner_spec: inner_spec.map(str::to_owned),
+        });
+    }
+    ensure!(
+        !forbidden_registry_range_spec(spec),
+        "Unsupported npm dependency protocol or path specifier: {spec}"
+    );
+    Ok(NpmDepSpec::RegistryRange(spec.to_owned()))
+}
+
+fn valid_registry_authority(authority: &str, scheme: &str) -> bool {
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let valid_port = |port: &str| port.parse::<u16>().is_ok_and(|p| p > 0);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((ipv6, port_part)) = bracketed.split_once(']') else {
+            return false;
+        };
+        let Ok(parsed_ip) = ipv6.parse::<std::net::Ipv6Addr>() else {
+            return false;
+        };
+        if !port_part.is_empty() && !port_part.strip_prefix(':').is_some_and(valid_port) {
+            return false;
+        }
+        return scheme == "https" || parsed_ip.is_loopback();
+    }
+    if authority.contains(['[', ']']) {
+        return false;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => {
+            if !valid_port(p) {
+                return false;
+            }
+            (h, Some(p))
+        }
+        None => (authority, None),
+    };
+    let _ = port;
+    if host.is_empty()
+        || host.starts_with(['.', '-'])
+        || host.ends_with('-')
+        || host.contains("..")
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+    {
+        return false;
+    }
+    scheme == "https" || matches!(host, "127.0.0.1" | "localhost")
+}
+
+pub fn valid_registry_or_tarball_url(url: &str) -> bool {
+    if url.is_empty()
+        || url.len() > 2048
+        || url.chars().any(|c| c.is_whitespace() || c.is_control())
+        || url.contains(['?', '#', '\\'])
+    {
+        return false;
+    }
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return false;
+    };
+    let (authority, _path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    valid_registry_authority(authority, scheme)
+}
+
+pub fn valid_resolved_source(root: &Path, resolved: &str, is_link: bool) -> bool {
+    if resolved.is_empty() || resolved.contains(['?', '#', '\0', '\n', '\r', '\t', '\\']) {
+        return false;
+    }
+    if is_link {
+        let target = resolved.strip_prefix("./").unwrap_or(resolved);
+        return validate_lock_location(target).is_ok() && local_path(root, "", target).is_ok();
+    }
+    if let Some(rel) = resolved.strip_prefix("file:") {
+        return !rel.is_empty() && !rel.starts_with('/') && local_path(root, "", rel).is_ok();
+    }
+    valid_registry_or_tarball_url(resolved)
+}
+
 pub fn root_workspace_link(location: &str) -> bool {
     location
         .strip_prefix("node_modules/")
@@ -139,13 +338,17 @@ fn packages_snapshot(root: &Path) -> Result<(Packages, FileIdentity)> {
     for (location, value) in records {
         validate_lock_location(location)?;
         let record = object(value, location)?.clone();
-        if location.contains("node_modules/") && record.get("link") != Some(&Value::Bool(true)) {
+        if record.get("link") == Some(&Value::Bool(true)) {
+            let resolved = record.get("resolved").and_then(Value::as_str);
+            ensure!(
+                resolved.is_some_and(|v| valid_resolved_source(root, v, true)),
+                "Unprovable native link target: {location}"
+            );
+        } else if location.contains("node_modules/") {
             let resolved = record.get("resolved").and_then(Value::as_str);
             let integrity = record.get("integrity").and_then(Value::as_str);
             ensure!(
-                resolved.is_some_and(|v| v.starts_with("https://")
-                    || v.starts_with("http://")
-                    || v.starts_with("file:"))
+                resolved.is_some_and(|v| valid_resolved_source(root, v, false))
                     && integrity.is_some_and(valid_integrity),
                 "Unprovable native artifact identity: {location}"
             );
@@ -234,7 +437,10 @@ pub fn admitted_dependency_target(
     manifest: &Fields,
     field: &str,
     name: &str,
+    spec: &str,
 ) -> Result<Option<String>> {
+    let parsed_spec = parse_npm_dependency_spec(spec)
+        .with_context(|| format!("Invalid dependency specifier {from}:{name}"))?;
     let target = locked_dependency(packages, from, name)?;
     let optional = field == "optionalDependencies"
         || (field == "dependencies"
@@ -252,6 +458,32 @@ pub fn admitted_dependency_target(
         target.is_some() || optional,
         "Native lock omits dependency {from}:{name}"
     );
+    if let Some(target_loc) = &target {
+        let target_record = packages
+            .get(target_loc)
+            .with_context(|| format!("Native lock target is missing: {target_loc}"))?;
+        match &parsed_spec {
+            NpmDepSpec::Alias { target_name, .. } => {
+                ensure!(
+                    target_loc.contains("node_modules/")
+                        && target_record.get("name").and_then(Value::as_str)
+                            == Some(target_name.as_str()),
+                    "Alias dependency {from}:{name} must resolve to registry package {target_name}"
+                );
+            }
+            NpmDepSpec::RegistryRange(_) => {
+                if target_loc.contains("node_modules/") {
+                    ensure!(
+                        target_record
+                            .get("name")
+                            .is_none_or(|v| v.as_str() == Some(name)),
+                        "Registry dependency {from}:{name} resolves to mismatched package name in lockfile"
+                    );
+                }
+            }
+            NpmDepSpec::LocalFile(_) => {}
+        }
+    }
     Ok(target)
 }
 
@@ -271,11 +503,18 @@ pub fn local_dependency_map(
     let packages = package_lock(root)?;
     let mut result = BTreeMap::new();
     for field in DEPENDENCY_FIELDS {
-        for name in dependency_table(&manifest, field)?.keys() {
-            if let Some(target) = locked_dependency(&packages, path, name)?
+        for (name, spec) in dependency_table(&manifest, field)? {
+            let spec_str = text(&spec, &format!("{path}:{name}"))?;
+            if matches!(
+                parse_npm_dependency_spec(spec_str)?,
+                NpmDepSpec::Alias { .. }
+            ) {
+                continue;
+            }
+            if let Some(target) = locked_dependency(&packages, path, &name)?
                 && state.components.contains_key(&target)
             {
-                result.insert(name.clone(), target);
+                result.insert(name, target);
             }
         }
     }
@@ -1023,8 +1262,17 @@ impl<'a> ReadContext<'a> {
             if component.toolchain == Toolchain::Node {
                 let manifest = self.manifest(path)?;
                 for field in DEPENDENCY_FIELDS {
-                    for name in dependency_table(&manifest, field)?.keys() {
-                        if let Some(target) = locked_dependency(self.packages()?, path, name)? {
+                    for (name, spec) in dependency_table(&manifest, field)? {
+                        let spec_str = text(&spec, &format!("{path}:{name}"))?;
+                        let parsed = parse_npm_dependency_spec(spec_str)?;
+                        if let Some(target) = locked_dependency(self.packages()?, path, &name)? {
+                            if matches!(parsed, NpmDepSpec::Alias { .. }) {
+                                ensure!(
+                                    !state.components.contains_key(&target),
+                                    "Alias dependency {path}:{name} cannot target registered workspace component {target}"
+                                );
+                                continue;
+                            }
                             register_edge(state, path, target, &mut deps)?;
                         }
                     }
@@ -1073,8 +1321,8 @@ impl<'a> ReadContext<'a> {
             };
             for field in DEPENDENCY_FIELDS {
                 for (name, spec) in dependency_table(&data, field)? {
-                    text(&spec, &format!("{location}:{name}"))?;
-                    admitted_dependency_target(&packages, location, &data, field, &name)?;
+                    let spec = text(&spec, &format!("{location}:{name}"))?;
+                    admitted_dependency_target(&packages, location, &data, field, &name, spec)?;
                 }
             }
         }
@@ -1468,6 +1716,7 @@ pub struct NativeAdmission {
     /// Complete admitted graph. Public 0.2 projections retain their original
     /// literal-path shape, while role/cycle safety always checks this graph.
     pub effective_dependencies: BTreeMap<String, Vec<String>>,
+    pub npmrc_policy: NpmrcPolicy,
     structure: NativeStructure,
 }
 impl NativeAdmission {
@@ -1516,8 +1765,18 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         for field in ["name", "version"] {
             ensure!(
                 manifest.get(field) == locked.get(field),
-                "Native package identity projection is stale: root"
+                "Native package identity projection is stale: root; run devkit sync"
             );
+        }
+    }
+    let mut private_workspace_names = BTreeMap::new();
+    for (ws_path, ws_comp) in &nodes {
+        let ws_manifest = context.manifest(ws_path)?;
+        if let Some(ws_name) = ws_manifest.get("name").and_then(Value::as_str)
+            && (ws_comp.role != Role::Library
+                || ws_manifest.get("private") != Some(&Value::Bool(false)))
+        {
+            private_workspace_names.insert(ws_name.to_owned(), (*ws_path).clone());
         }
     }
     for (path, component) in &state.components {
@@ -1539,7 +1798,7 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         for field in ["name", "version"] {
             ensure!(
                 manifest.get(field) == locked.get(field),
-                "Native package identity projection is stale: {path}"
+                "Native package identity projection is stale: {path}; run devkit sync"
             );
         }
         let name = text(
@@ -1552,7 +1811,7 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         ensure!(
             packages.get(&link).and_then(|p| p.get("link")) == Some(&Value::Bool(true))
                 && resolve_lock_node(packages, &link)? == *path,
-            "Native package identity projection is stale: {path}"
+            "Native package identity projection is stale: {path}; run devkit sync"
         );
         for (location, value) in packages {
             if root_workspace_link(location)
@@ -1561,7 +1820,7 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             {
                 ensure!(
                     location == &link,
-                    "Native package identity projection is stale: {path}"
+                    "Native package identity projection is stale: {path}; run devkit sync"
                 );
             }
         }
@@ -1596,19 +1855,58 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             component.role != Role::Library || manifest.contains_key("exports"),
             "Library must define public exports: {path}"
         );
+        if component.role == Role::App {
+            if let Some(priv_val) = manifest.get("private") {
+                ensure!(
+                    priv_val == &Value::Bool(true),
+                    "Application package.json cannot set \"private\": false: {path}"
+                );
+            }
+        } else {
+            let is_private = manifest
+                .get("private")
+                .and_then(Value::as_bool)
+                .with_context(|| {
+                    format!(
+                        "Library package.json must explicitly declare boolean \"private\": {path}"
+                    )
+                })?;
+            if component.tooling_profile == ToolingProfile::ReactLibrary {
+                ensure!(
+                    is_private,
+                    "Internal react-library profile requires \"private\": true: {path}"
+                );
+            }
+            if !is_private {
+                ensure!(
+                    matches!(
+                        component.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ),
+                    "Profile {} does not support \"private\": false: {path}",
+                    component.tooling_profile
+                );
+                validate_publishable_library_manifest(
+                    path,
+                    &manifest,
+                    scripts,
+                    &private_workspace_names,
+                )?;
+            }
+        }
     }
     let dependencies = context.derive(state)?;
     for (path, actual) in &dependencies.projected {
         ensure!(
             actual == &state.components[path].dependencies,
-            "Native dependency projection is stale: {path}; run the accepted devkit update"
+            "Native dependency projection is stale: {path}; run devkit sync"
         );
     }
     if !nodes.is_empty() {
         context.assert_npm_targets()?;
     }
     let inputs = context.closure_with_structure(state, &structure)?;
-    assert_npmrc_compatibility(root, &inputs.directories)?;
+    let npmrc_policy = parse_and_admit_npmrc(root, &inputs.directories)?;
     assert_input_identities(root, &inputs)?;
     let node_inputs = context
         .node_inputs
@@ -1619,58 +1917,505 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         node_inputs,
         dependencies: dependencies.projected,
         effective_dependencies: dependencies.effective,
+        npmrc_policy,
         structure,
     })
 }
 
-pub fn assert_npmrc_compatibility(root: &Path, directories: &[String]) -> Result<()> {
-    fn read(root: &Path, path: &Path) -> Result<BTreeMap<String, String>> {
-        if identity(path)?.is_none() {
-            return Ok(BTreeMap::new());
+fn validate_publishable_library_manifest(
+    path: &str,
+    manifest: &Fields,
+    scripts: &Fields,
+    private_workspace_names: &BTreeMap<String, String>,
+) -> Result<()> {
+    let name = text(
+        manifest
+            .get("name")
+            .context("Missing workspace package name")?,
+        "workspace package name",
+    )?;
+    ensure!(
+        valid_npm_package_name(name),
+        "Invalid npm package name for publishable library {path}: {name}"
+    );
+    if let Some(pc_val) = manifest.get("publishConfig") {
+        let pc = object(pc_val, &format!("{path}:publishConfig"))?;
+        if !name.starts_with('@') && pc.get("access") == Some(&Value::String("restricted".into())) {
+            bail!(
+                "Unscoped publishable library {path} ({name}) cannot set publishConfig.access to \"restricted\""
+            );
         }
-        let mut result = BTreeMap::new();
-        for line in fs::read_to_string(path)?.lines() {
-            let line = line.trim();
+    }
+    let version_str = text(
+        manifest
+            .get("version")
+            .with_context(|| format!("Publishable library {path} must declare version"))?,
+        "publishable library version",
+    )?;
+    SemVer::parse(version_str)
+        .with_context(|| format!("Invalid SemVer version in {path}/package.json: {version_str}"))?;
+    let files_arr = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .with_context(|| {
+            format!("Publishable library {path} must declare a non-empty \"files\" array")
+        })?;
+    ensure!(
+        !files_arr.is_empty(),
+        "Publishable library {path} must declare a non-empty \"files\" array"
+    );
+    let mut includes_dist = false;
+    for entry_val in files_arr {
+        let entry = text(entry_val, &format!("{path}:files entry"))?;
+        ensure!(
+            !entry.is_empty()
+                && !entry.starts_with('/')
+                && !entry.contains(['\\', '\0', '\n', '\r'])
+                && !entry.starts_with('!'),
+            "Unsafe \"files\" entry in {path}/package.json: {entry}"
+        );
+        let trimmed = entry.trim_start_matches("./").trim_end_matches('/');
+        ensure!(
+            !trimmed.is_empty(),
+            "Unsafe \"files\" entry in {path}/package.json: {entry}"
+        );
+        let segments: Vec<&str> = trimmed.split('/').collect();
+        ensure!(
+            segments
+                .iter()
+                .all(|s| !s.is_empty() && *s != "." && *s != ".."),
+            "Unsafe \"files\" path segments in {path}/package.json: {entry}"
+        );
+        let first = segments[0];
+        ensure!(
+            ![
+                "src",
+                "test",
+                "tests",
+                "__tests__",
+                "__mocks__",
+                "node_modules",
+                "release",
+                "coverage",
+                ".devkit",
+            ]
+            .contains(&first),
+            "Forbidden source/test/output directory in {path}/package.json \"files\": {entry}"
+        );
+        for seg in &segments {
+            ensure!(
+                *seg != ".env" && !seg.starts_with(".env.") && *seg != ".npmrc",
+                "Forbidden secret/config entry in {path}/package.json \"files\": {entry}"
+            );
+        }
+        let base_lower = segments.last().unwrap().to_ascii_lowercase();
+        ensure!(
+            !(base_lower.starts_with("tsconfig") && base_lower.ends_with(".json"))
+                && ![
+                    "tsdown.config.",
+                    "vitest.config.",
+                    "eslint.config.",
+                    "vite.config.",
+                    "prettier.config.",
+                ]
+                .iter()
+                .any(|p| base_lower.starts_with(p)),
+            "Forbidden config file in {path}/package.json \"files\": {entry}"
+        );
+        if trimmed == "dist" {
+            includes_dist = true;
+        }
+    }
+    ensure!(
+        includes_dist,
+        "Publishable library {path} \"files\" array must include \"dist\""
+    );
+    let exports_obj = manifest
+        .get("exports")
+        .and_then(Value::as_object)
+        .with_context(|| {
+            format!("Publishable library {path} must declare an \"exports\" object")
+        })?;
+    ensure!(
+        !exports_obj.is_empty(),
+        "Publishable library {path} \"exports\" object must not be empty"
+    );
+    fn collect_exports(
+        path: &str,
+        value: &Value,
+        depth: usize,
+        leaves: &mut Vec<String>,
+    ) -> Result<()> {
+        ensure!(depth <= 16, "Nested exports exceed depth limit: {path}");
+        match value {
+            Value::String(s) => {
+                ensure!(
+                    s == "./package.json"
+                        || (s.starts_with("./dist/")
+                            && !s.contains('\\')
+                            && s["./dist/".len()..]
+                                .split('/')
+                                .all(|seg| !seg.is_empty() && seg != "." && seg != "..")),
+                    "Publishable library {path} export target {s:?} must be \"./package.json\" or inside \"./dist/\""
+                );
+                leaves.push(s.clone());
+                Ok(())
+            }
+            Value::Object(map) => {
+                ensure!(
+                    !map.is_empty(),
+                    "Publishable library {path} contains an empty exports condition object"
+                );
+                for (k, v) in map {
+                    ensure!(
+                        !k.is_empty() && !k.contains(".."),
+                        "Invalid exports key {k:?} in {path}"
+                    );
+                    collect_exports(path, v, depth + 1, leaves)?;
+                }
+                Ok(())
+            }
+            _ => bail!("Unsupported value inside {path}/package.json \"exports\""),
+        }
+    }
+    let mut export_leaves = Vec::new();
+    for (subpath, val) in exports_obj {
+        ensure!(
+            subpath == "." || (subpath.starts_with("./") && !subpath.contains("..")),
+            "Invalid exports subpath {subpath:?} in {path}/package.json"
+        );
+        collect_exports(path, val, 1, &mut export_leaves)?;
+    }
+    ensure!(
+        export_leaves.iter().any(|t| t.starts_with("./dist/")),
+        "Publishable library {path} \"exports\" must expose at least one \"./dist/\" artifact"
+    );
+    let pkg_script = text(
+        scripts
+            .get("package")
+            .with_context(|| format!("Publishable library {path} must define scripts.package"))?,
+        &format!("native script {path}:package"),
+    )?;
+    ensure!(
+        !pkg_script.trim().is_empty(),
+        "Publishable library {path} scripts.package must not be empty"
+    );
+    for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
+        for (dep_name, dep_val) in dependency_table(manifest, field)? {
+            let spec_str = text(&dep_val, &format!("{path}:{field}.{dep_name}"))?;
+            let parsed = parse_npm_dependency_spec(spec_str)?;
+            match &parsed {
+                NpmDepSpec::LocalFile(_) => {
+                    bail!(
+                        "Publishable library {path} cannot declare local file: dependency {field}.{dep_name} ({spec_str})"
+                    );
+                }
+                NpmDepSpec::Alias { target_name, .. } => {
+                    if let Some(priv_ws) = private_workspace_names.get(target_name) {
+                        bail!(
+                            "Publishable library {path} cannot depend on private workspace component {priv_ws} ({target_name}) in {field}.{dep_name}"
+                        );
+                    }
+                }
+                NpmDepSpec::RegistryRange(_) => {}
+            }
+            if let Some(priv_ws) = private_workspace_names.get(&dep_name) {
+                bail!(
+                    "Publishable library {path} cannot depend on private workspace component {priv_ws} ({dep_name}) in {field}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NpmrcPolicy {
+    pub default_registry: Option<String>,
+    pub scoped_registries: BTreeMap<String, String>,
+    pub required_env_vars: BTreeSet<String>,
+}
+
+const NPMRC_SAFE_DEFAULTS: &[(&str, &str)] = &[
+    ("install-links", "false"),
+    ("strict-peer-deps", "true"),
+    ("legacy-peer-deps", "false"),
+    ("force", "false"),
+    ("fund", "false"),
+    ("audit", "false"),
+    ("update-notifier", "false"),
+    ("install-strategy", "hoisted"),
+    ("package-lock", "true"),
+    ("save-exact", "false"),
+    ("ignore-scripts", "true"),
+    ("workspaces-update", "false"),
+];
+
+const RESERVED_NPMRC_ENV_EXACT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "PWD",
+    "TMPDIR",
+    "CI",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+];
+
+const RESERVED_NPMRC_ENV_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "NODE_",
+    "NPM_CONFIG_",
+    "DEVKIT_",
+    "CARGO_",
+    "RUST",
+    "DOCKER_",
+    "GIT_",
+    "SSH_",
+    "SSL_",
+];
+
+fn valid_nerf_dart_host_path(host_and_path: &str) -> bool {
+    if host_and_path.is_empty()
+        || host_and_path.starts_with('/')
+        || host_and_path.chars().any(char::is_whitespace)
+        || host_and_path.contains(['\0', '?', '#', '@', '\\'])
+    {
+        return false;
+    }
+    let (authority, path_rest) = match host_and_path.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (host_and_path, ""),
+    };
+    valid_registry_authority(authority, "https") && !path_rest.split('/').any(|seg| seg == "..")
+}
+
+fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {
+    let Some(var) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        bail!(
+            "Unsupported secret value in .npmrc ({key}); use nerf-dart environment expansion ${{ENV_VAR}}"
+        );
+    };
+    let bytes = var.as_bytes();
+    ensure!(
+        (2..=64).contains(&bytes.len())
+            && (bytes[0].is_ascii_uppercase() || bytes[0] == b'_')
+            && bytes[1..]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_'),
+        "Invalid environment variable name '{var}' in .npmrc ({key}); expected ^[A-Z_][A-Z0-9_]{{1,63}}$"
+    );
+    ensure!(
+        !RESERVED_NPMRC_ENV_EXACT.contains(&var)
+            && !RESERVED_NPMRC_ENV_PREFIXES
+                .iter()
+                .any(|prefix| var.starts_with(prefix)),
+        "Reserved environment variable '{var}' is not allowed in .npmrc ({key})"
+    );
+    Ok(var)
+}
+
+pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
+    let path = input_path(root, ".npmrc")?;
+    if identity(&path)?.is_none() {
+        return Ok(NpmrcPolicy::default());
+    }
+    let mut policy = NpmrcPolicy::default();
+    let mut seen_keys = BTreeSet::new();
+    let defaults: BTreeMap<&str, &str> = NPMRC_SAFE_DEFAULTS.iter().copied().collect();
+    for raw_line in fs::read_to_string(&path)?.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        ensure!(
+            !line.starts_with('['),
+            "Unsupported INI section in .npmrc: {line}"
+        );
+        let (key, value) = line
+            .split_once('=')
+            .context("Unprovable npm configuration in .npmrc")?;
+        let key = key.trim();
+        let value = value.trim();
+        ensure!(
+            !key.is_empty()
+                && !key.chars().any(char::is_whitespace)
+                && !key.contains('$')
+                && !value.chars().any(char::is_whitespace)
+                && !value.contains(['"', '\'']),
+            "Unprovable npm configuration in .npmrc ({key})"
+        );
+        ensure!(
+            seen_keys.insert(key.to_owned()),
+            "Duplicate npm configuration key in .npmrc ({key})"
+        );
+        if let Some(&expected) = defaults.get(key) {
+            ensure!(
+                value == expected,
+                "Unsupported npm configuration override in .npmrc ({key}={value}; expected {expected})"
+            );
+            continue;
+        }
+        if key == "registry" {
+            ensure!(
+                valid_registry_or_tarball_url(value),
+                "Unsupported registry URL in .npmrc (registry={value})"
+            );
+            policy.default_registry = Some(value.to_owned());
+            continue;
+        }
+        if let Some(scope) = key
+            .strip_prefix('@')
+            .and_then(|s| s.strip_suffix(":registry"))
+        {
+            ensure!(
+                valid_npm_scope(scope),
+                "Invalid npm scope '@{scope}' in .npmrc ({key})"
+            );
+            ensure!(
+                valid_registry_or_tarball_url(value),
+                "Unsupported scoped registry URL in .npmrc ({key}={value})"
+            );
+            policy
+                .scoped_registries
+                .insert(scope.to_owned(), value.to_owned());
+            continue;
+        }
+        if key == "always-auth" {
+            ensure!(
+                matches!(value, "true" | "false"),
+                "Invalid boolean value in .npmrc (always-auth={value})"
+            );
+            continue;
+        }
+        if let Some(nerf) = key.strip_prefix("//") {
+            let Some((host_and_path, option)) = nerf.rsplit_once("/:") else {
+                bail!(
+                    "Invalid nerf-dart key in .npmrc ({key}); expected //<host>[/<path>]/:<option>"
+                );
+            };
+            ensure!(
+                valid_nerf_dart_host_path(host_and_path),
+                "Invalid nerf-dart registry prefix in .npmrc ({key})"
+            );
+            match option {
+                "_authToken" | "_auth" => {
+                    let var = parse_npmrc_env_var(key, value)?;
+                    policy.required_env_vars.insert(var.to_owned());
+                    continue;
+                }
+                "always-auth" => {
+                    ensure!(
+                        matches!(value, "true" | "false"),
+                        "Invalid boolean value in .npmrc ({key}={value})"
+                    );
+                    continue;
+                }
+                _ => {
+                    bail!("Unsupported nerf-dart option in .npmrc ({key})");
+                }
+            }
+        }
+        if matches!(
+            key,
+            "_authToken" | "_auth" | "_password" | "username" | "email"
+        ) {
+            bail!(
+                "Unaddressed authentication key '{key}' is not allowed in .npmrc; scope it with //<host>[/<path>]/:_authToken=${{ENV_VAR}}"
+            );
+        }
+        bail!("Unsupported npm configuration key in .npmrc ({key})");
+    }
+    Ok(policy)
+}
+
+pub fn parse_and_admit_npmrc(root: &Path, directories: &[String]) -> Result<NpmrcPolicy> {
+    let policy = parse_manifest_npmrc_policy(root)?;
+    let defaults: BTreeMap<&str, &str> = NPMRC_SAFE_DEFAULTS.iter().copied().collect();
+    for directory in directories.iter().filter(|d| !d.is_empty()) {
+        let path = input_path(root, format!("{directory}/.npmrc"))?;
+        if identity(&path)?.is_none() {
+            continue;
+        }
+        for raw_line in fs::read_to_string(&path)?.lines() {
+            let line = raw_line.trim();
             if line.is_empty() || line.starts_with(['#', ';']) {
                 continue;
             }
-            let (key, value) = line
-                .split_once('=')
-                .with_context(|| format!("Unprovable npm configuration: {}", path.display()))?;
+            let (key, value) = line.split_once('=').with_context(|| {
+                format!("Unprovable npm configuration in workspace context: {directory}/.npmrc")
+            })?;
             let key = key.trim();
+            let value = value.trim();
             ensure!(
                 !key.is_empty()
                     && !key.chars().any(char::is_whitespace)
                     && !line.contains(['$', '[', ']']),
-                "Unprovable npm configuration: {}",
-                relative_name(&project_root(root)?, path)?
+                "Unprovable npm configuration in workspace context: {directory}/.npmrc"
             );
-            result.insert(key.to_owned(), value.trim().to_owned());
-        }
-        Ok(result)
-    }
-    let base = read(root, &input_path(root, ".npmrc")?)?;
-    let defaults = BTreeMap::from([
-        ("install-links", "false"),
-        ("strict-peer-deps", "true"),
-        ("legacy-peer-deps", "false"),
-        ("force", "false"),
-        ("fund", "false"),
-        ("audit", "false"),
-        ("update-notifier", "false"),
-        ("install-strategy", "hoisted"),
-    ]);
-    for directory in directories.iter().filter(|d| !d.is_empty()) {
-        for (key, value) in read(root, &input_path(root, format!("{directory}/.npmrc"))?)? {
-            let accepted = base
-                .get(&key)
-                .map(String::as_str)
-                .or_else(|| defaults.get(key.as_str()).copied());
             ensure!(
-                Some(value.as_str()) == accepted,
+                defaults.get(key) == Some(&value),
                 "npm configuration changes in workspace context: {directory}/.npmrc ({key})"
             );
         }
     }
+    Ok(policy)
+}
+
+pub fn assert_npmrc_compatibility(root: &Path, directories: &[String]) -> Result<()> {
+    parse_and_admit_npmrc(root, directories).map(|_| ())
+}
+
+pub fn verify_required_npm_env_vars(policy: &NpmrcPolicy) -> Result<()> {
+    for var in &policy.required_env_vars {
+        match std::env::var(var) {
+            Ok(value) if !value.is_empty() => {}
+            _ => bail!("Missing environment variable {var} required by .npmrc"),
+        }
+    }
     Ok(())
+}
+
+pub fn resolve_ca_cert_path() -> Result<Option<std::path::PathBuf>> {
+    let Some(raw) = std::env::var_os("DEVKIT_CA_CERT") else {
+        return Ok(None);
+    };
+    ensure!(
+        !raw.is_empty(),
+        "DEVKIT_CA_CERT is set to an empty path; unset it or point to a valid PEM certificate file"
+    );
+    let path = std::path::PathBuf::from(&raw);
+    let metadata = fs::metadata(&path).with_context(|| {
+        format!(
+            "DEVKIT_CA_CERT does not point to an accessible file: {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "DEVKIT_CA_CERT must point to a non-empty regular PEM file: {}",
+        path.display()
+    );
+    let contents = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "DEVKIT_CA_CERT could not be read as UTF-8 PEM text: {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        contents.contains("-----BEGIN CERTIFICATE-----"),
+        "DEVKIT_CA_CERT does not contain a PEM certificate ('-----BEGIN CERTIFICATE-----'): {}",
+        path.display()
+    );
+    let canonical = fs::canonicalize(&path).with_context(|| {
+        format!(
+            "Failed to canonicalize DEVKIT_CA_CERT path: {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(canonical))
 }

@@ -56,8 +56,8 @@ pub fn validate_project_state(s: &ProjectState) -> Result<()> {
         );
     }
     ensure!(
-        s.components.keys().any(|p| p.starts_with("apps/")),
-        "Project has no registered apps"
+        !s.components.is_empty(),
+        "Project has no registered components"
     );
     for (path, c) in &s.components {
         valid_component_path(path)?;

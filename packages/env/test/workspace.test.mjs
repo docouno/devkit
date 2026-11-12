@@ -222,3 +222,103 @@ test('Bundler public comparison preserves node/browser export conditions for cod
       [],
     );
   }));
+
+test('library src forbids runtime devDependency imports, gates public type leaks, and preserves 0.3.2 app devDependencies', () =>
+  fixture(({ root, app, pkg, write }) => {
+    const uiDir = path.join(root, 'packages/ui');
+    write('.devkit/manifest.json', {
+      schemaVersion: 2,
+      components: {
+        'apps/web': { role: 'app' },
+        'apps/api': { role: 'app' },
+        'packages/client': { role: 'library' },
+        'packages/ui': { role: 'library' },
+      },
+    });
+    write('packages/ui/package.json', {
+      name: '@fixture/ui',
+      private: true,
+      type: 'module',
+      peerDependencies: { react: '^19.0.0' },
+      devDependencies: {
+        '@types/react': '19.0.0',
+        vitest: '5.0.5',
+      },
+      exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+    });
+    write('packages/ui/src/Button.tsx', 'export const Button = () => null;');
+
+    const checkUi = (fileRel, code) =>
+      workspaceImportErrors(workspaceContext(uiDir), path.join(uiDir, fileRel), code, options);
+
+    // Runtime import of devDependency in library src/** fails
+    const runtimeErrs = checkUi(
+      'src/Button.tsx',
+      "import { describe } from 'vitest'; export { describe };",
+    );
+    assert(
+      runtimeErrs.some((msg) =>
+        msg.includes(
+          'imports "vitest" at runtime, but it is not declared in dependencies, peerDependencies, or optionalDependencies',
+        ),
+      ),
+      JSON.stringify(runtimeErrs),
+    );
+
+    // Test file inside src/** CAN import devDependencies at runtime
+    assert.deepEqual(
+      checkUi('src/Button.test.tsx', "import { describe } from 'vitest'; export { describe };"),
+      [],
+    );
+
+    // Private library allows type-only import from devDependency
+    assert.deepEqual(
+      checkUi('src/Button.tsx', "import type { Suite } from 'vitest'; export type { Suite };"),
+      [],
+    );
+
+    // Public library ("private": false) rejects type-only import from pure devDependency,
+    // while allowing peerDependency ("react") and paired @types/react
+    write('packages/ui/package.json', {
+      name: '@fixture/ui',
+      private: false,
+      type: 'module',
+      peerDependencies: { react: '^19.0.0' },
+      devDependencies: {
+        '@types/react': '19.0.0',
+        vitest: '5.0.5',
+      },
+      exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+    });
+    const publicTypeErrs = checkUi(
+      'src/Button.tsx',
+      "import type { Suite } from 'vitest'; export type { Suite };",
+    );
+    assert(
+      publicTypeErrs.some((msg) => msg.includes('imports types from "vitest"')),
+      JSON.stringify(publicTypeErrs),
+    );
+    assert.deepEqual(
+      checkUi(
+        'src/Button.tsx',
+        "import type { ReactNode } from 'react'; export type { ReactNode };",
+      ),
+      [],
+    );
+
+    // 0.3.2 compatibility: apps/* may still consume file: workspace libraries declared in devDependencies
+    write('apps/web/package.json', {
+      ...pkg,
+      dependencies: {},
+      devDependencies: { '@fixture/client': 'file:../../packages/client' },
+    });
+    assert.deepEqual(
+      workspaceImportErrors(
+        workspaceContext(app),
+        path.join(app, 'src/index.ts'),
+        "import { value } from '@fixture/client'; export { value };",
+        options,
+      ),
+      [],
+    );
+  }));

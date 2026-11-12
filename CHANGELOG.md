@@ -2,10 +2,23 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-12
+
+### Added
+
+- Standalone and workspace npm library templates (`ts-library` and `react-ui` bundled with `tsdown`), repositories with `0..N` applications and `1..M` packages, repeatable `init --package NAME=TEMPLATE` and `--use PKG` flags, and `--preset design-system` (`packages/ui` + `apps/playground`).
+- Offline library packaging via `make package` (`devkit-pack` / `devkit-verify --pack`) validating export maps, `publint`, and `@arethetypeswrong/core` before emitting `.tgz` archives and `package-receipt.json`.
+- `devkitWorkspaceSource` Vite plugin (`@docouno/env/vite`) for instant source-level HMR on internal `packages/*` libraries during `make dev` without rebuilding `dist/`.
+- `devkit sync` to reconcile Make/Compose projections and `package-lock.json` after manual `package.json` or `.npmrc` edits, plus three-stage `--reconcile-lock` recovery on `sync`, `update`, `add-app`, `add-package`, and `register`.
+- Support for `npm:` dependency aliases across workspace graphs and private HTTPS npm registries (including GitLab Package Registry subpath endpoints) with `${ENV_VAR}` token expansion, custom TLS root CAs (`DEVKIT_CA_CERT`), and strict secret isolation in offline and Rust containers.
+- Cumulative migration notes in `devkit update`, forward-dispatch to newer target or accepted engines, managed `.devkit/runtime/GUIDE.md`, and complete standalone documentation under `docs/`.
+
 ### Changed
 
-- Generate GitHub release descriptions from the matching version entry in this changelog.
-- Keep build contracts and verification receipts in a collapsed section below the release notes.
+- Accelerate Rust `make check` by compiling workspace targets once (`cargo clippy --all-targets` + `cargo test -- --list`) without executing runtime tests twice, scale `CARGO_BUILD_JOBS` from cgroup v2 CPU quotas, and switch `docker compose up` from `--pull never` to `--pull missing` so backing services pull missing images on demand without re-pulling cached images.
+- Harden `make setup` supply-chain isolation by running `npm ci --ignore-scripts` during networked package extraction and executing any declared workspace component install hooks (`preinstall`, `install`, `postinstall`, `prepare`) in a subsequent `--network none` step without registry credentials.
+- Adopt file-glob ESLint and Prettier scripts and single-pass `check` scripts across Node and React templates.
+- Generate GitHub release descriptions from the matching version entry in this changelog while keeping build contracts and verification receipts in a collapsed section.
 
 ## [0.3.2] - 2026-10-24
 
