@@ -11,8 +11,30 @@ import { relativeList } from './paths.js';
 
 const sourceFiles = ['**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}'];
 const typedFiles = ['**/*.{ts,tsx,mts,cts}'];
+const rootConfigFiles = [
+  '*.config.{js,mjs,cjs,ts,mts,cts}',
+  'vite.config.*',
+  'vitest.config.*',
+  'tsdown.config.*',
+  'eslint.config.*',
+  'prettier.config.*',
+];
 
-function config(appRoot, browser) {
+function resolveRootInput(input) {
+  if (typeof input === 'string') {
+    return input;
+  }
+  if (input && typeof input === 'object') {
+    const candidate = input.appRoot ?? input.root;
+    if (typeof candidate === 'string') {
+      return candidate;
+    }
+  }
+  return '';
+}
+
+function config(input, mode) {
+  const appRoot = resolveRootInput(input);
   if (typeof appRoot !== 'string' || !path.isAbsolute(appRoot)) {
     throw new TypeError('Pass the absolute application directory to the Devkit config factory.');
   }
@@ -20,6 +42,7 @@ function config(appRoot, browser) {
   if (!fs.statSync(root).isDirectory()) {
     throw new TypeError('Application root must be a directory.');
   }
+  const browser = mode === 'browser' || mode === 'react-library';
   const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const configs = relativeList(
     packageJson.devkit?.typecheckConfigs,
@@ -33,7 +56,7 @@ function config(appRoot, browser) {
   const definitions = [
     {
       name: 'devkit/generated-output',
-      ignores: ['node_modules/**', 'dist/**', 'coverage/**', '.devkit/**'],
+      ignores: ['node_modules/**', 'dist/**', 'release/**', 'coverage/**', '.devkit/**'],
     },
     {
       name: 'devkit/javascript',
@@ -54,6 +77,14 @@ function config(appRoot, browser) {
       },
     },
     {
+      name: 'devkit/commonjs',
+      files: ['**/*.cjs'],
+      languageOptions: {
+        sourceType: 'commonjs',
+        globals: globals.node,
+      },
+    },
+    {
       name: 'devkit/typescript',
       files: typedFiles,
       extends: [tseslint.configs.recommendedTypeChecked],
@@ -66,6 +97,15 @@ function config(appRoot, browser) {
     },
   ];
   if (browser) {
+    definitions.push({
+      name: 'devkit/root-configs',
+      files: rootConfigFiles,
+      languageOptions: {
+        globals: globals.node,
+      },
+    });
+  }
+  if (mode === 'browser') {
     definitions.push({
       name: 'devkit/react',
       files: ['**/*.{tsx,jsx}'],
@@ -80,17 +120,27 @@ function config(appRoot, browser) {
       files: ['**/*.{test,spec}.{tsx,jsx}'],
       rules: { 'react-refresh/only-export-components': 'off' },
     });
+  } else if (mode === 'react-library') {
+    definitions.push({
+      name: 'devkit/react-library',
+      files: ['src/**/*.{ts,tsx,js,jsx}', '**/*.{tsx,jsx}'],
+      plugins: { 'react-hooks': reactHooks },
+      rules: {
+        ...reactHooks.configs.flat.recommended.rules,
+      },
+    });
   }
   return defineConfig(definitions);
 }
 
-export const nodeConfig = (appRoot) => config(appRoot, false);
-export const browserConfig = (appRoot) => config(appRoot, true);
+export const nodeConfig = (appRoot) => config(appRoot, 'node');
+export const browserConfig = (appRoot) => config(appRoot, 'browser');
+export const reactLibraryConfig = (appRoot) => config(appRoot, 'react-library');
 
 /** Electron's renderer uses browser globals even though its main process uses Node. */
 export const desktopConfig = (appRoot) => {
-  const definitions = config(appRoot, false);
-  const browser = config(appRoot, true);
+  const definitions = config(appRoot, 'node');
+  const browser = config(appRoot, 'browser');
   const renderer = ['src/renderer/**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}'];
   const forbidden = [
     ...new Set([

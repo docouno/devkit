@@ -199,6 +199,7 @@ pub fn run(command: &str, runner: &ProcessRunner) -> Result<()> {
                     "--offline",
                     "--",
                     "--list",
+                    "--format=terse",
                     "--color",
                     "never",
                 ];
@@ -234,6 +235,9 @@ pub fn run(command: &str, runner: &ProcessRunner) -> Result<()> {
                 counts[0] - counts[1],
                 counts[1]
             );
+            if command == "check" {
+                return Ok(());
+            }
             cargo_gate(runner, &["test", "--workspace", "--locked", "--offline"])
         }
         _ => unreachable!(),

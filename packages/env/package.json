@@ -1,6 +1,6 @@
 {
   "name": "@docouno/env",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Shared, checked JavaScript and TypeScript configuration for Devkit projects",
   "type": "module",
   "license": "MIT",
@@ -24,11 +24,22 @@
       "types": "./src/vitest-reporter.d.ts",
       "default": "./src/vitest-reporter.js"
     },
+    "./vite": {
+      "types": "./src/vite.d.ts",
+      "default": "./src/vite.js"
+    },
+    "./pack": {
+      "types": "./src/pack.d.ts",
+      "default": "./src/pack.js"
+    },
     "./tsconfig/node.json": "./tsconfig/node.json",
-    "./tsconfig/browser.json": "./tsconfig/browser.json"
+    "./tsconfig/browser.json": "./tsconfig/browser.json",
+    "./tsconfig/library.json": "./tsconfig/library.json",
+    "./tsconfig/react-library.json": "./tsconfig/react-library.json"
   },
   "bin": {
-    "devkit-verify": "./bin/devkit-verify.js"
+    "devkit-verify": "./bin/devkit-verify.js",
+    "devkit-pack": "./bin/devkit-pack.js"
   },
   "files": [
     "bin",

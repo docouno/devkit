@@ -5,6 +5,7 @@ import { verifyProject } from '../src/verify.js';
 const args = process.argv.slice(2);
 let root = process.cwd();
 let json = false;
+let pack = false;
 try {
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '--root') {
@@ -16,14 +17,16 @@ try {
       index += 1;
     } else if (args[index] === '--json') {
       json = true;
+    } else if (args[index] === '--pack') {
+      pack = true;
     } else if (args[index] === '--help') {
-      console.log('Usage: devkit-verify [--root <application>] [--json]');
+      console.log('Usage: devkit-verify [--root <application>] [--pack] [--json]');
       process.exit(0);
     } else {
       throw new Error(`Unknown argument: ${args[index]}`);
     }
   }
-  const result = await verifyProject(root);
+  const result = await verifyProject(root, { pack });
   if (json) {
     console.log(JSON.stringify(result));
   } else if (result.ok) {

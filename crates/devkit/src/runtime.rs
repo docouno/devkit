@@ -647,6 +647,7 @@ impl<'a> PreparedContext<'a> {
                 .map(|p| format!("/workspace/{p}"))
                 .unwrap_or_else(|| "/workspace".into()),
         ]);
+        let cargo_jobs = resolve_cargo_build_jobs()?;
         for value in [
             "HOME=/tmp/devkit-home",
             "CI=true",
@@ -659,10 +660,10 @@ impl<'a> PreparedContext<'a> {
             "ELECTRON_CACHE=/cache/electron",
             "CARGO_HOME=/cache/cargo",
             "RUSTUP_AUTO_INSTALL=0",
-            "CARGO_BUILD_JOBS=2",
         ] {
             c.args(["--env", value]);
         }
+        c.args(["--env", &format!("CARGO_BUILD_JOBS={cargo_jobs}")]);
         c.args([
             "--env",
             &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
@@ -1320,7 +1321,7 @@ fn run_development(
     for f in &overlays {
         command.arg("--file").arg(f.path());
     }
-    command.args(["up", "-d", "--wait", "--pull", "never", &service]);
+    command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
     full.recheck()?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     ctx.runner.checked(&mut command, OutputMode::Inherit)?;
@@ -1371,5 +1372,105 @@ impl ComposeNormalizer for DockerComposeNormalizer {
         ]);
         let output = self.runner.capture(&mut command)?;
         Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+fn parse_cargo_jobs_env(var_name: &str, raw: &std::ffi::OsStr) -> Result<usize> {
+    let text = raw
+        .to_str()
+        .with_context(|| format!("Invalid {var_name}: expected UTF-8 integer in 1..=256"))?;
+    let jobs: usize = text.trim().parse().with_context(|| {
+        format!("Invalid {var_name} value '{text}'; expected an integer in 1..=256")
+    })?;
+    ensure!(
+        (1..=256).contains(&jobs),
+        "Invalid {var_name} value '{text}'; expected an integer in 1..=256"
+    );
+    Ok(jobs)
+}
+
+fn resolve_cargo_build_jobs_from(
+    devkit_jobs: Option<&std::ffi::OsStr>,
+    cargo_jobs: Option<&std::ffi::OsStr>,
+    ci: Option<&std::ffi::OsStr>,
+    available_cpus: Option<usize>,
+) -> Result<usize> {
+    if let Some(raw) = devkit_jobs {
+        return parse_cargo_jobs_env("DEVKIT_CARGO_BUILD_JOBS", raw);
+    }
+    if let Some(raw) = cargo_jobs {
+        return parse_cargo_jobs_env("CARGO_BUILD_JOBS", raw);
+    }
+    let cpus = available_cpus.unwrap_or(2).max(1);
+    let is_ci = ci
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| matches!(v.trim(), "true" | "1"));
+    Ok(if is_ci { cpus.min(4) } else { cpus.min(8) })
+}
+
+pub fn resolve_cargo_build_jobs() -> Result<usize> {
+    let devkit_jobs = std::env::var_os("DEVKIT_CARGO_BUILD_JOBS");
+    let cargo_jobs = std::env::var_os("CARGO_BUILD_JOBS");
+    let ci = std::env::var_os("CI");
+    let available = std::thread::available_parallelism().ok().map(usize::from);
+    resolve_cargo_build_jobs_from(
+        devkit_jobs.as_deref(),
+        cargo_jobs.as_deref(),
+        ci.as_deref(),
+        available,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_cargo_build_jobs_from;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn cargo_build_jobs_prioritizes_overrides_caps_defaults_and_rejects_invalid_bounds() {
+        assert_eq!(
+            resolve_cargo_build_jobs_from(
+                Some(OsStr::new("12")),
+                Some(OsStr::new("3")),
+                Some(OsStr::new("true")),
+                Some(16),
+            )
+            .unwrap(),
+            12
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(
+                None,
+                Some(OsStr::new("6")),
+                Some(OsStr::new("1")),
+                Some(16),
+            )
+            .unwrap(),
+            6
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, Some(OsStr::new("true")), Some(16)).unwrap(),
+            4
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, Some(OsStr::new("1")), Some(16)).unwrap(),
+            4
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, None, Some(16)).unwrap(),
+            8
+        );
+        assert_eq!(
+            resolve_cargo_build_jobs_from(None, None, None, None).unwrap(),
+            2
+        );
+        for bad in ["", "0", "257", "abc", "-1"] {
+            assert!(
+                resolve_cargo_build_jobs_from(Some(OsStr::new(bad)), None, None, Some(4)).is_err()
+            );
+            assert!(
+                resolve_cargo_build_jobs_from(None, Some(OsStr::new(bad)), None, Some(4)).is_err()
+            );
+        }
     }
 }
