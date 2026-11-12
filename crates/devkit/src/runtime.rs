@@ -283,6 +283,7 @@ struct ContainerTask<'a> {
     image: &'a str,
     argv: &'a [OsString],
     network: &'a str,
+    forward_npm_secrets: bool,
     access: TaskAccess,
     inputs: Option<&'a InputIdentitySet>,
 }
@@ -533,6 +534,7 @@ impl<'a> PreparedContext<'a> {
             image,
             argv,
             network,
+            forward_npm_secrets,
             access,
             inputs,
         } = task;
@@ -688,8 +690,16 @@ impl<'a> PreparedContext<'a> {
             ),
         ]);
         if profile != ToolingProfile::Rust {
-            let npmrc_policy = crate::native::parse_manifest_npmrc_policy(root)?;
-            if network != "none" {
+            let node_dirs: Vec<String> = self
+                .admission
+                .state
+                .components
+                .iter()
+                .filter(|(_, c)| c.toolchain == Toolchain::Node)
+                .map(|(p, _)| p.clone())
+                .collect();
+            let npmrc_policy = crate::native::parse_and_admit_npmrc(root, &node_dirs)?;
+            if network != "none" && forward_npm_secrets {
                 crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
                 for var in &npmrc_policy.required_env_vars {
                     c.args(["--env", var]);
@@ -969,11 +979,13 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 vec![
                     "npm".into(),
                     "ci".into(),
+                    "--ignore-scripts".into(),
                     "--include=dev".into(),
                     "--strict-peer-deps".into(),
                 ],
             ),
             network: "bridge",
+            forward_npm_secrets: true,
             access: TaskAccess::Finite,
             inputs: Some(&full.native.inputs),
         })?;
@@ -995,6 +1007,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                         ],
                     ),
                     network: "bridge",
+                    forward_npm_secrets: false,
                     access: TaskAccess::Finite,
                     inputs: Some(&full.native.inputs),
                 })?;
@@ -1054,6 +1067,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 command.into(),
             ],
             network: if setup { "bridge" } else { "none" },
+            forward_npm_secrets: false,
             access: if command == "fix" {
                 TaskAccess::Fix
             } else {
@@ -1109,6 +1123,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 image: &image,
                 argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), command.into()]),
                 network: "none",
+                forward_npm_secrets: false,
                 access,
                 inputs: Some(&full.native.inputs),
             })?;
@@ -1179,6 +1194,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         image: &image,
         argv: &request.argv,
         network: &request.network,
+        forward_npm_secrets: request.network != "none",
         access: if request.write {
             TaskAccess::ExecWrite
         } else {

@@ -2719,7 +2719,25 @@ fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() 
     assert!(policy.required_env_vars.contains("GITLAB_NPM_TOKEN"));
     assert_native_components(root, &state).unwrap();
 
+    // IPv6 HTTPS registry and nerf-dart token expansion symmetry.
+    put(
+        root,
+        ".npmrc",
+        "@corp:registry=https://[fd00::1]:8443/api/v4/projects/12/packages/npm/\n\
+         //[fd00::1]:8443/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+    );
+    let ipv6_policy = parse_and_admit_npmrc(root, &closure.directories).unwrap();
+    assert_eq!(
+        ipv6_policy
+            .scoped_registries
+            .get("corp")
+            .map(String::as_str),
+        Some("https://[fd00::1]:8443/api/v4/projects/12/packages/npm/")
+    );
+
     for bad_npmrc in [
+        "//gitlab.example.com:0/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
+        "//gitlab.example.com:99999/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
         "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=glpat-secret-literal\n",
         "_authToken=${NPM_TOKEN}\n",
         "//gitlab.example.com/api/v4/projects/12/packages/npm/:_authToken=${LD_PRELOAD}\n",

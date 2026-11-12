@@ -5,7 +5,7 @@ export interface DevkitConfigOptions {
   readonly root?: string | undefined;
 }
 
-export function nodeConfig(appRoot: string): Linter.Config[];
-export function browserConfig(appRoot: string): Linter.Config[];
+export function nodeConfig(appRoot: string | DevkitConfigOptions): Linter.Config[];
+export function browserConfig(appRoot: string | DevkitConfigOptions): Linter.Config[];
 export function reactLibraryConfig(appRoot: string | DevkitConfigOptions): Linter.Config[];
-export function desktopConfig(appRoot: string): Linter.Config[];
+export function desktopConfig(appRoot: string | DevkitConfigOptions): Linter.Config[];

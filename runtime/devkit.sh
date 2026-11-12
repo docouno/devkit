@@ -28,10 +28,21 @@ valid_engine() {
   observed=$(sha256sum -- "$engine")
   [ "${observed%% *}" = "$expected" ]
 }
+exec_prepare=0
+if [ "$command" = exec ]; then
+  if [ "$#" -eq 1 ] && [ "${DEVKIT_EXEC_PREPARE:-0}" = 1 ]; then
+    exec_prepare=1
+  elif [ "$#" -gt 1 ]; then
+    for arg in "$@"; do
+      [ "$arg" != -- ] || break
+      [ "$arg" != --prepare ] || exec_prepare=1
+    done
+  fi
+fi
 if ! valid_engine; then
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
-  [ "$mode" = bootstrap ] || [ "$command" = setup ] || [ "$command" = setup-node ] || fail 'the accepted engine is unavailable; run make setup'
+  [ "$mode" = bootstrap ] || [ "$command" = setup ] || [ "$command" = setup-node ] || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup'
   parent=${engine%/*}
   [ "$(realpath -m -- "$parent")" = "$(realpath -ms -- "$parent")" ] || fail 'the engine cache path contains a symbolic link'
   umask 077
@@ -76,6 +87,10 @@ if [ "$mode" = bootstrap ]; then
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 if [ "$command" = exec ]; then
+  if [ "$#" -gt 1 ]; then
+    shift
+    exec "$engine" exec --root "$root" "$@"
+  fi
   for flag in "${DEVKIT_EXEC_WRITE:-0}" "${DEVKIT_EXEC_PREPARE:-0}"; do
     [ "$flag" = 0 ] || [ "$flag" = 1 ] || fail 'write and prepare must be 0 or 1'
   done

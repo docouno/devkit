@@ -45,7 +45,7 @@ jobs:
           make check
           make test
           make build
-          make package
+          # make package  # Uncomment when packaging an Electron app or a "private": false library
 
       - name: Upload packaged release artifacts
         if: hashFiles('packages/*/release/*.tgz', 'apps/*/release/*.tar.gz') != ''
@@ -93,7 +93,7 @@ verify:
     - make check
     - make test
     - make build
-    - make package
+    # - make package  # Uncomment when packaging an Electron app or a "private": false library
   artifacts:
     paths:
       - packages/*/release/
@@ -115,9 +115,10 @@ publish_packages:
       for receipt in packages/*/release/package-receipt.json; do
         [ -f "$receipt" ] || continue
         pkg_dir="$(dirname "$(dirname "$receipt")")"
-        archive="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"])' "$receipt")"
-        .devkit/runtime/devkit.sh exec --component "$pkg_dir" --network bridge -- \
-          npm publish "release/$archive"
+        pkg_slug="$(basename "$pkg_dir")"
+        filename="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["filename"])' "$receipt")"
+        make exec package="$pkg_slug" network=bridge prepare=1 \
+          command="npm publish ./release/$filename"
       done
 ```
 

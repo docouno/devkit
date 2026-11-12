@@ -26,7 +26,7 @@ function runtimeExportTarget(value) {
   if (!object(value)) {
     return null;
   }
-  for (const key of ['development', 'import', 'module', 'default']) {
+  for (const key of ['development', 'browser', 'import', 'module', 'default']) {
     if (key in value) {
       const resolved = runtimeExportTarget(value[key]);
       if (resolved) {
@@ -43,7 +43,7 @@ function existingRegularFile(root, candidate) {
     return null;
   }
   const stat = fs.lstatSync(full);
-  return stat.isFile() && !stat.isSymbolicLink() ? full : null;
+  return stat.isFile() && !stat.isSymbolicLink() ? full.replaceAll('\\', '/') : null;
 }
 
 function resolveCssSource(srcRoot, exportKey, distRelPath) {
@@ -51,7 +51,13 @@ function resolveCssSource(srcRoot, exportKey, distRelPath) {
   if (exportKey.startsWith('./')) {
     candidates.push(exportKey.slice(2));
   }
-  candidates.push(distRelPath, 'styles.css', 'style.css', 'index.css');
+  candidates.push(distRelPath);
+  if (
+    ['./styles.css', './style.css', './index.css'].includes(exportKey) ||
+    distRelPath === 'style.css'
+  ) {
+    candidates.push('styles.css', 'style.css', 'index.css');
+  }
   for (const candidate of candidates) {
     const found = existingRegularFile(srcRoot, candidate);
     if (found) {
@@ -63,8 +69,15 @@ function resolveCssSource(srcRoot, exportKey, distRelPath) {
 
 function resolveModuleSource(srcRoot, distRelPath) {
   const stem = distRelPath.replace(/\.(?:mjs|cjs|js)$/u, '');
-  for (const ext of ['.tsx', '.ts', '.mts', '.jsx', '.js', '.mjs']) {
+  const exts = ['.tsx', '.ts', '.mts', '.jsx', '.js', '.mjs'];
+  for (const ext of exts) {
     const found = existingRegularFile(srcRoot, `${stem}${ext}`);
+    if (found) {
+      return found;
+    }
+  }
+  for (const ext of exts) {
+    const found = existingRegularFile(srcRoot, `${stem}/index${ext}`);
     if (found) {
       return found;
     }

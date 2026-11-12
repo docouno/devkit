@@ -2626,6 +2626,73 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
     let after_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
     assert_eq!(after_pkg["dependencies"]["clsx"], "^2.1.0");
     devkit::native::assert_native_components(&target, &applied.state).unwrap();
+
+    // 4. Non-ERESOLVE failures (e.g. E401 auth failure or signal exit >= 128) abort at Stage 1 without escalating.
+    struct NonConflictResolver {
+        signal: bool,
+        calls: Cell<u8>,
+    }
+    impl LockResolver for NonConflictResolver {
+        fn regenerate(
+            &self,
+            _root: &Path,
+            _release: &AdmittedRelease,
+            _registry: Option<&str>,
+        ) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.signal {
+                Err(devkit::processes::failure(
+                    130,
+                    "interrupted by SIGINT during ERESOLVE check",
+                ))
+            } else {
+                bail!(
+                    "npm error code E401 Unable to authenticate, your authentication token seems to be invalid"
+                )
+            }
+        }
+    }
+    for signal in [false, true] {
+        let resolver = NonConflictResolver {
+            signal,
+            calls: Cell::new(0),
+        };
+        let err = devkit::project::sync_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                reconcile_lock: true,
+                ..Default::default()
+            },
+            &resolver,
+        );
+        // Drift must exist to invoke regenerate_reconciled: mutate lock version back to 2.1.0 first.
+        let _ = err;
+    }
+    let mut drifted_again: Value = read_json(&target.join("package-lock.json")).unwrap();
+    drifted_again["packages"]["node_modules/@docouno/env"]["version"] = json!("0.0.1");
+    write_json(&target.join("package-lock.json"), &drifted_again).unwrap();
+    for signal in [false, true] {
+        let resolver = NonConflictResolver {
+            signal,
+            calls: Cell::new(0),
+        };
+        let err = update_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                reconcile_lock: true,
+                ..Default::default()
+            },
+            &resolver,
+        )
+        .unwrap_err();
+        assert_eq!(
+            resolver.calls.get(),
+            1,
+            "non-conflict/signal error escalated past stage 1: {err:#}"
+        );
+    }
 }
 
 #[test]

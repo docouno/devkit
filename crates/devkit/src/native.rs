@@ -160,25 +160,7 @@ pub fn parse_npm_dependency_spec(spec: &str) -> Result<NpmDepSpec> {
     Ok(NpmDepSpec::RegistryRange(spec.to_owned()))
 }
 
-pub fn valid_registry_or_tarball_url(url: &str) -> bool {
-    if url.is_empty()
-        || url.len() > 2048
-        || url.chars().any(|c| c.is_whitespace() || c.is_control())
-        || url.contains(['?', '#', '\\'])
-    {
-        return false;
-    }
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        return false;
-    };
-    let (authority, _path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
-    };
+fn valid_registry_authority(authority: &str, scheme: &str) -> bool {
     if authority.is_empty() || authority.contains('@') {
         return false;
     }
@@ -187,13 +169,16 @@ pub fn valid_registry_or_tarball_url(url: &str) -> bool {
         let Some((ipv6, port_part)) = bracketed.split_once(']') else {
             return false;
         };
-        if ipv6.is_empty()
-            || !ipv6.bytes().all(|b| b.is_ascii_hexdigit() || b == b':')
-            || (!port_part.is_empty() && !port_part.strip_prefix(':').is_some_and(valid_port))
-        {
+        let Ok(parsed_ip) = ipv6.parse::<std::net::Ipv6Addr>() else {
+            return false;
+        };
+        if !port_part.is_empty() && !port_part.strip_prefix(':').is_some_and(valid_port) {
             return false;
         }
-        return scheme == "https" || ipv6 == "::1";
+        return scheme == "https" || parsed_ip.is_loopback();
+    }
+    if authority.contains(['[', ']']) {
+        return false;
     }
     let (host, port) = match authority.split_once(':') {
         Some((h, p)) => {
@@ -216,6 +201,28 @@ pub fn valid_registry_or_tarball_url(url: &str) -> bool {
         return false;
     }
     scheme == "https" || matches!(host, "127.0.0.1" | "localhost")
+}
+
+pub fn valid_registry_or_tarball_url(url: &str) -> bool {
+    if url.is_empty()
+        || url.len() > 2048
+        || url.chars().any(|c| c.is_whitespace() || c.is_control())
+        || url.contains(['?', '#', '\\'])
+    {
+        return false;
+    }
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return false;
+    };
+    let (authority, _path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    valid_registry_authority(authority, scheme)
 }
 
 pub fn valid_resolved_source(root: &Path, resolved: &str, is_link: bool) -> bool {
@@ -2184,29 +2191,7 @@ fn valid_nerf_dart_host_path(host_and_path: &str) -> bool {
         Some((a, p)) => (a, p),
         None => (host_and_path, ""),
     };
-    if authority.is_empty() {
-        return false;
-    }
-    if authority.starts_with('[') {
-        if !(authority == "[::1]" || authority.starts_with("[::1]:")) {
-            return false;
-        }
-        if let Some(port) = authority.strip_prefix("[::1]:")
-            && (port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
-        {
-            return false;
-        }
-    } else {
-        if authority.contains(['[', ']']) {
-            return false;
-        }
-        if let Some((host, port)) = authority.rsplit_once(':')
-            && (host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
-        {
-            return false;
-        }
-    }
-    !path_rest.split('/').any(|seg| seg == "..")
+    valid_registry_authority(authority, "https") && !path_rest.split('/').any(|seg| seg == "..")
 }
 
 fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {

@@ -179,6 +179,24 @@ pub fn applicable_migrations(
 
 /// Only native npm chooses dependency versions. The project core owns staging,
 /// field ownership, graph preservation and commit, never npm's resolver policy.
+fn is_reconcilable_lock_conflict(err: &anyhow::Error) -> bool {
+    if crate::processes::exit_code(err) >= 128 {
+        return false;
+    }
+    let detail = format!("{err:#}");
+    [
+        "ERESOLVE",
+        "ETARGET",
+        "EBADENGINE",
+        "EOVERRIDE",
+        "conflicting peer dependency",
+        "unable to resolve dependency tree",
+        "No matching version found",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+}
+
 pub trait LockResolver {
     fn regenerate(
         &self,
@@ -198,13 +216,17 @@ pub trait LockResolver {
         resolve_ca_cert_path()?;
         let lock_path = safe_path(root, "package-lock.json")?;
         let seeded_backup = fs::read(&lock_path)?;
-        if self.regenerate(root, release, registry).is_ok() {
-            return Ok(ReconcileStrategy::Seeded);
+        match self.regenerate(root, release, registry) {
+            Ok(()) => return Ok(ReconcileStrategy::Seeded),
+            Err(err) if !is_reconcilable_lock_conflict(&err) => return Err(err),
+            Err(_) => {}
         }
         write_atomic(&lock_path, &seeded_backup, 0o644)?;
         prune_dev_lock_packages(&lock_path)?;
-        if self.regenerate(root, release, registry).is_ok() {
-            return Ok(ReconcileStrategy::PruneDev);
+        match self.regenerate(root, release, registry) {
+            Ok(()) => return Ok(ReconcileStrategy::PruneDev),
+            Err(err) if !is_reconcilable_lock_conflict(&err) => return Err(err),
+            Err(_) => {}
         }
         remove_file(&lock_path)?;
         self.regenerate(root, release, registry)?;
@@ -320,7 +342,9 @@ impl LockResolver for DockerNpmResolver {
         let runner = ProcessRunner::new()?;
         let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
         owned.label = "org.docouno.devkit.operation".into();
-        runner.run_owned(&mut command, OutputMode::Stderr, &owned)?;
+        runner
+            .run_owned(&mut command, OutputMode::Capture(65_536), &owned)?
+            .success("npm lockfile resolution")?;
         Ok(())
     }
 }

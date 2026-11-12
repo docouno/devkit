@@ -33,16 +33,19 @@ function barePackageName(specifier) {
   return name;
 }
 
-function pairedRuntimePackage(pkgName) {
+function pairedRuntimePackages(pkgName) {
   if (!pkgName.startsWith('@types/')) {
-    return null;
+    return [];
   }
   const rest = pkgName.slice('@types/'.length);
+  if (!rest) {
+    return [];
+  }
   const sep = rest.indexOf('__');
   if (sep > 0) {
-    return `@${rest.slice(0, sep)}/${rest.slice(sep + 2)}`;
+    return [`@${rest.slice(0, sep)}/${rest.slice(sep + 2)}`, rest];
   }
-  return rest || null;
+  return [rest];
 }
 
 function isNonTestLibrarySource(componentRoot, file) {
@@ -285,10 +288,10 @@ export function workspaceImportErrors(context, file, text, compilerOptions) {
             continue;
           }
         } else if (context.isPublicLibrary) {
-          const paired = pairedRuntimePackage(barePkg);
+          const paired = pairedRuntimePackages(barePkg);
           const allowed =
             context.runtimeDependencies.has(barePkg) ||
-            (paired !== null && context.runtimeDependencies.has(paired));
+            paired.some((candidate) => context.runtimeDependencies.has(candidate));
           if (!allowed) {
             errors.push(
               `Library source file ${displayFile} imports types from "${barePkg}", which is not declared in dependencies, peerDependencies, or optionalDependencies of a public library.`,

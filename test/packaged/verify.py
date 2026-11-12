@@ -817,7 +817,7 @@ class Verification:
         require(tarball.is_file() and receipt_path.is_file(), "Missing packaged ts-library tarball or receipt")
         receipt = json.loads(receipt_path.read_text())
         require(receipt["name"] == "@corp/sdk" and receipt["version"] == "0.2.0"
-                and receipt["archive"] == "corp-sdk-0.2.0.tgz", f"Unexpected package receipt: {receipt}")
+                and receipt["filename"] == "corp-sdk-0.2.0.tgz", f"Unexpected package receipt: {receipt}")
         with tarfile.open(tarball) as tar:
             members = [entry.name for entry in tar.getmembers()]
             require(any(name.startswith("package/dist/") for name in members), "Library tarball lacks dist/")
@@ -865,7 +865,7 @@ class Verification:
         self.make(ds, "setup", label="design-system-setup-after-sync")
         self.make(ds, "package", label="design-system-ui-package")
         ui_receipt = json.loads((ds / "packages/ui/release/package-receipt.json").read_text())
-        ui_tarball = ds / "packages/ui/release" / ui_receipt["archive"]
+        ui_tarball = ds / "packages/ui/release" / ui_receipt["filename"]
         require(ui_tarball.is_file(), "Missing packaged react-ui archive")
         with tarfile.open(ui_tarball) as tar:
             ui_members = [entry.name for entry in tar.getmembers()]

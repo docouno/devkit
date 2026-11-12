@@ -352,7 +352,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         .contains(&command),
         "Unknown command: {command}"
     );
-    if command == "sync" {
+    if ["sync", "add-app", "add-package", "register"].contains(&command) {
         dispatch_accepted(command, &globals, runner)?;
     }
     crate::lifecycle_cli::run(command, &globals, runner)
@@ -388,7 +388,41 @@ fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader
     Ok(header)
 }
 
+fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let switches = ["--preview", "--reconcile-lock", "--no-app"];
+    let mut target = None;
+    let mut release_root = None;
+    let mut index = 0;
+    let mut positional = false;
+    while index < args.len() {
+        let arg = &args[index];
+        index += 1;
+        if !positional && arg == "--" {
+            positional = true;
+            continue;
+        }
+        if !positional && let Some(flag) = arg.to_str().filter(|s| s.starts_with('-')) {
+            if switches.contains(&flag) {
+                continue;
+            }
+            let Some(val) = args.get(index) else {
+                return Ok((target, release_root));
+            };
+            index += 1;
+            if flag == "--release-root" {
+                release_root = Some(PathBuf::from(val));
+            }
+            continue;
+        }
+        if target.is_none() {
+            target = Some(PathBuf::from(arg));
+        }
+    }
+    Ok((target, release_root))
+}
+
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
+    let is_lifecycle = ["sync", "add-app", "add-package", "register"].contains(&command_name);
     let (root, release_root) = if command_name == "sync" {
         let options = Options::parse(
             &globals.args[1..],
@@ -398,6 +432,17 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         )?;
         let release_root = options.path("--release-root");
         let root = project_root(&options.target.unwrap_or(std::env::current_dir()?))?;
+        (root, release_root)
+    } else if is_lifecycle {
+        let (target, release_root) = extract_lifecycle_target(&globals.args[1..])?;
+        let candidate = target.unwrap_or(std::env::current_dir()?);
+        if !candidate.exists() {
+            return Ok(());
+        }
+        let root = project_root(&candidate)?;
+        if !exists(&safe_path(&root, state::MANIFEST_PATH)?)? {
+            return Ok(());
+        }
         (root, release_root)
     } else {
         let before_separator = globals
@@ -424,6 +469,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     };
     let header = read_accepted_header(&root)?;
     if command_name == "describe" && cache::legacy(&header.version) {
+        return Ok(());
+    }
+    if ["add-app", "add-package", "register"].contains(&command_name)
+        && SemVer::parse(&header.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
+    {
         return Ok(());
     }
     if command_name == "sync" {
@@ -453,7 +503,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         "Accepted version differs from toolchain pins"
     );
     let Some(pin) = pins.engine else {
-        if ["describe", "sync"].contains(&command_name) {
+        if ["describe", "sync", "add-app", "add-package", "register"].contains(&command_name) {
             return Ok(());
         }
         anyhow::bail!("Missing accepted native engine pin");
@@ -470,7 +520,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     if command_name == "describe" && !exists(&cache.engine_path(&pin)?)? {
         return Ok(());
     }
-    if command_name == "sync" && !exists(&cache.engine_path(&pin)?)? {
+    if is_lifecycle && !exists(&cache.engine_path(&pin)?)? {
         cache.acquire(
             &header.version,
             Some(&header.release_identity),

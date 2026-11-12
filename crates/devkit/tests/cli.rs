@@ -431,4 +431,29 @@ fn update_and_sync_forward_dispatch_to_synthetic_99_0_0_release_with_unknown_pro
         String::from_utf8_lossy(&sync_out.stderr)
     );
     assert_eq!(decoded(&sync_out)["result"]["engine"], "99.0.0");
+
+    // 3. `devkit add-package` also forward-dispatches to the accepted 99.0.0 engine.
+    let add_out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "add-package",
+            proj.to_str().unwrap(),
+            "--name",
+            "extra",
+            "--template",
+            "future-wasm",
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "add-package stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_out.stdout),
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    assert_eq!(decoded(&add_out)["result"]["engine"], "99.0.0");
 }

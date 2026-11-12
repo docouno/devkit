@@ -1313,15 +1313,14 @@ for (const ro of ['package.json', 'dist/index.js', '../../node_modules/probe-ro'
 }
 const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 const slug = manifest.name.replace(/^@/, '').replace(/\//g, '-');
-const archive = `${slug}-${manifest.version}.tgz`;
-fs.writeFileSync(`release/${archive}`, 'TARBALL_FIXTURE\n');
+const filename = `${slug}-${manifest.version}.tgz`;
+fs.writeFileSync(`release/${filename}`, 'TARBALL_FIXTURE\n');
 fs.writeFileSync('release/package-receipt.json', JSON.stringify({
-  schemaVersion: 1,
   name: manifest.name,
   version: manifest.version,
-  archive
+  filename
 }, null, 2) + '\n');
-console.log('PACKED ' + archive);
+console.log('PACKED ' + filename);
 ''')
         accept_runtime(self.root, native=True, package_profiles={"packages/lib": "ts-library"})
 
@@ -1560,7 +1559,22 @@ if (priv.value !== 'from-private-gitlab-registry') {
             out = self.make(target, env=auth_env, timeout=240).stdout
             self.assertIn(f"GATE main {target}", out)
 
-        # 4. Verify secret_token is absent from ALL files under checkout (including package-lock.json, .npmrc, .devkit, node_modules).
+        # 4. Verify direct .devkit/runtime/devkit.sh exec CLI forwarding & component .npmrc rejection.
+        sh_exec = run("sh", str(self.root / ".devkit/runtime/devkit.sh"), "exec", "--component", "apps/main",
+                      "--", "node", "-e", "process.stdout.write('SH_EXEC_OK')", env=auth_env)
+        self.assertEqual(sh_exec.stdout, "SH_EXEC_OK")
+
+        comp_npmrc = self.root / "apps/main/.npmrc"
+        comp_npmrc.write_text("strict-ssl=false\n")
+        try:
+            bad_exec = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
+                           "--", "node", "-v", env=auth_env, check=False)
+            self.assertNotEqual(bad_exec.returncode, 0)
+            self.assertIn("Component .npmrc is unsupported", bad_exec.stderr)
+        finally:
+            comp_npmrc.unlink(missing_ok=True)
+
+        # 5. Verify secret_token is absent from ALL files under checkout (including package-lock.json, .npmrc, .devkit, node_modules).
         lock_text = (self.root / "package-lock.json").read_text()
         self.assertIn(f"{registry_url}@corp/token-lib/-/@corp/token-lib-1.0.0.tgz", lock_text)
         for file_path in self.root.rglob("*"):

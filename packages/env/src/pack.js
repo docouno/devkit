@@ -63,8 +63,11 @@ function isForbiddenPackedFile(relPath) {
 
 function declarationLeakErrors(relPath, content) {
   const issues = [];
-  if (/\/\/\/\s*<reference\s+types\s*=\s*["']vite\/client["']/iu.test(content)) {
-    issues.push(`Declaration file ${relPath} leaks a "vite/client" reference.`);
+  const ambientMatch = content.match(
+    /\/\/\/\s*<reference\s+types\s*=\s*["'](vite\/client|vitest(?:\/[^\s"']+)?|@testing-library\/[^\s"']+)["']/iu,
+  );
+  if (ambientMatch) {
+    issues.push(`Declaration file ${relPath} leaks a "${ambientMatch[1]}" reference.`);
   }
   if (/\/\/\/\s*<reference\s+path\s*=\s*["'][^"']*(?:^|\/)\.\.\/(?:\.\.\/)*src\//iu.test(content)) {
     issues.push(`Declaration file ${relPath} leaks a relative ../src/ reference.`);
@@ -338,19 +341,24 @@ export async function packComponent(componentDir, options = {}) {
 
     const finalTarballPath = path.join(releaseDir, verification.receipt.filename);
     const tmpTarball = path.join(releaseDir, `.tmp-${crypto.randomUUID()}.tgz`);
-    fs.copyFileSync(verification.tarballPath, tmpTarball);
-    fs.renameSync(tmpTarball, finalTarballPath);
-
-    for (const existing of fs.readdirSync(releaseDir)) {
-      if (existing.endsWith('.tgz') && existing !== verification.receipt.filename) {
-        fs.rmSync(path.join(releaseDir, existing), { force: true });
-      }
-    }
-
     const receiptPath = path.join(releaseDir, 'package-receipt.json');
     const tmpReceipt = path.join(releaseDir, `.tmp-${crypto.randomUUID()}.json`);
-    fs.writeFileSync(tmpReceipt, `${JSON.stringify(verification.receipt, null, 2)}\n`, 'utf8');
-    fs.renameSync(tmpReceipt, receiptPath);
+    try {
+      fs.copyFileSync(verification.tarballPath, tmpTarball);
+      fs.renameSync(tmpTarball, finalTarballPath);
+
+      for (const existing of fs.readdirSync(releaseDir)) {
+        if (existing.endsWith('.tgz') && existing !== verification.receipt.filename) {
+          fs.rmSync(path.join(releaseDir, existing), { force: true });
+        }
+      }
+
+      fs.writeFileSync(tmpReceipt, `${JSON.stringify(verification.receipt, null, 2)}\n`, 'utf8');
+      fs.renameSync(tmpReceipt, receiptPath);
+    } finally {
+      fs.rmSync(tmpTarball, { force: true });
+      fs.rmSync(tmpReceipt, { force: true });
+    }
 
     return {
       tarballPath: finalTarballPath,

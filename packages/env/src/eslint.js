@@ -123,7 +123,7 @@ function config(input, mode) {
   } else if (mode === 'react-library') {
     definitions.push({
       name: 'devkit/react-library',
-      files: ['src/**/*.{ts,tsx,js,jsx}', '**/*.{tsx,jsx}'],
+      files: ['src/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}', '**/*.{tsx,jsx}'],
       plugins: { 'react-hooks': reactHooks },
       rules: {
         ...reactHooks.configs.flat.recommended.rules,

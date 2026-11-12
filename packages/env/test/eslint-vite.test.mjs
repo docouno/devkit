@@ -119,12 +119,19 @@ test('devkitWorkspaceSource activates only in serve mode and maps workspace dist
             types: './dist/index.d.mts',
             default: './dist/index.mjs',
           },
+          './icons': {
+            types: './dist/icons.d.mts',
+            default: './dist/icons.mjs',
+          },
           './styles.css': './dist/style.css',
+          './tokens.css': './dist/tokens/base.css',
           './package.json': './package.json',
         },
       }),
     );
+    await fs.mkdir(path.join(uiRoot, 'src/icons'), { recursive: true });
     await fs.writeFile(path.join(uiRoot, 'src/index.tsx'), 'export const Button = () => null;\n');
+    await fs.writeFile(path.join(uiRoot, 'src/icons/index.ts'), 'export const Icon = "ok";\n');
     await fs.writeFile(path.join(uiRoot, 'src/styles.css'), '.btn { color: red; }\n');
 
     const plugin = devkitWorkspaceSource(appRoot);
@@ -145,11 +152,20 @@ test('devkitWorkspaceSource activates only in serve mode and maps workspace dist
     assert(patch.server.fs.allow.includes(temp));
     assert(patch.server.fs.allow.includes(path.join(uiRoot, 'src')));
 
-    assert.equal(plugin.resolveId('@demo/package-ui'), path.join(uiRoot, 'src/index.tsx'));
+    const normalize = (p) => p.replaceAll('\\', '/');
+    assert.equal(
+      plugin.resolveId('@demo/package-ui'),
+      normalize(path.join(uiRoot, 'src/index.tsx')),
+    );
+    assert.equal(
+      plugin.resolveId('@demo/package-ui/icons'),
+      normalize(path.join(uiRoot, 'src/icons/index.ts')),
+    );
     assert.equal(
       plugin.resolveId('@demo/package-ui/styles.css?inline'),
-      `${path.join(uiRoot, 'src/styles.css')}?inline`,
+      `${normalize(path.join(uiRoot, 'src/styles.css'))}?inline`,
     );
+    assert.equal(plugin.resolveId('@demo/package-ui/tokens.css'), null);
     assert.equal(plugin.resolveId('@demo/package-ui/package.json'), null);
   } finally {
     await fs.rm(temp, { recursive: true, force: true });

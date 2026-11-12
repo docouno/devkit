@@ -63,7 +63,7 @@ make setup
 
 ### Publishable npm libraries (`ts-library`, `react-ui`)
 
-1. Edit `packages/<slug>/package.json`: set the final `name`, `"private": false`, `exports` (`types` before `import`), `files` (`["dist"]`), and optional `publishConfig`.
+1. Edit `packages/<slug>/package.json`: set the final `name`, `"private": false`, `exports` (`types` before `import` or `default`), `files` (`["dist"]`), and optional `publishConfig`.
 2. Run `devkit sync` to synchronize projections and `package-lock.json`.
 3. Bump versions through the pinned Node container:
    ```sh

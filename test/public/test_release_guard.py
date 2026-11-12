@@ -149,5 +149,40 @@ class EventSourceGuard(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+REQUIRED_DOCS = (
+    "README.md",
+    "CHANGELOG.md",
+    "runtime/GUIDE.md",
+    "packages/env/README.md",
+    "docs/architecture.md",
+    "docs/workflows.md",
+    "docs/publishing.md",
+    "docs/ci.md",
+    "docs/upgrades.md",
+    "docs/migrations/index.json",
+    "docs/migrations/0.4.0.md",
+)
+
+
+class DocumentationGuard(unittest.TestCase):
+    def test_required_standalone_docs_exist_and_relative_links_resolve(self):
+        for rel in REQUIRED_DOCS:
+            self.assertTrue((REPO / rel).is_file(), f"Missing required documentation file: {rel}")
+
+        link_re = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+        for md in [REPO / "README.md", REPO / "runtime/GUIDE.md", REPO / "packages/env/README.md", *sorted((REPO / "docs").rglob("*.md"))]:
+            # Strip fenced code blocks before scanning Markdown links.
+            stripped = re.sub(r"(?ms)^```.*?^```", "", md.read_text())
+            for raw_target in link_re.findall(stripped):
+                target = raw_target.strip()
+                if not target or target.startswith(("#", "http://", "https://", "mailto:")):
+                    continue
+                rel_path = target.split("#", 1)[0]
+                if not rel_path:
+                    continue
+                resolved = (md.parent / rel_path).resolve()
+                self.assertTrue(resolved.exists(), f"Broken relative link {raw_target!r} in {md.relative_to(REPO)}")
+
+
 if __name__ == "__main__":
     unittest.main()

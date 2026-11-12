@@ -1,6 +1,6 @@
 # @docouno/env
 
-ESM configurations, source checks and test reporters for Devkit's TypeScript applications. The component runs its installed TypeScript, ESLint, Prettier and test binaries directly. A Devkit release pins compatible versions in native lockfiles.
+ESM configurations, source/boundary checks, Vite workspace HMR, library tarball verification, and test reporters for Devkit's TypeScript applications and libraries. Each component runs its installed TypeScript, ESLint, Prettier, bundler, and test binaries directly; a Devkit release pins compatible versions in native lockfiles.
 
 ## Configuration
 
@@ -12,7 +12,14 @@ import { nodeConfig } from '@docouno/env/eslint';
 export default nodeConfig(import.meta.dirname);
 ```
 
-Use `browserConfig` for React/browser code or `desktopConfig` for Electron. Each factory takes the absolute component root and enables typed linting. Desktop configurations separate main/preload from renderer code and check renderer imports against the native boundary. Inline ESLint disable directives are rejected; exceptions belong in visible configuration.
+Available ESLint factories:
+
+- `nodeConfig` — Node.js services and pure TypeScript libraries (`ts-library`).
+- `browserConfig` — React/browser applications (`react-web`, `react-client`).
+- `reactLibraryConfig` — React UI libraries and design systems (`react-ui`), enabling `react-hooks` without restricting modules to single-component Fast Refresh exports.
+- `desktopConfig` — Electron applications (`electron-react`), separating main/preload from renderer code and enforcing the native boundary.
+
+Inline ESLint disable directives are rejected; exceptions belong in visible configuration.
 
 Extend the appropriate compiler baseline in `tsconfig.json`:
 
@@ -23,7 +30,12 @@ Extend the appropriate compiler baseline in `tsconfig.json`:
 }
 ```
 
-Use `@docouno/env/tsconfig/browser.json` for browser code. The component supplies its source/output paths and runtime-specific types.
+Available TypeScript baselines:
+
+- `@docouno/env/tsconfig/node.json` — Node.js services.
+- `@docouno/env/tsconfig/browser.json` — React/browser applications.
+- `@docouno/env/tsconfig/library.json` — publishable ESM TypeScript libraries (`isolatedDeclarations`, bundler module resolution, empty ambient `types` so `.d.ts` output never leaks build-tool globals).
+- `@docouno/env/tsconfig/react-library.json` — publishable React UI libraries (`react-jsx`, DOM libs, `isolatedDeclarations`).
 
 Create `prettier.config.mjs`:
 
@@ -31,11 +43,32 @@ Create `prettier.config.mjs`:
 export { default } from '@docouno/env/prettier';
 ```
 
-## Source verification
+## Workspace Source HMR (`@docouno/env/vite`)
 
-Run the installed `devkit-verify` from the component, or use `devkit-verify --root PATH`. `--json` returns a structured result. Configuration or coverage failures return nonzero.
+In `react-web` and `electron-react` applications, `devkitWorkspaceSource()` resolves internal `packages/*` TypeScript, TSX, and CSS entrypoints directly from `src/` during `vite serve` (`make dev`), while leaving `vite build` (`make build`) and Vitest (`make test`) pointed at compiled `dist/` outputs:
 
-The defaults can be declared explicitly in `package.json`:
+```js
+import { devkitWorkspaceSource } from '@docouno/env/vite';
+import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [devkitWorkspaceSource(), react()],
+});
+```
+
+## Source and Package Verification
+
+Run the installed `devkit-verify` from the component, or pass `--root PATH`. `--json` returns a structured result, and `--pack` additionally validates the built npm tarball in a temporary staging directory (safe on read-only `/workspace` mounts during `make build`):
+
+```sh
+devkit-verify
+devkit-verify --pack
+```
+
+For `"private": false` libraries, `devkit-pack` (invoked by `make package`) stages `npm pack --ignore-scripts`, checks public `exports`, blocks leaked `src/`/test/config files and test ambient `/// <reference types="..." />` directives, runs `publint` (`strict: true`) and `@arethetypeswrong/core` (`node16-esm` and `bundler`), and atomically writes `<name>-<version>.tgz` and `package-receipt.json` into `release/`. Programmatic helpers (`verifyPackableComponent`, `packComponent`) are exported from `@docouno/env/pack`.
+
+Source defaults can be customized in `package.json`:
 
 ```json
 {
@@ -50,13 +83,9 @@ The defaults can be declared explicitly in `package.json`:
 }
 ```
 
-Declared source requires strict compiler and lint coverage. TypeScript additionally requires typed linting; JavaScript requires `checkJs`. Ignored or empty source roots, `noCheck`, `ts-nocheck`, source symlinks and unsupported configuration are errors. For multiple compiler projects, list the leaf configurations.
+Declared source requires strict compiler and lint coverage. Cross-app imports, library-to-app imports, private library paths, and runtime imports from `devDependencies` inside `packages/*/src` fail verification (and public `"private": false` libraries also forbid exported type-only imports from undeclared `devDependencies`).
 
-In Devkit projects, verification also checks native dependency declarations and shared packages' public exports using TypeScript resolution. Cross-app imports, library-to-app imports and private library paths fail. Computed runtime module paths remain outside static import checking.
-
-Verification checks compiler and lint coverage. Generated scripts also run the compiler, ESLint and Prettier.
-
-## Test reporters
+## Test Reporters
 
 For Node's test runner:
 
@@ -78,7 +107,7 @@ export default defineConfig({
 });
 ```
 
-Both profiles require a runnable registered test case. Empty, skipped-only and TODO-only suites fail; ordinary test failures retain native diagnostics. The Node profile uses `node:test` registrations. Vitest is an optional peer, required only by the Vitest reporter.
+Both profiles require at least one runnable registered test case; empty, skipped-only, and TODO-only suites fail.
 
 ## License
 
