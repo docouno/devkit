@@ -822,6 +822,43 @@ fn node_argv(ctx: &PreparedContext<'_>, argv: Vec<OsString>) -> Vec<OsString> {
     ]
     .concat()
 }
+fn npmrc_ignores_scripts(root: &Path) -> Result<bool> {
+    let path = input_path(root, ".npmrc")?;
+    if !exists(&path)? {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(text.lines().any(|raw| {
+        let line = raw.trim();
+        !line.is_empty()
+            && !line.starts_with(['#', ';'])
+            && line
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim() == "ignore-scripts" && v.trim() == "true")
+    }))
+}
+
+fn manifest_install_hooks(root: &Path, manifest_rel: &str) -> Result<Vec<&'static str>> {
+    let path = input_path(root, manifest_rel)?;
+    if !exists(&path)? {
+        return Ok(Vec::new());
+    }
+    let pkg: Value = read_json(&path)?;
+    let mut hooks = Vec::new();
+    if let Some(scripts) = pkg.get("scripts").and_then(Value::as_object) {
+        for hook in ["preinstall", "install", "postinstall", "prepare"] {
+            if scripts
+                .get(hook)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                hooks.push(hook);
+            }
+        }
+    }
+    Ok(hooks)
+}
+
 fn component_is_public_library(root: &Path, path: &str, c: &ComponentState) -> Result<bool> {
     if matches!(
         c.tooling_profile,
@@ -989,6 +1026,39 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             access: TaskAccess::Finite,
             inputs: Some(&full.native.inputs),
         })?;
+        if !npmrc_ignores_scripts(&ctx.admission.root)? {
+            for (path, c) in &full.state.components {
+                if c.toolchain != Toolchain::Node {
+                    continue;
+                }
+                for hook in
+                    manifest_install_hooks(&ctx.admission.root, &format!("{path}/package.json"))?
+                {
+                    ctx.task(ContainerTask {
+                        component: Some(path),
+                        profile: c.tooling_profile,
+                        image: &ctx.admission.pins.node_image,
+                        argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                        network: "none",
+                        forward_npm_secrets: false,
+                        access: TaskAccess::Finite,
+                        inputs: Some(&full.native.inputs),
+                    })?;
+                }
+            }
+            for hook in manifest_install_hooks(&ctx.admission.root, "package.json")? {
+                ctx.task(ContainerTask {
+                    component: None,
+                    profile: ToolingProfile::Node,
+                    image: &ctx.admission.pins.node_image,
+                    argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                    network: "none",
+                    forward_npm_secrets: false,
+                    access: TaskAccess::Finite,
+                    inputs: Some(&full.native.inputs),
+                })?;
+            }
+        }
         for (path, c) in &full.state.components {
             if c.tooling_profile == ToolingProfile::Electron {
                 ctx.task(ContainerTask {

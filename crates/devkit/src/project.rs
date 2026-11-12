@@ -342,9 +342,27 @@ impl LockResolver for DockerNpmResolver {
         let runner = ProcessRunner::new()?;
         let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
         owned.label = "org.docouno.devkit.operation".into();
-        runner
-            .run_owned(&mut command, OutputMode::Capture(65_536), &owned)?
-            .success("npm lockfile resolution")?;
+        let output =
+            runner.run_owned(&mut command, OutputMode::Capture(16 * 1024 * 1024), &owned)?;
+        if output.code != 0 {
+            let mut combined = output.stderr;
+            combined.extend_from_slice(&output.stdout);
+            let excerpt = if combined.len() <= 16_384 {
+                String::from_utf8_lossy(&combined).into_owned()
+            } else {
+                let head = String::from_utf8_lossy(&combined[..8_192]);
+                let tail = String::from_utf8_lossy(&combined[combined.len() - 8_192..]);
+                format!("{head}\n...[truncated]...\n{tail}")
+            };
+            return Err(crate::processes::failure(
+                output.code,
+                format!(
+                    "npm lockfile resolution failed (exit {}): {}",
+                    output.code,
+                    excerpt.trim()
+                ),
+            ));
+        }
         Ok(())
     }
 }

@@ -16,6 +16,7 @@
 ### Changed
 
 - Accelerate Rust `make check` by compiling workspace targets once (`cargo clippy --all-targets` + `cargo test -- --list`) without executing runtime tests twice, scale `CARGO_BUILD_JOBS` from cgroup v2 CPU quotas, and switch `docker compose up` from `--pull never` to `--pull missing` so backing services pull missing images on demand without re-pulling cached images.
+- Harden `make setup` supply-chain isolation by running `npm ci --ignore-scripts` during networked package extraction and executing any declared workspace component install hooks (`preinstall`, `install`, `postinstall`, `prepare`) in a subsequent `--network none` step without registry credentials.
 - Adopt file-glob ESLint and Prettier scripts and single-pass `check` scripts across Node and React templates.
 - Generate GitHub release descriptions from the matching version entry in this changelog while keeping build contracts and verification receipts in a collapsed section.
 

@@ -1570,7 +1570,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
             bad_exec = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
                            "--", "node", "-v", env=auth_env, check=False)
             self.assertNotEqual(bad_exec.returncode, 0)
-            self.assertIn("Component .npmrc is unsupported", bad_exec.stderr)
+            self.assertIn("workspace context: apps/main/.npmrc", bad_exec.stderr)
         finally:
             comp_npmrc.unlink(missing_ok=True)
 

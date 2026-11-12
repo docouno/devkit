@@ -63,7 +63,7 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 
 ## Forward-Dispatch Across Releases
 
-- Daily commands (`devkit exec`, `devkit task`, `devkit describe`, `devkit sync`) automatically dispatch to the project's accepted cached engine so projects pinned to newer or older releases behave consistently regardless of which `devkit` binary is on `PATH`.
+- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit describe`, `devkit sync`, and forward-version `add-app`, `add-package`, `register`) automatically dispatch to the project's accepted cached engine so projects pinned to newer or older releases behave consistently regardless of which `devkit` binary is on `PATH`.
 - `devkit update --to <version>` resolves and verifies the target release first; when `<version>` is newer than the currently running `devkit` binary, it delegates execution of the update to the verified `<version>` engine automatically.
 
 ## Recovering Interrupted Updates (`devkit recover`)

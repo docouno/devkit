@@ -389,7 +389,7 @@ fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader
 }
 
 fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-    let switches = ["--preview", "--reconcile-lock", "--no-app"];
+    let switches = ["--preview", "--reconcile-lock"];
     let mut target = None;
     let mut release_root = None;
     let mut index = 0;

@@ -23,13 +23,13 @@ npx @docouno/devkit@0.4.0 init my-suite --preset fullstack-desktop
 Create a package-only repository without scaffolding a dummy runnable application:
 
 ```sh
-npx @docouno/devkit@0.4.0 init acme-sdk --no-app --package sdk=ts-library
+npx @docouno/devkit@0.4.0 init acme-sdk --package sdk=ts-library
 ```
 
 Create a React component library repository:
 
 ```sh
-npx @docouno/devkit@0.4.0 init acme-ui --no-app --package ui=react-ui
+npx @docouno/devkit@0.4.0 init acme-ui --package ui=react-ui
 ```
 
 ### Design System with Interactive Playground

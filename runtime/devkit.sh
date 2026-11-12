@@ -29,6 +29,7 @@ valid_engine() {
   [ "${observed%% *}" = "$expected" ]
 }
 exec_prepare=0
+exec_has_root=0
 if [ "$command" = exec ]; then
   if [ "$#" -eq 1 ] && [ "${DEVKIT_EXEC_PREPARE:-0}" = 1 ]; then
     exec_prepare=1
@@ -36,6 +37,7 @@ if [ "$command" = exec ]; then
     for arg in "$@"; do
       [ "$arg" != -- ] || break
       [ "$arg" != --prepare ] || exec_prepare=1
+      [ "$arg" != --root ] || exec_has_root=1
     done
   fi
 fi
@@ -89,6 +91,9 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 if [ "$command" = exec ]; then
   if [ "$#" -gt 1 ]; then
     shift
+    if [ "$exec_has_root" = 1 ]; then
+      exec "$engine" exec "$@"
+    fi
     exec "$engine" exec --root "$root" "$@"
   fi
   for flag in "${DEVKIT_EXEC_WRITE:-0}" "${DEVKIT_EXEC_PREPARE:-0}"; do
