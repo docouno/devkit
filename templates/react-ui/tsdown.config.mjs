@@ -1,4 +1,3 @@
-import css from '@tsdown/css';
 import { defineConfig } from 'tsdown';
 
 export default defineConfig({
@@ -6,7 +5,10 @@ export default defineConfig({
   format: ['esm'],
   dts: { isolatedDeclarations: true },
   clean: true,
-  plugins: [css()],
+  css: {
+    splitting: false,
+    fileName: 'style.css',
+  },
   deps: {
     neverBundle: [/^[^./]/],
   },
