@@ -246,17 +246,17 @@ pub fn assert_projections(
 ) -> Result<()> {
     ensure!(
         fs::read(safe_path(root, ".devkit/project.mk")?)? == render_project_make(state).as_bytes(),
-        "Component Make registration projection is stale; run the accepted devkit update"
+        "Component Make registration projection is stale; run devkit sync"
     );
     let apps: Value = read_json(&safe_path(root, ".devkit/compose.apps.yaml")?)?;
     ensure!(
         apps == render_app_compose_value(state)?,
-        "Development integration projection is stale; run the accepted devkit update"
+        "Development integration projection is stale; run devkit sync"
     );
     let workspace: Value = read_json(&safe_path(root, ".devkit/compose.workspace.json")?)?;
     ensure!(
         workspace == render_workspace_compose_value(state, inputs)?,
-        "Workspace mount projection is stale; run the accepted devkit update"
+        "Workspace mount projection is stale; run devkit sync"
     );
     Ok(())
 }

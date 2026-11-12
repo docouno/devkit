@@ -45,10 +45,29 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--to",
             "--release-root",
         ],
-        "add-app" => &["--name", "--template", "--use", "--release-root"],
-        "add-package" => &["--name", "--template", "--release-root"],
-        "register" => &["--app", "--package", "--profile", "--release-root"],
-        "update" => &["--to", "--preview", "--package-source", "--release-root"],
+        "add-app" => &[
+            "--name",
+            "--template",
+            "--use",
+            "--reconcile-lock",
+            "--release-root",
+        ],
+        "add-package" => &["--name", "--template", "--reconcile-lock", "--release-root"],
+        "register" => &[
+            "--app",
+            "--package",
+            "--profile",
+            "--reconcile-lock",
+            "--release-root",
+        ],
+        "sync" => &["--preview", "--reconcile-lock", "--release-root"],
+        "update" => &[
+            "--to",
+            "--preview",
+            "--reconcile-lock",
+            "--package-source",
+            "--release-root",
+        ],
         "recover" => &[],
         _ => unreachable!(),
     };
@@ -56,7 +75,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         args,
         allowed,
         if command == "init" { &["--app"] } else { &[] },
-        &["--preview"],
+        &["--preview", "--reconcile-lock"],
     )?;
     let missing = match command {
         "init" => {
@@ -70,7 +89,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             !(options.flag("--app") || options.flag("--package")) || !options.flag("--profile")
         }
         "update" => !options.flag("--to"),
-        "recover" => false,
+        "sync" | "recover" => false,
         _ => unreachable!(),
     };
     if missing {
@@ -191,10 +210,12 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         package_mode: mode,
         compose_inventory: inventory.as_ref(),
         preview: options.flag("--preview"),
+        reconcile_lock: options.flag("--reconcile-lock"),
         hooks: Some(&cancellation),
         ..Default::default()
     };
     let outcome = match command {
+        "sync" => project::sync_project(&release.root, &root, &update, &DockerNpmResolver)?,
         "update" => project::update_project(&release.root, &root, &update, &DockerNpmResolver)?,
         "register" => {
             ensure!(
@@ -250,22 +271,50 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         _ => unreachable!(),
     };
     runner.check_cancelled()?;
-    if options.flag("--preview") && !globals.json {
-        for file in &outcome.files {
+    if !globals.json {
+        if options.flag("--preview") {
+            for file in &outcome.files {
+                println!(
+                    "{} {}",
+                    if file.before.is_none() {
+                        "A"
+                    } else if file.after.is_none() {
+                        "D"
+                    } else {
+                        "M"
+                    },
+                    file.path
+                );
+            }
+        }
+        if let Some(rec) = &outcome.lock_reconciliation {
             println!(
-                "{} {}",
-                if file.before.is_none() {
-                    "A"
-                } else if file.after.is_none() {
-                    "D"
-                } else {
-                    "M"
-                },
-                file.path
+                "Lock reconciliation ({}): {} changed, {} added, {} removed",
+                rec.strategy.as_str(),
+                rec.changed_packages.len(),
+                rec.added_count,
+                rec.removed_count
             );
+            for item in rec.changed_packages.iter().take(10) {
+                println!(
+                    "  {}: {} -> {}",
+                    item.name, item.before_version, item.after_version
+                );
+            }
         }
     }
-    let message = if !outcome.applied && !outcome.no_op {
+    let message = if command == "sync" {
+        if !outcome.applied && !outcome.no_op {
+            format!(
+                "Preview for devkit sync: {} changed files. No changes applied.",
+                outcome.files.len()
+            )
+        } else if outcome.no_op {
+            "Project projections and native lock are already synchronized; no changes.".to_owned()
+        } else {
+            "Synchronized project projections and native lock. Review git diff, then run make setup.".to_owned()
+        }
+    } else if !outcome.applied && !outcome.no_op {
         format!(
             "Preview for Devkit {}: {} changed files. No update applied.",
             outcome.state.version,
@@ -282,7 +331,19 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             outcome.state.version
         )
     };
-    globals.emit(command, json!({"root":root,"version":outcome.state.version,"releaseIdentity":outcome.state.release_identity,"generation":outcome.state.generation,"applied":outcome.applied,"noOp":outcome.no_op,"files":outcome.files}), &message);
+    let mut payload = json!({
+        "root": root,
+        "version": outcome.state.version,
+        "releaseIdentity": outcome.state.release_identity,
+        "generation": outcome.state.generation,
+        "applied": outcome.applied,
+        "noOp": outcome.no_op,
+        "files": outcome.files,
+    });
+    if let Some(rec) = &outcome.lock_reconciliation {
+        payload["lockReconciliation"] = serde_json::to_value(rec)?;
+    }
+    globals.emit(command, payload, &message);
     Ok(())
 }
 

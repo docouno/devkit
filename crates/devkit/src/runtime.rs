@@ -3,7 +3,7 @@ use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
 use anyhow::{Context, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -672,6 +672,27 @@ impl<'a> PreparedContext<'a> {
                 component.unwrap_or(".")
             ),
         ]);
+        if profile != ToolingProfile::Rust {
+            let npmrc_policy = crate::native::parse_manifest_npmrc_policy(root)?;
+            if network != "none" {
+                crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
+                for var in &npmrc_policy.required_env_vars {
+                    c.args(["--env", var]);
+                }
+                if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
+                    c.args([
+                        "--mount",
+                        &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
+                        "--env",
+                        "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                    ]);
+                }
+            } else {
+                for var in &npmrc_policy.required_env_vars {
+                    c.args(["--env", &format!("{var}=devkit-offline-unused")]);
+                }
+            }
+        }
         if component.is_some_and(|p| {
             self.admission.state.components[p]
                 .development
@@ -1247,7 +1268,55 @@ fn run_development(
             .map(move |o| format!("{p}/{o}"))
     }))?;
     ctx.dirs([".devkit/cache/cargo".into()])?;
+    let npm_env_overlay_path =
+        safe_path(&ctx.admission.root, ".devkit/state/compose.npm-env.json")?;
+    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(&ctx.admission.root)?;
+    let mut attach_npm_env_overlay = false;
+    if !npmrc_policy.required_env_vars.is_empty() {
+        let mut services_map = serde_json::Map::new();
+        for (path, c) in &full.state.components {
+            if c.role != Role::App || c.toolchain != Toolchain::Node {
+                continue;
+            }
+            let svc_name = service_name(path, c);
+            let existing_env = model
+                .get("services")
+                .and_then(|s| s.get(svc_name))
+                .and_then(|svc| svc.get("environment"));
+            let mut env_map = serde_json::Map::new();
+            for var in &npmrc_policy.required_env_vars {
+                let already_defined = match existing_env {
+                    Some(Value::Object(map)) => map.contains_key(var),
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|entry| entry == var || entry.starts_with(&format!("{var}="))),
+                    _ => false,
+                };
+                if !already_defined {
+                    env_map.insert(var.clone(), json!("devkit-offline-unused"));
+                }
+            }
+            if !env_map.is_empty() {
+                services_map.insert(svc_name.to_owned(), json!({ "environment": env_map }));
+            }
+        }
+        if !services_map.is_empty() {
+            write_atomic(
+                &npm_env_overlay_path,
+                &json_bytes(&json!({ "services": services_map }))?,
+                0o644,
+            )?;
+            attach_npm_env_overlay = true;
+        }
+    }
+    if !attach_npm_env_overlay && identity(&npm_env_overlay_path)?.is_some() {
+        remove_file(&npm_env_overlay_path)?;
+    }
     let mut command = ctx.compose()?;
+    if attach_npm_env_overlay {
+        command.arg("--file").arg(&npm_env_overlay_path);
+    }
     for f in &overlays {
         command.arg("--file").arg(f.path());
     }

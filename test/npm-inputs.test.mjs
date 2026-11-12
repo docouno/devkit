@@ -315,6 +315,105 @@ test('normalization removes only exact fixture origin and preserves every extern
   assert.throws(() => canonicalizeLock(next, registry), /identity conflict/);
 });
 
+test('npm: alias dependencies hydrate, preserve target name, and reject spoofed or nested specs', async () => {
+  const manifest = {
+    name: 'app',
+    version: '1.0.0',
+    devDependencies: { '@docouno/env': '0.2.1' },
+    dependencies: {
+      'string-width-cjs': 'npm:string-width@^4.2.0',
+      'scoped-alias': 'npm:@acme/core@^1.0.0',
+    },
+  };
+  const input = {
+    lockfileVersion: 3,
+    packages: {
+      '': {
+        dependencies: manifest.dependencies,
+        devDependencies: manifest.devDependencies,
+      },
+      'node_modules/@docouno/env': identity('@docouno/env', '0.2.1'),
+      'node_modules/string-width-cjs': {
+        name: 'string-width',
+        version: '4.2.3',
+      },
+      'node_modules/scoped-alias': {
+        name: '@acme/core',
+        version: '1.0.2',
+      },
+    },
+  };
+  const hydrated = await hydrateLockIdentities(input, async (name, version) => ({
+    tarball: registryUrl(name, version),
+    integrity,
+  }));
+  assert.equal(hydrated.packages['node_modules/string-width-cjs'].name, 'string-width');
+  assert.equal(
+    hydrated.packages['node_modules/string-width-cjs'].resolved,
+    registryUrl('string-width', '4.2.3'),
+  );
+  assert.equal(hydrated.packages['node_modules/scoped-alias'].name, '@acme/core');
+  assert.equal(
+    hydrated.packages['node_modules/scoped-alias'].resolved,
+    registryUrl('@acme/core', '1.0.2'),
+  );
+  assertCanonicalLock(hydrated);
+  const prepared = prepareTemplate(manifest, hydrated, '0.2.1', '0.3.0');
+  assert.equal(prepared.lock.packages['node_modules/string-width-cjs'].name, 'string-width');
+
+  const withEnv = structuredClone(hydrated);
+  withEnv.packages[''].devDependencies = { '@docouno/env': '0.3.0' };
+  withEnv.packages['node_modules/@docouno/env'] = identity('@docouno/env', '0.3.0');
+  assertSelectedIdentities(hydrated, withEnv, '0.3.0', integrity);
+  const renamedAlias = structuredClone(withEnv);
+  renamedAlias.packages['node_modules/string-width-cjs'].name = 'evil-pkg';
+  assert.throws(
+    () => assertSelectedIdentities(hydrated, renamedAlias, '0.3.0', integrity),
+    /selected external/,
+  );
+
+  const spoofedTarget = structuredClone(input);
+  spoofedTarget.packages['node_modules/string-width-cjs'].name = 'evil-pkg';
+  await assert.rejects(
+    hydrateLockIdentities(spoofedTarget, async (name, version) => ({
+      tarball: registryUrl(name, version),
+      integrity,
+    })),
+    /Unsupported canonical registry identity/,
+  );
+
+  const spoofedNonAlias = structuredClone(input);
+  spoofedNonAlias.packages['node_modules/chalk'] = { name: 'evil-pkg', version: '5.3.0' };
+  await assert.rejects(
+    hydrateLockIdentities(spoofedNonAlias, async (name, version) => ({
+      tarball: registryUrl(name, version),
+      integrity,
+    })),
+    /Unsupported canonical registry identity/,
+  );
+
+  for (const badSpec of [
+    'npm:',
+    'npm:a@npm:b@1.0.0',
+    'npm:file:../x',
+    'npm:pkg@file:../x',
+    'npm:pkg@https://example.com/pkg.tgz',
+    'npm:pkg@workspace:*',
+    'npm:pkg@',
+  ]) {
+    assert.throws(
+      () =>
+        prepareTemplate(
+          { ...manifest, dependencies: { bad: badSpec } },
+          hydrated,
+          '0.2.1',
+          '0.3.0',
+        ),
+      /alias|Source\/local/,
+    );
+  }
+});
+
 test('npm environment strips inherited npm and Node injection and isolates both configs', (t) => {
   const directory = temporary(t);
   const env = npmEnvironment(directory, undefined, {

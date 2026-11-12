@@ -2309,3 +2309,282 @@ fn author_port_mixed_alias_keeps_api_web_wiring_and_edited_web_source_on_update(
     );
     devkit::native::assert_native_components(&target, &state).unwrap();
 }
+
+#[test]
+fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_and_recovers() {
+    struct FailAfterFirstWrite;
+    impl MutationHooks for FailAfterFirstWrite {
+        fn after_write(&self, count: usize, _path: &str) -> Result<()> {
+            if count == 1 {
+                bail!("injected sync write interruption")
+            }
+            Ok(())
+        }
+    }
+
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.3.0");
+    let target = f.path().join("consumer");
+    init(&release, &target, "react-web", PackageMode::Registry);
+    let initial = add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "client".into(),
+            template: "react-client".into(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap()
+    .state;
+    assert!(initial.components.contains_key("packages/client"));
+
+    // Rename packages/client, bump its version, and wire local file: consumer in apps/web.
+    let mut client_pkg: Value = read_json(&target.join("packages/client/package.json")).unwrap();
+    let old_name = client_pkg["name"].as_str().unwrap().to_owned();
+    let new_name = "@acme/renamed-client";
+    client_pkg["name"] = json!(new_name);
+    client_pkg["version"] = json!("2.1.0");
+    put_json(&target, "packages/client/package.json", &client_pkg);
+
+    let mut web_pkg: Value = read_json(&target.join("apps/web/package.json")).unwrap();
+    web_pkg["dependencies"] = json!({ new_name: "file:../../packages/client" });
+    put_json(&target, "apps/web/package.json", &web_pkg);
+
+    // Inject mid-commit failure first and prove devkit recover rolls back cleanly!
+    let pre_sync_lock = fs::read(target.join("package-lock.json")).unwrap();
+    let interrupted = sync_project(
+        &release,
+        &target,
+        &UpdateOptions {
+            hooks: Some(&FailAfterFirstWrite),
+            ..Default::default()
+        },
+        &NoResolver,
+    )
+    .unwrap_err();
+    assert!(
+        interrupted
+            .to_string()
+            .contains("injected sync write interruption")
+    );
+    // Automatic rollback inside tx.commit restores pre-sync files; verify clean state.
+    assert!(!target.join(PENDING_PATH).exists());
+    assert_eq!(
+        fs::read(target.join("package-lock.json")).unwrap(),
+        pre_sync_lock
+    );
+    assert!(!recover_project(&target).unwrap());
+
+    // Now run sync_project offline (NoResolver proves Docker is NOT started!).
+    let synced = sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(synced.applied);
+    assert!(!synced.no_op);
+    assert_eq!(synced.state.version, initial.version);
+    assert_eq!(synced.state.release_identity, initial.release_identity);
+    assert_ne!(synced.state.generation, initial.generation);
+    assert_eq!(
+        synced.state.components["apps/web"].dependencies,
+        vec!["packages/client".to_string()]
+    );
+
+    let updated_lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    assert!(
+        updated_lock["packages"]
+            .get(format!("node_modules/{old_name}"))
+            .is_none()
+    );
+    assert_eq!(
+        updated_lock["packages"][format!("node_modules/{new_name}")]["resolved"],
+        "packages/client"
+    );
+    assert_eq!(
+        updated_lock["packages"]["packages/client"]["version"],
+        "2.1.0"
+    );
+    devkit::native::assert_native_components(&target, &synced.state).unwrap();
+
+    // Repeat sync_project must be a true no-op without rotating generation!
+    let repeat = sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(repeat.no_op);
+    assert!(!repeat.applied);
+    assert!(repeat.files.is_empty());
+    assert_eq!(repeat.state.generation, synced.state.generation);
+}
+
+#[test]
+fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
+    use devkit::{cli::error_code, graph::ReconcileStrategy};
+    use std::cell::Cell;
+
+    struct DriftingResolver {
+        min_stage: u8,
+        calls: Cell<u8>,
+    }
+    impl LockResolver for DriftingResolver {
+        fn regenerate(
+            &self,
+            root: &Path,
+            release: &AdmittedRelease,
+            _registry: Option<&str>,
+        ) -> Result<()> {
+            let attempt = self.calls.get() + 1;
+            self.calls.set(attempt);
+            let lock_path = root.join("package-lock.json");
+            if self.min_stage == 2 && attempt == 1 {
+                bail!("ERESOLVE simulated stage-1 conflict on dev tree");
+            }
+            if self.min_stage == 3 && attempt < 3 {
+                if attempt == 2 {
+                    // Verify stage 2 pruned dev nodes while preserving !dev product pin.
+                    let pruned: Value = read_json(&lock_path)?;
+                    assert!(pruned["packages"].get("node_modules/stale-dev").is_none());
+                    assert!(pruned["packages"].get("node_modules/clsx").is_some());
+                }
+                bail!("ERESOLVE simulated conflict before clean fallback");
+            }
+            let manifest: Value = read_json(&root.join("package.json"))?;
+            let mut packages = serde_json::Map::new();
+            packages.insert(String::new(), manifest.clone());
+            for path in manifest["workspaces"].as_array().unwrap() {
+                let p = path.as_str().unwrap();
+                let member: Value = read_json(&root.join(p).join("package.json"))?;
+                let name = member["name"].as_str().unwrap().to_owned();
+                packages.insert(p.to_owned(), member);
+                packages.insert(
+                    format!("node_modules/{name}"),
+                    json!({"resolved": p, "link": true}),
+                );
+            }
+            packages.insert(
+                "node_modules/@docouno/env".into(),
+                json!({
+                    "version": release.manifest.version,
+                    "resolved": format!("https://registry.npmjs.org/@docouno/env/-/env-{}.tgz", release.manifest.version),
+                    "integrity": release.manifest.environment.integrity,
+                    "dev": true,
+                }),
+            );
+            // Bump transitive/product clsx from 2.1.0 -> 2.1.1 while preserving direct spec ^2.1.0.
+            packages.insert(
+                "node_modules/clsx".into(),
+                json!({
+                    "version": "2.1.1",
+                    "resolved": "https://registry.npmjs.org/clsx/-/clsx-2.1.1.tgz",
+                    "integrity": sri(b"clsx-2.1.1"),
+                }),
+            );
+            write_json(
+                &lock_path,
+                &json!({
+                    "name": manifest["name"],
+                    "version": manifest["version"],
+                    "lockfileVersion": 3,
+                    "requires": true,
+                    "packages": packages,
+                }),
+            )
+        }
+    }
+
+    let f = TempDir::new().unwrap();
+    let old = fixture_release(f.path(), "0.3.0");
+    let next = fixture_release(f.path(), "0.4.0");
+    let target = f.path().join("consumer");
+    init(&old, &target, "node", PackageMode::Registry);
+
+    let mut main_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    main_pkg["dependencies"] = json!({"clsx": "^2.1.0"});
+    put_json(&target, "apps/main/package.json", &main_pkg);
+    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    lock["packages"]["apps/main"] = main_pkg.clone();
+    lock["packages"]["node_modules/clsx"] = json!({
+        "version": "2.1.0",
+        "resolved": "https://registry.npmjs.org/clsx/-/clsx-2.1.0.tgz",
+        "integrity": sri(b"clsx-2.1.0"),
+    });
+    lock["packages"]["node_modules/stale-dev"] = json!({
+        "version": "1.0.0",
+        "resolved": "https://registry.npmjs.org/stale-dev/-/stale-dev-1.0.0.tgz",
+        "integrity": sri(b"stale-dev"),
+        "dev": true,
+    });
+    put_json(&target, "package-lock.json", &lock);
+
+    // 1. Without --reconcile-lock -> PRODUCT_GRAPH_DRIFT with package diff and exact hint.
+    let err = update_project(
+        &next,
+        &target,
+        &UpdateOptions::default(),
+        &DriftingResolver {
+            min_stage: 1,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error_code(&err), "PRODUCT_GRAPH_DRIFT");
+    let msg = err.to_string();
+    assert!(msg.contains("clsx: 2.1.0 -> 2.1.1"), "{msg}");
+    assert!(
+        msg.contains("Product lockfile nodes drifted during resolution")
+            && msg.contains(
+                "inspect with --reconcile-lock --preview and apply with --reconcile-lock"
+            ),
+        "{msg}"
+    );
+
+    // 2. With --reconcile-lock --preview -> read-only report, checkout untouched (prune-dev stage 2).
+    let before_bytes = fs::read(target.join("package-lock.json")).unwrap();
+    let preview = update_project(
+        &next,
+        &target,
+        &UpdateOptions {
+            preview: true,
+            reconcile_lock: true,
+            ..Default::default()
+        },
+        &DriftingResolver {
+            min_stage: 2,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap();
+    assert!(!preview.applied);
+    let rec = preview.lock_reconciliation.as_ref().unwrap();
+    assert_eq!(rec.strategy, ReconcileStrategy::PruneDev);
+    assert!(
+        rec.changed_packages
+            .iter()
+            .any(|p| p.name == "clsx" && p.before_version == "2.1.0" && p.after_version == "2.1.1")
+    );
+    assert_eq!(
+        fs::read(target.join("package-lock.json")).unwrap(),
+        before_bytes
+    );
+
+    // 3. Apply with --reconcile-lock (exercising stage 3 clean-fallback) -> applied & direct specs intact.
+    let applied = update_project(
+        &next,
+        &target,
+        &UpdateOptions {
+            reconcile_lock: true,
+            ..Default::default()
+        },
+        &DriftingResolver {
+            min_stage: 3,
+            calls: Cell::new(0),
+        },
+    )
+    .unwrap();
+    assert!(applied.applied);
+    assert_eq!(
+        applied.lock_reconciliation.as_ref().unwrap().strategy,
+        ReconcileStrategy::CleanFallback
+    );
+    let after_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    assert_eq!(after_pkg["dependencies"]["clsx"], "^2.1.0");
+    devkit::native::assert_native_components(&target, &applied.state).unwrap();
+}

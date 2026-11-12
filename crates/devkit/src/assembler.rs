@@ -9,6 +9,7 @@ use crate::{
     distribution::{AssetIdentity, ENGINE_ASSET, NpmArtifact, ReleaseIndex, TARGET},
     files::*,
     model::{Environment, FileIdentity, Release},
+    native::{DEPENDENCY_FIELDS, NpmDepSpec, dependency_table, parse_npm_dependency_spec},
     notices::verify_notice_set,
     processes::{OutputMode, OwnedContainer, ProcessRunner},
     release::{admit_release, import_npm_payload},
@@ -231,23 +232,81 @@ fn verify_template_lock(
     let packages = object(&lock["packages"], "Template lock packages")?;
     let old_packages = object(&original["packages"], "Source template lock packages")?;
     let lock_root = packages.get("").context("Template lock root is missing")?;
-    for field in [
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ] {
+    for field in DEPENDENCY_FIELDS {
         ensure!(
             lock_root[field] == manifest[field],
             "Prepared template root dependency field differs: {name}/{field}"
         );
+    }
+    let mut alias_targets: BTreeMap<String, String> = BTreeMap::new();
+    for (parent_loc, parent_val) in packages {
+        let parent_obj = object(parent_val, "Template package record")?;
+        for field in DEPENDENCY_FIELDS {
+            for (dep_name, spec_val) in dependency_table(parent_obj, field)? {
+                let spec_str = text(&spec_val, &format!("{name}:{parent_loc}:{dep_name}"))?;
+                let parsed = parse_npm_dependency_spec(spec_str)?;
+                ensure!(
+                    !matches!(parsed, NpmDepSpec::LocalFile(_)),
+                    "Default template cannot declare local file dependency: {name}:{parent_loc}:{dep_name}"
+                );
+                if let NpmDepSpec::Alias { target_name, .. } = parsed {
+                    let mut bases = vec![parent_loc.clone()];
+                    let mut cursor = parent_loc.as_str();
+                    while let Some((prefix, _)) = cursor.rsplit_once("/node_modules/") {
+                        bases.push(prefix.to_owned());
+                        cursor = prefix;
+                    }
+                    if !parent_loc.is_empty() {
+                        bases.push(String::new());
+                    }
+                    let resolved_loc = bases.into_iter().find_map(|base| {
+                        let candidate = if base.is_empty() {
+                            format!("node_modules/{dep_name}")
+                        } else {
+                            format!("{base}/node_modules/{dep_name}")
+                        };
+                        packages.contains_key(&candidate).then_some(candidate)
+                    });
+                    if let Some(target_loc) = resolved_loc {
+                        if let Some(prev) = alias_targets.get(&target_loc) {
+                            ensure!(
+                                prev == &target_name,
+                                "Conflicting alias target names for {target_loc} in template {name}"
+                            );
+                        } else {
+                            alias_targets.insert(target_loc, target_name);
+                        }
+                    } else {
+                        ensure!(
+                            field == "optionalDependencies" || field == "peerDependencies",
+                            "Missing locked target for alias dependency {parent_loc}:{dep_name} in template {name}"
+                        );
+                    }
+                }
+            }
+        }
     }
     for (location, value) in packages {
         if location.is_empty() {
             continue;
         }
         let package = object(value, "Template package identity")?;
-        let package_name = npm_name(location)?;
+        let slot_name = npm_name(location)?;
+        let effective_name = if let Some(expected_target) = alias_targets.get(location) {
+            ensure!(
+                value.get("name").and_then(Value::as_str) == Some(expected_target.as_str()),
+                "Alias template package {location} must declare name {expected_target}"
+            );
+            expected_target.clone()
+        } else {
+            ensure!(
+                value
+                    .get("name")
+                    .is_none_or(|v| v.as_str() == Some(slot_name.as_str())),
+                "Non-alias template package {location} declares mismatched name"
+            );
+            slot_name.clone()
+        };
         let selected = text(&value["version"], "Template package version")?;
         ensure!(
             !selected.is_empty()
@@ -257,12 +316,12 @@ fn verify_template_lock(
                     .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b)),
             "Invalid selected template version"
         );
-        let base = package_name
+        let base = effective_name
             .rsplit('/')
             .next()
             .context("Package basename")?;
         let expected_url =
-            format!("https://registry.npmjs.org/{package_name}/-/{base}-{selected}.tgz");
+            format!("https://registry.npmjs.org/{effective_name}/-/{base}-{selected}.tgz");
         ensure!(
             value["resolved"].as_str() == Some(expected_url.as_str())
                 && value["integrity"].as_str().is_some_and(lock_integrity),
@@ -273,13 +332,16 @@ fn verify_template_lock(
                 && !package.get("inBundle").is_some_and(|v| v != &json!(false)),
             "Linked/bundled default template identity: {location}"
         );
-        if package_name == "@docouno/env" {
+        if slot_name == "@docouno/env" {
             ensure!(
-                selected == version && value["integrity"].as_str() == Some(environment_sri),
+                effective_name == "@docouno/env"
+                    && selected == version
+                    && value["integrity"].as_str() == Some(environment_sri),
                 "Prepared environment identity differs"
             );
         } else if let Some(old) = old_packages.get(location) {
             for field in [
+                "name",
                 "version",
                 "resolved",
                 "integrity",
@@ -290,9 +352,9 @@ fn verify_template_lock(
                 "inBundle",
                 "link",
             ] {
-                if old.get(field).is_some() {
+                if old.get(field).is_some() || (field == "name" && value.get(field).is_some()) {
                     ensure!(
-                        old[field] == value[field],
+                        old.get(field) == value.get(field),
                         "Selected external template identity changed: {location}/{field}"
                     );
                 }
