@@ -729,9 +729,21 @@ class Verification:
                 native_dev_dependencies[path] = dict(package.get("devDependencies", {}))
         state_file.write_text(json.dumps(state, indent=2) + "\n")
         before = source_snapshot(root)
-        self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
+        preview_out = self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
         require(source_snapshot(root) == before, f"{kind} preview changed project bytes")
-        self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
+        apply_out = self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
+        if state["version"].startswith("0.3.") and version == "0.4.0":
+            if kind in ("node", "mixed"):
+                for out_text in (preview_out, apply_out):
+                    require(f"Migration notes ({state['version']} -> {version}):" in out_text,
+                            f"{kind} upgrade missing Migration notes header")
+                    require("local: " in out_text and "docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
+                            f"{kind} upgrade missing local migration doc pointer")
+                    require("url:   https://github.com/docouno/devkit/blob/v0.4.0/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
+                            f"{kind} upgrade missing GitHub migration doc URL")
+            elif kind == "rust":
+                require("Migration notes" not in preview_out and "Migration notes" not in apply_out,
+                        "Rust-only upgrade unexpectedly emitted Node migration notes")
         after = json.loads(state_file.read_text())
         require(after["version"] == version and after["packageMode"] == self.package_source,
                 f"{kind} accepted wrong environment")
@@ -762,7 +774,8 @@ class Verification:
                     f"{kind} update changed consumer-owned devDependencies: {path}")
         self.healthy(root, f"upgraded-{kind}")
         unchanged = source_snapshot(root)
-        self.run(f"{kind}-upgrade-noop", self.cli(self.next_release, "update", root))
+        noop_out = self.run(f"{kind}-upgrade-noop", self.cli(self.next_release, "update", root))
+        require("Migration notes" not in noop_out, f"{kind} identical no-op emitted migration notes")
         require(source_snapshot(root) == unchanged, f"{kind} repeated upgrade rewrote source")
         self.results.append({"label": f"{kind}-native-upgrade-preservation", "passed": True,
                              "fromVersion": state["version"], "toVersion": version,

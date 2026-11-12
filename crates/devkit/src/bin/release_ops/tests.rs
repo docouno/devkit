@@ -193,6 +193,7 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
         "runtime/file",
         "templates/file",
         "packages/env/file",
+        "docs/file",
     ] {
         files::write_atomic(&source.path().join(name), b"reviewed source\n", 0o644).unwrap();
     }
@@ -231,6 +232,7 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
                 integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(environment))),
             },
             files: files::file_map(payload_source.path()).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();

@@ -130,6 +130,22 @@ impl Globals {
             println!("{human}");
         }
     }
+    pub fn write_flags(&self, command: &mut std::process::Command) {
+        if self.json {
+            command.arg("--json");
+        } else if self.non_interactive {
+            command.arg("--non-interactive");
+        }
+        if self.interactive {
+            command.arg("--interactive");
+        }
+        if self.offline {
+            command.arg("--offline");
+        }
+        if let Some(path) = &self.cache_dir {
+            command.arg("--cache-dir").arg(path);
+        }
+    }
 }
 
 pub(crate) struct Options {
@@ -295,7 +311,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             return Ok(());
         }
         if ["exec", "task"].contains(&command) {
-            dispatch_accepted(&globals, runner)?;
+            dispatch_accepted(command, &globals, runner)?;
         }
         return crate::runtime_cli::main(
             globals.args.clone(),
@@ -304,6 +320,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         );
     }
     if command == "describe" {
+        dispatch_accepted(command, &globals, runner)?;
         let options = Options::parse(&globals.args[1..], &["--root"], &[], &[])?;
         ensure!(options.target.is_none(), "Describe uses --root PATH");
         let root = project_root(&options.path("--root").unwrap_or(std::env::current_dir()?))?;
@@ -335,48 +352,112 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         .contains(&command),
         "Unknown command: {command}"
     );
+    if command == "sync" {
+        dispatch_accepted(command, &globals, runner)?;
+    }
     crate::lifecycle_cli::run(command, &globals, runner)
 }
 
-fn dispatch_accepted(globals: &Globals, runner: &ProcessRunner) -> Result<()> {
-    let before_separator = globals
-        .args
-        .iter()
-        .position(|a| a == "--")
-        .unwrap_or(globals.args.len());
-    let mut root = std::env::current_dir()?;
-    let mut seen = false;
-    for index in 1..before_separator {
-        if globals.args[index] == "--root" {
-            ensure!(!seen, "Repeated option: --root");
-            seen = true;
-            root = PathBuf::from(
-                globals
-                    .args
-                    .get(index + 1)
-                    .filter(|_| index + 1 < before_separator)
-                    .context("Missing value for --root")?,
-            );
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedManifestHeader {
+    schema_version: u32,
+    version: String,
+    release_identity: String,
+    managed: BTreeMap<String, crate::model::FileIdentity>,
+}
+
+fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
+    let path = safe_path(root, state::MANIFEST_PATH)?;
+    let before = identity(&path)?.context("Missing project manifest")?;
+    let bytes = fs::read(&path)?;
+    ensure!(
+        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
+        "Project manifest changed during admission"
+    );
+    let header: AcceptedManifestHeader = serde_json::from_slice(&bytes)?;
+    ensure!(
+        header.schema_version == 2,
+        "Unsupported project schemaVersion; only published schema2 is supported"
+    );
+    version(&header.version)?;
+    ensure!(
+        SHA256_RE.is_match(&header.release_identity),
+        "Invalid project release identity/generation"
+    );
+    Ok(header)
+}
+
+fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
+    let (root, release_root) = if command_name == "sync" {
+        let options = Options::parse(
+            &globals.args[1..],
+            &["--preview", "--reconcile-lock", "--release-root"],
+            &[],
+            &["--preview", "--reconcile-lock"],
+        )?;
+        let release_root = options.path("--release-root");
+        let root = project_root(&options.target.unwrap_or(std::env::current_dir()?))?;
+        (root, release_root)
+    } else {
+        let before_separator = globals
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .unwrap_or(globals.args.len());
+        let mut root = std::env::current_dir()?;
+        let mut seen = false;
+        for index in 1..before_separator {
+            if globals.args[index] == "--root" {
+                ensure!(!seen, "Repeated option: --root");
+                seen = true;
+                root = PathBuf::from(
+                    globals
+                        .args
+                        .get(index + 1)
+                        .filter(|_| index + 1 < before_separator)
+                        .context("Missing value for --root")?,
+                );
+            }
+        }
+        (project_root(&root)?, None)
+    };
+    let header = read_accepted_header(&root)?;
+    if command_name == "describe" && cache::legacy(&header.version) {
+        return Ok(());
+    }
+    if command_name == "sync" {
+        let min_sync = SemVer {
+            major: 0,
+            minor: 4,
+            patch: 0,
+            prerelease: Vec::new(),
+        };
+        if SemVer::parse(&header.version)? < min_sync {
+            return Ok(());
         }
     }
-    let root = project_root(&root)?;
-    let state = state::read_project_state(&root)?;
     ensure!(
-        !cache::legacy(&state.version),
+        !cache::legacy(&header.version),
         "Native exec/task requires Devkit 0.3 or newer; use run for legacy Make tasks or update --to VERSION"
     );
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
     ensure!(
-        state.managed.get(name) == identity(&path)?.as_ref(),
+        header.managed.get(name) == identity(&path)?.as_ref(),
         "Managed file conflict: {name}"
     );
     let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
     ensure!(
-        pins.version == state.version,
+        pins.version == header.version,
         "Accepted version differs from toolchain pins"
     );
-    let pin = pins.engine.context("Missing accepted native engine pin")?;
+    let Some(pin) = pins.engine else {
+        if ["describe", "sync"].contains(&command_name) {
+            return Ok(());
+        }
+        anyhow::bail!("Missing accepted native engine pin");
+    };
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::file_digest(&current)? == pin.sha256 {
         ensure!(
@@ -386,6 +467,17 @@ fn dispatch_accepted(globals: &Globals, runner: &ProcessRunner) -> Result<()> {
         return Ok(());
     }
     let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
+    if command_name == "describe" && !exists(&cache.engine_path(&pin)?)? {
+        return Ok(());
+    }
+    if command_name == "sync" && !exists(&cache.engine_path(&pin)?)? {
+        cache.acquire(
+            &header.version,
+            Some(&header.release_identity),
+            release_root.as_deref(),
+            globals.offline,
+        )?;
+    }
     let engine = cache.accepted_engine(&pin)?;
     ensure!(
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
@@ -393,9 +485,7 @@ fn dispatch_accepted(globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     );
     runner.check_cancelled()?;
     let mut command = std::process::Command::new(&engine);
-    if let Some(path) = &globals.cache_dir {
-        command.arg("--cache-dir").arg(path);
-    }
+    globals.write_flags(&mut command);
     command
         .args(&globals.args)
         .env("DEVKIT_DISPATCHED_ENGINE", &pin.sha256);

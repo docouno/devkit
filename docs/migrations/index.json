@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "migrations": [
+    {
+      "id": "glob-scripts-040",
+      "version": "0.4.0",
+      "severity": "recommended",
+      "title": "Adopt glob lint/format scripts and single-pass check",
+      "summary": "Update product-owned package.json scripts from 0.3.x to lint test files and avoid running npm test twice in check + test.",
+      "profiles": ["node", "web", "electron", "react-library"],
+      "docPath": "docs/migrations/0.4.0.md",
+      "anchor": "glob-scripts-and-single-pass-checks"
+    },
+    {
+      "id": "design-system-vite-alias-040",
+      "version": "0.4.0",
+      "severity": "info",
+      "title": "Enable live Vite HMR for workspace UI libraries",
+      "summary": "Add devkitWorkspaceSource() from @docouno/env/vite in Vite or Electron configs when consuming packages/* libraries.",
+      "profiles": ["web", "electron"],
+      "docPath": "docs/migrations/0.4.0.md",
+      "anchor": "design-system-vite-source-alias"
+    }
+  ]
+}

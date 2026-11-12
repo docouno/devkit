@@ -220,18 +220,59 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             &format!("Created {} with Devkit {}. Run make setup.", root.display(), state.version));
         return Ok(());
     }
-    let old = crate::state::read_project_state(&root)?;
-    let version = if command == "update" {
-        options.required("--to")?
+    let (old, release) = if command == "update" {
+        ensure!(
+            exists(&safe_path(&root, crate::state::MANIFEST_PATH)?)?,
+            "Missing project manifest"
+        );
+        let target_version = options.required("--to")?;
+        let release = cache.acquire(target_version, None, source.as_deref(), globals.offline)?;
+        if !crate::cache::legacy(&release.manifest.version)
+            && SemVer::parse(&release.manifest.version)? > SemVer::parse(env!("CARGO_PKG_VERSION"))?
+        {
+            let target_engine = safe_path(&release.root, "devkit")?;
+            let target_sha = crate::delivery::file_digest(&target_engine)?;
+            ensure!(
+                std::env::var("DEVKIT_UPDATE_DELEGATED").ok().as_deref()
+                    != Some(target_sha.as_str()),
+                "Forward update delegation did not converge"
+            );
+            runner.check_cancelled()?;
+            let mut delegated = std::process::Command::new(&target_engine);
+            globals.write_flags(&mut delegated);
+            delegated
+                .arg("update")
+                .arg(&root)
+                .arg("--to")
+                .arg(&release.manifest.version);
+            if let Some(src) = &source {
+                delegated.arg("--release-root").arg(src);
+            }
+            if let Some(ps) = options.value("--package-source")? {
+                delegated.arg("--package-source").arg(ps);
+            }
+            if options.flag("--preview") {
+                delegated.arg("--preview");
+            }
+            if options.flag("--reconcile-lock") {
+                delegated.arg("--reconcile-lock");
+            }
+            delegated.env("DEVKIT_UPDATE_DELEGATED", &target_sha);
+            use std::os::unix::process::CommandExt;
+            return Err(delegated.exec()).context("Cannot execute target release engine");
+        }
+        let old = crate::state::read_project_state(&root)?;
+        (old, release)
     } else {
-        &old.version
+        let old = crate::state::read_project_state(&root)?;
+        let release = cache.acquire(
+            &old.version,
+            Some(old.release_identity.as_str()),
+            source.as_deref(),
+            globals.offline,
+        )?;
+        (old, release)
     };
-    let expected = if command == "update" {
-        None
-    } else {
-        Some(old.release_identity.as_str())
-    };
-    let release = cache.acquire(version, expected, source.as_deref(), globals.offline)?;
     let inventory = if command == "add-app" {
         Some(admit_compose_inventory(
             &root,
@@ -339,7 +380,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             }
         }
     }
-    let message = if command == "sync" {
+    let mut message = if command == "sync" {
         if !outcome.applied && !outcome.no_op {
             format!(
                 "Preview for devkit sync: {} changed files. No changes applied.",
@@ -378,6 +419,22 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     });
     if let Some(rec) = &outcome.lock_reconciliation {
         payload["lockReconciliation"] = serde_json::to_value(rec)?;
+    }
+    if command == "update" {
+        let migrations = project::applicable_migrations(&old, &release)?;
+        if !migrations.is_empty() {
+            message += &format!(
+                "\n\nMigration notes ({} -> {}):",
+                old.version, outcome.state.version
+            );
+            for m in &migrations {
+                message += &format!(
+                    "\n  - [{}] {}: {}\n    local: {}\n    url:   {}",
+                    m.severity, m.title, m.summary, m.local_path, m.url
+                );
+            }
+        }
+        payload["migrations"] = serde_json::to_value(&migrations)?;
     }
     globals.emit(command, payload, &message);
     Ok(())

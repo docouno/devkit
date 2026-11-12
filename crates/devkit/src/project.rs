@@ -65,7 +65,9 @@ fn project_readme(name: &str, state: &ProjectState) -> String {
     }
     text += &format!(
         "\nApplication source, the root Makefile and `compose.yaml` belong to this project. \
-         Shared code lives in `packages/` and is consumed through its native public interfaces.\n\n\
+         Shared code lives in `packages/` and is consumed through its native public interfaces. \
+         See [.devkit/runtime/GUIDE.md](.devkit/runtime/GUIDE.md) for daily commands, \
+         ownership boundaries, dependency workflows and library packaging.\n\n\
          Use the [Devkit CLI](https://github.com/docouno/devkit/blob/v{}/README.md) to add \
          components or explicitly accept an environment update. A newer CLI does not update \
          this project's accepted environment automatically.\n",
@@ -115,6 +117,64 @@ pub struct MutationOutcome {
     pub no_op: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_reconciliation: Option<LockReconciliationReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicableMigration {
+    pub id: String,
+    pub version: String,
+    pub severity: MigrationSeverity,
+    pub title: String,
+    pub summary: String,
+    pub profiles: Vec<String>,
+    pub doc_path: String,
+    pub anchor: String,
+    pub local_path: String,
+    pub url: String,
+}
+
+pub fn applicable_migrations(
+    old: &ProjectState,
+    release: &AdmittedRelease,
+) -> Result<Vec<ApplicableMigration>> {
+    let old_ver = SemVer::parse(&old.version)?;
+    let target_ver = SemVer::parse(&release.manifest.version)?;
+    if old_ver >= target_ver {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for m in &release.manifest.migrations {
+        let m_ver = SemVer::parse(&m.version)?;
+        if !(old_ver < m_ver && m_ver <= target_ver) {
+            continue;
+        }
+        let matches_profile = m.profiles.is_empty()
+            || old.components.values().any(|c| {
+                m.profiles.iter().any(|p| p == c.tooling_profile.as_str())
+                    && SemVer::parse(&c.origin.version).is_ok_and(|orig| orig < m_ver)
+            });
+        if !matches_profile {
+            continue;
+        }
+        let local_doc = safe_path(&release.root, &m.doc_path)?;
+        out.push(ApplicableMigration {
+            id: m.id.clone(),
+            version: m.version.clone(),
+            severity: m.severity,
+            title: m.title.clone(),
+            summary: m.summary.clone(),
+            profiles: m.profiles.clone(),
+            doc_path: m.doc_path.clone(),
+            anchor: m.anchor.clone(),
+            local_path: format!("{}#{}", local_doc.display(), m.anchor),
+            url: format!(
+                "https://github.com/docouno/devkit/blob/v{}/{}#{}",
+                release.manifest.version, m.doc_path, m.anchor
+            ),
+        });
+    }
+    Ok(out)
 }
 
 /// Only native npm chooses dependency versions. The project core owns staging,

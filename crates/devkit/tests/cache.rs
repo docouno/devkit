@@ -25,6 +25,7 @@ fn fixture(root: &Path, marker: &[u8]) -> String {
                 integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(archive))),
             },
             files: file_map(root).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();

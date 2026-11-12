@@ -1,6 +1,6 @@
 # Devkit
 
-A shared development environment for independent TypeScript and Rust repositories. Create applications from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
+A shared development environment for independent TypeScript and Rust repositories. Create applications and npm libraries from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
 Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer, and GNU Make. Node.js is needed only for the optional npm entry point.
 
@@ -9,13 +9,13 @@ Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer,
 Start the interactive CLI:
 
 ```sh
-npx @docouno/devkit@0.3.2
+npx @docouno/devkit@0.4.0
 ```
 
 Or provide the choices explicitly:
 
 ```sh
-npx @docouno/devkit@0.3.2 init my-product --app web=react-web
+npx @docouno/devkit@0.4.0 init my-product --app web=react-web
 cd my-product
 make setup
 make check
@@ -25,17 +25,19 @@ make dev app=web
 Without host Node.js:
 
 ```sh
-curl -fsSL https://github.com/docouno/devkit/releases/download/v0.3.2/install.sh | sh -s -- init my-product --app web=react-web
+curl -fsSL https://github.com/docouno/devkit/releases/download/v0.4.0/install.sh | sh -s -- init my-product --app web=react-web
 ```
 
 Both entry points use the same native CLI. Projects record an exact release and its integrity; ordinary development commands use the verified local cache.
 
-## Applications and shared packages
+## Applications, libraries and presets
 
-Templates include `node-api`, `rust-api`, `react-web`, `electron-react`, and the shared `react-client` package. The `fullstack-desktop` preset combines a Rust API with web and Electron applications using one React client:
+Application templates include `node-api`, `rust-api`, `react-web`, and `electron-react`. Package templates include `ts-library`, `react-ui`, and `react-client`. Repositories can host `0..N` applications and `1..M` packages — including standalone library workspaces without applications:
 
 ```sh
-npx @docouno/devkit@0.3.2 init fullstack-product --preset fullstack-desktop
+npx @docouno/devkit@0.4.0 init my-sdk --package sdk=ts-library
+npx @docouno/devkit@0.4.0 init my-design-system --preset design-system
+npx @docouno/devkit@0.4.0 init fullstack-product --preset fullstack-desktop
 ```
 
 ```text
@@ -50,60 +52,75 @@ fullstack-product/
     └── client/    # UI and logic shared by web and desktop
 ```
 
-Applications are runnable product entry points. Packages hold code reused by applications and expose it through their native public interfaces. npm components share a root workspace and lockfile; Rust components own their Cargo manifests and locks.
+Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. npm components share a root workspace and lockfile; Rust components own their Cargo manifests and locks.
 
-Add components as the product grows:
+Add components as the repository grows:
 
 ```sh
-npx @docouno/devkit@0.3.2 add-app . --name api --template rust-api
-npx @docouno/devkit@0.3.2 add-package . --name client --template react-client
-npx @docouno/devkit@0.3.2 add-app . --name desktop --template electron-react --use client
+npx @docouno/devkit@0.4.0 add-app . --name api --template rust-api
+npx @docouno/devkit@0.4.0 add-package . --name ui --template react-ui
+npx @docouno/devkit@0.4.0 add-app . --name desktop --template electron-react --use ui
 make setup
 ```
 
-Use `register --help` to adopt an existing component without replacing its source.
+Use `register --help` to adopt an existing component without replacing its source, and `sync` after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
+
+```sh
+npx @docouno/devkit@0.4.0 sync .
+```
 
 ## Development
 
-| Command            | Purpose                                                           |
-| ------------------ | ----------------------------------------------------------------- |
-| `make setup`       | Prepare accepted images and dependencies                          |
-| `make check`       | Check source, types, formatting, lint and applicable native gates |
-| `make test`        | Run the registered components' native test suites                 |
-| `make build`       | Build the registered components                                   |
-| `make dev app=web` | Start one application's development service                       |
-| `make status`      | Show services and their local ports                               |
-| `make down`        | Stop services while preserving data volumes                       |
+| Command            | Purpose                                                                   |
+| ------------------ | ------------------------------------------------------------------------- |
+| `make setup`       | Prepare accepted images and dependencies                                  |
+| `make check`       | Check source, types, formatting, lint and applicable native gates         |
+| `make test`        | Run the registered components' native test suites                         |
+| `make build`       | Build the registered components                                           |
+| `make package`     | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) |
+| `make dev app=web` | Start one application's development service                               |
+| `make status`      | Show services and their local ports                                       |
+| `make down`        | Stop services while preserving data volumes                               |
 
-Use `app=NAME` or `package=NAME` for setup, check, fix, test and build. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
+Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
 
-Checks and builds keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
+Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 
 ```sh
-npx @docouno/devkit@0.3.2 exec --component apps/web --write --network bridge -- npm install zod
+npx @docouno/devkit@0.4.0 exec --component apps/web --write --network bridge -- npm install zod
 make setup
 make check
 ```
 
-`make package app=desktop` builds a Linux Electron directory and archive. TypeScript uses its native compiler and linters; web uses Vite, Electron uses electron-vite, and Rust uses Cargo, rustfmt and Clippy.
+`make package app=desktop` builds a Linux Electron directory and archive; `make package package=ui` builds a verified `.tgz` tarball and receipt (`publint` + `@arethetypeswrong/core`) for publishable libraries.
 
 ## Update an existing project
 
-Choose the target release, inspect the proposed changes, then apply them on a branch:
+Choose the target release, inspect the proposed changes and migration notes, then apply them on a branch:
 
 ```sh
-git switch -c chore/devkit-0.3.2
-npx @docouno/devkit@0.3.2 update . --to 0.3.2 --preview
-npx @docouno/devkit@0.3.2 update . --to 0.3.2
+git switch -c chore/devkit-0.4.0
+npx @docouno/devkit@0.4.0 update . --to 0.4.0 --preview
+npx @docouno/devkit@0.4.0 update . --to 0.4.0
 make setup
 make check
 ```
 
-Review and merge the resulting diff. Updating the CLI alone does not update a project's accepted environment. Application source, product dependencies and product-owned Make/Compose files retain their ownership; conflicting edits to managed files stop the update.
+Pass `--reconcile-lock` when transitive lockfile dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Updating the CLI alone does not update a project's accepted environment. Application source, product dependencies and product-owned Make/Compose files retain their ownership; conflicting edits to managed files stop the update.
 
-After an interrupted update, `npx @docouno/devkit@0.3.2 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
+After an interrupted update, `npx @docouno/devkit@0.4.0 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
 
-The native npm/curl entry points also upgrade public 0.2.0 and 0.2.1 projects. Use the new entry point for this migration.
+The native npm/curl entry points upgrade public `0.2.x` and `0.3.x` projects directly.
+
+## Documentation
+
+Every initialized repository includes a concise offline reference at `.devkit/runtime/GUIDE.md`. Detailed guides live in [`docs/`](docs/architecture.md):
+
+- [Architecture](docs/architecture.md) — `0..N` apps / `1..M` packages graph, tooling profiles, native manifest authority, and container security isolation.
+- [Workflows](docs/workflows.md) — creating apps and libraries, `--preset design-system` live HMR, `--use`, `npm:` aliases, and `devkit sync`.
+- [Publishing Libraries](docs/publishing.md) — opting into `"private": false`, `make package` verification, npm OIDC provenance, and GitLab Package Registry.
+- [Continuous Integration](docs/ci.md) — GitHub Actions, GitLab CI, custom enterprise CAs (`DEVKIT_CA_CERT`), and airgapped runners.
+- [Upgrading](docs/upgrades.md) — `devkit update`, `--reconcile-lock`, cumulative migration notes, forward-dispatch, and `devkit recover`.
 
 ## CLI and automation
 

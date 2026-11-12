@@ -8,11 +8,11 @@ use crate::{
     },
     distribution::{AssetIdentity, ENGINE_ASSET, NpmArtifact, ReleaseIndex, TARGET},
     files::*,
-    model::{Environment, FileIdentity, Release},
+    model::{Environment, FileIdentity, MigrationEntry, Release},
     native::{DEPENDENCY_FIELDS, NpmDepSpec, dependency_table, parse_npm_dependency_spec},
     notices::verify_notice_set,
     processes::{OutputMode, OwnedContainer, ProcessRunner},
-    release::{admit_release, import_npm_payload},
+    release::{admit_release, import_npm_payload, validate_migrations},
 };
 use anyhow::{Context, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -49,7 +49,7 @@ const TEMPLATES: [&str; 7] = [
     "ts-library",
     "react-ui",
 ];
-const RUNTIME_FILES: [&str; 8] = [
+const RUNTIME_FILES: [&str; 9] = [
     "devkit.mk",
     "compose.tools.yaml",
     "rust.Dockerfile",
@@ -57,8 +57,28 @@ const RUNTIME_FILES: [&str; 8] = [
     "desktop-seccomp.json",
     "licenses/Apache-2.0.txt",
     "licenses/moby-profiles.NOTICE",
+    "GUIDE.md",
     "devkit.sh",
 ];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MigrationIndex {
+    schema_version: u32,
+    migrations: Vec<MigrationEntry>,
+}
+
+pub fn verify_migration_index(root: &Path, version: &str) -> Result<Vec<MigrationEntry>> {
+    let index_path = safe_path(root, "docs/migrations/index.json")?;
+    let index: MigrationIndex =
+        read_json(&index_path).context("Invalid docs/migrations/index.json")?;
+    ensure!(
+        index.schema_version == 1,
+        "Unsupported docs/migrations/index.json schemaVersion"
+    );
+    validate_migrations(version, &index.migrations, root, None, true)?;
+    Ok(index.migrations)
+}
 
 pub struct AssemblyOptions {
     pub root: PathBuf,
@@ -730,7 +750,7 @@ fn source_snapshot(root: &Path) -> Result<BTreeMap<String, FileIdentity>> {
             identity(&safe_path(root, name)?)?.context("Missing assembly source")?,
         );
     }
-    for name in ["runtime", "templates", "packages/env"] {
+    for name in ["runtime", "templates", "packages/env", "docs"] {
         selected_sources(root, name, &mut result)?;
     }
     Ok(result)
@@ -998,6 +1018,12 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         )?;
     }
     copy_tree(&notices, &payload.join("notices"), &|_| false, false)?;
+    copy_tree(
+        &safe_path(&root, "docs")?,
+        &payload.join("docs"),
+        &ignored,
+        false,
+    )?;
     for name in ["README.md", "LICENSE"] {
         write_atomic(
             &payload.join(name),
@@ -1007,22 +1033,31 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     }
     write_json(
         &payload.join("package.json"),
-        &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":["linux"],"cpu":["x64"],"bin":{"devkit":"devkit"},"files":["devkit","runtime","templates","npm","notices","release.json","README.md","LICENSE"],"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
+        &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":["linux"],"cpu":["x64"],"bin":{"devkit":"devkit"},"files":["devkit","runtime","templates","npm","notices","docs","release.json","README.md","LICENSE"],"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
     )?;
     for (name, file) in file_map(&payload)? {
-        ensure!(!name.split('/').any(|p| p.eq_ignore_ascii_case("AGENTS.md") || p.eq_ignore_ascii_case("CLAUDE.md")), "Private agent instructions are forbidden in the release payload");
+        ensure!(
+            !name.split('/').any(|p| {
+                p.eq_ignore_ascii_case("AGENTS.md")
+                    || p.eq_ignore_ascii_case("CLAUDE.md")
+                    || p.eq_ignore_ascii_case("GEMINI.md")
+            }),
+            "Private agent instructions are forbidden in the release payload"
+        );
         let mode = if file.mode & 0o111 != 0 { 0o755 } else { 0o644 };
         if file.mode != mode {
             let path = safe_path(&payload, &name)?;
             write_atomic(&path, &fs::read(&path)?, mode)?;
         }
     }
+    let migrations = verify_migration_index(&payload, &version)?;
     let manifest = Release {
         schema_version: 1,
         version: version.clone(),
         files: file_map(&payload)?,
         environment: inputs.environment.clone(),
         rust_version: settings["DEVKIT_RUST_VERSION"].clone(),
+        migrations,
     };
     write_json(&payload.join("release.json"), &manifest)?;
     let admitted = admit_release(&payload)?;

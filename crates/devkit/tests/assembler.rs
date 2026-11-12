@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     assembler::{
-        AssemblyOptions, assemble, verify_npm_inputs, verify_npm_pack, verify_runtime_notices,
-        verify_rust_template, verify_source_checkout,
+        AssemblyOptions, assemble, verify_migration_index, verify_npm_inputs, verify_npm_pack,
+        verify_runtime_notices, verify_rust_template, verify_source_checkout,
     },
     files::{digest, file_map, write_atomic, write_json},
     processes::ProcessRunner,
@@ -253,6 +253,10 @@ fn runtime_notices_refuse_empty_missing_and_symlinked_sources_before_staging() {
         ("Cargo.lock", "version=4\n"),
         ("package.json", "{}\n"),
         ("toolchains.env", "DEVKIT_RUST_VERSION=1.99.1\n"),
+        (
+            "docs/migrations/index.json",
+            "{\"schemaVersion\":1,\"migrations\":[]}\n",
+        ),
     ] {
         write_atomic(&root.join(name), value.as_bytes(), 0o644).unwrap();
     }
@@ -350,6 +354,7 @@ fn source_checkout_fixture(root: &Path) {
         "runtime/fixture",
         "templates/rust-api/fixture",
         "packages/env/fixture",
+        "docs/migrations/index.json",
     ] {
         write_atomic(&root.join(name), b"tracked source\n", 0o644).unwrap();
     }
@@ -545,4 +550,77 @@ fn assembler_requires_the_external_notice_digest_before_downstream_inputs_or_sta
             .to_string_lossy()
             .starts_with(".devkit-build-set-")
     }));
+}
+
+#[test]
+fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anchors() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_atomic(
+        &root.join("docs/migrations/0.4.0.md"),
+        b"# Migration to 0.4.0\n\n## Glob Scripts and Single-Pass Checks\n\nDetails here.\n\n```md\n## Fake Heading Inside Fence\n```\n",
+        0o644,
+    )
+    .unwrap();
+    let valid_entry = json!({
+        "id": "glob-scripts-040",
+        "version": "0.4.0",
+        "severity": "recommended",
+        "title": "Adopt glob lint/format scripts and single-pass check",
+        "summary": "Replace directory scripts and duplicate npm test in check for projects initialized on 0.3.x.",
+        "profiles": ["node", "web", "electron", "react-library"],
+        "docPath": "docs/migrations/0.4.0.md",
+        "anchor": "glob-scripts-and-single-pass-checks"
+    });
+    write_json(
+        &root.join("docs/migrations/index.json"),
+        &json!({ "schemaVersion": 1, "migrations": [valid_entry.clone()] }),
+    )
+    .unwrap();
+    let parsed = verify_migration_index(root, "0.4.0").unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].id, "glob-scripts-040");
+
+    // Anchor inside fenced code block must NOT satisfy heading validation.
+    let mut fenced_anchor = valid_entry.clone();
+    fenced_anchor["anchor"] = json!("fake-heading-inside-fence");
+    write_json(
+        &root.join("docs/migrations/index.json"),
+        &json!({ "schemaVersion": 1, "migrations": [fenced_anchor] }),
+    )
+    .unwrap();
+    assert!(
+        verify_migration_index(root, "0.4.0")
+            .unwrap_err()
+            .to_string()
+            .contains("anchor #fake-heading-inside-fence not found")
+    );
+
+    // Version newer than release is rejected.
+    let mut future_ver = valid_entry.clone();
+    future_ver["version"] = json!("0.5.0");
+    write_json(
+        &root.join("docs/migrations/index.json"),
+        &json!({ "schemaVersion": 1, "migrations": [future_ver] }),
+    )
+    .unwrap();
+    assert!(
+        verify_migration_index(root, "0.4.0")
+            .unwrap_err()
+            .to_string()
+            .contains("newer than release")
+    );
+
+    // Duplicate IDs are rejected.
+    write_json(
+        &root.join("docs/migrations/index.json"),
+        &json!({ "schemaVersion": 1, "migrations": [valid_entry.clone(), valid_entry] }),
+    )
+    .unwrap();
+    assert!(
+        verify_migration_index(root, "0.4.0")
+            .unwrap_err()
+            .to_string()
+            .contains("Duplicate migration id")
+    );
 }

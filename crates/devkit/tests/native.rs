@@ -89,6 +89,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
                 integrity: environment_integrity,
             },
             files: file_map(&release).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();

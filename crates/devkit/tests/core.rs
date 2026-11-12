@@ -45,6 +45,7 @@ fn seal(root: &Path, version: &str) {
                 integrity: sri(&fs::read(root.join(archive)).unwrap()),
             },
             files: file_map(root).unwrap(),
+            migrations: Vec::new(),
         },
     )
     .unwrap();
@@ -2860,5 +2861,96 @@ fn project_make_stays_byte_identical_without_packageable_libraries() {
     assert!(
         updated_mk.contains("package/packages/sdk: build/packages/sdk\n"),
         "{updated_mk}"
+    );
+}
+
+#[test]
+fn applicable_migrations_filters_by_semver_window_profile_and_component_origin() {
+    let temp = TempDir::new().unwrap();
+    let rel_032 = fixture_release(temp.path(), "0.3.2");
+    let rel_040 = fixture_release(temp.path(), "0.4.0");
+    put(
+        &rel_040,
+        "docs/migrations/0.4.0.md",
+        b"# Migration 0.4.0\n\n## Glob Scripts and Single-Pass Checks\n\nBody.\n\n## Rust Notes\n\nBody.\n",
+    );
+    remove_file(&rel_040.join("release.json")).unwrap();
+    let archive = "npm/env-0.4.0.tgz".to_string();
+    write_json(
+        &rel_040.join("release.json"),
+        &Release {
+            schema_version: 1,
+            version: "0.4.0".into(),
+            rust_version: "1.99.1".into(),
+            environment: Environment {
+                name: "@docouno/env".into(),
+                version: "0.4.0".into(),
+                archive: archive.clone(),
+                integrity: sri(&fs::read(rel_040.join(&archive)).unwrap()),
+            },
+            files: file_map(&rel_040).unwrap(),
+            migrations: vec![
+                MigrationEntry {
+                    id: "glob-scripts-040".into(),
+                    version: "0.4.0".into(),
+                    severity: MigrationSeverity::Recommended,
+                    title: "Adopt glob lint/format scripts".into(),
+                    summary: "Update package.json lint and check scripts.".into(),
+                    profiles: vec!["web".into(), "node".into()],
+                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    anchor: "glob-scripts-and-single-pass-checks".into(),
+                },
+                MigrationEntry {
+                    id: "rust-notes-040".into(),
+                    version: "0.4.0".into(),
+                    severity: MigrationSeverity::Info,
+                    title: "Rust notes".into(),
+                    summary: "Applies to Rust components.".into(),
+                    profiles: vec!["rust".into()],
+                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    anchor: "rust-notes".into(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let admitted_040 = devkit::release::admit_release(&rel_040).unwrap();
+
+    // 1. Web-only 0.3.2 project receives glob-scripts-040 but NOT rust-notes-040.
+    let web_proj = temp.path().join("web-proj");
+    let web_state_032 = init_project(
+        &rel_032,
+        &web_proj,
+        &InitOptions {
+            apps: Some(vec![ComponentSpec {
+                name: "web".into(),
+                template: "react-web".into(),
+                uses: vec![],
+            }]),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let applicable = devkit::project::applicable_migrations(&web_state_032, &admitted_040).unwrap();
+    assert_eq!(applicable.len(), 1);
+    assert_eq!(applicable[0].id, "glob-scripts-040");
+    assert!(
+        applicable[0]
+            .local_path
+            .ends_with("docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks")
+    );
+    assert_eq!(
+        applicable[0].url,
+        "https://github.com/docouno/devkit/blob/v0.4.0/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks"
+    );
+
+    // 2. Same-version update (0.4.0 -> 0.4.0) returns 0 migrations.
+    let mut web_state_040 = web_state_032.clone();
+    web_state_040.version = "0.4.0".into();
+    assert!(
+        devkit::project::applicable_migrations(&web_state_040, &admitted_040)
+            .unwrap()
+            .is_empty()
     );
 }
