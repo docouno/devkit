@@ -4,10 +4,10 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        digest, exists, identity, input_path, object, project_root, read_json, relative_name,
-        safe_path, sorted_entries, text,
+        SemVer, digest, exists, identity, input_path, object, project_root, read_json,
+        relative_name, safe_path, sorted_entries, text,
     },
-    model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain},
+    model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
 use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1762,6 +1762,16 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             );
         }
     }
+    let mut private_workspace_names = BTreeMap::new();
+    for (ws_path, ws_comp) in &nodes {
+        let ws_manifest = context.manifest(ws_path)?;
+        if let Some(ws_name) = ws_manifest.get("name").and_then(Value::as_str)
+            && (ws_comp.role != Role::Library
+                || ws_manifest.get("private") != Some(&Value::Bool(false)))
+        {
+            private_workspace_names.insert(ws_name.to_owned(), (*ws_path).clone());
+        }
+    }
     for (path, component) in &state.components {
         if component.toolchain == Toolchain::Rust {
             for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
@@ -1838,6 +1848,45 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             component.role != Role::Library || manifest.contains_key("exports"),
             "Library must define public exports: {path}"
         );
+        if component.role == Role::App {
+            if let Some(priv_val) = manifest.get("private") {
+                ensure!(
+                    priv_val == &Value::Bool(true),
+                    "Application package.json cannot set \"private\": false: {path}"
+                );
+            }
+        } else {
+            let is_private = manifest
+                .get("private")
+                .and_then(Value::as_bool)
+                .with_context(|| {
+                    format!(
+                        "Library package.json must explicitly declare boolean \"private\": {path}"
+                    )
+                })?;
+            if component.tooling_profile == ToolingProfile::ReactLibrary {
+                ensure!(
+                    is_private,
+                    "Internal react-library profile requires \"private\": true: {path}"
+                );
+            }
+            if !is_private {
+                ensure!(
+                    matches!(
+                        component.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ),
+                    "Profile {} does not support \"private\": false: {path}",
+                    component.tooling_profile
+                );
+                validate_publishable_library_manifest(
+                    path,
+                    &manifest,
+                    scripts,
+                    &private_workspace_names,
+                )?;
+            }
+        }
     }
     let dependencies = context.derive(state)?;
     for (path, actual) in &dependencies.projected {
@@ -1864,6 +1913,213 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         npmrc_policy,
         structure,
     })
+}
+
+fn validate_publishable_library_manifest(
+    path: &str,
+    manifest: &Fields,
+    scripts: &Fields,
+    private_workspace_names: &BTreeMap<String, String>,
+) -> Result<()> {
+    let name = text(
+        manifest
+            .get("name")
+            .context("Missing workspace package name")?,
+        "workspace package name",
+    )?;
+    ensure!(
+        valid_npm_package_name(name),
+        "Invalid npm package name for publishable library {path}: {name}"
+    );
+    if let Some(pc_val) = manifest.get("publishConfig") {
+        let pc = object(pc_val, &format!("{path}:publishConfig"))?;
+        if !name.starts_with('@') && pc.get("access") == Some(&Value::String("restricted".into())) {
+            bail!(
+                "Unscoped publishable library {path} ({name}) cannot set publishConfig.access to \"restricted\""
+            );
+        }
+    }
+    let version_str = text(
+        manifest
+            .get("version")
+            .with_context(|| format!("Publishable library {path} must declare version"))?,
+        "publishable library version",
+    )?;
+    SemVer::parse(version_str)
+        .with_context(|| format!("Invalid SemVer version in {path}/package.json: {version_str}"))?;
+    let files_arr = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .with_context(|| {
+            format!("Publishable library {path} must declare a non-empty \"files\" array")
+        })?;
+    ensure!(
+        !files_arr.is_empty(),
+        "Publishable library {path} must declare a non-empty \"files\" array"
+    );
+    let mut includes_dist = false;
+    for entry_val in files_arr {
+        let entry = text(entry_val, &format!("{path}:files entry"))?;
+        ensure!(
+            !entry.is_empty()
+                && !entry.starts_with('/')
+                && !entry.contains(['\\', '\0', '\n', '\r'])
+                && !entry.starts_with('!'),
+            "Unsafe \"files\" entry in {path}/package.json: {entry}"
+        );
+        let trimmed = entry.trim_start_matches("./").trim_end_matches('/');
+        ensure!(
+            !trimmed.is_empty(),
+            "Unsafe \"files\" entry in {path}/package.json: {entry}"
+        );
+        let segments: Vec<&str> = trimmed.split('/').collect();
+        ensure!(
+            segments
+                .iter()
+                .all(|s| !s.is_empty() && *s != "." && *s != ".."),
+            "Unsafe \"files\" path segments in {path}/package.json: {entry}"
+        );
+        let first = segments[0];
+        ensure!(
+            ![
+                "src",
+                "test",
+                "tests",
+                "__tests__",
+                "__mocks__",
+                "node_modules",
+                "release",
+                "coverage",
+                ".devkit",
+            ]
+            .contains(&first),
+            "Forbidden source/test/output directory in {path}/package.json \"files\": {entry}"
+        );
+        for seg in &segments {
+            ensure!(
+                *seg != ".env" && !seg.starts_with(".env.") && *seg != ".npmrc",
+                "Forbidden secret/config entry in {path}/package.json \"files\": {entry}"
+            );
+        }
+        let base_lower = segments.last().unwrap().to_ascii_lowercase();
+        ensure!(
+            !(base_lower.starts_with("tsconfig") && base_lower.ends_with(".json"))
+                && ![
+                    "tsdown.config.",
+                    "vitest.config.",
+                    "eslint.config.",
+                    "vite.config.",
+                    "prettier.config.",
+                ]
+                .iter()
+                .any(|p| base_lower.starts_with(p)),
+            "Forbidden config file in {path}/package.json \"files\": {entry}"
+        );
+        if trimmed == "dist" {
+            includes_dist = true;
+        }
+    }
+    ensure!(
+        includes_dist,
+        "Publishable library {path} \"files\" array must include \"dist\""
+    );
+    let exports_obj = manifest
+        .get("exports")
+        .and_then(Value::as_object)
+        .with_context(|| {
+            format!("Publishable library {path} must declare an \"exports\" object")
+        })?;
+    ensure!(
+        !exports_obj.is_empty(),
+        "Publishable library {path} \"exports\" object must not be empty"
+    );
+    fn collect_exports(
+        path: &str,
+        value: &Value,
+        depth: usize,
+        leaves: &mut Vec<String>,
+    ) -> Result<()> {
+        ensure!(depth <= 16, "Nested exports exceed depth limit: {path}");
+        match value {
+            Value::String(s) => {
+                ensure!(
+                    s == "./package.json"
+                        || (s.starts_with("./dist/")
+                            && !s.contains('\\')
+                            && s["./dist/".len()..]
+                                .split('/')
+                                .all(|seg| !seg.is_empty() && seg != "." && seg != "..")),
+                    "Publishable library {path} export target {s:?} must be \"./package.json\" or inside \"./dist/\""
+                );
+                leaves.push(s.clone());
+                Ok(())
+            }
+            Value::Object(map) => {
+                ensure!(
+                    !map.is_empty(),
+                    "Publishable library {path} contains an empty exports condition object"
+                );
+                for (k, v) in map {
+                    ensure!(
+                        !k.is_empty() && !k.contains(".."),
+                        "Invalid exports key {k:?} in {path}"
+                    );
+                    collect_exports(path, v, depth + 1, leaves)?;
+                }
+                Ok(())
+            }
+            _ => bail!("Unsupported value inside {path}/package.json \"exports\""),
+        }
+    }
+    let mut export_leaves = Vec::new();
+    for (subpath, val) in exports_obj {
+        ensure!(
+            subpath == "." || (subpath.starts_with("./") && !subpath.contains("..")),
+            "Invalid exports subpath {subpath:?} in {path}/package.json"
+        );
+        collect_exports(path, val, 1, &mut export_leaves)?;
+    }
+    ensure!(
+        export_leaves.iter().any(|t| t.starts_with("./dist/")),
+        "Publishable library {path} \"exports\" must expose at least one \"./dist/\" artifact"
+    );
+    let pkg_script = text(
+        scripts
+            .get("package")
+            .with_context(|| format!("Publishable library {path} must define scripts.package"))?,
+        &format!("native script {path}:package"),
+    )?;
+    ensure!(
+        !pkg_script.trim().is_empty(),
+        "Publishable library {path} scripts.package must not be empty"
+    );
+    for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
+        for (dep_name, dep_val) in dependency_table(manifest, field)? {
+            let spec_str = text(&dep_val, &format!("{path}:{field}.{dep_name}"))?;
+            let parsed = parse_npm_dependency_spec(spec_str)?;
+            match &parsed {
+                NpmDepSpec::LocalFile(_) => {
+                    bail!(
+                        "Publishable library {path} cannot declare local file: dependency {field}.{dep_name} ({spec_str})"
+                    );
+                }
+                NpmDepSpec::Alias { target_name, .. } => {
+                    if let Some(priv_ws) = private_workspace_names.get(target_name) {
+                        bail!(
+                            "Publishable library {path} cannot depend on private workspace component {priv_ws} ({target_name}) in {field}.{dep_name}"
+                        );
+                    }
+                }
+                NpmDepSpec::RegistryRange(_) => {}
+            }
+            if let Some(priv_ws) = private_workspace_names.get(&dep_name) {
+                bail!(
+                    "Publishable library {path} cannot depend on private workspace component {priv_ws} ({dep_name}) in {field}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

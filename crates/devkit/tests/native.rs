@@ -164,6 +164,7 @@ fn manifest(name: &str, deps: Value, library: bool) -> Value {
     let mut value = json!({"name":name,"version":"1.0.0","dependencies":deps,
         "scripts":{"check":"check","fix":"fix","test":"test","build":"build","dev":"dev"}});
     if library {
+        value["private"] = json!(true);
         value["exports"] = json!({".":"./src/index.ts"});
     }
     value
@@ -2755,4 +2756,179 @@ fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() 
             "expected resolved URL to be rejected: {bad_resolved}"
         );
     }
+}
+
+#[test]
+fn publishable_library_contract_enforces_private_exports_files_semver_and_public_deps() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let mut st = state(&[
+        ("apps/web", "node"),
+        ("packages/internal", "node"),
+        ("packages/core", "node"),
+        ("packages/ui", "node"),
+    ]);
+    st.version = "0.4.0".into();
+    st.components
+        .get_mut("packages/core")
+        .unwrap()
+        .tooling_profile = ToolingProfile::TsLibrary;
+    st.components
+        .get_mut("packages/ui")
+        .unwrap()
+        .tooling_profile = ToolingProfile::ReactUi;
+    st.components.get_mut("packages/ui").unwrap().dependencies = vec!["packages/core".into()];
+    st.components.get_mut("apps/web").unwrap().dependencies = vec!["packages/ui".into()];
+
+    let valid_lib = |name: &str, deps: Value| -> Value {
+        json!({
+            "name": name,
+            "version": "1.2.0",
+            "private": false,
+            "type": "module",
+            "files": ["dist"],
+            "exports": {
+                ".": {
+                    "types": "./dist/index.d.mts",
+                    "default": "./dist/index.mjs"
+                },
+                "./package.json": "./package.json"
+            },
+            "dependencies": deps,
+            "scripts": {
+                "check": "devkit-verify",
+                "fix": "prettier --write .",
+                "test": "vitest run",
+                "build": "tsdown && devkit-verify --pack",
+                "package": "devkit-pack"
+            }
+        })
+    };
+
+    let base_web = manifest("@corp/app-web", json!({"@corp/ui": "^1.2.0"}), false);
+    let base_internal = manifest("@corp/internal", json!({}), true);
+    let base_core = valid_lib("@corp/core", json!({}));
+    let base_ui = valid_lib("@corp/ui", json!({"@corp/core": "^1.2.0"}));
+
+    let write_all = |web: &Value, internal: &Value, core: &Value, ui: &Value| {
+        node_project(
+            root,
+            &st,
+            &[
+                ("apps/web", web.clone()),
+                ("packages/internal", internal.clone()),
+                ("packages/core", core.clone()),
+                ("packages/ui", ui.clone()),
+            ],
+            json!({}),
+        );
+    };
+
+    write_all(&base_web, &base_internal, &base_core, &base_ui);
+    let admitted = admit_native_components(root, &st).unwrap();
+    assert_eq!(admitted.dependencies["packages/ui"], vec!["packages/core"]);
+    assert_eq!(admitted.dependencies["apps/web"], vec!["packages/ui"]);
+
+    // 1. Role::App cannot set "private": false (omitting "private" is valid, false is rejected).
+    let mut bad_web = base_web.clone();
+    bad_web["private"] = json!(false);
+    write_all(&bad_web, &base_internal, &base_core, &base_ui);
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot set \"private\": false")
+    );
+
+    // 2. Role::Library requires explicit boolean "private", and ReactLibrary requires "private": true.
+    let mut missing_priv = base_core.clone();
+    missing_priv.as_object_mut().unwrap().remove("private");
+    write_all(&base_web, &base_internal, &missing_priv, &base_ui);
+    assert!(assert_native_components(root, &st).is_err());
+
+    let mut bad_react_lib = base_internal.clone();
+    bad_react_lib["private"] = json!(false);
+    write_all(&base_web, &bad_react_lib, &base_core, &base_ui);
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("Internal react-library profile requires \"private\": true")
+    );
+
+    // 3. Publishable library validations on "private": false.
+    let mut unscoped_restricted = base_core.clone();
+    unscoped_restricted["name"] = json!("plain-core");
+    unscoped_restricted["publishConfig"] = json!({"access": "restricted"});
+    let mut ui_for_plain = base_ui.clone();
+    ui_for_plain["dependencies"] = json!({"plain-core": "^1.2.0"});
+    write_all(
+        &base_web,
+        &base_internal,
+        &unscoped_restricted,
+        &ui_for_plain,
+    );
+    assert!(
+        assert_native_components(root, &st)
+            .unwrap_err()
+            .to_string()
+            .contains("Unscoped publishable library")
+    );
+
+    for (label, mutate) in [
+        (
+            "bad-semver",
+            (&|m: &mut Value| m["version"] = json!("01.2.0")) as &dyn Fn(&mut Value),
+        ),
+        ("empty-files", &|m: &mut Value| m["files"] = json!([])),
+        ("files-missing-dist", &|m: &mut Value| {
+            m["files"] = json!(["README.md"])
+        }),
+        ("files-leaks-src", &|m: &mut Value| {
+            m["files"] = json!(["dist", "src"])
+        }),
+        ("files-leaks-tests", &|m: &mut Value| {
+            m["files"] = json!(["dist", "tests"])
+        }),
+        ("files-leaks-parent", &|m: &mut Value| {
+            m["files"] = json!(["dist", "../secret"])
+        }),
+        ("files-leaks-dotenv", &|m: &mut Value| {
+            m["files"] = json!(["dist", ".env.production"])
+        }),
+        ("files-leaks-config", &|m: &mut Value| {
+            m["files"] = json!(["dist", "tsconfig.json"])
+        }),
+        ("string-exports", &|m: &mut Value| {
+            m["exports"] = json!("./dist/index.mjs")
+        }),
+        ("empty-exports", &|m: &mut Value| m["exports"] = json!({})),
+        ("src-exports", &|m: &mut Value| {
+            m["exports"] = json!({".": "./src/index.ts"})
+        }),
+        ("missing-package-script", &|m: &mut Value| {
+            m["scripts"].as_object_mut().unwrap().remove("package");
+        }),
+        ("file-dependency", &|m: &mut Value| {
+            m["dependencies"] = json!({"@corp/core": "file:../core"})
+        }),
+        ("private-workspace-dependency", &|m: &mut Value| {
+            m["dependencies"] = json!({"@corp/internal": "^1.0.0"})
+        }),
+        ("private-workspace-peer", &|m: &mut Value| {
+            m["peerDependencies"] = json!({"@corp/internal": "^1.0.0"})
+        }),
+    ] {
+        let mut candidate = base_ui.clone();
+        mutate(&mut candidate);
+        write_all(&base_web, &base_internal, &base_core, &candidate);
+        assert!(
+            assert_native_components(root, &st).is_err(),
+            "expected publishable library rejection for {label}"
+        );
+    }
+
+    // Restore valid state and confirm clean pass.
+    write_all(&base_web, &base_internal, &base_core, &base_ui);
+    assert_native_components(root, &st).unwrap();
 }

@@ -38,6 +38,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     let allowed: &[&str] = match command {
         "init" => &[
             "--app",
+            "--package",
             "--preset",
             "--template",
             "--name",
@@ -52,7 +53,13 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--reconcile-lock",
             "--release-root",
         ],
-        "add-package" => &["--name", "--template", "--reconcile-lock", "--release-root"],
+        "add-package" => &[
+            "--name",
+            "--template",
+            "--use",
+            "--reconcile-lock",
+            "--release-root",
+        ],
         "register" => &[
             "--app",
             "--package",
@@ -71,16 +78,17 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         "recover" => &[],
         _ => unreachable!(),
     };
-    let mut options = Options::parse(
-        args,
-        allowed,
-        if command == "init" { &["--app"] } else { &[] },
-        &["--preview", "--reconcile-lock"],
-    )?;
+    let repeat: &[&str] = match command {
+        "init" => &["--app", "--package"],
+        "add-app" | "add-package" => &["--use"],
+        _ => &[],
+    };
+    let mut options = Options::parse(args, allowed, repeat, &["--preview", "--reconcile-lock"])?;
     let missing = match command {
         "init" => {
             options.target.is_none()
                 || !(options.flag("--app")
+                    || options.flag("--package")
                     || options.flag("--preset")
                     || options.flag("--template"))
         }
@@ -164,6 +172,33 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                     .collect::<Result<Vec<_>>>()?,
             )
         };
+        let packages = options.all("--package")?;
+        let packages = if packages.is_empty() {
+            None
+        } else {
+            Some(
+                packages
+                    .iter()
+                    .map(|entry| {
+                        let (name, template) = entry
+                            .split_once('=')
+                            .context("Expected --package NAME=TEMPLATE")?;
+                        slug(name)?;
+                        let t = catalog::template(template)?;
+                        ensure!(
+                            t.role == Role::Library,
+                            "Template {} does not create a library; use --app for applications",
+                            t.id
+                        );
+                        Ok(ComponentSpec {
+                            name: name.to_owned(),
+                            template: template.to_owned(),
+                            uses: Vec::new(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         let release = cache.acquire(version, None, source.as_deref(), globals.offline)?;
         let state = project::init_project(
             &release.root,
@@ -171,6 +206,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             &InitOptions {
                 template: options.value("--template")?.map(str::to_owned),
                 apps,
+                packages,
                 preset: options.value("--preset")?.map(str::to_owned),
                 package_mode: mode,
                 name: options.value("--name")?.map(str::to_owned),
@@ -243,14 +279,14 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             slug(name)?;
             let template = options.required("--template")?;
             catalog::template(template)?;
-            let uses = options
-                .value("--use")?
-                .map(|v| {
-                    slug(v)?;
-                    Ok::<_, anyhow::Error>(vec![v.to_owned()])
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let mut uses = Vec::new();
+            let mut seen_uses = std::collections::BTreeSet::new();
+            for u in options.all("--use")? {
+                slug(&u)?;
+                if seen_uses.insert(u.clone()) {
+                    uses.push(u);
+                }
+            }
             project::add_project_component(
                 &release.root,
                 &root,
@@ -354,7 +390,11 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                 prompt.ask("Project directory", Some("my-project"))?,
             ));
         }
-        if !(options.flag("--app") || options.flag("--preset") || options.flag("--template")) {
+        if !(options.flag("--app")
+            || options.flag("--package")
+            || options.flag("--preset")
+            || options.flag("--template"))
+        {
             loop {
                 let template = prompt.choose(
                     "Application template",
@@ -364,28 +404,48 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                         "React web",
                         "Electron React",
                         "Full stack: Rust API + shared React web and Electron",
+                        "Design system: React UI library + playground",
+                        "TypeScript library (packages/*)",
+                        "React UI library (packages/*)",
                     ],
                 )?;
-                if template == 4 {
+                if template == 4 || template == 5 {
                     ensure!(
-                        !options.flag("--app"),
-                        "The full-stack preset is selected on its own"
+                        !options.flag("--app") && !options.flag("--package"),
+                        "A preset must be selected on its own"
                     );
-                    options.set("--preset", "fullstack-desktop");
+                    options.set(
+                        "--preset",
+                        if template == 4 {
+                            "fullstack-desktop"
+                        } else {
+                            "design-system"
+                        },
+                    );
                     break;
                 }
-                let name = prompt.ask(
-                    "Application name",
-                    Some(["api", "api", "web", "desktop"][template]),
-                )?;
-                slug(&name)?;
-                options.add(
-                    "--app",
-                    format!(
-                        "{name}={}",
-                        ["node-api", "rust-api", "react-web", "electron-react"][template]
-                    ),
-                );
+                if template >= 6 {
+                    let pkg_idx = template - 6;
+                    let name = prompt.ask("Package name", Some(["lib", "ui"][pkg_idx]))?;
+                    slug(&name)?;
+                    options.add(
+                        "--package",
+                        format!("{name}={}", ["ts-library", "react-ui"][pkg_idx]),
+                    );
+                } else {
+                    let name = prompt.ask(
+                        "Application name",
+                        Some(["api", "api", "web", "desktop"][template]),
+                    )?;
+                    slug(&name)?;
+                    options.add(
+                        "--app",
+                        format!(
+                            "{name}={}",
+                            ["node-api", "rust-api", "react-web", "electron-react"][template]
+                        ),
+                    );
+                }
                 if !["y", "yes"].contains(
                     &prompt
                         .ask("Add another application? y/N", Some("n"))?
@@ -426,8 +486,18 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
         }
         if !options.flag("--template") {
             if command == "add-package" {
-                eprintln!("Package template: react-client");
-                options.set("--template", "react-client");
+                let selected = prompt.choose(
+                    "Package template",
+                    &[
+                        "TypeScript library",
+                        "React UI library",
+                        "React shared client",
+                    ],
+                )?;
+                options.set(
+                    "--template",
+                    ["ts-library", "react-ui", "react-client"][selected],
+                );
             } else {
                 let selected = prompt.choose(
                     "Application template",
@@ -450,7 +520,7 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
             let profiles: &[&str] = if options.flag("--app") {
                 &["node", "web", "electron", "rust"]
             } else {
-                &["react-library", "rust"]
+                &["ts-library", "react-ui", "react-library", "rust"]
             };
             let selected = prompt.choose("Tooling profile", profiles)?;
             options.set("--profile", profiles[selected]);

@@ -29,6 +29,24 @@ pub fn render_project_make(state: &ProjectState) -> String {
         names(&|c| c.role == Role::Library),
         names(&|c| c.role == Role::App && c.tooling_profile == ToolingProfile::Electron)
     );
+    let has_packageable = state.components.values().any(|c| {
+        matches!(
+            c.tooling_profile,
+            ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+        )
+    });
+    if has_packageable {
+        result += &format!(
+            "DEVKIT_PACKAGEABLE_PACKAGES := {}\n",
+            names(&|c| {
+                c.role == Role::Library
+                    && matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    )
+            })
+        );
+    }
     for (path, c) in &state.components {
         if c.toolchain == Toolchain::Node {
             result += &format!("{}: setup-node-workspace\n", target("setup", path, c.role));
@@ -52,7 +70,10 @@ pub fn render_project_make(state: &ProjectState) -> String {
                 result += &format!("{}: {}\n", target(command, path, c.role), deps.join(" "));
             }
         }
-        if c.tooling_profile == ToolingProfile::Electron {
+        if matches!(
+            c.tooling_profile,
+            ToolingProfile::Electron | ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+        ) {
             result += &format!(
                 "{}: {}\n",
                 target("package", path, c.role),

@@ -149,6 +149,14 @@ class Verification:
             command += ["--release-root", release]
         return command + list(arguments)
 
+    def exec_cli(self, root, component, *argv, write=False):
+        command = (["sh", self.public_bootstrap] if self.public_bootstrap
+                   else [self.manager / "devkit"])
+        command += ["exec", "--root", root, "--component", component]
+        if write:
+            command.append("--write")
+        return command + ["--", *argv]
+
     def copy_release(self, source, name):
         source = Path(source).resolve()
         if source.is_file():
@@ -173,7 +181,7 @@ class Verification:
         require((destination / "runtime/LICENSE").read_bytes() == (destination / "LICENSE").read_bytes(),
                 "Vendored runtime must retain the MIT notice")
         for path in actual:
-            require(Path(path).name not in ("AGENTS.md", "CLAUDE.md"), f"Agent file shipped: {path}")
+            require(Path(path).name not in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"), f"Agent file shipped: {path}")
         return destination
 
     def run(self, label, argv, *, expected=None, timeout=600, cwd=None, environment=None):
@@ -277,7 +285,8 @@ class Verification:
         release = release or self.release
         selected_version = json.loads((release / "release.json").read_text())["version"]
         selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
-                      "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"]}
+                      "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"],
+                      "tslib": ["--template", "ts-library"], "design-system": ["--preset", "design-system"]}
         arguments = [*selections[kind], "--name", f"verification-{kind}"]
         if not self.public_bootstrap or self.package_source != "registry":
             arguments += ["--package-source", self.package_source]
@@ -442,12 +451,13 @@ class Verification:
         require(binary.is_file() and os.access(binary, os.X_OK), "Prepared Electron binary is absent")
         return binary.parent
 
-    def helper(self, root, mode, network_container, heading, label, *, hmr=None, packaged=None):
+    def helper(self, root, mode, network_container, heading, label, *, hmr=None, hmr_marker=None, packaged=None, electron_root=None):
         output = self.receipt / label
         output.mkdir()
         name = f"devkit-packaged-{self.token}-{label}"
         self.containers.append(name)
-        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        runtime_root = electron_root or root
+        image = (runtime_root / ".devkit/state/desktop-image").read_text().strip()
         argv = ["docker", "run", "--detach", "--pull", "never", "--name", name,
                 "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--network", f"container:{network_container}", "--read-only", "--tmpfs", "/tmp:mode=1777",
@@ -458,10 +468,12 @@ class Verification:
                 "--env", f"PROBE_HEADING={heading}", "--env", f"PROBE_NAME={label}"]
         if hmr:
             argv += ["--env", f"PROBE_HMR_HEADING={hmr}"]
+        if hmr_marker:
+            argv += ["--env", f"PROBE_HMR_MARKER={hmr_marker}"]
         if mode == "packaged-desktop":
             argv += ["--volume", f"{packaged}:/app:ro,z", "--env", "PROBE_API_TARGET=http://127.0.0.1:8080"]
         elif mode != "development-desktop":
-            argv += ["--volume", f"{self.electron_runtime(root)}:/electron:ro,z"]
+            argv += ["--volume", f"{self.electron_runtime(runtime_root)}:/electron:ro,z"]
             if mode == "production-web":
                 argv += ["--volume", f"{root}/apps/web/dist:/web:ro,z", "--env", "PROBE_API_TARGET=http://127.0.0.1:8080"]
         argv += [image, "timeout", "65s", "node", "/harness/browser.mjs"]
@@ -756,6 +768,101 @@ class Verification:
                              "fromVersion": state["version"], "toVersion": version,
                              "preservedFiles": len(preserve), "unknownMetadataPreserved": True})
 
+    def verify_v04_libraries_and_design_system(self, fullstack):
+        manager_version = json.loads((self.manager / "release.json").read_text())["version"]
+        core_parts = tuple(int(part) for part in manager_version.split("-", 1)[0].split("+")[0].split("."))
+        if core_parts < (0, 4, 0):
+            return
+
+        # 1. Zero-app ts-library lifecycle: init -> setup -> dev refusal -> check/test/build ->
+        #    private package refusal -> "private": false + devkit sync -> npm version 0.2.0 ->
+        #    setup -> make package -> verified tarball + package-receipt.json.
+        tslib = self.create("tslib", "e-tslib", release=self.manager)
+        state = json.loads((tslib / ".devkit/manifest.json").read_text())
+        require(set(state["components"]) == {"packages/lib"}, "ts-library init registered wrong components")
+        self.healthy(tslib, "tslib")
+        self.make(tslib, "dev", expected="Project has no runnable apps", label="tslib-dev-refused")
+        self.make(tslib, "down", label="tslib-down-noop")
+        self.make(tslib, "status", label="tslib-status-noop")
+        self.make(tslib, "package", expected="No packageable components found", label="tslib-private-package-refused")
+        self.make(tslib, "package", "package=lib", expected='has "private": true', label="tslib-targeted-private-refused")
+
+        pkg_path = tslib / "packages/lib/package.json"
+        pkg = json.loads(pkg_path.read_text())
+        pkg["name"] = "@corp/sdk"
+        pkg["private"] = False
+        pkg_path.write_text(json.dumps(pkg, indent=2) + "\n")
+        self.run("tslib-sync", self.cli(self.manager, "sync", tslib))
+        self.make(tslib, "setup", label="tslib-setup-after-sync")
+        self.run("tslib-npm-version", self.exec_cli(
+            tslib, "packages/lib", "npm", "version", "0.2.0", "--no-git-tag-version", write=True))
+        self.make(tslib, "setup", label="tslib-setup-after-version")
+        self.make(tslib, "package", label="tslib-package")
+
+        tarball = tslib / "packages/lib/release/corp-sdk-0.2.0.tgz"
+        receipt_path = tslib / "packages/lib/release/package-receipt.json"
+        require(tarball.is_file() and receipt_path.is_file(), "Missing packaged ts-library tarball or receipt")
+        receipt = json.loads(receipt_path.read_text())
+        require(receipt["name"] == "@corp/sdk" and receipt["version"] == "0.2.0"
+                and receipt["archive"] == "corp-sdk-0.2.0.tgz", f"Unexpected package receipt: {receipt}")
+        with tarfile.open(tarball) as tar:
+            members = [entry.name for entry in tar.getmembers()]
+            require(any(name.startswith("package/dist/") for name in members), "Library tarball lacks dist/")
+            require(not any(name.startswith("package/src/") for name in members), "Library tarball leaked src/")
+        self.results.append({"label": "tslib-zero-app-package", "passed": True,
+                             "archive": tarball.name, "sha256": sha256(tarball.read_bytes())})
+
+        # 2. Design-system preset: packages/ui + apps/playground, live HMR on packages/ui/src/Button.tsx,
+        #    and publishable UI library packaging.
+        ds = self.create("design-system", "f-design-system", release=self.manager)
+        ds_state = json.loads((ds / ".devkit/manifest.json").read_text())
+        require(set(ds_state["components"]) == {"packages/ui", "apps/playground"}, "Wrong design-system components")
+        require(ds_state["components"]["apps/playground"]["dependencies"] == ["packages/ui"],
+                "Playground did not derive dependency on packages/ui")
+        self.healthy(ds, "design-system")
+
+        self.make(ds, "dev", "app=playground", label="design-system-dev-start")
+        playground = self.service(ds, "playground")
+        self.http(self.port(playground, 5173), "/", "<title>")
+        ds_helper = self.helper(
+            ds, "design-system-web", playground, "Design System Playground", "dev-design-system",
+            hmr_marker="live-ui-hmr", electron_root=fullstack,
+        )
+        self.helper_ready(ds_helper)
+        button_src = ds / "packages/ui/src/Button.tsx"
+        original_button = button_src.read_text()
+        require("data-variant={variant}" in original_button, "Unexpected Button.tsx template source")
+        ui_dist_before = {str(p.relative_to(ds)): sha256(p.read_bytes())
+                          for p in (ds / "packages/ui/dist").rglob("*") if p.is_file()}
+        with changed_files({button_src: original_button.replace(
+                "data-variant={variant}", 'data-variant={variant} data-hmr="live-ui-hmr"')}):
+            self.helper_finish(ds_helper, "dev-design-system")
+            ui_dist_after = {str(p.relative_to(ds)): sha256(p.read_bytes())
+                             for p in (ds / "packages/ui/dist").rglob("*") if p.is_file()}
+            require(ui_dist_before == ui_dist_after, "Design-system HMR unexpectedly rebuilt packages/ui/dist")
+            self.results.append({"label": "design-system-live-hmr", "passed": True, "uiDistUnchanged": True})
+        self.make(ds, "down", label="design-system-dev-down")
+        require(self.inspect("container", playground) is None, "Playground service survived down")
+
+        ui_pkg_path = ds / "packages/ui/package.json"
+        ui_pkg = json.loads(ui_pkg_path.read_text())
+        ui_pkg["private"] = False
+        ui_pkg_path.write_text(json.dumps(ui_pkg, indent=2) + "\n")
+        self.run("design-system-ui-sync", self.cli(self.manager, "sync", ds))
+        self.make(ds, "setup", label="design-system-setup-after-sync")
+        self.make(ds, "package", label="design-system-ui-package")
+        ui_receipt = json.loads((ds / "packages/ui/release/package-receipt.json").read_text())
+        ui_tarball = ds / "packages/ui/release" / ui_receipt["archive"]
+        require(ui_tarball.is_file(), "Missing packaged react-ui archive")
+        with tarfile.open(ui_tarball) as tar:
+            ui_members = [entry.name for entry in tar.getmembers()]
+            require(any(name.endswith(".css") and name.startswith("package/dist/") for name in ui_members),
+                    "Packaged react-ui archive lacks dist/*.css")
+            require(not any(name.startswith("package/src/") for name in ui_members),
+                    "Packaged react-ui archive leaked src/")
+        self.results.append({"label": "design-system-ui-package", "passed": True,
+                             "archive": ui_tarball.name, "sha256": sha256(ui_tarball.read_bytes())})
+
     def cleanup(self):
         errors = []
         for root in reversed(self.projects):
@@ -820,6 +927,7 @@ class Verification:
             self.library_negative(fullstack)
             self.upgrade_product(fullstack, "fullstack")
             self.fullstack(fullstack, node)
+            self.verify_v04_libraries_and_design_system(fullstack)
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)

@@ -27,7 +27,7 @@ import {
 } from '../tooling/npm-inputs/locks.mjs';
 import { npmEnvironment, runNpm, withEnvRegistry } from '../tooling/npm-inputs/npm.mjs';
 
-const names = ['node-api', 'react-web', 'electron-react', 'react-client'];
+const names = ['node-api', 'react-web', 'electron-react', 'react-client', 'ts-library', 'react-ui'];
 const integrity = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
 const identity = (name, version = '1.2.3') => ({
   version,

@@ -84,6 +84,7 @@ pub struct ComponentSpec {
 pub struct InitOptions<'a> {
     pub template: Option<String>,
     pub apps: Option<Vec<ComponentSpec>>,
+    pub packages: Option<Vec<ComponentSpec>>,
     pub preset: Option<String>,
     pub package_mode: Option<PackageMode>,
     pub name: Option<String>,
@@ -391,27 +392,41 @@ pub fn render_component(
         "Component path already exists: {path}"
     );
     ensure!(
-        spec.uses.len() <= 1
-            && (spec.uses.is_empty() || ["react-web", "electron-react"].contains(&definition.id)),
-        "This template supports one shared client binding"
+        spec.uses.is_empty() || definition.toolchain == Toolchain::Node,
+        "--use is supported for Node.js components"
     );
-    let client = spec
-        .uses
-        .first()
-        .map(|n| component_path(Role::Library, n))
-        .transpose()?;
-    let client_name = if let Some(client) = &client {
+    let mut resolved_uses = Vec::new();
+    let mut seen_use_paths = BTreeSet::new();
+    for use_slug in &spec.uses {
+        let dep_path = component_path(Role::Library, use_slug)?;
+        ensure!(dep_path != path, "Component cannot --use itself: {path}");
+        if !seen_use_paths.insert(dep_path.clone()) {
+            continue;
+        }
+        let dep_comp = components
+            .get(&dep_path)
+            .with_context(|| format!("Unknown workspace package for --use: {dep_path}"))?;
         ensure!(
-            components
-                .get(client)
-                .is_some_and(|c| c.tooling_profile == ToolingProfile::ReactLibrary),
-            "Shared client is not a registered React library: {client}"
+            dep_comp.role == Role::Library && dep_comp.toolchain == Toolchain::Node,
+            "Target of --use must be a registered Node.js library: {dep_path}"
         );
-        let m = native_manifest(destination, client)?;
-        text(m.get("name").context("Client name")?, "client package name")?.to_string()
-    } else {
-        String::new()
-    };
+        let m = native_manifest(destination, &dep_path)?;
+        let dep_pkg_name = text(
+            m.get("name").context("Workspace package name")?,
+            "workspace package name",
+        )?
+        .to_string();
+        resolved_uses.push((dep_path, dep_comp.tooling_profile, dep_pkg_name));
+    }
+    let shared_clients: Vec<&str> = resolved_uses
+        .iter()
+        .filter(|(_, p, _)| *p == ToolingProfile::ReactLibrary)
+        .map(|(_, _, n)| n.as_str())
+        .collect();
+    ensure!(
+        shared_clients.len() <= 1,
+        "At most one react-client shared client binding is supported per component"
+    );
     let prefix = format!("templates/{}/", definition.id);
     for (name, id) in &release.manifest.files {
         if let Some(suffix) = name.strip_prefix(&prefix) {
@@ -425,36 +440,55 @@ pub fn render_component(
             )?;
         }
     }
-    if client.is_some() {
-        let variant = format!("{prefix}variants/shared/");
-        let descriptor: Value =
-            serde_json::from_slice(&release.bytes(&format!("{variant}variant.json"))?)?;
-        for remove in descriptor["remove"]
-            .as_array()
-            .context("Variant requires explicit remove list")?
+    let variant_spec = if let Some(&client_pkg) = shared_clients.first()
+        && ["react-web", "electron-react"].contains(&definition.id)
+    {
+        Some(("shared", "__DEVKIT_CLIENT_PACKAGE__", client_pkg))
+    } else if definition.id == "react-web"
+        && let Some((_, _, ui_pkg)) = resolved_uses
+            .iter()
+            .find(|(_, p, _)| *p == ToolingProfile::ReactUi)
+    {
+        Some(("design-system", "__DEVKIT_UI_PACKAGE__", ui_pkg.as_str()))
+    } else {
+        None
+    };
+    if let Some((variant_name, token, replacement)) = variant_spec {
+        let variant = format!("{prefix}variants/{variant_name}/");
+        if release
+            .manifest
+            .files
+            .contains_key(&format!("{variant}variant.json"))
         {
-            let p = safe_path(
-                destination,
-                &format!("{path}/{}", text(remove, "removed path")?),
-            )?;
-            if exists(&p)? {
-                if p.is_dir() {
-                    fs::remove_dir_all(p)?;
-                } else {
-                    remove_file(&p)?;
+            let descriptor: Value =
+                serde_json::from_slice(&release.bytes(&format!("{variant}variant.json"))?)?;
+            for remove in descriptor["remove"]
+                .as_array()
+                .context("Variant requires explicit remove list")?
+            {
+                let p = safe_path(
+                    destination,
+                    &format!("{path}/{}", text(remove, "removed path")?),
+                )?;
+                if exists(&p)? {
+                    if p.is_dir() {
+                        fs::remove_dir_all(p)?;
+                    } else {
+                        remove_file(&p)?;
+                    }
                 }
             }
-        }
-        let files_prefix = format!("{variant}files/");
-        for (name, id) in &release.manifest.files {
-            if let Some(suffix) = name.strip_prefix(&files_prefix) {
-                let bytes = String::from_utf8(release.bytes(name)?)?
-                    .replace("__DEVKIT_CLIENT_PACKAGE__", &client_name);
-                write_atomic(
-                    &safe_path(destination, &format!("{path}/{suffix}"))?,
-                    bytes.as_bytes(),
-                    id.mode,
-                )?;
+            let files_prefix = format!("{variant}files/");
+            for (name, id) in &release.manifest.files {
+                if let Some(suffix) = name.strip_prefix(&files_prefix) {
+                    let bytes =
+                        String::from_utf8(release.bytes(name)?)?.replace(token, replacement);
+                    write_atomic(
+                        &safe_path(destination, &format!("{path}/{suffix}"))?,
+                        bytes.as_bytes(),
+                        id.mode,
+                    )?;
+                }
             }
         }
     }
@@ -490,11 +524,20 @@ pub fn render_component(
     for (name, value) in &state.tool_dependencies {
         deps.insert(name.clone(), json!(value));
     }
-    if let Some(client) = &client {
-        deps.insert(
-            client_name,
-            json!(format!("file:{}", local_relative(&path, client))),
-        );
+    if !resolved_uses.is_empty() {
+        if !manifest.get("dependencies").is_some_and(Value::is_object) {
+            manifest["dependencies"] = json!({});
+        }
+        let prod_deps = manifest
+            .get_mut("dependencies")
+            .and_then(Value::as_object_mut)
+            .context("Template dependencies must be an object")?;
+        for (dep_path, _, dep_pkg_name) in &resolved_uses {
+            prod_deps.insert(
+                dep_pkg_name.clone(),
+                json!(format!("file:{}", local_relative(&path, dep_path))),
+            );
+        }
     }
     write_native(destination, &path, &manifest)?;
     let mut lock: Value = read_json(&safe_path(
@@ -700,17 +743,18 @@ pub fn init_project(
     options: &InitOptions<'_>,
     resolver: &dyn LockResolver,
 ) -> Result<ProjectState> {
+    let has_components = options.apps.is_some() || options.packages.is_some();
     ensure!(
         [
             options.template.is_some(),
-            options.apps.is_some(),
+            has_components,
             options.preset.is_some()
         ]
         .into_iter()
         .filter(|v| *v)
         .count()
             == 1,
-        "Choose exactly one of --app, --preset or --template"
+        "Choose exactly one of --app/--package, --preset or --template"
     );
     let release = admit_release(release_root)?;
     let target = project_root(target)?;
@@ -743,27 +787,46 @@ pub fn init_project(
         uses: vec![],
     };
     let specs = if let Some(preset) = &options.preset {
-        ensure!(preset == "fullstack-desktop", "Unknown preset: {preset}");
-        vec![
-            (Role::Library, app("client", "react-client")),
-            (Role::App, app("api", "rust-api")),
-            (
-                Role::App,
-                ComponentSpec {
-                    uses: vec!["client".to_string()],
-                    ..app("web", "react-web")
-                },
-            ),
-            (
-                Role::App,
-                ComponentSpec {
-                    uses: vec!["client".to_string()],
-                    ..app("desktop", "electron-react")
-                },
-            ),
-        ]
-    } else if let Some(apps) = &options.apps {
-        apps.iter().cloned().map(|a| (Role::App, a)).collect()
+        match preset.as_str() {
+            "fullstack-desktop" => vec![
+                (Role::Library, app("client", "react-client")),
+                (Role::App, app("api", "rust-api")),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["client".to_string()],
+                        ..app("web", "react-web")
+                    },
+                ),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["client".to_string()],
+                        ..app("desktop", "electron-react")
+                    },
+                ),
+            ],
+            "design-system" => vec![
+                (Role::Library, app("ui", "react-ui")),
+                (
+                    Role::App,
+                    ComponentSpec {
+                        uses: vec!["ui".to_string()],
+                        ..app("playground", "react-web")
+                    },
+                ),
+            ],
+            _ => anyhow::bail!("Unknown preset: {preset}"),
+        }
+    } else if has_components {
+        let mut v = Vec::new();
+        if let Some(pkgs) = &options.packages {
+            v.extend(pkgs.iter().cloned().map(|p| (Role::Library, p)));
+        }
+        if let Some(apps) = &options.apps {
+            v.extend(apps.iter().cloned().map(|a| (Role::App, a)));
+        }
+        v
     } else if options.template.as_deref() == Some("mixed") {
         vec![
             (Role::App, app("api", "rust-api")),
@@ -771,24 +834,17 @@ pub fn init_project(
         ]
     } else {
         let t = template(options.template.as_deref().unwrap())?;
-        vec![(
-            Role::App,
-            app(
-                if t.id == "node-api" {
-                    "main"
-                } else if t.id == "rust-api" {
-                    "api"
-                } else {
-                    "web"
-                },
-                t.id,
-            ),
-        )]
+        let default_slug = match t.id {
+            "node-api" => "main",
+            "rust-api" => "api",
+            "ts-library" => "lib",
+            "react-ui" => "ui",
+            "react-client" => "client",
+            _ => "web",
+        };
+        vec![(t.role, app(default_slug, t.id))]
     };
-    ensure!(
-        specs.iter().any(|(r, _)| *r == Role::App),
-        "Init requires an application"
-    );
+    ensure!(!specs.is_empty(), "Init requires at least one component");
     let stage = tempfile::Builder::new()
         .prefix(".devkit-init-")
         .tempdir_in(parent)?;
@@ -808,7 +864,9 @@ pub fn init_project(
             seeds.push(seed);
         }
     }
-    if options.preset.is_some() || options.template.as_deref() == Some("mixed") {
+    if options.preset.as_deref() == Some("fullstack-desktop")
+        || options.template.as_deref() == Some("mixed")
+    {
         for path in ["apps/web", "apps/desktop"] {
             if let Some(c) = state.components.get_mut(path)
                 && let Some(d) = &mut c.development

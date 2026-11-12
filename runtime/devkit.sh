@@ -31,7 +31,7 @@ valid_engine() {
 if ! valid_engine; then
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
-  [ "$mode" = bootstrap ] || [ "$command" = setup ] || fail 'the accepted engine is unavailable; run make setup'
+  [ "$mode" = bootstrap ] || [ "$command" = setup ] || [ "$command" = setup-node ] || fail 'the accepted engine is unavailable; run make setup'
   parent=${engine%/*}
   [ "$(realpath -m -- "$parent")" = "$(realpath -ms -- "$parent")" ] || fail 'the engine cache path contains a symbolic link'
   umask 077

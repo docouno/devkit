@@ -88,7 +88,7 @@ def fixture_tool(root, script):
                "node", "--input-type=module", "-e", script, timeout=35)
 
 
-def write_fixture(root, apps=("main",), packages=()):
+def write_fixture(root, apps=("main",), packages=(), package_profiles=None):
     runtime = root / ".devkit/runtime"
     shutil.copytree(RUNTIME_SOURCE, runtime)
     (runtime / "toolchains.env").write_text(
@@ -104,7 +104,7 @@ def write_fixture(root, apps=("main",), packages=()):
                    "scripts": {name: f"node gate.cjs {name}" for name in ("check", "fix", "test", "build", "dev")
                                if name != "dev" or area == "apps"}}
         if area == "packages":
-            package["exports"] = "./dist/index.js"
+            package["exports"] = {".": "./dist/index.js", "./package.json": "./package.json"}
         (path / "package.json").write_text(json.dumps(package) + "\n")
         (path / "untracked.txt").write_text("untracked source\n")
         (path / "gate.cjs").write_text("const expectedNode = " + json.dumps(NODE_VERSION) + ";\n" + r'''
@@ -134,7 +134,7 @@ if (fs.existsSync('SLOW')) {
   setTimeout(()=>{},25000);
 }
 ''')
-    accept_runtime(root, native=True)
+    accept_runtime(root, native=True, package_profiles=package_profiles)
 
 
 def seal_runtime(root):
@@ -174,7 +174,8 @@ def seal_runtime(root):
     state_path.write_text(json.dumps(state) + "\n")
 
 
-def accept_runtime(root, native=False):
+def accept_runtime(root, native=False, package_profiles=None):
+    package_profiles = package_profiles or {}
     state_path = root / ".devkit/manifest.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {
         "schemaVersion": 2, "version": VERSION, "generation": str(uuid.uuid4()), "packageMode": "registry", "releaseIdentity": "0"*64, "managed": {}}
@@ -191,9 +192,12 @@ def accept_runtime(root, native=False):
                 continue
             name = area + "/" + path.name
             role = "app" if area == "apps" else "library"
-            profile = "rust" if rust else "node" if role == "app" else "react-library"
+            default_lib_profile = package_profiles.get(name) or previous.get(name, {}).get("toolingProfile") or "react-library"
+            profile = "rust" if rust else "node" if role == "app" else default_lib_profile
+            default_template = "rust-api" if rust else "node-api" if role == "app" else (
+                profile if profile in ("ts-library", "react-ui") else "react-client")
             components[name] = {"role": role, "toolchain": "rust" if rust else "node",
-                "toolingProfile": profile, "origin": {"template": "rust-api" if rust else "node-api" if role == "app" else "react-client", "version": VERSION},
+                "toolingProfile": profile, "origin": {"template": default_template, "version": VERSION},
                 "toolDependencies": {}, "dependencies": [], **previous.get(name, {})}
             components[name].update({"role": role, "toolchain": "rust" if rust else "node", "toolingProfile": profile})
             if role == "app":
@@ -731,7 +735,7 @@ build: simulate-update
         empty = json.loads(accepted_manifest)
         empty["components"] = {}
         manifest.write_text(json.dumps(empty))
-        self.assertIn("Project has no registered apps", self.make("check", check=False).stderr)
+        self.assertIn("Project has no registered components", self.make("check", check=False).stderr)
         manifest.write_bytes(accepted_manifest)
         self.make("setup")
         for selector in ("absent", "main;touch bad"):
@@ -1290,6 +1294,279 @@ wait
         output, _ = proc.communicate(timeout=8)
         self.assertNotEqual(proc.returncode, 0, output)
         self.assertEqual(container(name)["Id"], before)
+
+    def test_zero_app_library_repository_and_package_library_mount_isolation(self):
+        write_fixture(self.root, apps=(), packages=("lib",), package_profiles={"packages/lib": "ts-library"})
+        lib_dir = self.root / "packages/lib"
+        pkg_path = lib_dir / "package.json"
+        pkg = json.loads(pkg_path.read_text())
+        pkg["files"] = ["dist"]
+        pkg["scripts"]["package"] = "node gate-pack.cjs"
+        pkg_path.write_text(json.dumps(pkg, indent=2) + "\n")
+        (lib_dir / "gate-pack.cjs").write_text(r'''
+const fs = require('node:fs');
+for (const ro of ['package.json', 'dist/index.js', '../../node_modules/probe-ro']) {
+  let blocked = false;
+  try { fs.writeFileSync(ro, 'ILLEGAL'); }
+  catch (err) { if (['EROFS', 'EACCES'].includes(err.code)) blocked = true; else throw err; }
+  if (!blocked) throw new Error('expected read-only mount during package task: ' + ro);
+}
+const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const slug = manifest.name.replace(/^@/, '').replace(/\//g, '-');
+const archive = `${slug}-${manifest.version}.tgz`;
+fs.writeFileSync(`release/${archive}`, 'TARBALL_FIXTURE\n');
+fs.writeFileSync('release/package-receipt.json', JSON.stringify({
+  schemaVersion: 1,
+  name: manifest.name,
+  version: manifest.version,
+  archive
+}, null, 2) + '\n');
+console.log('PACKED ' + archive);
+''')
+        accept_runtime(self.root, native=True, package_profiles={"packages/lib": "ts-library"})
+
+        self.make("setup")
+        for target in ("check", "test", "build"):
+            self.assertIn(f"GATE lib {target}", self.make(target).stdout)
+        for service_target in ("status", "logs", "down"):
+            self.assertEqual(self.make(service_target).returncode, 0)
+
+        for dev_target in ("dev", "up"):
+            failed_dev = self.make(dev_target, check=False)
+            self.assertNotEqual(failed_dev.returncode, 0)
+            self.assertIn("Project has no runnable apps; add a playground or app with devkit add-app",
+                          failed_dev.stderr)
+
+        no_pkg = self.make("package", check=False)
+        self.assertNotEqual(no_pkg.returncode, 0)
+        self.assertIn('No packageable components found; set "private": false in packages/lib/package.json and run devkit sync',
+                      no_pkg.stderr)
+        priv_pkg = self.make("package", "package=lib", check=False)
+        self.assertNotEqual(priv_pkg.returncode, 0)
+        self.assertIn('Package packages/lib has "private": true in package.json; set "private": false and run devkit sync before packaging',
+                      priv_pkg.stderr)
+
+        # Switch to publishable mode ("private": false), bump version via devkit exec --write, setup and package.
+        pkg["name"] = "@corp/sdk"
+        pkg["private"] = False
+        pkg_path.write_text(json.dumps(pkg, indent=2) + "\n")
+        accept_runtime(self.root, native=True, package_profiles={"packages/lib": "ts-library"})
+        self.make("setup")
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "packages/lib", "--write",
+            "--", "npm", "version", "0.2.0", "--no-git-tag-version")
+        self.assertEqual(json.loads(pkg_path.read_text())["version"], "0.2.0")
+        self.assertIn("dependencies are absent/stale", self.make("package", check=False).stderr)
+        self.make("setup")
+        packed = self.make("package")
+        self.assertIn("PACKED corp-sdk-0.2.0.tgz", packed.stdout)
+        self.assertTrue((lib_dir / "release/corp-sdk-0.2.0.tgz").is_file())
+        receipt = json.loads((lib_dir / "release/package-receipt.json").read_text())
+        self.assertEqual(receipt["name"], "@corp/sdk")
+        self.assertEqual(receipt["version"], "0.2.0")
+
+    def test_private_gitlab_https_san_registry_with_custom_ca_and_token_isolation(self):
+        secret_token = "glpat-runtime-secret-token-777"
+        reg_dir = self.base / "gitlab-registry"
+        pkg_src = self.base / "token-lib-src"
+        certs_dir = self.base / "certs"
+        for d in (reg_dir, pkg_src, certs_dir):
+            d.mkdir(parents=True)
+
+        # Build authentic @corp/token-lib@1.0.0 tarball via pinned Node image.
+        (pkg_src / "package.json").write_text(json.dumps({
+            "name": "@corp/token-lib",
+            "version": "1.0.0",
+            "main": "./index.cjs",
+            "exports": {".": "./index.cjs"}
+        }, indent=2) + "\n")
+        (pkg_src / "index.cjs").write_text("module.exports = { value: 'from-private-gitlab-registry' };\n")
+        fixture_tool(pkg_src, (
+            "import {spawnSync} from 'node:child_process';"
+            "const r=spawnSync('npm',['pack','--json','--pack-destination','/fixture'],{stdio:'inherit'});"
+            "process.exit(r.status??1)"
+        ))
+        tarball_path = pkg_src / "corp-token-lib-1.0.0.tgz"
+        tarball_bytes = tarball_path.read_bytes()
+        shutil.copy2(tarball_path, reg_dir / "corp-token-lib-1.0.0.tgz")
+        import base64
+        tarball_shasum = hashlib.sha1(tarball_bytes).hexdigest()
+        tarball_integrity = "sha512-" + base64.b64encode(hashlib.sha512(tarball_bytes).digest()).decode()
+
+        # Generate Root CA first, launch container to discover its exact bridge IP, then sign SAN server cert.
+        ca_key = certs_dir / "ca.key"
+        ca_pem = certs_dir / "ca.pem"
+        run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(ca_key), "-out", str(ca_pem), "-days", "2",
+            "-subj", "/CN=Devkit Test Root CA")
+
+        (reg_dir / "server.cjs").write_text(r'''
+const fs = require('node:fs');
+const https = require('node:https');
+
+const expectedAuth = 'Bearer ' + process.env.EXPECTED_TOKEN;
+const prefix = '/api/v4/projects/7/packages/npm';
+const tarball = fs.readFileSync('/registry/corp-token-lib-1.0.0.tgz');
+
+function waitForCerts() {
+  if (!fs.existsSync('/registry/server.pem') || !fs.existsSync('/registry/server.key')) {
+    setTimeout(waitForCerts, 30);
+    return;
+  }
+  const server = https.createServer({
+    cert: fs.readFileSync('/registry/server.pem'),
+    key: fs.readFileSync('/registry/server.key'),
+  }, (req, res) => {
+    if (req.headers.authorization !== expectedAuth) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    const baseUrl = `https://${req.headers.host}${prefix}`;
+    const url = req.url.split('?')[0];
+    if (url === `${prefix}/@corp%2ftoken-lib` || url === `${prefix}/@corp%2Ftoken-lib` || url === `${prefix}/@corp/token-lib`) {
+      const tarballUrl = `${baseUrl}/@corp/token-lib/-/@corp/token-lib-1.0.0.tgz`;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        name: '@corp/token-lib',
+        'dist-tags': { latest: '1.0.0' },
+        versions: {
+          '1.0.0': {
+            name: '@corp/token-lib',
+            version: '1.0.0',
+            main: './index.cjs',
+            dist: {
+              tarball: tarballUrl,
+              shasum: process.env.TARBALL_SHASUM,
+              integrity: process.env.TARBALL_INTEGRITY,
+            },
+          },
+        },
+      }));
+      return;
+    }
+    if (url === `${prefix}/@corp/token-lib/-/@corp/token-lib-1.0.0.tgz`) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(tarball);
+      return;
+    }
+    res.writeHead(404);
+    res.end('not found: ' + url);
+  });
+  server.listen(8443, '0.0.0.0', () => console.log('GITLAB_REGISTRY_READY'));
+}
+waitForCerts();
+''')
+
+        reg_name = self.owned_name()
+        run("docker", "run", "--detach", "--pull", "never", "--name", reg_name,
+            "--label", f"{LABEL}={self.token}", "--network", "bridge",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--volume", f"{reg_dir}:/registry:ro,z",
+            "--env", f"EXPECTED_TOKEN={secret_token}",
+            "--env", f"TARBALL_SHASUM={tarball_shasum}",
+            "--env", f"TARBALL_INTEGRITY={tarball_integrity}",
+            IMAGE, "node", "/registry/server.cjs")
+        bridge_ip = container(reg_name)["NetworkSettings"]["Networks"]["bridge"]["IPAddress"]
+        self.assertTrue(bridge_ip, "missing bridge IP for private registry container")
+
+        srv_key = certs_dir / "server.key"
+        srv_csr = certs_dir / "server.csr"
+        ext_cfg = certs_dir / "san.cnf"
+        ext_cfg.write_text(f"subjectAltName=IP:{bridge_ip},DNS:gitlab.registry.test\nextendedKeyUsage=serverAuth\n")
+        run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(srv_key), "-out", str(srv_csr),
+            "-subj", f"/CN={bridge_ip}")
+        srv_pem_tmp = certs_dir / "server.pem"
+        run("openssl", "x509", "-req", "-in", str(srv_csr),
+            "-CA", str(ca_pem), "-CAkey", str(ca_key), "-CAcreateserial",
+            "-out", str(srv_pem_tmp), "-days", "2", "-extfile", str(ext_cfg))
+        shutil.copy2(srv_key, reg_dir / "server.key")
+        shutil.copy2(srv_pem_tmp, reg_dir / "server.pem")
+        wait_until(lambda: "GITLAB_REGISTRY_READY" in run("docker", "logs", reg_name, check=False).stdout)
+
+        # Build project with BOTH Node (apps/main) and Rust (apps/api) components.
+        write_fixture(self.root, apps=("main",))
+        shutil.copytree(REPO / "templates/rust-api", self.root / "apps/api", ignore=shutil.ignore_patterns("target"))
+        (self.root / "apps/api/tests/secret_isolation.rs").write_text(
+            "#[test]\n"
+            "fn private_npm_tokens_and_ca_never_enter_rust_containers() {\n"
+            "    assert!(\n"
+            '        std::env::var("GITLAB_NPM_TOKEN").is_err(),\n'
+            '        "GITLAB_NPM_TOKEN leaked to Rust container"\n'
+            "    );\n"
+            "    assert!(\n"
+            '        std::env::var("NODE_EXTRA_CA_CERTS").is_err(),\n'
+            '        "NODE_EXTRA_CA_CERTS leaked to Rust container"\n'
+            "    );\n"
+            "    assert!(\n"
+            '        !std::path::Path::new("/devkit/ca.pem").exists(),\n'
+            '        "/devkit/ca.pem mounted in Rust container"\n'
+            "    );\n"
+            "}\n"
+        )
+        (self.root / "apps/main/gate.cjs").write_text(
+            (self.root / "apps/main/gate.cjs").read_text() + r'''
+if (process.env.GITLAB_NPM_TOKEN !== 'devkit-offline-unused') {
+  throw new Error('offline Node task saw unexpected GITLAB_NPM_TOKEN: ' + process.env.GITLAB_NPM_TOKEN);
+}
+if (process.env.NODE_EXTRA_CA_CERTS || fs.existsSync('/devkit/ca.pem')) {
+  throw new Error('offline Node task mounted CA cert unexpectedly');
+}
+const priv = require('@corp/token-lib');
+if (priv.value !== 'from-private-gitlab-registry') {
+  throw new Error('unexpected @corp/token-lib payload');
+}
+''')
+        registry_url = f"https://{bridge_ip}:8443/api/v4/projects/7/packages/npm/"
+        nerf = f"//{bridge_ip}:8443/api/v4/projects/7/packages/npm/"
+        (self.root / ".npmrc").write_text(
+            f"@corp:registry={registry_url}\n"
+            f"{nerf}:_authToken=${{GITLAB_NPM_TOKEN}}\n"
+            f"{nerf}:always-auth=true\n"
+        )
+        accept_runtime(self.root, native=True)
+
+        # 1. Missing GITLAB_NPM_TOKEN fails closed before container launch.
+        no_tok_env = env()
+        no_tok_env["DEVKIT_CA_CERT"] = str(ca_pem)
+        missing_tok = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
+                          "--write", "--network", "bridge", "--prepare", "--",
+                          "npm", "install", "@corp/token-lib@1.0.0", "--save-exact",
+                          env=no_tok_env, check=False, timeout=90)
+        self.assertNotEqual(missing_tok.returncode, 0)
+        self.assertIn("Missing environment variable GITLAB_NPM_TOKEN required by .npmrc", missing_tok.stderr)
+
+        # 2. Missing DEVKIT_CA_CERT fails TLS verification (strict-ssl remains enforced).
+        no_ca_env = env()
+        no_ca_env["GITLAB_NPM_TOKEN"] = secret_token
+        missing_ca = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
+                         "--write", "--network", "bridge", "--prepare", "--",
+                         "npm", "install", "@corp/token-lib@1.0.0", "--save-exact",
+                         env=no_ca_env, check=False, timeout=90)
+        self.assertNotEqual(missing_ca.returncode, 0)
+
+        # 3. With DEVKIT_CA_CERT + GITLAB_NPM_TOKEN, install & lock @corp/token-lib, then run full setup + offline gates.
+        auth_env = env()
+        auth_env["DEVKIT_CA_CERT"] = str(ca_pem)
+        auth_env["GITLAB_NPM_TOKEN"] = secret_token
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
+            "--write", "--network", "bridge", "--prepare", "--",
+            "npm", "install", "@corp/token-lib@1.0.0", "--save-exact", "--ignore-scripts",
+            env=auth_env, timeout=120)
+        accept_runtime(self.root, native=False)
+
+        self.make("setup", env=auth_env, timeout=240)
+        for target in ("check", "test", "build"):
+            out = self.make(target, env=auth_env, timeout=240).stdout
+            self.assertIn(f"GATE main {target}", out)
+
+        # 4. Verify secret_token is absent from ALL files under checkout (including package-lock.json, .npmrc, .devkit, node_modules).
+        lock_text = (self.root / "package-lock.json").read_text()
+        self.assertIn(f"{registry_url}@corp/token-lib/-/@corp/token-lib-1.0.0.tgz", lock_text)
+        for file_path in self.root.rglob("*"):
+            if file_path.is_file() and not file_path.is_symlink():
+                data = file_path.read_bytes()
+                self.assertNotIn(secret_token.encode(), data, f"Secret token leaked into {file_path}")
 
 
 if __name__ == "__main__":

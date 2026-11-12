@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -43,6 +43,7 @@ pub struct RuntimeRequest {
     pub package: Option<String>,
     pub expected_manifest: Option<String>,
     pub headless: bool,
+    pub package_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
 }
@@ -56,6 +57,7 @@ impl RuntimeRequest {
             package: None,
             expected_manifest: None,
             headless: false,
+            package_aggregate: false,
             follow: false,
             tail: 100,
         }
@@ -270,6 +272,7 @@ impl ToolAdmission {
 #[derive(Clone, Copy)]
 enum TaskAccess {
     Finite,
+    PackageLibrary,
     Fix,
     ExecReadOnly,
     ExecWrite,
@@ -535,7 +538,14 @@ impl<'a> PreparedContext<'a> {
         } = task;
         let write_root = matches!(access, TaskAccess::ExecWrite);
         let fix = matches!(access, TaskAccess::Fix);
-        let readonly_deps = matches!(access, TaskAccess::ExecReadOnly);
+        let package_release_dir = if matches!(access, TaskAccess::PackageLibrary) {
+            Some(format!(
+                "{}/release",
+                component.context("PackageLibrary requires a component")?
+            ))
+        } else {
+            None
+        };
         let root = &self.admission.root;
         let mut writes = BTreeSet::new();
         if let Some(inputs) = inputs {
@@ -615,7 +625,11 @@ impl<'a> PreparedContext<'a> {
             ]);
         }
         for path in &writes {
-            let readonly = readonly_deps && path.ends_with("node_modules");
+            let readonly = match access {
+                TaskAccess::PackageLibrary => package_release_dir.as_deref() != Some(path.as_str()),
+                TaskAccess::ExecReadOnly => path.ends_with("node_modules"),
+                _ => false,
+            };
             c.args([
                 "--mount",
                 &bind_mount(
@@ -798,6 +812,17 @@ fn node_argv(ctx: &PreparedContext<'_>, argv: Vec<OsString>) -> Vec<OsString> {
     ]
     .concat()
 }
+fn component_is_public_library(root: &Path, path: &str, c: &ComponentState) -> Result<bool> {
+    if matches!(
+        c.tooling_profile,
+        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+    ) {
+        let manifest: Value = read_json(&input_path(root, format!("{path}/package.json"))?)?;
+        Ok(manifest.get("private") == Some(&Value::Bool(false)))
+    } else {
+        Ok(false)
+    }
+}
 pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     if request.command == "help" {
         print!("{HELP}");
@@ -819,6 +844,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             "logs",
             "status",
             "snapshot",
+            "dev-snapshot",
             "package-snapshot"
         ]
         .contains(&request.command.as_str()),
@@ -846,20 +872,71 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     };
     let target = tool.target(&request)?;
     let mut ctx = PreparedContext::new(tool, runner)?;
-    if ["snapshot", "package-snapshot"].contains(&request.command.as_str()) {
-        if request.command == "package-snapshot" {
+    if ["snapshot", "dev-snapshot", "package-snapshot"].contains(&request.command.as_str()) {
+        if request.command == "dev-snapshot" {
             ensure!(
                 request.package.is_none(),
-                "package selects a desktop app, not a library"
+                "Development requires an app selector"
             );
             ensure!(
                 ctx.admission
                     .state
                     .components
                     .values()
-                    .any(|c| c.tooling_profile == ToolingProfile::Electron),
-                "No desktop component is registered"
+                    .any(|c| c.role == Role::App),
+                "Project has no runnable apps; add a playground or app with devkit add-app"
             );
+        } else if request.command == "package-snapshot" {
+            if let Some(pkg) = &request.package {
+                let pkg_path = format!("packages/{pkg}");
+                let c = &ctx.admission.state.components[&pkg_path];
+                ensure!(
+                    matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ),
+                    "Package {pkg_path} uses internal profile {} and cannot be packaged as a tarball",
+                    c.tooling_profile
+                );
+                ensure!(
+                    component_is_public_library(&ctx.admission.root, &pkg_path, c)?,
+                    "Package {pkg_path} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                );
+            } else if let Some(app) = &request.app {
+                let app_path = format!("apps/{app}");
+                ensure!(
+                    ctx.admission.state.components[&app_path].tooling_profile
+                        == ToolingProfile::Electron,
+                    "Application {app_path} is not a desktop Electron app"
+                );
+            } else {
+                let mut any_packageable = false;
+                let mut hint_slug: Option<String> = None;
+                for (path, c) in &ctx.admission.state.components {
+                    if c.tooling_profile == ToolingProfile::Electron {
+                        any_packageable = true;
+                        break;
+                    }
+                    if matches!(
+                        c.tooling_profile,
+                        ToolingProfile::TsLibrary | ToolingProfile::ReactUi
+                    ) {
+                        if hint_slug.is_none() {
+                            hint_slug = path.rsplit('/').next().map(str::to_owned);
+                        }
+                        if component_is_public_library(&ctx.admission.root, path, c)? {
+                            any_packageable = true;
+                            break;
+                        }
+                    }
+                }
+                if !any_packageable {
+                    let slug_hint = hint_slug.as_deref().unwrap_or("<name>");
+                    anyhow::bail!(
+                        "No packageable components found; set \"private\": false in packages/{slug_hint}/package.json and run devkit sync, or add an Electron app"
+                    );
+                }
+            }
         }
         return Ok(());
     }
@@ -992,10 +1069,39 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         } else {
             ctx.admission.pins.node_image.clone()
         };
-        ensure!(
-            command != "package" || component.tooling_profile == ToolingProfile::Electron,
-            "package is defined for desktop applications"
-        );
+        let mut access = if command == "fix" {
+            TaskAccess::Fix
+        } else {
+            TaskAccess::Finite
+        };
+        if command == "package" {
+            match component.tooling_profile {
+                ToolingProfile::Electron => {}
+                ToolingProfile::TsLibrary | ToolingProfile::ReactUi => {
+                    if !component_is_public_library(&ctx.admission.root, &target, &component)? {
+                        if request.package_aggregate {
+                            full.recheck()?;
+                            runner.check_cancelled()?;
+                            drop(lock);
+                            return Ok(());
+                        }
+                        anyhow::bail!(
+                            "Package {target} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                        );
+                    }
+                    access = TaskAccess::PackageLibrary;
+                }
+                _ => {
+                    if component.role == Role::Library {
+                        anyhow::bail!(
+                            "Package {target} uses internal profile {} and cannot be packaged as a tarball",
+                            component.tooling_profile
+                        );
+                    }
+                    anyhow::bail!("Application {target} is not a desktop Electron app");
+                }
+            }
+        }
         if !setup {
             ctx.task(ContainerTask {
                 component: Some(&target),
@@ -1003,11 +1109,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 image: &image,
                 argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), command.into()]),
                 network: "none",
-                access: if command == "fix" {
-                    TaskAccess::Fix
-                } else {
-                    TaskAccess::Finite
-                },
+                access,
                 inputs: Some(&full.native.inputs),
             })?;
         }
@@ -1100,7 +1202,6 @@ fn run_service(
     ctx: &mut PreparedContext<'_>,
 ) -> Result<()> {
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
-    let mut command = ctx.compose()?;
     let selected = if let Some(path) = target {
         let c = &ctx.admission.state.components[path];
         ensure!(
@@ -1111,6 +1212,19 @@ fn run_service(
     } else {
         None
     };
+    if selected.is_none()
+        && !ctx
+            .admission
+            .state
+            .components
+            .values()
+            .any(|c| c.role == Role::App)
+        && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none()
+    {
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        return Ok(());
+    }
+    let mut command = ctx.compose()?;
     // Existing recorded derived image IDs allow interpolation; never inspect or
     // acquire tool images for service status/logs/down.
     for kind in ["rust", "desktop"] {

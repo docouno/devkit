@@ -28,8 +28,23 @@ import {
 } from './npm-inputs/locks.mjs';
 import { npmEnvironment, runNpm, withEnvRegistry } from './npm-inputs/npm.mjs';
 
-const templateNames = ['node-api', 'react-web', 'electron-react', 'react-client'];
-const excluded = new Set(['node_modules', 'target', 'dist', '.artifacts', '.tmp', '.git']);
+const templateNames = [
+  'node-api',
+  'react-web',
+  'electron-react',
+  'react-client',
+  'ts-library',
+  'react-ui',
+];
+const excluded = new Set([
+  'node_modules',
+  'target',
+  'dist',
+  'release',
+  '.artifacts',
+  '.tmp',
+  '.git',
+]);
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const sri = (bytes) => `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
 const encode = (value) => `${JSON.stringify(value, null, 2)}\n`;

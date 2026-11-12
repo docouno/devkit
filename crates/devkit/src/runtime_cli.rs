@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME]\n  devkit describe [--root PATH]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
+const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit describe [--root PATH]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
 fn string(arg: &OsStr) -> Result<&str> {
     arg.to_str().context("Expected UTF-8 command option")
 }
@@ -41,7 +41,9 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
     }
     if command == "catalog" {
         ensure!(args.len() == 1, "catalog takes no arguments");
-        println!("node-api\nrust-api\nreact-web\nelectron-react\nreact-client");
+        println!(
+            "node-api\nrust-api\nreact-web\nelectron-react\nts-library\nreact-ui\nreact-client"
+        );
         return Ok(());
     }
     if command == "internal" {
@@ -68,6 +70,10 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         request.headless = boolean(
             &env_string("DEVKIT_HEADLESS").unwrap_or_else(|| "0".into()),
             "headless",
+        )?;
+        request.package_aggregate = boolean(
+            &env_string("DEVKIT_PACKAGE_AGGREGATE").unwrap_or_else(|| "0".into()),
+            "package_aggregate",
         )?;
         request.follow = boolean(
             &env_string("DEVKIT_FOLLOW").unwrap_or_else(|| "0".into()),

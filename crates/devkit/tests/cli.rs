@@ -195,3 +195,42 @@ fn unknown_recovery_conflict_does_not_roll_back_anything() {
     assert_eq!(fs::read(root.join(PENDING_PATH)).unwrap(), pending_before);
     assert_eq!(fs::read(root.join(stage).join("backup/0")).unwrap(), before);
 }
+
+#[test]
+fn catalog_exposes_library_templates_and_design_system_preset() {
+    let temp = TempDir::new().unwrap();
+    let json_out = invoke(temp.path(), &["catalog", "--json"]);
+    assert!(json_out.status.success());
+    let payload = decoded(&json_out);
+    let templates = payload["result"]["templates"].as_array().unwrap();
+    let find_template = |id: &str| {
+        templates
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("missing template {id}"))
+    };
+    let ts_lib = find_template("ts-library");
+    assert_eq!(ts_lib["role"], "library");
+    assert_eq!(ts_lib["toolchain"], "node");
+    assert_eq!(ts_lib["profile"], "ts-library");
+
+    let react_ui = find_template("react-ui");
+    assert_eq!(react_ui["role"], "library");
+    assert_eq!(react_ui["toolchain"], "node");
+    assert_eq!(react_ui["profile"], "react-ui");
+
+    assert_eq!(
+        payload["result"]["presets"],
+        serde_json::json!(["fullstack-desktop", "design-system"])
+    );
+
+    let text_out = invoke(temp.path(), &["catalog"]);
+    assert!(text_out.status.success());
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    for needle in ["ts-library", "react-ui", "design-system"] {
+        assert!(
+            stdout.contains(needle),
+            "catalog text missing {needle}: {stdout}"
+        );
+    }
+}

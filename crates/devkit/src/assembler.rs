@@ -32,13 +32,22 @@ use std::{
     time::Duration,
 };
 
-const NODE_TEMPLATES: [&str; 4] = ["node-api", "react-web", "electron-react", "react-client"];
-const TEMPLATES: [&str; 5] = [
+const NODE_TEMPLATES: [&str; 6] = [
+    "node-api",
+    "react-web",
+    "electron-react",
+    "react-client",
+    "ts-library",
+    "react-ui",
+];
+const TEMPLATES: [&str; 7] = [
     "node-api",
     "react-web",
     "rust-api",
     "electron-react",
     "react-client",
+    "ts-library",
+    "react-ui",
 ];
 const RUNTIME_FILES: [&str; 8] = [
     "devkit.mk",
@@ -90,6 +99,7 @@ fn ignored(name: &str) -> bool {
             "node_modules",
             "target",
             "dist",
+            "release",
             ".artifacts",
             ".tmp",
             ".git",

@@ -49,7 +49,14 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
     .unwrap();
     let external = json!({"version":"1.2.3","resolved":"https://registry.npmjs.org/external/-/external-1.2.3.tgz","integrity":sri(b"selected external artifact"),"dev":true});
     let mut templates = BTreeMap::new();
-    for name in ["node-api", "react-web", "electron-react", "react-client"] {
+    for name in [
+        "node-api",
+        "react-web",
+        "electron-react",
+        "react-client",
+        "ts-library",
+        "react-ui",
+    ] {
         let manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","devDependencies":{"@docouno/env":"0.2.1","external":"1.2.3"}});
         let lock = json!({"lockfileVersion":3,"packages":{"":manifest,"node_modules/@docouno/env":{"version":"0.2.1","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.2.1.tgz","integrity":sri(b"old environment")},"node_modules/external":external}});
         let manifest_name = format!("templates/{name}/package.json");

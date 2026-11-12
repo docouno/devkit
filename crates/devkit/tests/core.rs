@@ -74,12 +74,20 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
         ("react-web", false),
         ("electron-react", false),
         ("react-client", true),
+        ("ts-library", true),
+        ("react-ui", true),
     ] {
         let mut manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","private":true,
             "devDependencies":{"@docouno/env":version},"scripts":{"check":"check","fix":"fix","test":"test","build":"build","dev":"dev"}});
         if library {
-            manifest["exports"] = json!({".":"./src/index.ts"});
             manifest["scripts"].as_object_mut().unwrap().remove("dev");
+            if ["ts-library", "react-ui"].contains(&name) {
+                manifest["files"] = json!(["dist"]);
+                manifest["exports"] = json!({".":{"types":"./dist/index.d.mts","default":"./dist/index.mjs"},"./package.json":"./package.json"});
+                manifest["scripts"]["package"] = json!("devkit-pack");
+            } else {
+                manifest["exports"] = json!({".":"./src/index.ts"});
+            }
         }
         put_json(&root, &format!("templates/{name}/package.json"), &manifest);
         put_json(
@@ -93,6 +101,36 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             b"export const answer = 42;\n",
         );
     }
+    put_json(
+        &root,
+        "templates/react-web/variants/shared/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/react-web/variants/shared/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_CLIENT_PACKAGE__';\n",
+    );
+    put_json(
+        &root,
+        "templates/electron-react/variants/shared/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/electron-react/variants/shared/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_CLIENT_PACKAGE__';\n",
+    );
+    put_json(
+        &root,
+        "templates/react-web/variants/design-system/variant.json",
+        &json!({"remove":[]}),
+    );
+    put(
+        &root,
+        "templates/react-web/variants/design-system/files/src/index.ts",
+        b"export { answer } from '__DEVKIT_UI_PACKAGE__';\n",
+    );
     for (name, bytes) in [
         (
             "Cargo.toml",
@@ -2587,4 +2625,240 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
     let after_pkg: Value = read_json(&target.join("apps/main/package.json")).unwrap();
     assert_eq!(after_pkg["dependencies"]["clsx"], "^2.1.0");
     devkit::native::assert_native_components(&target, &applied.state).unwrap();
+}
+
+#[test]
+fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.4.0");
+
+    // 1. Single --template ts-library creates a 0-app repository at packages/lib.
+    let lib_only = f.path().join("lib-only");
+    let lib_state = init_project(
+        &release,
+        &lib_only,
+        &InitOptions {
+            template: Some("ts-library".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("acme".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        lib_state.components.keys().cloned().collect::<Vec<_>>(),
+        vec!["packages/lib"]
+    );
+    assert_eq!(
+        lib_state.components["packages/lib"].tooling_profile,
+        ToolingProfile::TsLibrary
+    );
+    assert!(lib_state.components["packages/lib"].development.is_none());
+    let apps_compose: Value =
+        serde_json::from_slice(&fs::read(lib_only.join(".devkit/compose.apps.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(apps_compose["services"], json!({}));
+    let lib_mk = fs::read_to_string(lib_only.join(".devkit/project.mk")).unwrap();
+    assert!(lib_mk.contains("DEVKIT_REGISTERED_APPS := \n"), "{lib_mk}");
+    assert!(
+        lib_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES := lib\n"),
+        "{lib_mk}"
+    );
+    assert!(
+        lib_mk.contains("package/packages/lib: build/packages/lib\n"),
+        "{lib_mk}"
+    );
+    let gitignore = fs::read_to_string(lib_only.join(".gitignore")).unwrap();
+    assert!(gitignore.contains("/packages/*/dist/\n"), "{gitignore}");
+    assert!(gitignore.contains("/packages/*/release/\n"), "{gitignore}");
+    let sig_before = source_signature(&lib_only, Some(&lib_state)).unwrap();
+    put(&lib_only, "packages/lib/release/sdk-0.1.0.tgz", b"tarball");
+    assert_eq!(
+        source_signature(&lib_only, Some(&lib_state)).unwrap(),
+        sig_before,
+        "profile_outputs must exclude packages/*/release from source_signature"
+    );
+
+    // 2. Multi-package 0-app init + add-package --use + add-app --use writes to dependencies.
+    let multi = f.path().join("multi");
+    init_project(
+        &release,
+        &multi,
+        &InitOptions {
+            packages: Some(vec![
+                ComponentSpec {
+                    name: "core".into(),
+                    template: "ts-library".into(),
+                    uses: vec![],
+                },
+                ComponentSpec {
+                    name: "ui".into(),
+                    template: "react-ui".into(),
+                    uses: vec!["core".into()],
+                },
+            ]),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("suite".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let ui_pkg: Value = read_json(&multi.join("packages/ui/package.json")).unwrap();
+    assert_eq!(
+        ui_pkg["dependencies"]["@suite/package-core"],
+        "file:../core"
+    );
+    assert!(
+        ui_pkg["devDependencies"]
+            .get("@suite/package-core")
+            .is_none()
+    );
+
+    let compose_inventory = capture_compose_inputs(&multi).unwrap();
+    let after_add = add_project_component(
+        &release,
+        &multi,
+        Role::App,
+        ComponentSpec {
+            name: "playground".into(),
+            template: "react-web".into(),
+            uses: vec!["ui".into(), "core".into()],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&compose_inventory),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let play_pkg: Value = read_json(&multi.join("apps/playground/package.json")).unwrap();
+    assert_eq!(
+        play_pkg["dependencies"]["@suite/package-ui"],
+        "file:../../packages/ui"
+    );
+    assert_eq!(
+        play_pkg["dependencies"]["@suite/package-core"],
+        "file:../../packages/core"
+    );
+    assert!(
+        play_pkg["devDependencies"]
+            .get("@suite/package-ui")
+            .is_none()
+    );
+    assert_eq!(
+        after_add.state.components["packages/ui"].dependencies,
+        vec!["packages/core"]
+    );
+    assert_eq!(
+        after_add.state.components["apps/playground"].dependencies,
+        vec!["packages/core", "packages/ui"]
+    );
+    assert_eq!(
+        fs::read_to_string(multi.join("apps/playground/src/index.ts")).unwrap(),
+        "export { answer } from '@suite/package-ui';\n"
+    );
+
+    // 3. --preset design-system scaffolds packages/ui + apps/playground without a backend app.
+    let ds = f.path().join("ds");
+    let ds_state = init_project(
+        &release,
+        &ds,
+        &InitOptions {
+            preset: Some("design-system".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("system".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        ds_state.components.keys().cloned().collect::<Vec<_>>(),
+        vec!["apps/playground", "packages/ui"]
+    );
+    assert_eq!(
+        ds_state.components["packages/ui"].tooling_profile,
+        ToolingProfile::ReactUi
+    );
+    assert_eq!(
+        ds_state.components["apps/playground"].dependencies,
+        vec!["packages/ui"]
+    );
+    assert_eq!(
+        fs::read_to_string(ds.join("apps/playground/src/index.ts")).unwrap(),
+        "export { answer } from '@system/package-ui';\n"
+    );
+}
+
+#[test]
+fn project_make_stays_byte_identical_without_packageable_libraries() {
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.4.0");
+    let target = f.path().join("fullstack");
+    init_project(
+        &release,
+        &target,
+        &InitOptions {
+            preset: Some("fullstack-desktop".into()),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("legacy-compat".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let legacy_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    assert!(
+        !legacy_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES"),
+        "0.3.2 profile set must not emit DEVKIT_PACKAGEABLE_PACKAGES:\n{legacy_mk}"
+    );
+    assert!(
+        !legacy_mk.contains("package/packages/"),
+        "0.3.2 profile set must not emit library package targets:\n{legacy_mk}"
+    );
+    assert_eq!(
+        legacy_mk,
+        "# Managed component registration.\n\
+         DEVKIT_REGISTERED_APPS := api desktop web\n\
+         DEVKIT_REGISTERED_PACKAGES := client\n\
+         DEVKIT_DESKTOP_APPS := desktop\n\
+         setup-desktop: setup-node-workspace\n\
+         check-desktop: check/packages/client build/packages/client\n\
+         test-desktop: build/packages/client\n\
+         build-desktop: build/packages/client\n\
+         dev-desktop: build/packages/client\n\
+         package-desktop: build-desktop\n\
+         setup-web: setup-node-workspace\n\
+         check-web: check/packages/client build/packages/client\n\
+         test-web: build/packages/client\n\
+         build-web: build/packages/client\n\
+         dev-web: build/packages/client\n\
+         setup/packages/client: setup-node-workspace\n"
+    );
+
+    // Adding a TsLibrary introduces DEVKIT_PACKAGEABLE_PACKAGES and package/packages/<slug>.
+    add_project_component(
+        &release,
+        &target,
+        Role::Library,
+        ComponentSpec {
+            name: "sdk".into(),
+            template: "ts-library".into(),
+            uses: vec![],
+        },
+        &UpdateOptions::default(),
+        &FixtureResolver,
+    )
+    .unwrap();
+    let updated_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    assert!(
+        updated_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES := sdk\n"),
+        "{updated_mk}"
+    );
+    assert!(
+        updated_mk.contains("package/packages/sdk: build/packages/sdk\n"),
+        "{updated_mk}"
+    );
 }

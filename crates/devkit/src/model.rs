@@ -17,7 +17,7 @@ macro_rules! wire_enum {
 wire_enum!(PackageMode { Local => "local", Registry => "registry" });
 wire_enum!(Role { App => "app", Library => "library" });
 wire_enum!(Toolchain { Node => "node", Rust => "rust" });
-wire_enum!(ToolingProfile { Node => "node", Web => "web", Electron => "electron", ReactLibrary => "react-library", Rust => "rust" });
+wire_enum!(ToolingProfile { Node => "node", Web => "web", Electron => "electron", ReactLibrary => "react-library", TsLibrary => "ts-library", ReactUi => "react-ui", Rust => "rust" });
 wire_enum!(DevelopmentOwner { Managed => "managed", Project => "project" });
 wire_enum!(DevelopmentKind { Compose => "compose", Desktop => "desktop" });
 

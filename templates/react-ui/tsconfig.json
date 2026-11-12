@@ -1,0 +1,5 @@
+{
+  "extends": "@docouno/env/tsconfig/react-library.json",
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}
