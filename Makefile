@@ -55,7 +55,7 @@ bootstrap:
 	if [ -f /sys/fs/cgroup/cpu.max ]; then \
 	  set -- $$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf 'max 100000'); \
 	  if [ "$${1:-max}" != max ] && [ "$${2:-0}" -gt 0 ] 2>/dev/null; then \
-	    milli=$$(( $$1 * 1000 / $$2 )); [ "$$milli" -ge 10 ] || milli=10; \
+	    milli=$$(( $$1 * 1000 / $$2 )); [ "$$milli" -ge 100 ] || milli=100; \
 	    if [ "$$milli" -lt 2000 ]; then \
 	      whole=$$(( milli / 1000 )); frac=$$(( (milli % 1000) / 100 )); \
 	      if [ "$$frac" -eq 0 ] && [ "$$whole" -ge 1 ]; then cpus="$$whole"; else cpus="$$whole.$$frac"; fi; \

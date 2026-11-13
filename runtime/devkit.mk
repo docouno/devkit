@@ -12,8 +12,8 @@ export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.j
 devkit_loader := .devkit/runtime/devkit.sh
 include .devkit/project.mk
 
-devkit_app_valid := $(if $(strip $(app)),$(if $(filter 1,$(words $(app))),$(filter $(app),$(DEVKIT_REGISTERED_APPS)),),1)
-devkit_package_valid := $(if $(strip $(package)),$(if $(filter 1,$(words $(package))),$(filter $(package),$(DEVKIT_REGISTERED_PACKAGES)),),1)
+devkit_app_valid := $(if $(strip $(app)),$(if $(findstring %,$(app)),,$(if $(filter 1,$(words $(app))),$(filter $(app),$(DEVKIT_REGISTERED_APPS)),)),1)
+devkit_package_valid := $(if $(strip $(package)),$(if $(findstring %,$(package)),,$(if $(filter 1,$(words $(package))),$(filter $(package),$(DEVKIT_REGISTERED_PACKAGES)),)),1)
 devkit_selectors_valid := $(if $(and $(strip $(app)),$(strip $(package))),,$(and $(devkit_app_valid),$(devkit_package_valid)))
 devkit_dev_selectors_valid := $(if $(strip $(package)),,$(devkit_app_valid))
 

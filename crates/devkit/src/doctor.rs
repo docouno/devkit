@@ -900,13 +900,22 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
     match admitted {
         Err(err) => {
             let msg = format!("{err:#}");
-            let rem = if msg.contains("Managed file conflict") {
-                "git checkout -- .devkit && devkit sync"
-            } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
-                "devkit sync && make setup"
-            } else {
-                "devkit sync"
-            };
+            let rem = ["restore it with '", "Run '", "run '"]
+                .iter()
+                .find_map(|prefix| {
+                    let rest = msg.split_once(prefix)?.1;
+                    let cmd = rest.split_once('\'')?.0.trim();
+                    (!cmd.is_empty()).then(|| cmd.to_owned())
+                })
+                .unwrap_or_else(|| {
+                    if msg.contains("Managed file conflict") {
+                        "git checkout -- .devkit && devkit sync".into()
+                    } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
+                        "make setup".into()
+                    } else {
+                        "devkit sync".into()
+                    }
+                });
             DoctorCheck {
                 id: "checkout_state",
                 status: "fail",
@@ -916,7 +925,7 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                     "pendingUpdate": false,
                     "activeLockOwner": active_owner,
                 }),
-                remediation: Some(rem.into()),
+                remediation: Some(rem),
             }
         }
         Ok((project_state, version, receipts)) => {

@@ -352,10 +352,7 @@ pub fn parse_memory_bytes(var_name: &str, raw: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-pub fn is_cgroup_delegation_failure(exit_code: u8, stderr: &[u8]) -> bool {
-    if !(125..=127).contains(&exit_code) {
-        return false;
-    }
+fn matches_cgroup_delegation_stderr(stderr: &[u8]) -> bool {
     let text = String::from_utf8_lossy(stderr);
     [
         "cannot enter cgroupv2",
@@ -365,6 +362,14 @@ pub fn is_cgroup_delegation_failure(exit_code: u8, stderr: &[u8]) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+pub fn is_cgroup_delegation_failure(exit_code: u8, stderr: &[u8]) -> bool {
+    (125..=127).contains(&exit_code) && matches_cgroup_delegation_stderr(stderr)
+}
+
+pub fn is_compose_cgroup_delegation_failure(exit_code: u8, stderr: &[u8]) -> bool {
+    (exit_code == 1 || (125..=127).contains(&exit_code)) && matches_cgroup_delegation_stderr(stderr)
 }
 
 fn socket_peer_cred(path: &Path) -> std::result::Result<PeerCred, std::io::ErrorKind> {
@@ -2134,5 +2139,21 @@ mod tests {
         ));
         assert!(!is_cgroup_delegation_failure(1, b"cannot enter cgroupv2"));
         assert!(!is_cgroup_delegation_failure(125, b"pull access denied"));
+        assert!(is_compose_cgroup_delegation_failure(
+            1,
+            b"Error response from daemon: failed to create task for container: cannot enter cgroupv2 \"/sys/fs/cgroup/docker\" with domain controllers"
+        ));
+        assert!(is_compose_cgroup_delegation_failure(
+            125,
+            b"cgroup.subtree_control: permission denied"
+        ));
+        assert!(!is_compose_cgroup_delegation_failure(
+            2,
+            b"cannot enter cgroupv2"
+        ));
+        assert!(!is_compose_cgroup_delegation_failure(
+            1,
+            b"pull access denied"
+        ));
     }
 }

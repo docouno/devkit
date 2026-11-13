@@ -1730,7 +1730,10 @@ fn run_development(
             break;
         }
         if attempt == 0
-            && crate::resources::is_cgroup_delegation_failure(up_output.code, &up_output.stderr)
+            && crate::resources::is_compose_cgroup_delegation_failure(
+                up_output.code,
+                &up_output.stderr,
+            )
         {
             eprintln!(
                 "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
