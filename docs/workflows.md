@@ -1,6 +1,6 @@
 # Daily Workflows
 
-This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.4.0`.
+This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.4.1`.
 
 ## 1. Create a New Repository
 
@@ -9,13 +9,13 @@ This guide covers day-to-day repository creation, component wiring, dependency m
 Initialize a single-app or multi-app workspace:
 
 ```sh
-npx @docouno/devkit@0.4.0 init my-product --app web=react-web
+npx @docouno/devkit@0.4.1 init my-product --app web=react-web
 ```
 
 Or scaffold the fullstack preset (`apps/api` Rust API + `apps/web` React SPA + `apps/desktop` Electron app + `packages/client` shared React library):
 
 ```sh
-npx @docouno/devkit@0.4.0 init my-suite --preset fullstack-desktop
+npx @docouno/devkit@0.4.1 init my-suite --preset fullstack-desktop
 ```
 
 ### Standalone Libraries (Zero-App Workspace)
@@ -23,13 +23,13 @@ npx @docouno/devkit@0.4.0 init my-suite --preset fullstack-desktop
 Create a package-only repository without scaffolding a dummy runnable application:
 
 ```sh
-npx @docouno/devkit@0.4.0 init acme-sdk --package sdk=ts-library
+npx @docouno/devkit@0.4.1 init acme-sdk --package sdk=ts-library
 ```
 
 Create a React component library repository:
 
 ```sh
-npx @docouno/devkit@0.4.0 init acme-ui --package ui=react-ui
+npx @docouno/devkit@0.4.1 init acme-ui --package ui=react-ui
 ```
 
 ### Design System with Interactive Playground
@@ -37,7 +37,7 @@ npx @docouno/devkit@0.4.0 init acme-ui --package ui=react-ui
 Scaffold `packages/ui` (`react-ui`) pre-wired to `apps/playground` (`react-web`) with instant source HMR:
 
 ```sh
-npx @docouno/devkit@0.4.0 init acme-design --preset design-system
+npx @docouno/devkit@0.4.1 init acme-design --preset design-system
 ```
 
 After initialization, prepare pinned toolchains and workspace dependencies:
@@ -52,9 +52,9 @@ make setup
 Add libraries or applications at any time and wire them to existing `packages/<slug>` components with repeatable `--use`:
 
 ```sh
-npx @docouno/devkit@0.4.0 add-package . --name tokens --template ts-library
-npx @docouno/devkit@0.4.0 add-package . --name ui --template react-ui --use tokens
-npx @docouno/devkit@0.4.0 add-app . --name docs --template react-web --use tokens --use ui
+npx @docouno/devkit@0.4.1 add-package . --name tokens --template ts-library
+npx @docouno/devkit@0.4.1 add-package . --name ui --template react-ui --use tokens
+npx @docouno/devkit@0.4.1 add-app . --name docs --template react-web --use tokens --use ui
 make setup
 ```
 
@@ -66,14 +66,14 @@ Never run host `npm install` or `cargo` directly on the checkout. Always execute
 
 ```sh
 # Node.js / React / TypeScript component (including npm: aliases)
-npx @docouno/devkit@0.4.0 exec --component packages/ui --write --network bridge -- \
+npx @docouno/devkit@0.4.1 exec --component packages/ui --write --network bridge -- \
   npm install clsx
 
-npx @docouno/devkit@0.4.0 exec --component packages/ui --write --network bridge -- \
+npx @docouno/devkit@0.4.1 exec --component packages/ui --write --network bridge -- \
   npm install legacy-zod@npm:zod@^3.24.0
 
 # Rust component
-npx @docouno/devkit@0.4.0 exec --component apps/api --write --network bridge -- \
+npx @docouno/devkit@0.4.1 exec --component apps/api --write --network bridge -- \
   cargo update --manifest-path Cargo.toml
 ```
 
@@ -85,22 +85,24 @@ make exec package=ui write=1 network=bridge command="npm install clsx"
 
 Follow dependency mutations with `make setup` to refresh the verified workspace lock receipt.
 
-## 4. Edit Native Manifests and Synchronize (`devkit sync`)
+## 4. Edit Native Manifests and Synchronize (`make sync` / `devkit sync`)
 
 Devkit treats `package.json`, `Cargo.toml`, and root `.npmrc` as product-owned sources of truth. When you edit package metadata directly — such as renaming `"name"` to `@corp/ui`, setting `"private": false`, adjusting workspace dependencies, or adding scoped private registries in `.npmrc` — synchronize the lockfile and Devkit projections:
 
 ```sh
 # Preview planned lockfile and projection updates without writing
-npx @docouno/devkit@0.4.0 sync . --preview
+make sync preview=1
 
 # Apply fast offline JSON sync (or online resolution when registry packages changed)
-npx @docouno/devkit@0.4.0 sync .
+make sync
 
 # Reconcile drifted peer/transitive locks across the 3-stage ladder when needed
-npx @docouno/devkit@0.4.0 sync . --reconcile-lock
+make sync reconcile=1
 
 make setup
 ```
+
+You can also invoke `npx @docouno/devkit@0.4.1 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
 
 ## 5. Run Daily Gates and Development Services
 
@@ -130,16 +132,16 @@ For repositories with runnable applications (`apps/*`):
 make dev                    # Start development services and print http://127.0.0.1:<port> URLs
 make up                     # Start development stack in the background and print service URLs
 make status                 # Inspect running service containers via Docker Compose
-npx @docouno/devkit@0.4.0 status . --json    # Structured services, health, URLs, and receipts
+npx @docouno/devkit@0.4.1 status . --json    # Structured services, health, URLs, and receipts
 make logs app=playground    # Print recent service logs (follow=1 streams without holding task.lock)
 make down                   # Stop and remove project containers and networks
 ```
 
-For environment diagnostics and zero-Docker metadata inspection:
+For environment diagnostics and zero-Docker metadata inspection (via `npx` or directly through `.devkit/runtime/devkit.sh` without host Node.js):
 
 ```sh
-npx @docouno/devkit@0.4.0 doctor . --json    # Lock-free Docker, cgroup v2, DinD, disk, and checkout checks
-npx @docouno/devkit@0.4.0 describe . --json  # Offline component graph, selectors, ports, and receipts
+sh .devkit/runtime/devkit.sh cli doctor . --json    # Lock-free Docker, cgroup v2, DinD, disk, and checkout checks
+sh .devkit/runtime/devkit.sh cli describe . --json  # Offline component graph, selectors, ports, and receipts
 ```
 
 Read-only commands (`devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs`, and read-only `devkit exec`) use shared checkout locks so multiple terminals or automation tools can inspect the repository concurrently. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).

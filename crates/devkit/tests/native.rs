@@ -2957,3 +2957,31 @@ fn publishable_library_contract_enforces_private_exports_files_semver_and_public
     write_all(&base_web, &base_internal, &base_core, &base_ui);
     assert_native_components(root, &st).unwrap();
 }
+
+#[test]
+fn plain_non_component_directories_and_files_in_namespaces_pass_recheck() {
+    let f = TempDir::new().unwrap();
+    let (_, root, _) = runtime_project(f.path(), "node");
+    assert!(!root.join("packages").exists());
+    let admitted = admit_runtime_project(&root, "0.3.0").unwrap();
+
+    // Creating a plain non-component folder and file under packages/ and apps/ passes recheck.
+    put(&root, "packages/notes/scratch.md", "temporary notes\n");
+    put(&root, "apps/README.md", "apps overview\n");
+    admitted.recheck().unwrap();
+
+    // Removing the plain folder/file also passes recheck.
+    fs::remove_dir_all(root.join("packages/notes")).unwrap();
+    fs::remove_file(root.join("apps/README.md")).unwrap();
+    admitted.recheck().unwrap();
+
+    // Creating a symlink inside packages/ still fails recheck.
+    std::os::unix::fs::symlink("..", root.join("packages/escape")).unwrap();
+    assert!(
+        admitted
+            .recheck()
+            .unwrap_err()
+            .to_string()
+            .contains("namespace changed")
+    );
+}

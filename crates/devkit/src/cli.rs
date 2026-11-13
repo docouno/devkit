@@ -548,8 +548,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
     ensure!(
-        header.managed.get(name) == identity(&path)?.as_ref(),
-        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'devkit sync'"
+        crate::model::FileIdentity::matches_git_tracked_opt(
+            identity(&path)?.as_ref(),
+            header.managed.get(name),
+        ),
+        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
     );
     let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
     ensure!(

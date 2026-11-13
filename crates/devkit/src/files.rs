@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
 
@@ -476,6 +476,8 @@ pub fn copy_tree(
             }
         } else if info.is_file() {
             write_atomic(t, &fs::read(p)?, info.permissions().mode() & 0o777)?;
+        } else if links && (info.file_type().is_socket() || info.file_type().is_fifo()) {
+            return Ok(());
         } else {
             bail!("Unsupported input file type: {}", p.display());
         }

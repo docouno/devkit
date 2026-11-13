@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-13
+
+### Added
+
+- `make sync [reconcile=1] [preview=1]` and `sh .devkit/runtime/devkit.sh cli <subcommand> ...` so pure `git clone` and `git worktree` checkouts can synchronize manifests, run lock-free `doctor --json` / `describe --json` / `status --json`, add components, and apply updates through the pinned engine without a global `devkit` or Node.js installation.
+
+### Fixed
+
+- Compare Git-tracked managed files by SHA-256 and executable class (`100644` vs `100755`) instead of literal `0o777` mode bits so repositories cloned or linked as Git worktrees under `umask 0002` (`0664`/`0775`) or `umask 0077` (`0600`/`0700`) pass admission and `sync` without spurious `Managed file conflict` errors or untouched-file diffs.
+- Ignore transient Unix domain sockets and FIFOs during project staging and source-tree snapshotting instead of aborting `sync`, `update`, or component registration with `Unsupported project input`.
+- Allow plain non-component directories (without `package.json`, `Cargo.toml`, or symlinks) to be created or removed under `apps/` and `packages/` without tripping `NativeStructure::recheck`.
+
 ## [0.4.0] - 2026-11-12
 
 ### Added

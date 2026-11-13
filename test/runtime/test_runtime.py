@@ -1593,10 +1593,32 @@ if (priv.value !== 'from-private-gitlab-registry') {
 
         # Cold-safe make help works and documents flags and diagnostic commands.
         help_out = self.make("help").stdout
-        for token in ("headless=1", "follow=1", "tail=100", "devkit status", "devkit doctor", "devkit exec"):
+        for token in ("headless=1", "follow=1", "tail=100", "make sync", "devkit status", "devkit doctor", "devkit exec", "devkit.sh cli"):
             self.assertIn(token, help_out)
 
+        # Offline CLI invocation with cold engine cache refuses network download cleanly.
+        cold_cache = self.base / "cold-cache"
+        cold_env = dict(os.environ, DEVKIT_CACHE_DIR=str(cold_cache), CI="true")
+        cold_env.pop("DEVKIT_ENGINE_PATH", None)
+        cold_cli = run("sh", str(self.root / ".devkit/runtime/devkit.sh"), "cli", "--offline", "describe", str(self.root),
+                       env=cold_env, check=False)
+        self.assertNotEqual(cold_cli.returncode, 0)
+        self.assertIn("the accepted engine is unavailable; run make setup", cold_cli.stderr)
+
         self.make("setup")
+
+        # Simulate umask 0002 Git clone / worktree modes (0o664 regular, 0o775 executable) and run
+        # Make gates + devkit.sh cli subcommands without global devkit on PATH.
+        for managed_file in (self.root / ".devkit").rglob("*"):
+            if managed_file.is_file() and not managed_file.is_symlink() and "state" not in managed_file.parts and "cache" not in managed_file.parts:
+                cur_mode = managed_file.stat().st_mode & 0o777
+                managed_file.chmod(0o775 if (cur_mode & 0o111) else 0o664)
+        self.make("check")
+        self.make("doctor")
+        cli_desc = run("sh", str(self.root / ".devkit/runtime/devkit.sh"), "cli", "describe", str(self.root), "--json")
+        self.assertTrue(json.loads(cli_desc.stdout)["ok"])
+        cli_doc = run("sh", str(self.root / ".devkit/runtime/devkit.sh"), "cli", "doctor", str(self.root), "--json")
+        self.assertTrue(json.loads(cli_doc.stdout)["ok"])
 
         # Invalid Make selector prints registered apps and packages instead of 'No rule to make target'.
         bad_sel = self.make("check", "app=absent", check=False)

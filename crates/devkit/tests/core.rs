@@ -3020,3 +3020,130 @@ fn applicable_migrations_filters_by_semver_window_profile_and_component_origin()
             .is_empty()
     );
 }
+
+#[test]
+fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_churn() {
+    use std::os::unix::net::UnixListener;
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.4.1");
+    let proj = temp.path().join("umask-proj");
+    init_project(
+        &release,
+        &proj,
+        &InitOptions {
+            apps: Some(vec![
+                ComponentSpec {
+                    name: "api".into(),
+                    template: "rust-api".into(),
+                    uses: vec![],
+                },
+                ComponentSpec {
+                    name: "web".into(),
+                    template: "react-web".into(),
+                    uses: vec!["sdk".into()],
+                },
+            ]),
+            packages: Some(vec![ComponentSpec {
+                name: "sdk".into(),
+                template: "ts-library".into(),
+                uses: vec![],
+            }]),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    // Normalize FixtureResolver's synthetic lockfile to seed_workspace_lock's canonical shape first.
+    let initial = sync_project(&release, &proj, &UpdateOptions::default(), &FixtureResolver)
+        .unwrap()
+        .state;
+
+    // Test both Ubuntu/Debian group-writable worktree modes (umask 0002 -> 0664/0775)
+    // and restrictive modes (umask 0077 -> 0600/0700).
+    for (reg_mode, exec_mode) in [(0o664, 0o775), (0o600, 0o700)] {
+        for (rel, id) in file_map(&proj).unwrap() {
+            if rel.starts_with(".devkit/state/") {
+                continue;
+            }
+            let new_mode = if id.mode & 0o111 != 0 {
+                exec_mode
+            } else {
+                reg_mode
+            };
+            fs::set_permissions(proj.join(rel), fs::Permissions::from_mode(new_mode)).unwrap();
+        }
+
+        // Admission succeeds despite non-0644/0755 modes when sha256 + exec class match.
+        admit_runtime_project(&proj, "0.4.1").unwrap();
+
+        // Untouched sync is a true no-op (does not mint a new generation or rewrite files).
+        let noop = sync_project(&release, &proj, &UpdateOptions::default(), &NoResolver).unwrap();
+        assert!(noop.no_op);
+        assert!(!noop.applied);
+        assert!(noop.files.is_empty());
+        assert_eq!(noop.state.generation, initial.generation);
+    }
+
+    // Flipping executable class on a managed file MUST still fail with Managed file conflict.
+    let tc_path = proj.join(".devkit/runtime/toolchains.env");
+    fs::set_permissions(&tc_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let err = match admit_runtime_project(&proj, "0.4.1") {
+        Ok(_) => panic!("expected Managed file conflict when executable bit flips"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("Managed file conflict"));
+    fs::set_permissions(&tc_path, fs::Permissions::from_mode(0o664)).unwrap();
+
+    // Editing one product package.json under 0664 modes only reports changed files in --preview,
+    // never churning untouched .devkit/* files.
+    for (rel, id) in file_map(&proj).unwrap() {
+        if rel.starts_with(".devkit/state/") {
+            continue;
+        }
+        let m = if id.mode & 0o111 != 0 { 0o775 } else { 0o664 };
+        fs::set_permissions(proj.join(rel), fs::Permissions::from_mode(m)).unwrap();
+    }
+    let mut sdk_pkg: Value = read_json(&proj.join("packages/sdk/package.json")).unwrap();
+    sdk_pkg["description"] = json!("Updated under umask 0002");
+    put_json(&proj, "packages/sdk/package.json", &sdk_pkg);
+    fs::set_permissions(
+        proj.join("packages/sdk/package.json"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+
+    // Also place a live Unix domain socket and a FIFO inside the project tree to verify
+    // source_signature and copy_tree ignore transient IPC nodes cleanly.
+    let sock_path = proj.join("apps/web/transient.sock");
+    let _listener = UnixListener::bind(&sock_path).unwrap();
+    let fifo_path = proj.join("apps/web/transient.fifo");
+    let c_fifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+    let preview = sync_project(
+        &release,
+        &proj,
+        &UpdateOptions {
+            preview: true,
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert!(!preview.no_op);
+    assert!(!preview.applied);
+    assert!(
+        !preview
+            .files
+            .iter()
+            .any(|f| f.path.starts_with(".devkit/runtime/")),
+        "untouched .devkit/runtime/* files must not appear in preview: {:?}",
+        preview.files
+    );
+
+    let applied =
+        sync_project(&release, &proj, &UpdateOptions::default(), &FixtureResolver).unwrap();
+    assert!(applied.applied);
+    admit_runtime_project(&proj, "0.4.1").unwrap();
+}

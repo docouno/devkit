@@ -732,14 +732,14 @@ class Verification:
         preview_out = self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
         require(source_snapshot(root) == before, f"{kind} preview changed project bytes")
         apply_out = self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
-        if state["version"].startswith("0.3.") and version == "0.4.0":
+        if state["version"].startswith("0.3.") and version.startswith("0.4."):
             if kind in ("node", "mixed"):
                 for out_text in (preview_out, apply_out):
                     require(f"Migration notes ({state['version']} -> {version}):" in out_text,
                             f"{kind} upgrade missing Migration notes header")
                     require("local: " in out_text and "docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
                             f"{kind} upgrade missing local migration doc pointer")
-                    require("url:   https://github.com/docouno/devkit/blob/v0.4.0/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
+                    require(f"url:   https://github.com/docouno/devkit/blob/v{version}/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
                             f"{kind} upgrade missing GitHub migration doc URL")
             elif kind == "rust":
                 require("Migration notes" not in preview_out and "Migration notes" not in apply_out,

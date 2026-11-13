@@ -1470,7 +1470,10 @@ fn mutate(
             if !old.managed.contains_key(name) && identity(&safe_path(root, name)?)?.is_some() {
                 let adopting = matches!(&change,Some(Change::Register{role,name:component,..}) if name==&format!("{}/rust-toolchain.toml",component_path(*role,component)?));
                 ensure!(
-                    adopting && identity(&safe_path(root, name)?)?.as_ref() == Some(id),
+                    adopting
+                        && identity(&safe_path(root, name)?)?
+                            .as_ref()
+                            .is_some_and(|actual| actual.matches_git_tracked(id)),
                     "New managed file conflicts with project content: {name}"
                 );
             }
@@ -1783,8 +1786,10 @@ pub fn sync_project(
                 if name == MANIFEST_PATH {
                     continue;
                 }
-                if identity(&safe_path(root, name)?)? != identity(&safe_path(&staged_root, name)?)?
-                {
+                if !FileIdentity::matches_git_tracked_opt(
+                    identity(&safe_path(root, name)?)?.as_ref(),
+                    identity(&safe_path(&staged_root, name)?)?.as_ref(),
+                ) {
                     any_changed = true;
                     break;
                 }
