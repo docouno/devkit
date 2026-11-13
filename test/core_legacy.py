@@ -40,7 +40,7 @@ def main():
             with (proof / 'public-factory-init.log').open('w') as output:
                 created = subprocess.run(['bash', str(release / 'devkit'), 'init', consumer,
                     '--app', 'api=rust-api', '--package-source', 'local'], env=env,
-                    stdout=output, stderr=subprocess.STDOUT, timeout=180)
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=180)
             assert created.returncode == 0, (proof / 'public-factory-init.log').read_text()
             # Product-owned input preserved by the existing compatibility oracle.
             (Path(consumer) / '.env').write_text('PRODUCT_OWNER_SENTINEL=preserve\n')
@@ -50,7 +50,7 @@ def main():
         for name in ('genuine_accepted_legacy_add_passes_old_runtime_doctor', 'legacy_library_patch_registration_add_and_modern_migration_preserve_native_ownership'):
             with (proof / (name + '.log')).open('w') as output:
                 result = subprocess.run([str(binaries[0]), '--exact', name, '--ignored', '--nocapture', '--test-threads=1'],
-                    cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=240)
+                    cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=240)
             rows.append(dict(test=name, exitCode=result.returncode))
             assert result.returncode == 0, (proof / (name + '.log')).read_text()
     (proof / 'receipt.json').write_text(json.dumps(dict(passed=True, cases=rows,

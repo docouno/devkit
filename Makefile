@@ -91,32 +91,32 @@ verify-runtime-gates: verify-runtime verify-rust
 verify-delivery-gates: verify-delivery verify-bootstrap
 verify-core-legacy:
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core --no-run)
-	@set -eu; image=$$(docker image inspect --format '{{.Id}}' "$$DEVKIT_AUTHOR_RUST_IMAGE"); DEVKIT_TEST_RUST_IMAGE="$$image" DEVKIT_VERIFY_PREVIOUS="$$DEVKIT_VERIFY_PREVIOUS" python3 test/core_legacy.py
+	@set -eu; image=$$(docker image inspect --format '{{.Id}}' "$$DEVKIT_AUTHOR_RUST_IMAGE"); DEVKIT_TEST_RUST_IMAGE="$$image" DEVKIT_VERIFY_PREVIOUS="$$DEVKIT_VERIFY_PREVIOUS" python3 test/core_legacy.py < /dev/null
 verify-author:
-	@python3 test/author.py
+	@python3 test/author.py < /dev/null
 verify-engine:
-	@python3 test/author.py --engine-only
+	@python3 test/author.py --engine-only < /dev/null
 verify-runtime: $(author_blackbox_build) build-fixtures verify-engine
-	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_TEST_FIXTURE="$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/examples/runtime_fixture" python3 test/runtime/test_runtime.py
+	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_TEST_FIXTURE="$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/examples/runtime_fixture" python3 test/runtime/test_runtime.py < /dev/null
 verify-rust: $(author_blackbox_build) verify-engine
-	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" python3 test/rust-check/test_rust_check.py
+	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" python3 test/rust-check/test_rust_check.py < /dev/null
 verify-delivery:
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
-	@DEVKIT_TEST_BUILD_SET="$$DEVKIT_BUILD_SET" DEVKIT_TEST_DOCKER=1 python3 test/delivery/test_delivery.py
+	@DEVKIT_TEST_BUILD_SET="$$DEVKIT_BUILD_SET" DEVKIT_TEST_DOCKER=1 python3 test/delivery/test_delivery.py < /dev/null
 verify-bootstrap:
 	@test -n "$$DEVKIT_LEGACY_ARCHIVE" || { printf '%s\n' 'Set legacy_archive=/absolute/public-0.2.1.tar.gz with adjacent checksum.' >&2; exit 1; }
 	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
-	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --legacy-release "$$DEVKIT_LEGACY_ARCHIVE"
+	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --legacy-release "$$DEVKIT_LEGACY_ARCHIVE" < /dev/null
 verify-packaged:
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
-	@DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS"
+	@DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS" < /dev/null
 verify-registry: build-fixtures
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
-	@bash test/verify-registry.sh "$$DEVKIT_VERIFY_PREVIOUS" "$$DEVKIT_VERIFY_RELEASE"
+	@bash test/verify-registry.sh "$$DEVKIT_VERIFY_PREVIOUS" "$$DEVKIT_VERIFY_RELEASE" < /dev/null
 verify-public:
 	@test -n "$$DEVKIT_EXPECTED_INDEX_SHA256" || { printf '%s\n' 'Set expected_index_sha256= to the frozen release-index.json SHA256.' >&2; exit 1; }
-	@python3 test/public/verify.py --version "$$DEVKIT_FROM_VERSION" --next-version "$$DEVKIT_RELEASE_VERSION" --expected-index-sha256 "$$DEVKIT_EXPECTED_INDEX_SHA256"
+	@python3 test/public/verify.py --version "$$DEVKIT_FROM_VERSION" --next-version "$$DEVKIT_RELEASE_VERSION" --expected-index-sha256 "$$DEVKIT_EXPECTED_INDEX_SHA256" < /dev/null
 init: build
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_INIT_TARGET" || { printf '%s\n' 'Set release= and target=.' >&2; exit 1; }
 	@"$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/release/devkit" init "$$DEVKIT_INIT_TARGET" --release-root "$$DEVKIT_VERIFY_RELEASE" --template "$$DEVKIT_INIT_TEMPLATE" --package-source local --non-interactive

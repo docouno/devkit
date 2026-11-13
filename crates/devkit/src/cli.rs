@@ -533,7 +533,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
         "Accepted engine dispatch did not converge"
     );
-    runner.check_cancelled()?;
+    crate::processes::restore_exec_pdeathsig(runner)?;
     let mut command = std::process::Command::new(&engine);
     globals.write_flags(&mut command);
     command

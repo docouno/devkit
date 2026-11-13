@@ -16,7 +16,7 @@ use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use tempfile::TempDir;
 
@@ -892,6 +892,7 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
         .arg("setup")
         .env("CARGO_BUILD_JOBS", "2")
         .current_dir(&target)
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(
@@ -901,6 +902,7 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
     let status = Command::new("make")
         .arg("doctor")
         .current_dir(&target)
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(
@@ -1146,6 +1148,7 @@ fn legacy_library_patch_registration_add_and_modern_migration_preserve_native_ow
             .arg(command)
             .env("CARGO_BUILD_JOBS", "1")
             .current_dir(&target)
+            .stdin(Stdio::null())
             .status()
             .unwrap();
         assert!(

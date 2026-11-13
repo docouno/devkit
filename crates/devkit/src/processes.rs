@@ -1,6 +1,6 @@
 //! One process boundary for native tools and Docker creators. No shell interprets argv.
 use crate::Result;
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use serde_json::Value;
 use std::{
     fmt,
@@ -12,11 +12,13 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
+
+static INITIAL_PPID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug)]
 pub struct CommandFailure {
@@ -141,6 +143,12 @@ impl OwnedContainer {
 }
 impl ProcessRunner {
     pub fn new() -> Result<Self> {
+        // SAFETY: SIG_IGN is a valid POSIX disposition; inherited across execve so
+        // child process groups (process_group(0)) never stall on background TTY writes.
+        ensure!(
+            unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) } != libc::SIG_ERR,
+            "Cannot ignore SIGTTOU"
+        );
         let cancelled = Arc::new(AtomicUsize::new(0));
         let mut signals = Signals {
             cancelled: cancelled.clone(),
@@ -161,6 +169,26 @@ impl ProcessRunner {
             }?;
             signals.registrations.push(id);
         }
+        {
+            let cancelled = cancelled.clone();
+            // SAFETY: getppid() and lock-free atomic operations are async-signal-safe.
+            // Linux PR_SET_PDEATHSIG fires when the spawning OS thread exits even while
+            // the parent process (TGID) remains alive; only cancel when getppid() changes.
+            let id = unsafe {
+                signal_hook::low_level::register(libc::SIGURG, move || {
+                    let initial = INITIAL_PPID.load(Ordering::Relaxed);
+                    if initial > 0 && libc::getppid() != initial {
+                        let _ = cancelled.compare_exchange(
+                            0,
+                            libc::SIGTERM as usize,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                })
+            }?;
+            signals.registrations.push(id);
+        }
         // Orphaned ordinary creator descendants remain our responsibility.
         // SAFETY: prctl accepts these scalar arguments, with no borrowed pointers.
         ensure!(
@@ -170,6 +198,14 @@ impl ProcessRunner {
         Ok(Self {
             signals: Arc::new(signals),
         })
+    }
+    pub(crate) fn cancel(&self, sig: i32) {
+        let _ = self.signals.cancelled.compare_exchange(
+            0,
+            sig as usize,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
     pub fn check_cancelled(&self) -> Result<()> {
         let sig = self.signals.cancelled.load(Ordering::SeqCst);
@@ -570,6 +606,7 @@ impl Creator {
             return Ok(());
         }
         signal_group(self.pid, libc::SIGTERM);
+        signal_group(self.pid, libc::SIGCONT);
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut first_error = None;
         let mut reaped = false;
@@ -669,15 +706,36 @@ fn reap_available(pid: i32) -> Result<()> {
 }
 /// The CLI dies with its invoking Make/shell; its installed handlers still get
 /// to clean up. Install ProcessRunner before calling this, before any spawn.
-pub fn watch_parent() -> Result<()> {
-    // SAFETY: these prctl arguments contain no borrowed pointers.
+pub fn watch_parent(runner: &ProcessRunner) -> Result<()> {
+    // SAFETY: getppid and scalar prctl arguments contain no borrowed pointers.
     let parent = unsafe { libc::getppid() };
+    INITIAL_PPID.store(parent, Ordering::SeqCst);
     ensure!(
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } == 0,
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGURG, 0, 0, 0) } == 0,
         "Cannot watch parent lifetime"
     );
-    if unsafe { libc::getppid() } != parent {
-        bail!("Invoking process exited during startup");
+    let current = unsafe { libc::getppid() };
+    if current != parent || (parent != 1 && current == 1) {
+        runner.cancel(libc::SIGTERM);
+        runner.check_cancelled()?;
+    }
+    Ok(())
+}
+
+/// Restore SIGTERM parent-death notification before replacing this image via execve,
+/// while guarding against a parent exit in the transition window.
+pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
+    runner.check_cancelled()?;
+    let initial = INITIAL_PPID.load(Ordering::SeqCst);
+    // SAFETY: scalar prctl arguments contain no borrowed pointers.
+    ensure!(
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } == 0,
+        "Cannot restore parent death signal before exec"
+    );
+    let current = unsafe { libc::getppid() };
+    if initial > 0 && (current != initial || (initial != 1 && current == 1)) {
+        runner.cancel(libc::SIGTERM);
+        runner.check_cancelled()?;
     }
     Ok(())
 }

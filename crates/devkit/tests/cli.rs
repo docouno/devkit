@@ -457,3 +457,86 @@ fn update_and_sync_forward_dispatch_to_synthetic_99_0_0_release_with_unknown_pro
     );
     assert_eq!(decoded(&add_out)["result"]["engine"], "99.0.0");
 }
+
+#[test]
+fn bootstrap_interactive_with_dev_null_stdin_fails_immediately_listing_missing_flags() {
+    use std::os::{fd::FromRawFd, unix::process::CommandExt};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let temp = TempDir::new().unwrap();
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: openpty initializes two valid file descriptors when returning 0.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let _master_guard = unsafe { fs::File::from_raw_fd(master) };
+    let stderr_tty = unsafe { fs::File::from_raw_fd(slave) };
+
+    let started = Instant::now();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_devkit"));
+    cmd.arg("init")
+        .current_dir(temp.path())
+        .env_clear()
+        .env("DEVKIT_BOOTSTRAP_INTERACTIVE", "1")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_tty));
+    // SAFETY: setsid and TIOCSCTTY make stderr's PTY the foreground controlling terminal
+    // of the child, reproducing an agent subshell with a live TTY on stderr and /dev/null on stdin.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(2, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DEVKIT_BOOTSTRAP_INTERACTIVE=1 with /dev/null stdin hung on /dev/tty"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let json_out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args(["init", "--json"])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("DEVKIT_BOOTSTRAP_INTERACTIVE", "1")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!json_out.status.success());
+    let payload = decoded(&json_out);
+    assert_eq!(payload["error"]["code"], "MISSING_ARGUMENT");
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("TARGET"), "missing TARGET in: {message}");
+    assert!(
+        message.contains("--app/--package/--preset/--template"),
+        "missing template flags in: {message}"
+    );
+}

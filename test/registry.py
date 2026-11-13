@@ -73,13 +73,13 @@ def main():
                     '--', 'node', 'test/registry-consumer.mjs', mode]
         def run(name, argv):
             started = time.monotonic()
-            result = subprocess.run(argv, cwd=scratch, env=env, capture_output=True, text=True, timeout=240)
+            result = subprocess.run(argv, cwd=scratch, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=240)
             (proof / f'{name}.log').write_text(result.stdout + result.stderr)
             rows.append(dict(name=name, exitCode=result.returncode, seconds=time.monotonic() - started))
             assert result.returncode == 0, f'{name}: {result.stdout}\n{result.stderr}'
         try:
             with (proof / 'server.log').open('w') as log:
-                server = subprocess.Popen(node('serve'), cwd=scratch, env=env, stdout=log, stderr=log)
+                server = subprocess.Popen(node('serve'), cwd=scratch, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
                 deadline = time.monotonic() + 20
                 while not (scratch / 'registry-url').exists() and server.poll() is None and time.monotonic() < deadline:
                     time.sleep(.05)

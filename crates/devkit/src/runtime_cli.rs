@@ -209,7 +209,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         if let Some(cache_dir) = cache_dir {
             make.env("DEVKIT_CACHE_DIR", cache_dir);
         }
-        runner.check_cancelled()?;
+        crate::processes::restore_exec_pdeathsig(runner)?;
         // Make owns its signal/exit behavior and the actual DAG. Native leaves
         // supervise their own children; no second controller kills their cleanup.
         use std::os::unix::process::CommandExt;

@@ -59,7 +59,7 @@ def snapshot(root):
 def execute(argv, cwd, env, timeout=120):
     started = time.perf_counter()
     process = subprocess.Popen([str(arg) for arg in argv], cwd=cwd, env=env,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
     try:
         stdout, stderr = process.communicate(timeout=timeout)

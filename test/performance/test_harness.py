@@ -48,6 +48,7 @@ class HarnessTests(unittest.TestCase):
             path = root / "apps/api/vendor/local/src/lib.rs"
             path.parent.mkdir(parents=True)
             path.write_text("pub fn value() {}\n")
+            path.chmod(0o644)
             before = snapshot(root)
             path.chmod(0o600)
             self.assertNotEqual(before, snapshot(root))
