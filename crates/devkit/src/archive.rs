@@ -20,28 +20,34 @@ pub const MAX_EXPANDED: u64 = 256 * 1024 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 16_384;
 
-/// Linux publication must not replace a concurrently created destination,
-/// including an empty directory. Callers stage on the same filesystem.
-pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
-    let stage = CString::new(stage.as_os_str().as_bytes())?;
-    let destination = CString::new(target.as_os_str().as_bytes())?;
+pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    let src = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
+    let dst = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
     // SAFETY: both C strings live for the call; Linux is the supported host.
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
             libc::AT_FDCWD,
-            stage.as_ptr(),
+            src.as_ptr(),
             libc::AT_FDCWD,
-            destination.as_ptr(),
+            dst.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     };
-    ensure!(
-        result == 0,
-        "Cannot publish new directory {}: {}",
-        target.display(),
-        io::Error::last_os_error()
-    );
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Linux publication must not replace a concurrently created destination,
+/// including an empty directory. Callers stage on the same filesystem.
+pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
+    rename_noreplace(stage, target)
+        .with_context(|| format!("Cannot publish new directory {}", target.display()))?;
     sync_directory(target.parent().context("Output parent")?)
 }
 

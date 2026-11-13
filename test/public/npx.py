@@ -9,11 +9,15 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO / "test") not in sys.path:
+    sys.path.insert(0, str(REPO / "test"))
+from docker_flags import author_docker_flags  # noqa: E402
 
 
 def require(condition, message):
@@ -107,7 +111,8 @@ def main():
                 command = [engine, "internal", "guard", name, token, "--", "docker", "run",
                        "--pull", "never", "--rm", "--init", "--name", name,
                        "--label", f"io.docouno.devkit.invocation={token}",
-                       "--network", "bridge" if phase == "acquire" else "none", "--read-only", "--memory", "768m", "--cpus", "2",
+                       "--network", "bridge" if phase == "acquire" else "none", "--read-only",
+                       *author_docker_flags(2, 768, pids_limit=512, node_fallback=True),
                        "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL",
                        "--security-opt", "no-new-privileges:true",
                        "--tmpfs", "/tmp:rw,exec,mode=1777,size=268435456",

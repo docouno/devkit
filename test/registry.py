@@ -12,11 +12,15 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'test') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'test'))
+from docker_flags import author_docker_flags  # noqa: E402
 PINS = dict(line.split('=', 1) for line in (ROOT / 'toolchains.env').read_text().splitlines())
 
 
@@ -63,8 +67,9 @@ def main():
             return [str(engine), 'internal', 'guard', 'devkit-registry-' + token, token, '--',
                     'docker', 'run', '--pull', 'never', '--rm', '--init', '--name', 'devkit-registry-' + token,
                     '--label', 'io.docouno.devkit.invocation=' + token, '--network', 'host',
-                    '--user', f'{os.getuid()}:{os.getgid()}', '--read-only', '--memory', '768m', '--cpus', '2',
-                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777',
+                    '--user', f'{os.getuid()}:{os.getgid()}', '--read-only',
+                    *author_docker_flags(2, 768, pids_limit=512, node_fallback=True),
+                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777,size=256m',
                     '--volume', f'{ROOT}:/source:ro,z', '--volume', f'{engine}:/devkit/devkit:ro,z',
                     '--volume', f'{releases[0]}:/release-v1:ro,z', '--volume', f'{releases[1]}:/release-v2:ro,z',
                     '--volume', f'{scratch}:/proof:z', '--volume', f'{consumer}:/consumer:z',
@@ -73,13 +78,13 @@ def main():
                     '--', 'node', 'test/registry-consumer.mjs', mode]
         def run(name, argv):
             started = time.monotonic()
-            result = subprocess.run(argv, cwd=scratch, env=env, capture_output=True, text=True, timeout=240)
+            result = subprocess.run(argv, cwd=scratch, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=240)
             (proof / f'{name}.log').write_text(result.stdout + result.stderr)
             rows.append(dict(name=name, exitCode=result.returncode, seconds=time.monotonic() - started))
             assert result.returncode == 0, f'{name}: {result.stdout}\n{result.stderr}'
         try:
             with (proof / 'server.log').open('w') as log:
-                server = subprocess.Popen(node('serve'), cwd=scratch, env=env, stdout=log, stderr=log)
+                server = subprocess.Popen(node('serve'), cwd=scratch, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
                 deadline = time.monotonic() + 20
                 while not (scratch / 'registry-url').exists() and server.poll() is None and time.monotonic() < deadline:
                     time.sleep(.05)

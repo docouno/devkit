@@ -4,12 +4,13 @@ fn main() -> std::process::ExitCode {
     let command = devkit::cli::command_label(&args);
     let result = (|| -> devkit::Result<()> {
         let runner = devkit::processes::ProcessRunner::new()?;
-        devkit::processes::watch_parent()?;
+        devkit::processes::watch_parent(&runner)?;
         let result = devkit::cli::main(args, &runner);
         if result.as_ref().err().is_some_and(|e| {
             e.chain().any(|e| {
                 e.downcast_ref::<devkit::processes::CommandFailure>()
                     .is_some()
+                    || e.downcast_ref::<devkit::cli::SilentExit>().is_some()
             })
         }) {
             return result;
@@ -26,6 +27,12 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(silent) = error
+                .chain()
+                .find_map(|e| e.downcast_ref::<devkit::cli::SilentExit>())
+            {
+                return std::process::ExitCode::from(silent.0);
+            }
             let code = devkit::processes::exit_code(&error);
             if json {
                 println!(

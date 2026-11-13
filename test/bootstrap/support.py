@@ -153,7 +153,7 @@ class Harness:
     def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None):
         started = time.monotonic()
         result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=self.scratch,
-            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
             preexec_fn=(lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))) if memory_limit else None)
         output = result.stdout + result.stderr
         (self.logs / f'{len(self.results):02d}-{name}.log').write_text(output)

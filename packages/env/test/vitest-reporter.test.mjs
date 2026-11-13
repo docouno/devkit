@@ -35,3 +35,45 @@ test('only completed native Vitest cases count and individual skips remain valid
   }
   assert.doesNotThrow(() => reporter.onTestRunEnd(modules('skipped', 'passed'), [], 'passed'));
 });
+
+test('onInit bounds maxWorkers and fork heap without breaking threads or user serialization', () => {
+  const savedWorkers = process.env.DEVKIT_TEST_WORKERS;
+  const savedHeap = process.env.DEVKIT_WORKER_MAX_OLD_SPACE_SIZE;
+  try {
+    process.env.DEVKIT_TEST_WORKERS = '2';
+    process.env.DEVKIT_WORKER_MAX_OLD_SPACE_SIZE = '384';
+
+    const reporter = new RunnableTestsReporter();
+    const forksTarget = { config: { maxWorkers: 8, pool: 'forks' } };
+    reporter.onInit(forksTarget);
+    assert.equal(forksTarget.config.maxWorkers, 2);
+    assert.deepEqual(forksTarget.config.execArgv, ['--max-old-space-size=384']);
+
+    const explicitSingle = { config: { maxWorkers: 1, pool: 'vmForks' } };
+    process.env.DEVKIT_TEST_WORKERS = '4';
+    reporter.onInit(explicitSingle);
+    assert.equal(explicitSingle.config.maxWorkers, 1);
+    assert.deepEqual(explicitSingle.config.execArgv, ['--max-old-space-size=384']);
+
+    const noParallelism = { config: { fileParallelism: false, maxWorkers: 1, pool: 'forks' } };
+    reporter.onInit(noParallelism);
+    assert.equal(noParallelism.config.fileParallelism, false);
+    assert.equal(noParallelism.config.maxWorkers, 1);
+
+    const threadsTarget = { config: { pool: 'threads', maxWorkers: 8 } };
+    reporter.onInit(threadsTarget);
+    assert.equal(threadsTarget.config.maxWorkers, 4);
+    assert.equal(threadsTarget.config.execArgv, undefined);
+  } finally {
+    if (savedWorkers === undefined) {
+      delete process.env.DEVKIT_TEST_WORKERS;
+    } else {
+      process.env.DEVKIT_TEST_WORKERS = savedWorkers;
+    }
+    if (savedHeap === undefined) {
+      delete process.env.DEVKIT_WORKER_MAX_OLD_SPACE_SIZE;
+    } else {
+      process.env.DEVKIT_WORKER_MAX_OLD_SPACE_SIZE = savedHeap;
+    }
+  }
+});

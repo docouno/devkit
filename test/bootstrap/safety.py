@@ -31,7 +31,7 @@ class Safety(Harness):
         original = self.fixture.routes.get(route)
         self.fixture.routes[route] = self.fixture.stall
         env = self.environment(name)
-        process = subprocess.Popen([str(v) for v in argv], env=env, cwd=self.scratch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([str(v) for v in argv], env=env, cwd=self.scratch, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         children = []
         try:
             require(self.fixture.ready.wait(10), 'Download never reached its real TLS endpoint')
@@ -135,7 +135,7 @@ class Safety(Harness):
         target = self.scratch / 'cancel-native-extraction'
         process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.old_version,
             '--app', 'api=rust-api', '--non-interactive'], cwd=self.scratch, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 10
             cache = Path(env['DEVKIT_CACHE_DIR'])

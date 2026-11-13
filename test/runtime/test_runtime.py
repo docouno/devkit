@@ -1582,6 +1582,175 @@ if (priv.value !== 'from-private-gitlab-registry') {
                 data = file_path.read_bytes()
                 self.assertNotIn(secret_token.encode(), data, f"Secret token leaked into {file_path}")
 
+    def test_shared_locks_adaptive_queuing_describe_enrichment_and_lockfree_doctor(self):
+        import fcntl
+        write_fixture(self.root, ("main",), ("lib",), package_profiles={"packages/lib": "ts-library"})
+        state_path = self.root / ".devkit/manifest.json"
+        state = json.loads(state_path.read_text())
+        state["components"]["apps/main"]["development"]["owner"] = "managed"
+        state_path.write_text(json.dumps(state))
+        accept_runtime(self.root, native=True, package_profiles={"packages/lib": "ts-library"})
+
+        # Cold-safe make help works and documents flags and diagnostic commands.
+        help_out = self.make("help").stdout
+        for token in ("headless=1", "follow=1", "tail=100", "devkit status", "devkit doctor", "devkit exec"):
+            self.assertIn(token, help_out)
+
+        self.make("setup")
+
+        # Invalid Make selector prints registered apps and packages instead of 'No rule to make target'.
+        bad_sel = self.make("check", "app=absent", check=False)
+        self.assertNotEqual(bad_sel.returncode, 0)
+        self.assertNotIn("No rule to make target", bad_sel.stderr)
+        self.assertIn("registered apps: main; registered packages: lib", bad_sel.stderr)
+
+        # Enriched positional devkit describe makes 0 Docker calls.
+        fake_bin = self.base / "no-docker-bin"
+        fake_bin.mkdir()
+        docker_log = self.base / "describe-docker.log"
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(f"#!/bin/sh\necho called >> {docker_log}\nexit 99\n")
+        fake_docker.chmod(0o755)
+        no_docker_env = dict(env(), PATH=f"{fake_bin}:{os.environ['PATH']}")
+        desc_res = run(str(ENGINE), "describe", str(self.root), "--json", env=no_docker_env)
+        self.assertFalse(docker_log.exists(), "devkit describe invoked Docker")
+        desc = json.loads(desc_res.stdout)["result"]
+        self.assertTrue(desc["composeProject"].startswith("devkit-"))
+        self.assertEqual(desc["components"]["apps/main"]["selector"], "app=main")
+        self.assertEqual(desc["components"]["apps/main"]["exposedContainerPort"], 8080)
+        self.assertFalse(desc["components"]["apps/main"]["packageable"])
+        self.assertEqual(desc["components"]["packages/lib"]["selector"], "package=lib")
+        self.assertIsNone(desc["components"]["packages/lib"]["exposedContainerPort"])
+        self.assertEqual(desc["receipts"], {
+            "nodeWorkspaceReady": True,
+            "rustImageReady": False,
+            "desktopImageReady": False,
+        })
+
+        # Concurrent LOCK_SH readers succeed in parallel while an external LOCK_SH is also held.
+        lock_path = self.root / ".devkit/state/task.lock"
+        lock_path.write_text("LOCK CONTENT MUST SURVIVE\n")
+        with lock_path.open("r+") as shared_holder:
+            fcntl.flock(shared_holder, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            procs = [
+                subprocess.Popen([str(ENGINE), "describe", str(self.root), "--json"],
+                                 env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True),
+                subprocess.Popen([str(ENGINE), "status", str(self.root), "--json"],
+                                 env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True),
+                subprocess.Popen(["make", "--no-print-directory", "-C", str(self.root), "doctor"],
+                                 env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True),
+            ]
+            for proc in procs:
+                out, err = proc.communicate(timeout=20)
+                self.assertEqual(proc.returncode, 0, f"shared reader failed: {err}\n{out}")
+
+        # Raw external LOCK_EX without task.owner.json fails make doctor in < 1.5s while devkit doctor --json succeeds lock-free.
+        with lock_path.open("r+") as ex_holder:
+            fcntl.flock(ex_holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            t0 = time.monotonic()
+            blocked_doc = self.make("doctor", check=False)
+            elapsed = time.monotonic() - t0
+            self.assertNotEqual(blocked_doc.returncode, 0)
+            self.assertLess(elapsed, 2.0)
+            self.assertIn("Another devkit operation owns this checkout", blocked_doc.stderr)
+            self.assertEqual(lock_path.read_text(), "LOCK CONTENT MUST SURVIVE\n")
+
+            top_doc = run(str(ENGINE), "doctor", str(self.root), "--json")
+            top_payload = json.loads(top_doc.stdout)
+            self.assertTrue(top_payload["ok"], top_doc.stdout)
+            self.assertEqual(len(top_payload["result"]["checks"]), 6)
+        self.assertEqual(lock_path.read_text(), "LOCK CONTENT MUST SURVIVE\n")
+
+        # Two parallel make check runs with live task.owner.json serialize cleanly and both exit 0.
+        gate_js = self.root / "apps/main/gate.cjs"
+        gate_js.write_text(gate_js.read_text() + "\nif (action === 'check' && fs.existsSync('HOLD_CHECK')) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900); }\n")
+        (self.root / "apps/main/HOLD_CHECK").write_text("1\n")
+        p1 = subprocess.Popen(["make", "--no-print-directory", "-C", str(self.root), "check", "app=main"],
+                              env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_until(lambda: (self.root / ".devkit/state/task.owner.json").is_file(), timeout=10)
+            p2 = subprocess.Popen(["make", "--no-print-directory", "-C", str(self.root), "check", "app=main"],
+                                  env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out1, err1 = p1.communicate(timeout=45)
+            out2, err2 = p2.communicate(timeout=45)
+            self.assertEqual(p1.returncode, 0, err1)
+            self.assertEqual(p2.returncode, 0, err2)
+            self.assertIn("GATE main check", out1)
+            self.assertIn("GATE main check", out2)
+            self.assertIn("waiting for active checkout operation", err2)
+            self.assertFalse((self.root / ".devkit/state/task.owner.json").exists())
+        finally:
+            if p1.poll() is None:
+                p1.kill()
+                p1.communicate(timeout=5)
+
+    def test_port_discovery_status_json_logs_follow_lock_drop_and_running_setup_guard(self):
+        import urllib.request
+        write_fixture(self.root, ("main",))
+        pkg_path = self.root / "apps/main/package.json"
+        pkg = json.loads(pkg_path.read_text())
+        pkg["scripts"]["dev"] = "node server.cjs"
+        pkg_path.write_text(json.dumps(pkg) + "\n")
+        (self.root / "apps/main/server.cjs").write_text(
+            "require('node:http').createServer((req,res)=>res.end('DEV_PORT_OK')).listen(8080,'0.0.0.0',()=>console.log('SERVER_LISTENING'));\n"
+        )
+        accept_runtime(self.root, native=True)
+        state_path = self.root / ".devkit/manifest.json"
+        state = json.loads(state_path.read_text())
+        state["components"]["apps/main"]["development"]["owner"] = "managed"
+        state_path.write_text(json.dumps(state))
+        accept_runtime(self.root, native=True)
+
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        svc_container = project + "-main-1"
+        self.resources.append(svc_container)
+        self.projects.append((project, self.root, "unused-volume-" + self.token))
+        labels = {LABEL: self.token}
+        (self.root / "compose.yaml").write_text(json.dumps({
+            "services": {"main": {"labels": labels}},
+            "networks": {"default": {"labels": labels}},
+        }))
+
+        self.make("setup")
+        logs_proc = None
+        try:
+            up_out = self.make("up").stdout
+            match = re.search(r"Service main \(apps/main\): (http://127\.0\.0\.1:\d+)", up_out)
+            self.assertIsNotNone(match, f"expected Service URL in make up output: {up_out}")
+            url = match.group(1)
+            wait_until(lambda: urllib.request.urlopen(url, timeout=2).read() == b"DEV_PORT_OK", timeout=10)
+
+            status_res = run(str(ENGINE), "status", str(self.root), "--json")
+            status_json = json.loads(status_res.stdout)["result"]
+            self.assertEqual(status_json["composeProject"], project)
+            self.assertEqual(len(status_json["services"]), 1)
+            self.assertEqual(status_json["services"][0]["service"], "main")
+            self.assertEqual(status_json["services"][0]["component"], "apps/main")
+            self.assertIn(url, status_json["services"][0]["urls"])
+
+            # Running make setup while dev services are running refuses cleanly without removing node-workspace.lock.
+            blocked_setup = self.make("setup", check=False)
+            self.assertNotEqual(blocked_setup.returncode, 0)
+            self.assertIn("Development services are running; stop them with 'make down' before running 'make setup'",
+                          blocked_setup.stderr)
+            self.assertTrue((self.root / ".devkit/state/node-workspace.lock").is_file())
+
+            # make logs follow=1 drops task.lock before streaming so concurrent make check succeeds immediately.
+            logs_proc = subprocess.Popen(
+                ["make", "--no-print-directory", "-C", str(self.root), "logs", "follow=1", "tail=10"],
+                env=env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            )
+            wait_until(lambda: logs_proc.poll() is None, timeout=5)
+            time.sleep(0.3)
+            self.assertIsNone(logs_proc.poll(), "logs follow=1 exited prematurely")
+            check_out = self.make("check").stdout
+            self.assertIn("GATE main check", check_out)
+        finally:
+            if logs_proc is not None and logs_proc.poll() is None:
+                os.killpg(logs_proc.pid, signal.SIGTERM)
+                logs_proc.communicate(timeout=10)
+            self.make("down", check=False)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

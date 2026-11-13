@@ -4,7 +4,6 @@ use crate::{
     cache::ReleaseCache,
     catalog,
     cli::{Globals, Options, error},
-    compose::admit_compose_inventory,
     files::*,
     model::*,
     processes::ProcessRunner,
@@ -84,35 +83,56 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         _ => &[],
     };
     let mut options = Options::parse(args, allowed, repeat, &["--preview", "--reconcile-lock"])?;
-    let missing = match command {
+    let mut missing = Vec::new();
+    match command {
         "init" => {
-            options.target.is_none()
-                || !(options.flag("--app")
-                    || options.flag("--package")
-                    || options.flag("--preset")
-                    || options.flag("--template"))
+            if options.target.is_none() {
+                missing.push("TARGET");
+            }
+            if !(options.flag("--app")
+                || options.flag("--package")
+                || options.flag("--preset")
+                || options.flag("--template"))
+            {
+                missing.push("--app/--package/--preset/--template");
+            }
         }
-        "add-app" | "add-package" => !options.flag("--name") || !options.flag("--template"),
+        "add-app" | "add-package" => {
+            if !options.flag("--name") {
+                missing.push("--name");
+            }
+            if !options.flag("--template") {
+                missing.push("--template");
+            }
+        }
         "register" => {
-            !(options.flag("--app") || options.flag("--package")) || !options.flag("--profile")
+            if !(options.flag("--app") || options.flag("--package")) {
+                missing.push("--app/--package");
+            }
+            if !options.flag("--profile") {
+                missing.push("--profile");
+            }
         }
-        "update" => !options.flag("--to"),
-        "sync" | "recover" => false,
+        "update" => {
+            if !options.flag("--to") {
+                missing.push("--to");
+            }
+        }
+        "sync" | "recover" => {}
         _ => unreachable!(),
-    };
-    if missing {
+    }
+    if !missing.is_empty() {
         let ci = std::env::var("CI").is_ok_and(|s| {
             !s.is_empty() && !["0", "false"].contains(&s.to_ascii_lowercase().as_str())
         });
-        let terminal = io::stdin().is_terminal()
-            || globals.interactive
-            || (std::env::var_os("DEVKIT_BOOTSTRAP_INTERACTIVE").is_some_and(|v| v == "1")
-                && io::stderr().is_terminal());
+        let terminal =
+            io::stdin().is_terminal() || globals.interactive || bootstrap_interactive_allowed();
         if globals.non_interactive || ci || !terminal {
             return Err(error(
                 "MISSING_ARGUMENT",
                 format!(
-                    "{command} requires complete arguments in non-interactive mode; see devkit --help"
+                    "{command} requires complete arguments in non-interactive mode (missing: {}); see devkit --help",
+                    missing.join(", ")
                 ),
             ));
         }
@@ -122,7 +142,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     // Recovery is intentionally before manifest/release/cache admission. A valid
     // journal can restore a missing or partially restored accepted manifest.
     if command == "recover" {
-        let recovered = project::recover_project(&root)?;
+        let recovered = crate::transaction::recover_project_with(&root, Some(runner))?;
         runner.check_cancelled()?;
         globals.emit(
             command,
@@ -237,7 +257,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                     != Some(target_sha.as_str()),
                 "Forward update delegation did not converge"
             );
-            runner.check_cancelled()?;
+            crate::processes::restore_exec_pdeathsig(runner)?;
             let mut delegated = std::process::Command::new(&target_engine);
             globals.write_flags(&mut delegated);
             delegated
@@ -273,19 +293,14 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         )?;
         (old, release)
     };
-    let inventory = if command == "add-app" {
-        Some(admit_compose_inventory(
-            &root,
-            &crate::runtime::DockerComposeNormalizer {
-                runner: runner.clone(),
-            },
-        )?)
-    } else {
-        None
+    let compose_normalizer = crate::runtime::DockerComposeNormalizer {
+        runner: runner.clone(),
     };
     let update = UpdateOptions {
         package_mode: mode,
-        compose_inventory: inventory.as_ref(),
+        compose_normalizer: (command == "add-app")
+            .then_some(&compose_normalizer as &dyn crate::compose::ComposeNormalizer),
+        runner: Some(runner),
         preview: options.flag("--preview"),
         reconcile_lock: options.flag("--reconcile-lock"),
         hooks: Some(&cancellation),
@@ -591,6 +606,29 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
         options.set("--to", version);
     }
     Ok(())
+}
+
+fn bootstrap_interactive_allowed() -> bool {
+    if !std::env::var_os("DEVKIT_BOOTSTRAP_INTERACTIVE").is_some_and(|v| v == "1")
+        || !io::stderr().is_terminal()
+    {
+        return false;
+    }
+    // Only piped bootstrap (`curl ... | sh`, where fd 0 is S_IFIFO) may fall back
+    // to /dev/tty. Redirected /dev/null (S_IFCHR), regular files (S_IFREG), or closed
+    // descriptors must fail immediately as non-interactive without touching /dev/tty.
+    // SAFETY: zeroed libc::stat is valid POD storage for fstat on descriptor 0.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(0, &mut stat) } != 0 || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+        return false;
+    }
+    let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        return false;
+    };
+    // SAFETY: tty is a valid open descriptor; getpgrp has no preconditions.
+    let fg_pgrp = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    let self_pgrp = unsafe { libc::getpgrp() };
+    fg_pgrp > 0 && fg_pgrp == self_pgrp
 }
 
 struct Prompt<'a> {

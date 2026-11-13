@@ -457,3 +457,194 @@ fn update_and_sync_forward_dispatch_to_synthetic_99_0_0_release_with_unknown_pro
     );
     assert_eq!(decoded(&add_out)["result"]["engine"], "99.0.0");
 }
+
+#[test]
+fn bootstrap_interactive_with_dev_null_stdin_fails_immediately_listing_missing_flags() {
+    use std::os::{fd::FromRawFd, unix::process::CommandExt};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let temp = TempDir::new().unwrap();
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: openpty initializes two valid file descriptors when returning 0.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let _master_guard = unsafe { fs::File::from_raw_fd(master) };
+    let stderr_tty = unsafe { fs::File::from_raw_fd(slave) };
+
+    let started = Instant::now();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_devkit"));
+    cmd.arg("init")
+        .current_dir(temp.path())
+        .env_clear()
+        .env("DEVKIT_BOOTSTRAP_INTERACTIVE", "1")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_tty));
+    // SAFETY: setsid and TIOCSCTTY make stderr's PTY the foreground controlling terminal
+    // of the child, reproducing an agent subshell with a live TTY on stderr and /dev/null on stdin.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(2, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DEVKIT_BOOTSTRAP_INTERACTIVE=1 with /dev/null stdin hung on /dev/tty"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let json_out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args(["init", "--json"])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("DEVKIT_BOOTSTRAP_INTERACTIVE", "1")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!json_out.status.success());
+    let payload = decoded(&json_out);
+    assert_eq!(payload["error"]["code"], "MISSING_ARGUMENT");
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("TARGET"), "missing TARGET in: {message}");
+    assert!(
+        message.contains("--app/--package/--preset/--template"),
+        "missing template flags in: {message}"
+    );
+}
+
+#[test]
+fn doctor_json_runs_lockfree_outside_checkout_and_emits_single_json_on_failure() {
+    let temp = TempDir::new().unwrap();
+    let sentinel = temp.path().join("invalid-cache-file");
+    fs::write(&sentinel, "owner cache sentinel").unwrap();
+
+    // Outside any initialized project (with empty PATH so docker check fails cleanly -> single JSON object, exit 1).
+    let outside_dir = temp.path().join("uninitialized");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let out = invoke(&outside_dir, &["doctor", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.is_empty(),
+        "doctor --json leaked to stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload = decoded(&out);
+    assert_eq!(payload["schemaVersion"], 1);
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["command"], "doctor");
+    let checks = payload["result"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 6);
+    let checkout_check = checks
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .expect("missing checkout_state check");
+    assert_eq!(checkout_check["status"], "ok");
+    assert_eq!(checkout_check["details"]["present"], false);
+    assert!(!outside_dir.join(".devkit").exists());
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "owner cache sentinel"
+    );
+
+    // Inside a checkout with incomplete update-pending.json and held LOCK_EX on task.lock.
+    let broken = temp.path().join("broken-checkout");
+    fs::create_dir_all(broken.join(".devkit/state")).unwrap();
+    fs::write(broken.join(PENDING_PATH), "{}").unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(broken.join(".devkit/state/task.lock"))
+        .unwrap();
+    lock_file.try_lock().unwrap();
+
+    let broken_out = invoke(temp.path(), &["doctor", broken.to_str().unwrap(), "--json"]);
+    assert_eq!(broken_out.status.code(), Some(1));
+    assert!(broken_out.stderr.is_empty());
+    let broken_json = decoded(&broken_out);
+    let broken_checkout = broken_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(broken_checkout["status"], "fail");
+    assert_eq!(broken_checkout["remediation"], "devkit recover");
+    drop(lock_file);
+}
+
+#[test]
+fn checkout_lock_supports_concurrent_shared_readers_and_detects_self_recursion() {
+    use devkit::state::CheckoutLock;
+    use std::collections::BTreeMap;
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+
+    // Multiple shared locks coexist simultaneously.
+    let s1 = CheckoutLock::acquire_shared(root, "describe", None).unwrap();
+    let s2 = CheckoutLock::acquire_shared(root, "status", None).unwrap();
+    let s3 = CheckoutLock::acquire_shared(root, "task doctor", None).unwrap();
+    drop((s1, s2, s3));
+
+    // Exclusive lock records live owner and immediately rejects recursive self-acquisition in 0ms.
+    let ex = CheckoutLock::acquire_exclusive(root, "task check", None).unwrap();
+    assert!(devkit::state::read_live_owner(root).is_some());
+    let started = std::time::Instant::now();
+    let err = match CheckoutLock::acquire_shared(root, "describe", None) {
+        Ok(_) => panic!("expected recursive lock acquisition to fail"),
+        Err(err) => err,
+    };
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    assert!(
+        format!("{err:#}").contains("Recursive devkit invocation detected inside active operation"),
+        "unexpected error: {err:#}"
+    );
+    drop(ex);
+    assert!(devkit::state::read_live_owner(root).is_none());
+
+    // Compose ps JSON parser handles both NDJSON and JSON arrays.
+    let mut map = BTreeMap::new();
+    map.insert("web".to_owned(), "apps/web".to_owned());
+    let ndjson = br#"{"Service":"web","Name":"proj-web-1","State":"running","Status":"Up 2s (healthy)","Health":"healthy","Publishers":[{"URL":"0.0.0.0","TargetPort":5173,"PublishedPort":49152,"Protocol":"tcp"},{"URL":"","TargetPort":5173,"PublishedPort":0,"Protocol":"tcp"}]}
+{"Service":"db","Name":"proj-db-1","State":"running","Status":"Up 2s","Health":"","Ports":"127.0.0.1:54320->5432/tcp"}"#;
+    let parsed = devkit::doctor::parse_compose_ps_json(ndjson, &map).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].service, "db");
+    assert_eq!(parsed[0].component, None);
+    assert_eq!(parsed[0].urls, vec!["http://127.0.0.1:54320"]);
+    assert_eq!(parsed[1].service, "web");
+    assert_eq!(parsed[1].component.as_deref(), Some("apps/web"));
+    assert_eq!(parsed[1].health.as_deref(), Some("healthy"));
+    assert_eq!(parsed[1].urls, vec!["http://127.0.0.1:49152"]);
+}

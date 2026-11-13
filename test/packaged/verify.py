@@ -189,7 +189,7 @@ class Verification:
         logfile = self.receipt / f"{sequence:03d}-{label}.log"
         started = time.monotonic()
         process = subprocess.Popen([str(arg) for arg in argv], cwd=cwd, env=environment or self.environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
         try:
             output, _ = process.communicate(timeout=timeout)

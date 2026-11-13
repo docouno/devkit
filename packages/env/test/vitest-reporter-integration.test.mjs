@@ -43,8 +43,13 @@ test(
       npm_config_fund: 'false',
       npm_config_update_notifier: 'false',
     };
-    const run = (binary, args, timeout = 30_000) =>
-      spawnSync(binary, args, { cwd: app, env: childEnv, encoding: 'utf8', timeout });
+    const run = (binary, args, timeout = 30_000, extraEnv = {}) =>
+      spawnSync(binary, args, {
+        cwd: app,
+        env: { ...childEnv, ...extraEnv },
+        encoding: 'utf8',
+        timeout,
+      });
     const output = (result) => `${result.stdout}\n${result.stderr}`;
     try {
       write(app, 'package.json', {
@@ -94,12 +99,13 @@ test(
 import type { Reporter } from 'vitest/node';
 const reporter: Reporter = new Guard();
 const constructor: new () => Reporter = Guard;
+const forwardInit = (...args: Parameters<NonNullable<Reporter['onInit']>>) => new Guard().onInit(...args);
 const forward = (...args: Parameters<NonNullable<Reporter['onTestRunEnd']>>) => new Guard().onTestRunEnd(...args);
 // @ts-expect-error The reporter must keep its required native module surface.
 new Guard().onTestRunEnd([{}], [], 'passed');
 // @ts-expect-error An unsupported run reason is not accepted.
 new Guard().onTestRunEnd([], [], 'cancelled');
-void reporter; void constructor; void forward;
+void reporter; void constructor; void forwardInit; void forward;
 `,
       );
       const declaration = path.join(installedEnv, 'src/vitest-reporter.d.ts');
@@ -159,6 +165,89 @@ export default { test: { reporters: ['default', new Guard()], passWithNoTests: t
       context.diagnostic(
         'Real nested Vitest 5.0.5: positive, skip-only, empty and native-failure cases retained.',
       );
+
+      write(
+        app,
+        'sample.test.js',
+        `import v8 from 'node:v8';
+import { it, expect } from 'vitest';
+it('caps worker heap limit in forks pool', () => {
+  expect(v8.getHeapStatistics().heap_size_limit).toBeLessThan(600 * 1024 * 1024);
+});
+`,
+      );
+      write(
+        app,
+        'vitest.config.mjs',
+        `import fs from 'node:fs';
+import Guard from '@docouno/env/vitest-reporter';
+class ProbeGuard extends Guard {
+  onInit(v) {
+    super.onInit(v);
+    fs.writeFileSync('probe.json', JSON.stringify({
+      maxWorkers: v.config.maxWorkers,
+      fileParallelism: v.config.fileParallelism,
+      execArgv: v.config.execArgv ?? [],
+    }));
+  }
+}
+export default { test: { reporters: ['default', new ProbeGuard()], pool: 'forks', maxWorkers: 4 } };
+`,
+      );
+      const forksRun = run(process.execPath, [vitest, 'run'], 30_000, {
+        DEVKIT_TEST_WORKERS: '1',
+        DEVKIT_WORKER_MAX_OLD_SPACE_SIZE: '384',
+      });
+      assert.equal(forksRun.status, 0, output(forksRun));
+      const forksProbe = JSON.parse(fs.readFileSync(path.join(app, 'probe.json'), 'utf8'));
+      assert.equal(forksProbe.maxWorkers, 1);
+      assert.ok(forksProbe.execArgv.includes('--max-old-space-size=384'));
+
+      write(
+        app,
+        'vitest.config.mjs',
+        `import fs from 'node:fs';
+import Guard from '@docouno/env/vitest-reporter';
+class ProbeGuard extends Guard {
+  onInit(v) {
+    super.onInit(v);
+    fs.writeFileSync('probe.json', JSON.stringify({
+      maxWorkers: v.config.maxWorkers,
+      fileParallelism: v.config.fileParallelism,
+    }));
+  }
+}
+export default { test: { reporters: ['default', new ProbeGuard()], maxWorkers: 1, fileParallelism: false } };
+`,
+      );
+      write(
+        app,
+        'sample.test.js',
+        "import {it,expect} from 'vitest'; it('ok',()=>expect(1).toBe(1));",
+      );
+      const serialRun = run(process.execPath, [vitest, 'run'], 30_000, {
+        DEVKIT_TEST_WORKERS: '4',
+        DEVKIT_WORKER_MAX_OLD_SPACE_SIZE: '384',
+      });
+      assert.equal(serialRun.status, 0, output(serialRun));
+      const serialProbe = JSON.parse(fs.readFileSync(path.join(app, 'probe.json'), 'utf8'));
+      assert.equal(serialProbe.maxWorkers, 1);
+      assert.equal(serialProbe.fileParallelism, false);
+
+      write(
+        app,
+        'vitest.config.mjs',
+        `import Guard from '@docouno/env/vitest-reporter';
+export default { test: { reporters: ['default', new Guard()], pool: 'threads', maxWorkers: 2 } };
+`,
+      );
+      const threadsRun = run(process.execPath, [vitest, 'run'], 30_000, {
+        DEVKIT_TEST_WORKERS: '1',
+        DEVKIT_WORKER_MAX_OLD_SPACE_SIZE: '384',
+      });
+      assert.equal(threadsRun.status, 0, output(threadsRun));
+      assert.doesNotMatch(output(threadsRun), /ERR_WORKER_INVALID_EXEC_ARGV/u);
+
       assert.equal(fs.existsSync(path.join(root, 'node_modules/vitest')), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

@@ -322,7 +322,7 @@ export async function packComponent(componentDir, options = {}) {
   const manifest = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   if (manifest.private !== false) {
     throw new Error(
-      `Package ${manifest.name ?? resolvedComponent} has "private": true in package.json; set "private": false and run devkit sync before packaging.`,
+      `Package ${manifest.name ?? resolvedComponent} has "private": true in package.json; set "private": false and run devkit sync before packaging (then make setup).`,
     );
   }
 

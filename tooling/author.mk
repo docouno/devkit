@@ -80,12 +80,13 @@ define author_node
 	@test -x "$$DEVKIT_AUTHOR_ENGINE" || { printf '%s\n' 'Native author engine is missing. Run make setup.' >&2; exit 1; }
 	@mkdir -p "$$DEVKIT_AUTHOR_ROOT/node_modules" "$$DEVKIT_AUTHOR_ROOT/packages/env/node_modules" "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/npm" "$$DEVKIT_AUTHOR_ROOT/.tmp"
 	@set -eu; read -r token < /proc/sys/kernel/random/uuid; name="devkit-author-$$token"; \
+	res_flags=$$("$$DEVKIT_AUTHOR_ENGINE" internal docker-flags --cpus 2 --memory 1024m --pids-limit 512 --node-fallback); \
 	exec "$$DEVKIT_AUTHOR_ENGINE" internal guard "$$name" "$$token" -- \
 	  docker run --pull never --rm --init --name "$$name" \
 	    --label "io.docouno.devkit.invocation=$$token" \
 	    --user "$$DEVKIT_AUTHOR_UID:$$DEVKIT_AUTHOR_GID" \
-	    --network $(1) --read-only --memory 768m --cpus 2 \
-	    --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,exec,mode=1777 \
+	    --network $(1) --read-only $$res_flags \
+	    --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,exec,mode=1777,size=256m \
 	    --volume "$$DEVKIT_AUTHOR_ROOT:/workspace:$(or $(4),ro),z" \
 	    --volume "$$DEVKIT_AUTHOR_ROOT/node_modules:/workspace/node_modules:z" \
 	    --volume "$$DEVKIT_AUTHOR_ROOT/packages/env/node_modules:/workspace/packages/env/node_modules:z" \
@@ -104,19 +105,20 @@ define author_rust
 	@test -x "$$DEVKIT_AUTHOR_ENGINE" || { printf '%s\n' 'Native author engine is missing. Run make setup.' >&2; exit 1; }
 	@mkdir -p "$$DEVKIT_AUTHOR_CARGO_HOME" "$$DEVKIT_AUTHOR_TARGET" "$$DEVKIT_AUTHOR_ROOT/.artifacts/author"
 	@set -eu; read -r token < /proc/sys/kernel/random/uuid; name="devkit-author-$$token"; \
+	res_flags=$$("$$DEVKIT_AUTHOR_ENGINE" internal docker-flags --cpus 4 --memory 3072m --pids-limit 512); \
 	DEVKIT_SOURCE_COMMIT=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse HEAD); \
 	DEVKIT_SOURCE_TREE=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse 'HEAD^{tree}'); \
 	export DEVKIT_SOURCE_COMMIT DEVKIT_SOURCE_TREE; \
 	exec "$$DEVKIT_AUTHOR_ENGINE" internal guard "$$name" "$$token" -- \
 	  docker run --pull never --rm --init --name "$$name" \
 	    --label "io.docouno.devkit.invocation=$$token" \
-	    --user "$$DEVKIT_AUTHOR_UID:$$DEVKIT_AUTHOR_GID" --network none --read-only --memory 2g --cpus 2 \
-	    --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,exec,mode=1777 \
+	    --user "$$DEVKIT_AUTHOR_UID:$$DEVKIT_AUTHOR_GID" --network none --read-only $$res_flags \
+	    --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,exec,mode=1777,size=512m \
 	    --volume "$$DEVKIT_AUTHOR_ROOT:/workspace:$(or $(2),ro),z" \
 	    --volume "$$DEVKIT_AUTHOR_CARGO_HOME:/cargo:z" --volume "$$DEVKIT_AUTHOR_TARGET:/target:z" \
 	    --volume "$$DEVKIT_AUTHOR_ROOT/.artifacts:/workspace/.artifacts:z" \
 	    --workdir /workspace --env HOME=/tmp/devkit-author-home --env CARGO_HOME=/cargo \
-	    --env CARGO_TARGET_DIR=/target --env CARGO_BUILD_JOBS=1 --env RUSTUP_AUTO_INSTALL=0 \
+	    --env CARGO_TARGET_DIR=/target --env "CARGO_BUILD_JOBS=$${CARGO_BUILD_JOBS:-2}" --env RUSTUP_AUTO_INSTALL=0 \
 	    --env DEVKIT_SOURCE_COMMIT --env DEVKIT_SOURCE_TREE \
 	    "$$DEVKIT_AUTHOR_RUST_IMAGE" $(1)
 endef

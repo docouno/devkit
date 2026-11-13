@@ -29,6 +29,9 @@ from measure import (digest, docker_kind, docker_logger, exec_counts, execute,
 
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO / "test") not in sys.path:
+    sys.path.insert(0, str(REPO / "test"))
+from docker_flags import author_docker_flags  # noqa: E402
 BASELINE_VERSION = "0.2.1"
 BASELINE_MANIFEST_SHA = "7f9dea1455027e0a0637077c7b040dbd7420a7fbc554d83d4d80ca47e9e849e0"
 BASELINE_ARCHIVE_SHA = "882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb"
@@ -216,12 +219,12 @@ class Gate:
         self.receipt["tools"].update(traceImageId=self.sdk, traceImageRepoDigests=image_data["RepoDigests"],
                                       traceRecipeSha256=sha256(REPO / "tooling/native.Dockerfile"))
         self.receipt["tools"]["sdkVersions"] = self.run("sdk-versions", [
-            docker, "run", "--rm", "--pull", "never", "--network", "none", "--memory", "256m",
-            "--cpus", "1", self.sdk, "sh", "-c", "rustc --version; cargo --version; rustfmt --version; cargo clippy --version"])["stdout"].splitlines()
+            docker, "run", "--rm", "--pull", "never", "--network", "none",
+            *author_docker_flags(1, 256), self.sdk, "sh", "-c", "rustc --version; cargo --version; rustfmt --version; cargo clippy --version"])["stdout"].splitlines()
         # Extract the trusted image's strace and its actual dynamic dependencies.
         # Explicit loader arguments affect only strace, never the traced child env.
         ldd = self.run("trace-ldd", [docker, "run", "--rm", "--pull", "never", "--network", "none",
-                                    "--memory", "256m", "--cpus", "1", "--entrypoint", "/usr/bin/ldd",
+                                    *author_docker_flags(1, 256), "--entrypoint", "/usr/bin/ldd",
                                     self.sdk, "/usr/bin/strace"])["stdout"]
         libraries = sorted(set(re.findall(r"(/[\w/+.\-]+)\s+\(0x", ldd)))
         require(libraries and any("ld-linux" in name for name in libraries), "No strace dynamic loader")
@@ -246,25 +249,40 @@ class Gate:
     def edit_product(self, root, count, closure):
         for number in range(1, count + 1):
             app = root / "apps" / f"app{number:03}"
+            manifest = app / "Cargo.toml"
+            manifest_mode = manifest.stat().st_mode & 0o777 if manifest.exists() else 0o644
             shutil.rmtree(app / "src")
             shutil.rmtree(app / "tests")
             (app / "src").mkdir()
+            (app / "src").chmod(0o755)
             dependencies = ""
             if closure:
+                vendor = app / "vendor"
+                vendor.mkdir(exist_ok=True)
+                vendor.chmod(0o755)
                 for index in range(closure):
-                    crate = app / "vendor" / f"dep{index:03}"
+                    crate = vendor / f"dep{index:03}"
                     (crate / "src").mkdir(parents=True)
+                    crate.chmod(0o755)
+                    (crate / "src").chmod(0o755)
                     declaration = f'dep{index-1:03} = {{ path = "../dep{index-1:03}" }}\n' if index else ""
-                    (crate / "Cargo.toml").write_text(
+                    crate_manifest = crate / "Cargo.toml"
+                    crate_manifest.write_text(
                         f'[package]\nname = "dep{index:03}"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n{declaration}')
+                    crate_manifest.chmod(0o644)
                     expression = f"dep{index-1:03}::value() + 1" if index else "1"
-                    (crate / "src/lib.rs").write_text(f"pub fn value() -> usize {{\n    {expression}\n}}\n")
+                    crate_lib = crate / "src/lib.rs"
+                    crate_lib.write_text(f"pub fn value() -> usize {{\n    {expression}\n}}\n")
+                    crate_lib.chmod(0o644)
                 dependencies = f'dep{closure-1:03} = {{ path = "vendor/dep{closure-1:03}" }}\n'
             expression = f"dep{closure-1:03}::value()" if closure else "1"
-            (app / "Cargo.toml").write_text(
+            manifest.write_text(
                 f'[package]\nname = "bench-app{number:03}"\nversion = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n[dependencies]\n{dependencies}')
-            (app / "src/lib.rs").write_text(
+            manifest.chmod(manifest_mode)
+            app_lib = app / "src/lib.rs"
+            app_lib.write_text(
                 f"pub fn value() -> usize {{\n    {expression}\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn value_is_expected() {{\n        assert_eq!(super::value(), {closure or 1});\n    }}\n}}\n")
+            app_lib.chmod(0o644)
             (app / "Cargo.lock").unlink()
             # Historical template prose differs; compare identical fixture inputs.
             readme = app / "README.md"
@@ -296,8 +314,8 @@ class Gate:
             f"cd /workspace/apps/app{number:03}; cargo generate-lockfile --offline"
             for number in range(1, count + 1))
         self.run(f"resolve-{shape}-{side}", [
-            self.docker, "run", "--rm", "--pull", "never", "--network", "none", "--cpus", "2",
-            "--memory", "2g", "--pids-limit", "256", "--user", f"{os.getuid()}:{os.getgid()}",
+            self.docker, "run", "--rm", "--pull", "never", "--network", "none",
+            *author_docker_flags(2, 2048, pids_limit=256), "--user", f"{os.getuid()}:{os.getgid()}",
             "--volume", f"{root}:/workspace", "--env", "HOME=/tmp", "--env", "CARGO_HOME=/tmp/cargo",
             "--env", "CARGO_BUILD_JOBS=1", "--env", "RUSTUP_AUTO_INSTALL=0", self.sdk,
             "sh", "-c", script], timeout=600)

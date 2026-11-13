@@ -98,6 +98,8 @@ pub struct UpdateOptions<'a> {
     pub package_mode: Option<PackageMode>,
     pub registry: Option<&'a str>,
     pub compose_inventory: Option<&'a ComposeInventory>,
+    pub compose_normalizer: Option<&'a dyn crate::compose::ComposeNormalizer>,
+    pub runner: Option<&'a crate::processes::ProcessRunner>,
     pub hooks: Option<&'a dyn MutationHooks>,
     pub preview: bool,
     pub reconcile_lock: bool,
@@ -262,7 +264,11 @@ impl LockResolver for DockerNpmResolver {
         verify_required_npm_env_vars(&npmrc_policy)?;
         let ca_cert = resolve_ca_cert_path()?;
         let meta = fs::metadata(&root)?;
-        let token = uuid::Uuid::new_v4().to_string();
+        let runner = ProcessRunner::new()?;
+        let mut budget = crate::resources::HostResourceBudget::probe_with_docker(
+            &runner,
+            &mut Command::new("docker"),
+        )?;
         // Docker's --mount value is CSV; quoting keeps spaces and commas in the
         // source path inside one field. No shell interprets any argument.
         let mount = format!(
@@ -271,79 +277,108 @@ impl LockResolver for DockerNpmResolver {
                 .context("Non-UTF8 checkout")?
                 .replace('"', "\"\"")
         );
-        let mut command = Command::new("docker");
-        command.args([
-            "run",
-            "--rm",
-            "--init",
-            "--network",
-            "host",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges:true",
-            "--name",
-            &format!("devkit-resolve-{token}"),
-            "--label",
-            &format!("org.docouno.devkit.operation={token}"),
-            "--user",
-            &format!("{}:{}", meta.uid(), meta.gid()),
-            "--mount",
-            &mount,
-            "--workdir",
-            "/workspace",
-            "--tmpfs",
-            "/tmp:mode=1777",
-        ]);
-        if let Some(ca_path) = &ca_cert {
-            let ca_mount = format!(
-                "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
-                ca_path
-                    .to_str()
-                    .context("Non-UTF8 DEVKIT_CA_CERT path")?
-                    .replace('"', "\"\"")
-            );
-            command.args([
-                "--mount",
-                &ca_mount,
-                "--env",
-                "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
-            ]);
+        let build_command =
+            |budget: &crate::resources::HostResourceBudget, token: &str| -> Result<Command> {
+                let spec = budget.for_npm_resolver();
+                let env_plan = budget.toolchain_env_for_resolver(&spec);
+                let mut command = Command::new("docker");
+                command.args([
+                    "run",
+                    "--rm",
+                    "--init",
+                    "--network",
+                    "host",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "--name",
+                    &format!("devkit-resolve-{token}"),
+                    "--label",
+                    &format!("org.docouno.devkit.operation={token}"),
+                    "--user",
+                    &format!("{}:{}", meta.uid(), meta.gid()),
+                    "--mount",
+                    &mount,
+                    "--workdir",
+                    "/workspace",
+                ]);
+                spec.write_docker_args(&mut command);
+                if let Some(ca_path) = &ca_cert {
+                    let ca_mount = format!(
+                        "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
+                        ca_path
+                            .to_str()
+                            .context("Non-UTF8 DEVKIT_CA_CERT path")?
+                            .replace('"', "\"\"")
+                    );
+                    command.args([
+                        "--mount",
+                        &ca_mount,
+                        "--env",
+                        "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                    ]);
+                }
+                for value in [
+                    "HOME=/tmp/devkit-home",
+                    "npm_config_cache=/tmp/npm-cache",
+                    "npm_config_userconfig=/tmp/devkit-user.npmrc",
+                    "npm_config_globalconfig=/tmp/devkit-global.npmrc",
+                    "npm_config_update_notifier=false",
+                    "npm_config_fund=false",
+                    "npm_config_audit=false",
+                    "npm_config_install_links=false",
+                ] {
+                    command.args(["--env", value]);
+                }
+                env_plan.write_docker_args(&mut command);
+                for var in &npmrc_policy.required_env_vars {
+                    command.args(["--env", var]);
+                }
+                if let Some(registry) = registry {
+                    command.args(["--env", &format!("npm_config_registry={registry}")]);
+                }
+                command.arg(&image).args([
+                    "npm",
+                    "install",
+                    "--package-lock-only",
+                    "--package-lock=true",
+                    "--ignore-scripts",
+                    "--include=dev",
+                    "--strict-peer-deps",
+                    "--legacy-peer-deps=false",
+                    "--force=false",
+                ]);
+                Ok(command)
+            };
+        let mut last_output = None;
+        for attempt in 0..2 {
+            let token = uuid::Uuid::new_v4().to_string();
+            let mut command = build_command(&budget, &token)?;
+            let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token);
+            owned.label = "org.docouno.devkit.operation".into();
+            let output = runner.run_owned_unchecked(
+                &mut command,
+                OutputMode::Capture(16 * 1024 * 1024),
+                &owned,
+                None,
+            )?;
+            if output.code == 0 {
+                return Ok(());
+            }
+            if attempt == 0
+                && crate::resources::is_cgroup_delegation_failure(output.code, &output.stderr)
+            {
+                eprintln!(
+                    "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying npm resolver without container cgroup limits"
+                );
+                budget.disable_cgroup_limits();
+                continue;
+            }
+            last_output = Some(output);
+            break;
         }
-        for value in [
-            "HOME=/tmp/devkit-home",
-            "npm_config_cache=/tmp/npm-cache",
-            "npm_config_userconfig=/tmp/devkit-user.npmrc",
-            "npm_config_globalconfig=/tmp/devkit-global.npmrc",
-            "npm_config_update_notifier=false",
-            "npm_config_fund=false",
-            "npm_config_audit=false",
-            "npm_config_install_links=false",
-        ] {
-            command.args(["--env", value]);
-        }
-        for var in &npmrc_policy.required_env_vars {
-            command.args(["--env", var]);
-        }
-        if let Some(registry) = registry {
-            command.args(["--env", &format!("npm_config_registry={registry}")]);
-        }
-        command.arg(image).args([
-            "npm",
-            "install",
-            "--package-lock-only",
-            "--package-lock=true",
-            "--ignore-scripts",
-            "--include=dev",
-            "--strict-peer-deps",
-            "--legacy-peer-deps=false",
-            "--force=false",
-        ]);
-        let runner = ProcessRunner::new()?;
-        let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
-        owned.label = "org.docouno.devkit.operation".into();
-        let output =
-            runner.run_owned(&mut command, OutputMode::Capture(16 * 1024 * 1024), &owned)?;
+        let output = last_output.context("Missing npm resolver output")?;
         if output.code != 0 {
             let mut combined = output.stderr;
             combined.extend_from_slice(&output.stdout);
@@ -1018,20 +1053,17 @@ pub fn init_project(
     }
     empty_target(&target)?;
     if !exists(&target)? {
-        fs::rename(stage.path(), &target)?;
+        crate::archive::publish_new_directory(stage.path(), &target)?;
+        let _ = stage.keep();
     } else {
         for entry in sorted_entries(stage.path())? {
             let dest = target.join(entry.file_name());
-            ensure!(
-                !exists(&dest)?,
-                "Concurrent init conflict: {}",
-                dest.display()
-            );
-            fs::rename(entry.path(), dest)?;
+            crate::archive::rename_noreplace(&entry.path(), &dest)
+                .with_context(|| format!("Concurrent init conflict: {}", dest.display()))?;
         }
         sync_directory(&target)?;
+        sync_directory(parent)?;
     }
-    sync_directory(parent)?;
     Ok(state)
 }
 
@@ -1113,7 +1145,7 @@ fn verify_old_tools(root: &Path, state: &ProjectState) -> Result<()> {
             for (name, spec) in &c.tool_dependencies {
                 ensure!(
                     deps.get(name) == Some(&json!(spec)),
-                    "Tool dependency conflict: {path}/package.json devDependencies.{name}"
+                    "Tool dependency conflict: {path}/package.json devDependencies.{name} (expected {spec}; restore it or run 'devkit update')"
                 );
             }
         }
@@ -1171,13 +1203,42 @@ fn mutate(
     resolver: &dyn LockResolver,
 ) -> Result<MutationOutcome> {
     let release = admit_release(release_root)?;
-    let lock = CheckoutLock::acquire(target)?;
+    let root_candidate = project_root(target)?;
+    assert_no_pending(&root_candidate)?;
+    let op_label = match &change {
+        Some(Change::Add {
+            role: Role::App, ..
+        }) => "add-app",
+        Some(Change::Add {
+            role: Role::Library,
+            ..
+        }) => "add-package",
+        Some(Change::Register { .. }) => "register",
+        None if options.preview => "preview",
+        None => "sync/update",
+    };
+    let lock = CheckoutLock::acquire_exclusive(target, op_label, options.runner)?;
     let snapshot = AdmissionSnapshot::capture(&lock.root)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
     verify_old_tools(root, &next)?;
-    if let Some(inventory) = options.compose_inventory {
+    let owned_inventory = match (options.compose_inventory, options.compose_normalizer) {
+        (None, Some(normalizer))
+            if matches!(
+                change,
+                Some(Change::Add {
+                    role: Role::App,
+                    ..
+                })
+            ) =>
+        {
+            Some(crate::compose::admit_compose_inventory(root, normalizer)?)
+        }
+        _ => None,
+    };
+    let compose_inventory = options.compose_inventory.or(owned_inventory.as_ref());
+    if let Some(inventory) = compose_inventory {
         assert_compose_inventory(root, inventory)?;
     }
     let adding_node = change.as_ref().is_some_and(|c| match c {
@@ -1268,8 +1329,7 @@ fn mutate(
                 "Component path already exists: {path}"
             );
             if *role == Role::App {
-                let inventory = options
-                    .compose_inventory
+                let inventory = compose_inventory
                     .context("Adding a managed service requires admitted Compose inventory")?;
                 ensure!(
                     !inventory.services.contains(&spec.name),
@@ -1452,7 +1512,7 @@ fn mutate(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
-            if let Some(inventory) = options.compose_inventory {
+            if let Some(inventory) = compose_inventory {
                 assert_compose_inventory(root, inventory)?;
             }
             Ok(())

@@ -11,6 +11,7 @@ interface RunnableTestModule {
 type RunEndReason = 'passed' | 'interrupted' | 'failed';
 
 export default class RunnableTestsReporter {
+  onInit(vitest: unknown): void;
   onTestRunEnd(
     modules: ReadonlyArray<RunnableTestModule>,
     errors: ReadonlyArray<unknown>,

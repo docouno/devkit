@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -170,12 +170,19 @@ pub struct ToolAdmission {
 }
 impl ToolAdmission {
     pub fn capture(request: &RuntimeRequest) -> Result<Self> {
-        Self::capture_kind(request, false)
+        Self::capture_kind(request, false, false)
     }
     pub fn capture_service(request: &RuntimeRequest) -> Result<Self> {
-        Self::capture_kind(request, true)
+        Self::capture_kind(request, true, false)
     }
-    fn capture_kind(request: &RuntimeRequest, service: bool) -> Result<Self> {
+    pub fn capture_status_compat(request: &RuntimeRequest) -> Result<Self> {
+        Self::capture_kind(request, true, true)
+    }
+    fn capture_kind(
+        request: &RuntimeRequest,
+        service: bool,
+        allow_older_accepted: bool,
+    ) -> Result<Self> {
         let root = project_root(&request.root)?;
         ensure!(root.is_dir(), "Checkout does not exist");
         runtime_pending(&root)?;
@@ -197,7 +204,7 @@ impl ToolAdmission {
             {
                 ensure!(
                     identity(&safe_path(&root, path)?)?.as_ref() == Some(id),
-                    "Managed file conflict: {path}"
+                    "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'devkit sync'"
                 );
             }
         }
@@ -214,12 +221,21 @@ impl ToolAdmission {
             pins.version == state.version,
             "Manifest version differs from accepted toolchains.env"
         );
-        ensure!(
-            state.version == env!("CARGO_PKG_VERSION"),
-            "Native engine version {} does not match accepted project {}; run the accepted engine",
-            env!("CARGO_PKG_VERSION"),
-            state.version
-        );
+        if allow_older_accepted {
+            ensure!(
+                SemVer::parse(&state.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?,
+                "Native engine version {} is older than accepted project {}; run the accepted engine",
+                env!("CARGO_PKG_VERSION"),
+                state.version
+            );
+        } else {
+            ensure!(
+                state.version == env!("CARGO_PKG_VERSION"),
+                "Native engine version {} does not match accepted project {}; run the accepted engine",
+                env!("CARGO_PKG_VERSION"),
+                state.version
+            );
+        }
         let admitted = Self {
             root,
             state,
@@ -238,19 +254,42 @@ impl ToolAdmission {
         );
         runtime_pending(&self.root)
     }
+    fn registered_summary(&self) -> String {
+        let format_list = |role: Role| -> String {
+            let items: Vec<&str> = self
+                .state
+                .components
+                .iter()
+                .filter(|(_, c)| c.role == role)
+                .map(|(p, _)| p.rsplit('/').next().unwrap_or(p.as_str()))
+                .collect();
+            if items.is_empty() {
+                "none".to_owned()
+            } else {
+                items.join(", ")
+            }
+        };
+        format!(
+            "(registered apps: {}; registered packages: {})",
+            format_list(Role::App),
+            format_list(Role::Library)
+        )
+    }
     pub fn target(&self, request: &RuntimeRequest) -> Result<Option<String>> {
+        let summary = self.registered_summary();
         ensure!(
             request.app.is_none() || request.package.is_none(),
-            "app and package selectors are mutually exclusive"
+            "app and package selectors are mutually exclusive {summary}"
         );
         for (name, area) in [(&request.app, "apps"), (&request.package, "packages")] {
             if let Some(name) = name {
-                slug(name)?;
+                slug(name)
+                    .with_context(|| format!("Invalid {area} selector '{name}' {summary}"))?;
                 ensure!(
                     self.state
                         .components
                         .contains_key(&format!("{area}/{name}")),
-                    "Unregistered {area} selector: {name}"
+                    "Unregistered {area} selector: {name} {summary}"
                 );
             }
         }
@@ -263,7 +302,7 @@ impl ToolAdmission {
             valid_component_path(t)?;
             ensure!(
                 self.state.components.contains_key(t),
-                "Unregistered target component: {t}"
+                "Unregistered target component: {t} {summary}"
             );
         }
         Ok(target)
@@ -294,21 +333,31 @@ struct PreparedContext<'a> {
     engine: PathBuf,
     rust_image: Option<String>,
     desktop_image: Option<String>,
+    node_image_verified: std::cell::Cell<bool>,
+    node_ready_verified: std::cell::Cell<bool>,
+    budget: std::cell::RefCell<Option<crate::resources::HostResourceBudget>>,
 }
 impl<'a> PreparedContext<'a> {
     fn new(admission: ToolAdmission, runner: &'a ProcessRunner) -> Result<Self> {
+        Self::new_inner(admission, runner, true)
+    }
+    fn new_for_status(admission: ToolAdmission, runner: &'a ProcessRunner) -> Result<Self> {
+        Self::new_inner(admission, runner, false)
+    }
+    fn new_inner(
+        admission: ToolAdmission,
+        runner: &'a ProcessRunner,
+        verify_pin: bool,
+    ) -> Result<Self> {
         let engine = fs::canonicalize(std::env::current_exe()?)?;
         ensure!(
             identity(&engine)?.is_some(),
             "Current native engine is not a regular executable"
         );
-        if let Some(pin) = &admission.pins.engine {
+        if verify_pin && let Some(pin) = &admission.pins.engine {
             crate::delivery::verify_engine(&engine, pin)?;
         }
-        let project = format!(
-            "devkit-{}",
-            &digest(admission.root.as_os_str().as_encoded_bytes())[..16]
-        );
+        let project = crate::doctor::compose_project_name(&admission.root);
         Ok(Self {
             admission,
             runner,
@@ -316,6 +365,9 @@ impl<'a> PreparedContext<'a> {
             engine,
             rust_image: None,
             desktop_image: None,
+            node_image_verified: std::cell::Cell::new(false),
+            node_ready_verified: std::cell::Cell::new(false),
+            budget: std::cell::RefCell::new(None),
         })
     }
     fn docker(&self) -> Command {
@@ -378,7 +430,7 @@ impl<'a> PreparedContext<'a> {
         self.env(&mut c);
         Ok(c)
     }
-    fn prerequisite(&self) -> Result<()> {
+    fn prerequisite_service(&self) -> Result<()> {
         require_compose(self.runner, &mut self.docker())?;
         let info = self
             .runner
@@ -387,6 +439,15 @@ impl<'a> PreparedContext<'a> {
             info.text()?.trim() == "linux",
             "A Linux Docker daemon is required"
         );
+        Ok(())
+    }
+    fn prerequisite(&self) -> Result<()> {
+        require_compose(self.runner, &mut self.docker())?;
+        let budget = crate::resources::HostResourceBudget::probe_with_docker(
+            self.runner,
+            &mut self.docker(),
+        )?;
+        *self.budget.borrow_mut() = Some(budget);
         Ok(())
     }
     fn image(&self, image: &str) -> Result<bool> {
@@ -407,6 +468,9 @@ impl<'a> PreparedContext<'a> {
         Ok(false)
     }
     fn node_image(&self, prepare: bool) -> Result<()> {
+        if !prepare && self.node_image_verified.get() {
+            return Ok(());
+        }
         if !self.image(&self.admission.pins.node_image)? {
             ensure!(
                 prepare,
@@ -418,9 +482,20 @@ impl<'a> PreparedContext<'a> {
                 OutputMode::Inherit,
             )?;
         }
+        self.node_image_verified.set(true);
         Ok(())
     }
     fn derived_image(&mut self, kind: &str, prepare: bool) -> Result<String> {
+        if !prepare {
+            let cached = if kind == "rust" {
+                self.rust_image.as_ref()
+            } else {
+                self.desktop_image.as_ref()
+            };
+            if let Some(existing) = cached {
+                return Ok(existing.clone());
+            }
+        }
         let (recipe, pin, label) = if kind == "rust" {
             (
                 "rust.Dockerfile",
@@ -578,168 +653,200 @@ impl<'a> PreparedContext<'a> {
             ".devkit/cache/cargo".into(),
             ".devkit/cache/electron".into(),
         ])?;
-        let token = uuid::Uuid::new_v4().to_string();
-        let owned = OwnedContainer::new(format!("{}-task-{token}", self.project), token);
-        let mut c = self.docker();
-        c.args([
-            "run",
-            "--pull",
-            "never",
-            "--rm",
-            "--init",
-            "--name",
-            &owned.name,
-            "--label",
-            &format!("{}={}", owned.label, owned.token),
-            "--label",
-            &format!("io.docouno.devkit.checkout={}", self.project),
-            "--label",
-            "io.docouno.devkit.role=tool",
-            "--user",
-            &format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
-                libc::getegid()
-            }),
-            "--network",
-            network,
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges:true",
-            "--tmpfs",
-            if profile == ToolingProfile::Rust {
-                "/tmp:mode=1777,exec"
-            } else {
-                "/tmp:mode=1777"
-            },
-            "--mount",
-            &bind_mount(root, Path::new("/workspace"), !write_root)?,
-        ]);
-        if fix {
-            let target = component.context("Fix requires a component")?;
+        let mut budget = self
+            .budget
+            .borrow()
+            .clone()
+            .context("Missing host resource budget; prerequisite not checked")?;
+        let build_command = |budget: &crate::resources::HostResourceBudget,
+                             owned: &OwnedContainer|
+         -> Result<Command> {
+            let spec = budget.for_task(profile);
+            let env_plan = budget.toolchain_env_for_task(profile, &spec)?;
+            let mut c = self.docker();
             c.args([
-                "--mount",
-                &bind_mount(
-                    &input_path(root, target)?,
-                    &Path::new("/workspace").join(target),
-                    false,
-                )?,
-            ]);
-        }
-        for path in &writes {
-            let readonly = match access {
-                TaskAccess::PackageLibrary => package_release_dir.as_deref() != Some(path.as_str()),
-                TaskAccess::ExecReadOnly => path.ends_with("node_modules"),
-                _ => false,
-            };
-            c.args([
-                "--mount",
-                &bind_mount(
-                    &input_path(root, path)?,
-                    &Path::new("/workspace").join(path),
-                    readonly,
-                )?,
-            ]);
-        }
-        for (source, target) in [
-            ("npm", "/cache/npm"),
-            ("cargo", "/cache/cargo"),
-            ("electron", "/cache/electron"),
-        ] {
-            c.args([
-                "--mount",
-                &bind_mount(
-                    &safe_path(root, &format!(".devkit/cache/{source}"))?,
-                    Path::new(target),
-                    false,
-                )?,
-            ]);
-        }
-        c.args([
-            "--mount",
-            &bind_mount(&self.engine, Path::new("/devkit/devkit"), true)?,
-            "--workdir",
-            &component
-                .map(|p| format!("/workspace/{p}"))
-                .unwrap_or_else(|| "/workspace".into()),
-        ]);
-        let cargo_jobs = resolve_cargo_build_jobs()?;
-        for value in [
-            "HOME=/tmp/devkit-home",
-            "CI=true",
-            "NPM_CONFIG_CACHE=/cache/npm",
-            "NPM_CONFIG_USERCONFIG=/tmp/devkit-user.npmrc",
-            "NPM_CONFIG_GLOBALCONFIG=/tmp/devkit-global.npmrc",
-            "NPM_CONFIG_UPDATE_NOTIFIER=false",
-            "NPM_CONFIG_FUND=false",
-            "NPM_CONFIG_AUDIT=false",
-            "ELECTRON_CACHE=/cache/electron",
-            "CARGO_HOME=/cache/cargo",
-            "RUSTUP_AUTO_INSTALL=0",
-        ] {
-            c.args(["--env", value]);
-        }
-        c.args(["--env", &format!("CARGO_BUILD_JOBS={cargo_jobs}")]);
-        c.args([
-            "--env",
-            &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
-            "--env",
-            &format!(
-                "CARGO_TARGET_DIR=/workspace/{}/target",
-                component.unwrap_or(".")
-            ),
-        ]);
-        if profile != ToolingProfile::Rust {
-            let node_dirs: Vec<String> = self
-                .admission
-                .state
-                .components
-                .iter()
-                .filter(|(_, c)| c.toolchain == Toolchain::Node)
-                .map(|(p, _)| p.clone())
-                .collect();
-            let npmrc_policy = crate::native::parse_and_admit_npmrc(root, &node_dirs)?;
-            if network != "none" && forward_npm_secrets {
-                crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
-                for var in &npmrc_policy.required_env_vars {
-                    c.args(["--env", var]);
-                }
-                if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
-                    c.args([
-                        "--mount",
-                        &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
-                        "--env",
-                        "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
-                    ]);
-                }
-            } else {
-                for var in &npmrc_policy.required_env_vars {
-                    c.args(["--env", &format!("{var}=devkit-offline-unused")]);
-                }
-            }
-        }
-        if component.is_some_and(|p| {
-            self.admission.state.components[p]
-                .development
-                .as_ref()
-                .is_some_and(|d| d.api.is_some())
-        }) && profile == ToolingProfile::Web
-        {
-            c.args(["--env", "VITE_API_ENABLED=true"]);
-        }
-        if profile == ToolingProfile::Electron {
-            c.args([
-                "--shm-size",
-                "256m",
+                "run",
+                "--pull",
+                "never",
+                "--rm",
+                "--init",
+                "--name",
+                &owned.name,
+                "--label",
+                &format!("{}={}", owned.label, owned.token),
+                "--label",
+                &format!("io.docouno.devkit.checkout={}", self.project),
+                "--label",
+                "io.docouno.devkit.role=tool",
+                "--user",
+                &format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                }),
+                "--network",
+                network,
+                "--read-only",
+                "--cap-drop",
+                "ALL",
                 "--security-opt",
+                "no-new-privileges:true",
+            ]);
+            spec.write_docker_args(&mut c);
+            c.args([
+                "--mount",
+                &bind_mount(root, Path::new("/workspace"), !write_root)?,
+            ]);
+            if fix {
+                let target = component.context("Fix requires a component")?;
+                c.args([
+                    "--mount",
+                    &bind_mount(
+                        &input_path(root, target)?,
+                        &Path::new("/workspace").join(target),
+                        false,
+                    )?,
+                ]);
+            }
+            for path in &writes {
+                let readonly = match access {
+                    TaskAccess::PackageLibrary => {
+                        package_release_dir.as_deref() != Some(path.as_str())
+                    }
+                    TaskAccess::ExecReadOnly => path.ends_with("node_modules"),
+                    _ => false,
+                };
+                c.args([
+                    "--mount",
+                    &bind_mount(
+                        &input_path(root, path)?,
+                        &Path::new("/workspace").join(path),
+                        readonly,
+                    )?,
+                ]);
+            }
+            for (source, target) in [
+                ("npm", "/cache/npm"),
+                ("cargo", "/cache/cargo"),
+                ("electron", "/cache/electron"),
+            ] {
+                c.args([
+                    "--mount",
+                    &bind_mount(
+                        &safe_path(root, &format!(".devkit/cache/{source}"))?,
+                        Path::new(target),
+                        false,
+                    )?,
+                ]);
+            }
+            c.args([
+                "--mount",
+                &bind_mount(&self.engine, Path::new("/devkit/devkit"), true)?,
+                "--workdir",
+                &component
+                    .map(|p| format!("/workspace/{p}"))
+                    .unwrap_or_else(|| "/workspace".into()),
+            ]);
+            for value in [
+                "HOME=/tmp/devkit-home",
+                "CI=true",
+                "NPM_CONFIG_CACHE=/cache/npm",
+                "NPM_CONFIG_USERCONFIG=/tmp/devkit-user.npmrc",
+                "NPM_CONFIG_GLOBALCONFIG=/tmp/devkit-global.npmrc",
+                "NPM_CONFIG_UPDATE_NOTIFIER=false",
+                "NPM_CONFIG_FUND=false",
+                "NPM_CONFIG_AUDIT=false",
+                "ELECTRON_CACHE=/cache/electron",
+                "CARGO_HOME=/cache/cargo",
+                "RUSTUP_AUTO_INSTALL=0",
+            ] {
+                c.args(["--env", value]);
+            }
+            env_plan.write_docker_args(&mut c);
+            c.args([
+                "--env",
+                &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
+                "--env",
                 &format!(
-                    "seccomp={}",
-                    safe_path(root, ".devkit/runtime/desktop-seccomp.json")?.display()
+                    "CARGO_TARGET_DIR=/workspace/{}/target",
+                    component.unwrap_or(".")
                 ),
             ]);
+            if profile != ToolingProfile::Rust {
+                let node_dirs: Vec<String> = self
+                    .admission
+                    .state
+                    .components
+                    .iter()
+                    .filter(|(_, c)| c.toolchain == Toolchain::Node)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                let npmrc_policy = crate::native::parse_and_admit_npmrc(root, &node_dirs)?;
+                if network != "none" && forward_npm_secrets {
+                    crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
+                    for var in &npmrc_policy.required_env_vars {
+                        c.args(["--env", var]);
+                    }
+                    if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
+                        c.args([
+                            "--mount",
+                            &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
+                            "--env",
+                            "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                        ]);
+                    }
+                } else {
+                    for var in &npmrc_policy.required_env_vars {
+                        c.args(["--env", &format!("{var}=devkit-offline-unused")]);
+                    }
+                }
+            }
+            if component.is_some_and(|p| {
+                self.admission.state.components[p]
+                    .development
+                    .as_ref()
+                    .is_some_and(|d| d.api.is_some())
+            }) && profile == ToolingProfile::Web
+            {
+                c.args(["--env", "VITE_API_ENABLED=true"]);
+            }
+            if profile == ToolingProfile::Electron {
+                c.args([
+                    "--security-opt",
+                    &format!(
+                        "seccomp={}",
+                        safe_path(root, ".devkit/runtime/desktop-seccomp.json")?.display()
+                    ),
+                ]);
+            }
+            c.arg(image).args(argv);
+            Ok(c)
+        };
+        for attempt in 0..2 {
+            let token = uuid::Uuid::new_v4().to_string();
+            let owned = OwnedContainer::new(format!("{}-task-{token}", self.project), token);
+            let mut c = build_command(&budget, &owned)?;
+            let mut output = self.runner.run_owned_unchecked(
+                &mut c,
+                OutputMode::TeeStderr(64 * 1024),
+                &owned,
+                None,
+            )?;
+            if output.code == 0 {
+                return Ok(());
+            }
+            if attempt == 0
+                && crate::resources::is_cgroup_delegation_failure(output.code, &output.stderr)
+            {
+                eprintln!(
+                    "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying without container cgroup limits"
+                );
+                budget.disable_cgroup_limits();
+                *self.budget.borrow_mut() = Some(budget.clone());
+                continue;
+            }
+            output.stderr.clear();
+            output.success("Container task")?;
+            return Ok(());
         }
-        c.arg(image).args(argv);
-        self.runner.run_owned(&mut c, OutputMode::Inherit, &owned)?;
         Ok(())
     }
 }
@@ -800,6 +907,9 @@ fn node_fingerprint(admission: &RuntimeAdmission) -> Result<String> {
     )))
 }
 fn node_ready(ctx: &PreparedContext<'_>, fingerprint: &str) -> Result<()> {
+    if ctx.node_ready_verified.get() {
+        return Ok(());
+    }
     let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
     ensure!(
         identity(&receipt)?.is_some()
@@ -807,6 +917,7 @@ fn node_ready(ctx: &PreparedContext<'_>, fingerprint: &str) -> Result<()> {
             && safe_path(&ctx.admission.root, "node_modules")?.is_dir(),
         "workspace dependencies are absent/stale; run make setup"
     );
+    ctx.node_ready_verified.set(true);
     Ok(())
 }
 fn node_argv(ctx: &PreparedContext<'_>, argv: Vec<OsString>) -> Vec<OsString> {
@@ -900,7 +1011,13 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     );
     // Pending objects block before creating/opening a lock, regardless of type.
     runtime_pending(&project_root(&request.root)?)?;
-    let lock = CheckoutLock::acquire(&request.root)?;
+    let shared_lock = matches!(request.command.as_str(), "doctor" | "status" | "logs");
+    let lock_op = format!("task {}", request.command);
+    let lock = if shared_lock {
+        CheckoutLock::acquire_shared(&request.root, &lock_op, Some(runner))?
+    } else {
+        CheckoutLock::acquire_exclusive(&request.root, &lock_op, Some(runner))?
+    };
     let service = ["status", "logs", "down"].contains(&request.command.as_str());
     let tool = if service {
         ToolAdmission::capture_service(&request)?
@@ -922,16 +1039,16 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     if ["snapshot", "dev-snapshot", "package-snapshot"].contains(&request.command.as_str()) {
         if request.command == "dev-snapshot" {
             ensure!(
-                request.package.is_none(),
-                "Development requires an app selector"
-            );
-            ensure!(
                 ctx.admission
                     .state
                     .components
                     .values()
                     .any(|c| c.role == Role::App),
                 "Project has no runnable apps; add a playground or app with devkit add-app"
+            );
+            ensure!(
+                request.package.is_none(),
+                "Development requires an app selector"
             );
         } else if request.command == "package-snapshot" {
             if let Some(pkg) = &request.package {
@@ -947,7 +1064,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 );
                 ensure!(
                     component_is_public_library(&ctx.admission.root, &pkg_path, c)?,
-                    "Package {pkg_path} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                    "Package {pkg_path} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging (then make setup)"
                 );
             } else if let Some(app) = &request.app {
                 let app_path = format!("apps/{app}");
@@ -980,20 +1097,19 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 if !any_packageable {
                     let slug_hint = hint_slug.as_deref().unwrap_or("<name>");
                     anyhow::bail!(
-                        "No packageable components found; set \"private\": false in packages/{slug_hint}/package.json and run devkit sync, or add an Electron app"
+                        "No packageable components found; set \"private\": false in packages/{slug_hint}/package.json and run devkit sync, or add an Electron app (then make setup)"
                     );
                 }
             }
         }
         return Ok(());
     }
-    ctx.prerequisite()?;
     if service {
-        run_service(&request, target.as_deref(), &mut ctx)?;
-        ctx.admission.recheck()?;
-        drop(lock);
+        ctx.prerequisite_service()?;
+        run_service(&request, target.as_deref(), &mut ctx, lock)?;
         return Ok(());
     }
+    ctx.prerequisite()?;
     let full = full.context("Missing quality admission")?;
     let fingerprint = node_fingerprint(&full)?;
     ctx.dirs(workspace_write_directories(
@@ -1002,6 +1118,20 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     )?)?;
     let command = request.command.as_str();
     if command == "setup-node" {
+        if full.state.components.values().any(|c| c.role == Role::App) {
+            let running = ctx.runner.capture(ctx.compose()?.args([
+                "--profile",
+                "*",
+                "ps",
+                "--status",
+                "running",
+                "--quiet",
+            ]))?;
+            ensure!(
+                running.text()?.trim().is_empty(),
+                "Development services are running; stop them with 'make down' before running 'make setup'"
+            );
+        }
         let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
         if identity(&receipt)?.is_some() {
             fs::remove_file(&receipt)?;
@@ -1089,6 +1219,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         return Ok(());
     }
     if command == "doctor" {
+        crate::doctor::ensure_disk_space(&ctx.admission.root)?;
         for (path, c) in full.state.components.clone() {
             if c.toolchain == Toolchain::Rust {
                 ctx.derived_image("rust", false)?;
@@ -1123,7 +1254,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     if component.toolchain == Toolchain::Rust {
         ensure!(
             command != "package",
-            "package is defined for desktop applications"
+            "package is defined for desktop applications and publishable libraries"
         );
         let image = ctx.derived_image("rust", setup)?;
         ctx.task(ContainerTask {
@@ -1170,7 +1301,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                             return Ok(());
                         }
                         anyhow::bail!(
-                            "Package {target} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging"
+                            "Package {target} has \"private\": true in package.json; set \"private\": false and run devkit sync before packaging (then make setup)"
                         );
                     }
                     access = TaskAccess::PackageLibrary;
@@ -1215,7 +1346,21 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         "network must be none or bridge"
     );
     runtime_pending(&project_root(&request.runtime.root)?)?;
-    let _lock = CheckoutLock::acquire(&request.runtime.root)?;
+    let lock_mode = if request.write || request.prepare {
+        CheckoutLockMode::Exclusive
+    } else {
+        CheckoutLockMode::Shared
+    };
+    let _lock = CheckoutLock::acquire_with(
+        &request.runtime.root,
+        lock_mode,
+        if lock_mode == CheckoutLockMode::Exclusive {
+            "exec --write"
+        } else {
+            "exec"
+        },
+        Some(runner),
+    )?;
     let tool = ToolAdmission::capture(&request.runtime)?;
     runtime_paths(&tool)?;
     let target = tool
@@ -1246,6 +1391,9 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
         if identity(&receipt)?.is_some() {
             fs::remove_file(receipt)?;
+            eprintln!(
+                "devkit: note: workspace lock receipt invalidated by --write; run 'make setup' after dependency changes"
+            );
         }
     }
     let image = if component.toolchain == Toolchain::Rust {
@@ -1254,7 +1402,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.node_image(request.prepare)?;
         ctx.admission.pins.node_image.clone()
     };
-    ctx.task(ContainerTask {
+    let task_result = ctx.task(ContainerTask {
         component: Some(&target),
         profile: if component.toolchain == Toolchain::Rust {
             ToolingProfile::Rust
@@ -1271,7 +1419,21 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
             TaskAccess::ExecReadOnly
         },
         inputs: None,
-    })?;
+    });
+    if let Err(err) = task_result {
+        if (!request.write || request.network == "none")
+            && let Some(cf) = err.downcast_ref::<CommandFailure>()
+        {
+            return Err(failure(
+                cf.code,
+                format!(
+                    "{}; add --write to modify checkout files, --network bridge for network access, or --prepare to pull/build missing tool images",
+                    cf.message
+                ),
+            ));
+        }
+        return Err(err);
+    }
     ctx.admission.recheck()?;
     runner.check_cancelled()?;
     Ok(())
@@ -1286,6 +1448,7 @@ fn run_service(
     request: &RuntimeRequest,
     target: Option<&str>,
     ctx: &mut PreparedContext<'_>,
+    lock: CheckoutLock,
 ) -> Result<()> {
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let selected = if let Some(path) = target {
@@ -1308,6 +1471,8 @@ fn run_service(
         && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none()
     {
         assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        ctx.admission.recheck()?;
+        drop(lock);
         return Ok(());
     }
     let mut command = ctx.compose()?;
@@ -1353,17 +1518,20 @@ fn run_service(
         }
         _ => unreachable!(),
     };
+    if request.command == "logs" && request.follow {
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        ctx.admission.recheck()?;
+        drop(lock);
+        ctx.runner.checked(&mut command, OutputMode::Inherit)?;
+        return Ok(());
+    }
     ctx.runner.checked(&mut command, OutputMode::Inherit)?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
+    ctx.admission.recheck()?;
+    drop(lock);
     Ok(())
 }
-/// Normalized Compose, including implicit dependencies and selected profiles,
-/// determines which registered applications need a prepared toolchain.
-pub fn development_components(
-    state: &ProjectState,
-    model: &Value,
-    selected: &str,
-) -> Result<Vec<String>> {
+pub fn active_compose_services(model: &Value, selected: &str) -> Result<BTreeSet<String>> {
     let services = object(
         model.get("services").context("Compose services")?,
         "Compose services",
@@ -1408,6 +1576,16 @@ pub fn development_components(
             }
         }
     }
+    Ok(seen)
+}
+/// Normalized Compose, including implicit dependencies and selected profiles,
+/// determines which registered applications need a prepared toolchain.
+pub fn development_components(
+    state: &ProjectState,
+    model: &Value,
+    selected: &str,
+) -> Result<Vec<String>> {
+    let seen = active_compose_services(model, selected)?;
     Ok(state
         .components
         .iter()
@@ -1422,6 +1600,7 @@ fn run_development(
     fingerprint: &str,
     ctx: &mut PreparedContext<'_>,
 ) -> Result<()> {
+    use std::io::Write;
     ensure!(
         request.package.is_none() && full.state.components[target].role == Role::App,
         "Development requires an app selector"
@@ -1437,11 +1616,13 @@ fn run_development(
         "json",
     ]))?;
     let model: Value = serde_json::from_slice(&output.stdout)?;
+    let active_services = active_compose_services(&model, &service)?;
     let reached = development_components(&full.state, &model, &service)?;
     ensure!(
         !reached.is_empty(),
         "Selected Compose service has no registered application"
     );
+    let state_dir = safe_path(&ctx.admission.root, ".devkit/state")?;
     let mut overlays = Vec::new();
     for path in reached {
         let c = &full.state.components[&path];
@@ -1457,8 +1638,7 @@ fn run_development(
             let mut file = tempfile::Builder::new()
                 .prefix("display-")
                 .suffix(".json")
-                .tempfile_in(ctx.admission.root.join(".devkit/state"))?;
-            use std::io::Write;
+                .tempfile_in(&state_dir)?;
             file.write_all(&json_bytes(&spec)?)?;
             overlays.push(file);
         }
@@ -1469,10 +1649,11 @@ fn run_development(
             .map(move |o| format!("{p}/{o}"))
     }))?;
     ctx.dirs([".devkit/cache/cargo".into()])?;
-    let npm_env_overlay_path =
-        safe_path(&ctx.admission.root, ".devkit/state/compose.npm-env.json")?;
+    let legacy_npm_overlay = safe_path(&ctx.admission.root, ".devkit/state/compose.npm-env.json")?;
+    if identity(&legacy_npm_overlay)?.is_some() {
+        let _ = remove_file(&legacy_npm_overlay);
+    }
     let npmrc_policy = crate::native::parse_manifest_npmrc_policy(&ctx.admission.root)?;
-    let mut attach_npm_env_overlay = false;
     if !npmrc_policy.required_env_vars.is_empty() {
         let mut services_map = serde_json::Map::new();
         for (path, c) in &full.state.components {
@@ -1503,30 +1684,226 @@ fn run_development(
             }
         }
         if !services_map.is_empty() {
-            write_atomic(
-                &npm_env_overlay_path,
-                &json_bytes(&json!({ "services": services_map }))?,
-                0o644,
-            )?;
-            attach_npm_env_overlay = true;
+            let mut npm_file = tempfile::Builder::new()
+                .prefix("npm-env-")
+                .suffix(".json")
+                .tempfile_in(&state_dir)?;
+            npm_file.write_all(&json_bytes(&json!({ "services": services_map }))?)?;
+            overlays.push(npm_file);
         }
     }
-    if !attach_npm_env_overlay && identity(&npm_env_overlay_path)?.is_some() {
-        remove_file(&npm_env_overlay_path)?;
+    let mut budget = ctx
+        .budget
+        .borrow()
+        .clone()
+        .context("Missing host resource budget; prerequisite not checked")?;
+    for attempt in 0..2 {
+        let mut res_overlay_file = None;
+        if let Some(res_spec) = crate::resources::build_compose_resource_overlay(
+            &budget,
+            &full.state,
+            &ctx.admission.pins.rust_version,
+            &model,
+            &active_services,
+        )? {
+            let mut file = tempfile::Builder::new()
+                .prefix("compose-resources-")
+                .suffix(".json")
+                .tempfile_in(&state_dir)?;
+            file.write_all(&json_bytes(&res_spec)?)?;
+            res_overlay_file = Some(file);
+        }
+        let mut command = ctx.compose()?;
+        for f in &overlays {
+            command.arg("--file").arg(f.path());
+        }
+        if let Some(f) = &res_overlay_file {
+            command.arg("--file").arg(f.path());
+        }
+        command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
+        full.recheck()?;
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        let mut up_output = ctx
+            .runner
+            .run(&mut command, OutputMode::TeeStderr(64 * 1024))?;
+        if up_output.code == 0 {
+            break;
+        }
+        if attempt == 0
+            && crate::resources::is_compose_cgroup_delegation_failure(
+                up_output.code,
+                &up_output.stderr,
+            )
+        {
+            eprintln!(
+                "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
+            );
+            budget.disable_cgroup_limits();
+            *ctx.budget.borrow_mut() = Some(budget.clone());
+            continue;
+        }
+        up_output.stderr.clear();
+        up_output.success("docker")?;
     }
-    let mut command = ctx.compose()?;
-    if attach_npm_env_overlay {
-        command.arg("--file").arg(&npm_env_overlay_path);
+    let service_to_component = app_service_component_map(&full.state);
+    let mut ps_cmd = ctx.compose()?;
+    ps_cmd.args(["--profile", "*", "ps", "--format", "json"]);
+    let ps_out = ctx.runner.capture(&mut ps_cmd)?;
+    for entry in crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)? {
+        if !active_services.contains(&entry.service) || entry.state != "running" {
+            continue;
+        }
+        for url in &entry.urls {
+            if let Some(comp) = &entry.component {
+                println!("Service {} ({comp}): {url}", entry.service);
+            } else {
+                println!("Service {}: {url}", entry.service);
+            }
+        }
     }
-    for f in &overlays {
-        command.arg("--file").arg(f.path());
-    }
-    command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
-    full.recheck()?;
-    assert_compose_inventory(&ctx.admission.root, &inventory)?;
-    ctx.runner.checked(&mut command, OutputMode::Inherit)?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     Ok(())
+}
+
+fn app_service_component_map(state: &ProjectState) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (path, c) in &state.components {
+        if c.role == Role::App {
+            map.insert(service_name(path, c).to_owned(), path.clone());
+        }
+    }
+    map
+}
+
+pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
+    let mut components = serde_json::Map::new();
+    for (path, c) in &full.state.components {
+        let mut obj = match serde_json::to_value(c)? {
+            Value::Object(m) => m,
+            _ => anyhow::bail!("Component state must serialize to an object"),
+        };
+        let short = path.rsplit('/').next().unwrap_or(path.as_str());
+        let selector = if c.role == Role::App {
+            format!("app={short}")
+        } else {
+            format!("package={short}")
+        };
+        let packageable = c.tooling_profile == ToolingProfile::Electron
+            || component_is_public_library(&full.root, path, c)?;
+        let exposed_port = if c.role == Role::App
+            && c.development
+                .as_ref()
+                .is_some_and(|d| d.owner == DevelopmentOwner::Managed)
+            && c.tooling_profile != ToolingProfile::Electron
+        {
+            Some(if c.tooling_profile == ToolingProfile::Web {
+                5173u16
+            } else {
+                8080u16
+            })
+        } else {
+            None
+        };
+        obj.insert("selector".into(), json!(selector));
+        obj.insert("packageable".into(), json!(packageable));
+        obj.insert("exposedContainerPort".into(), json!(exposed_port));
+        components.insert(path.clone(), Value::Object(obj));
+    }
+    let receipts = crate::doctor::local_receipts(
+        &full.root,
+        &full.state,
+        Some(&full.native.node_inputs.digest),
+    )?;
+    Ok(json!({
+        "root": full.root,
+        "version": full.state.version,
+        "releaseIdentity": full.state.release_identity,
+        "generation": full.state.generation,
+        "composeProject": crate::doctor::compose_project_name(&full.root),
+        "components": components,
+        "inputs": full.native.inputs,
+        "receipts": receipts,
+    }))
+}
+
+pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, String)> {
+    let root = project_root(root)?;
+    assert_no_pending(&root)?;
+    let lock = CheckoutLock::acquire_shared(&root, "status", Some(runner))?;
+    let req = RuntimeRequest::new(root.clone(), "status".into());
+    let tool = ToolAdmission::capture_status_compat(&req)?;
+    runtime_paths(&tool)?;
+    let mut ctx = PreparedContext::new_for_status(tool, runner)?;
+    ctx.prerequisite_service()?;
+    let inventory = capture_compose_inputs(&ctx.admission.root)?;
+    let service_to_component = app_service_component_map(&ctx.admission.state);
+    let has_apps = ctx
+        .admission
+        .state
+        .components
+        .values()
+        .any(|c| c.role == Role::App);
+    let services =
+        if !has_apps && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none() {
+            Vec::new()
+        } else {
+            for kind in ["rust", "desktop"] {
+                let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
+                if identity(&p)?.is_some() {
+                    let image = fs::read_to_string(p)?.trim().to_owned();
+                    if image
+                        .strip_prefix("sha256:")
+                        .is_some_and(|h| SHA256_RE.is_match(h))
+                    {
+                        ctx.set_image(kind, image);
+                    }
+                }
+            }
+            let mut command = ctx.compose()?;
+            ctx.env(&mut command);
+            command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
+            let out = ctx.runner.capture(&mut command)?;
+            crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?
+        };
+    assert_compose_inventory(&ctx.admission.root, &inventory)?;
+    let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
+    ctx.admission.recheck()?;
+    runner.check_cancelled()?;
+    drop(lock);
+
+    let mut lines = vec![format!("Compose project: {}", ctx.project)];
+    if services.is_empty() {
+        lines.push("Services: none".into());
+    } else {
+        for svc in &services {
+            let comp_suffix = svc
+                .component
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            let health_suffix = svc
+                .health
+                .as_deref()
+                .map(|h| format!(" [{h}]"))
+                .unwrap_or_default();
+            let url_suffix = if svc.urls.is_empty() {
+                String::new()
+            } else {
+                format!(" -> {}", svc.urls.join(", "))
+            };
+            lines.push(format!(
+                "Service {}{}: {}{}{}",
+                svc.service, comp_suffix, svc.state, health_suffix, url_suffix
+            ));
+        }
+    }
+    let result = json!({
+        "root": ctx.admission.root,
+        "composeProject": ctx.project,
+        "services": services,
+        "receipts": receipts,
+    });
+    Ok((result, lines.join("\n")))
 }
 /// Lifecycle service inventory uses the same cancellable native process facade.
 pub struct DockerComposeNormalizer {

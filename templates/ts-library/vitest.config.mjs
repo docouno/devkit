@@ -11,6 +11,5 @@ export default defineConfig({
     reporters: ['default', new RunnableTestsReporter()],
     restoreMocks: true,
     clearMocks: true,
-    maxWorkers: 2,
   },
 });

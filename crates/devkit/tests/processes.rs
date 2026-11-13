@@ -398,3 +398,207 @@ fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() 
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
 }
+
+#[test]
+fn stopped_creator_group_wakes_and_terminates_without_sigkill_delay() {
+    let runner = ProcessRunner::new().unwrap();
+    let started = Instant::now();
+    let error = runner
+        .checked_with_timeout(
+            Command::new("sh").args(["-c", "kill -STOP $$"]),
+            OutputMode::Capture(4096),
+            Duration::from_millis(100),
+        )
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("exceeded its deadline"));
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "Stopped creator waited for SIGKILL instead of waking on SIGCONT: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn parent_lifetime_spawner_probe() {
+    let Ok(scenario) = std::env::var("DEVKIT_PARENT_PROBE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(std::env::var("DEVKIT_PROCESS_FIXTURE").unwrap());
+    let path_env = std::env::var_os("PATH").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let root_for_thread = root.clone();
+    let scenario_for_thread = scenario.clone();
+    let worker = thread::spawn(move || {
+        let script_body = match scenario_for_thread.as_str() {
+            "worker-exits-parent-lives" => {
+                "printf accepted-token > \"$DEVKIT_PROCESS_FIXTURE/container\"; \
+                 touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; \
+                 while ! test -f \"$DEVKIT_PROCESS_FIXTURE/thread-exited\"; do sleep 0.01; done; \
+                 sleep 0.15"
+            }
+            "worker-exits-then-parent-killed" => {
+                "printf accepted-token > \"$DEVKIT_PROCESS_FIXTURE/container\"; \
+                 sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; \
+                 touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; \
+                 wait"
+            }
+            other => panic!("Unknown parent probe scenario: {other}"),
+        };
+        let out_file = fs::File::create(root_for_thread.join("devkit.out")).unwrap();
+        let err_file = fs::File::create(root_for_thread.join("devkit.err")).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args([
+                "internal",
+                "guard",
+                "devkit-process-test",
+                "accepted-token",
+                "--",
+                "sh",
+                "-c",
+                script_body,
+            ])
+            .env("DEVKIT_PROCESS_FIXTURE", &root_for_thread)
+            .env("PATH", &path_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
+            .spawn()
+            .unwrap();
+        fs::write(root_for_thread.join("devkit-pid"), child.id().to_string()).unwrap();
+        wait_for(&root_for_thread.join("ready"));
+        tx.send(child).unwrap();
+    });
+    worker.join().unwrap();
+    let mut child = rx.recv().unwrap();
+    fs::write(root.join("thread-exited"), "1").unwrap();
+    if scenario == "worker-exits-parent-lives" {
+        let status = child.wait().unwrap();
+        fs::write(
+            root.join("devkit-code"),
+            status.code().unwrap_or(-1).to_string(),
+        )
+        .unwrap();
+        std::process::exit(0);
+    } else {
+        thread::sleep(Duration::from_secs(30));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_cleans_up() {
+    // 1. Spawning OS thread exits while parent process stays alive: devkit must NOT cancel.
+    {
+        let fixture = Fixture::new();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![fixture.root().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        let parent = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "parent_lifetime_spawner_probe", "--nocapture"])
+            .env("DEVKIT_PARENT_PROBE", "worker-exits-parent-lives")
+            .env("DEVKIT_PROCESS_FIXTURE", fixture.root())
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait(parent);
+        assert!(
+            output.status.success(),
+            "Parent probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let devkit_err = fs::read_to_string(fixture.root().join("devkit.err")).unwrap();
+        let devkit_code = fs::read_to_string(fixture.root().join("devkit-code")).unwrap();
+        assert_eq!(
+            devkit_code.trim(),
+            "0",
+            "devkit cancelled when spawning worker thread exited: {devkit_err}"
+        );
+        assert!(!fixture.root().join("container").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root().join("mutations")).unwrap(),
+            format!("stop {ID}\nrm {ID}\n")
+        );
+    }
+
+    // 2. Spawning OS thread exits, devkit survives, then real parent process is SIGKILLed:
+    //    devkit must receive SIGURG with changed PPID, cancel (143), reap child, and clean up container.
+    {
+        let fixture = Fixture::new();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![fixture.root().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        let mut parent = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "parent_lifetime_spawner_probe", "--nocapture"])
+            .env("DEVKIT_PARENT_PROBE", "worker-exits-then-parent-killed")
+            .env("DEVKIT_PROCESS_FIXTURE", fixture.root())
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for(&fixture.root().join("thread-exited"));
+        thread::sleep(Duration::from_millis(100));
+        let devkit_pid: i32 = fs::read_to_string(fixture.root().join("devkit-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let grandchild_pid: i32 = fs::read_to_string(fixture.root().join("child-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            "devkit died prematurely on worker thread exit"
+        );
+        // SAFETY: parent is the live helper process spawned above.
+        assert_eq!(unsafe { libc::kill(parent.id() as i32, libc::SIGKILL) }, 0);
+        let _ = parent.wait();
+        let mut reaped_code = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (Path::new(&format!("/proc/{devkit_pid}")).exists()
+            || Path::new(&format!("/proc/{grandchild_pid}")).exists())
+            && Instant::now() < deadline
+        {
+            let mut status = 0;
+            // SAFETY: earlier tests in this binary enable PR_SET_CHILD_SUBREAPER on the
+            // test runner, so adopted devkit_pid stays a zombie in /proc until reaped here.
+            let waited = unsafe { libc::waitpid(devkit_pid, &mut status, libc::WNOHANG) };
+            if waited == devkit_pid && libc::WIFEXITED(status) {
+                reaped_code = Some(libc::WEXITSTATUS(status));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let devkit_err = fs::read_to_string(fixture.root().join("devkit.err")).unwrap_or_default();
+        if let Some(code) = reaped_code {
+            assert_eq!(
+                code, 143,
+                "Expected exit 143 on parent SIGKILL: {devkit_err}"
+            );
+        }
+        assert!(
+            !Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            "devkit survived real parent SIGKILL: {devkit_err}"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+            "grandchild survived real parent SIGKILL: {devkit_err}"
+        );
+        assert!(
+            devkit_err.contains("Cancelled by signal 15"),
+            "Expected SIGTERM cancellation diagnostic, got: {devkit_err}"
+        );
+        assert!(!fixture.root().join("container").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root().join("mutations")).unwrap(),
+            format!("stop {ID}\nrm {ID}\n")
+        );
+    }
+}

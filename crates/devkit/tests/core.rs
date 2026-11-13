@@ -16,7 +16,7 @@ use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use tempfile::TempDir;
 
@@ -892,6 +892,7 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
         .arg("setup")
         .env("CARGO_BUILD_JOBS", "2")
         .current_dir(&target)
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(
@@ -901,6 +902,7 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
     let status = Command::new("make")
         .arg("doctor")
         .current_dir(&target)
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(
@@ -911,17 +913,13 @@ fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
 
 fn pinned_test_cargo(root: &Path, component: &str, args: &[&str]) -> std::process::Output {
     let metadata = fs::metadata(root).unwrap();
-    let output = Command::new("docker")
+    let budget = devkit::resources::HostResourceBudget::probe_local().unwrap();
+    let res_flags = budget.author_flags(1000, 768 * devkit::resources::MIB, Some(256), false);
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "--rm", "--pull=never", "--network", "none"]);
+    cmd.args(&res_flags);
+    let output = cmd
         .args([
-            "run",
-            "--rm",
-            "--pull=never",
-            "--network",
-            "none",
-            "--cpus",
-            "1",
-            "--memory",
-            "768m",
             "--user",
             &format!("{}:{}", metadata.uid(), metadata.gid()),
             "--volume",
@@ -1146,6 +1144,7 @@ fn legacy_library_patch_registration_add_and_modern_migration_preserve_native_ow
             .arg(command)
             .env("CARGO_BUILD_JOBS", "1")
             .current_dir(&target)
+            .stdin(Stdio::null())
             .status()
             .unwrap();
         assert!(

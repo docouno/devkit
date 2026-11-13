@@ -31,15 +31,24 @@ This repository uses a pinned Devkit development environment. Daily commands run
 | Command | Purpose |
 | --- | --- |
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
-| `make doctor` | Verify Docker Engine, Compose v5+, cgroup support, and project invariants |
+| `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |
 | `make test` | Run native unit and integration test suites offline |
 | `make build` | Produce component build artifacts (`dist/` or `target/`) |
 | `make package` | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) into `release/` |
-| `make dev app=<name>` | Start a runnable application service (`make status`, `make logs`, `make down`) |
+| `make dev [app=<name>]` | Start runnable application services and print published `http://127.0.0.1:<port>` URLs |
+| `make logs [app=<name>] [follow=1] [tail=100]` | Inspect or stream service logs (`follow=1` releases the checkout lock before streaming) |
+| `devkit status [TARGET] [--json]` | Query Compose services, health, published HTTP URLs, and local readiness receipts |
+| `devkit doctor [TARGET] [--json]` | Run lock-free host, cgroup v2, DinD, disk, and checkout diagnostics with remediation commands |
+| `devkit describe [TARGET] [--json]` | Read offline component metadata, selectors, exposed ports, and local receipts (`0` Docker calls) |
 
-Scope `setup`, `check`, `fix`, `test`, `build`, and `package` with `app=<name>` or `package=<name>` when working on a single component.
+Scope `setup`, `check`, `fix`, `test`, `build`, and `package` with `app=<name>` or `package=<name>` when working on a single component. Read-only commands (`devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs`, and read-only `devkit exec`) share a concurrent read lock, while mutating tasks queue up to `DEVKIT_LOCK_TIMEOUT_MS` (default `120000`).
+
+### Container budgets and Git worktrees
+
+- Devkit automatically sizes container CPU, memory, and worker concurrency from the active cgroup quota (falling back cleanly to in-process toolchain bounds when nested Docker-in-Docker lacks cgroup v2 controller delegation). Override detected ceilings when needed via `DEVKIT_CPUS=<cores>` and `DEVKIT_MEMORY_LIMIT=<bytes>` (for example `DEVKIT_CPUS=2 DEVKIT_MEMORY_LIMIT=4g`).
+- Containers bind-mount only the checkout root at `/workspace`. In a linked `git worktree` (where `.git` points to a parent repository outside the checkout directory), run `git` commands on the host rather than inside `devkit exec`.
 
 ## Common Workflows
 
