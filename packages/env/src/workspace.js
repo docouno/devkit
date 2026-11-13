@@ -347,7 +347,9 @@ export function workspaceImportErrors(context, file, text, compilerOptions) {
     }
     const reject = (reason) => errors.push(`Import ${JSON.stringify(specifier)} ${reason}`);
     if (owner.role !== 'library') {
-      reject('targets another application.');
+      reject(
+        "targets another application; extract shared code into a workspace library with 'devkit add-package'.",
+      );
       continue;
     }
     if (relative) {

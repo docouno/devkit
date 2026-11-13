@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit describe [--root PATH]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
+const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
 fn string(arg: &OsStr) -> Result<&str> {
     arg.to_str().context("Expected UTF-8 command option")
 }
@@ -50,7 +50,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         return internal(&args[1..], runner);
     }
     ensure!(
-        ["task", "run", "exec", "describe"].contains(&command),
+        ["task", "run", "exec"].contains(&command),
         "Unknown command: {command}"
     );
     let mut index = 1;
@@ -166,20 +166,6 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         );
     }
     ensure!(argv.is_empty(), "Unexpected trailing arguments");
-    if command == "describe" {
-        let lock = crate::state::CheckoutLock::acquire(&request.root)?;
-        let tool = runtime::ToolAdmission::capture(&request)?;
-        let full =
-            crate::state::admit_runtime_snapshot(&tool.root, tool.state, tool.manifest_identity)?;
-        println!(
-            "{}",
-            serde_json::to_string(
-                &serde_json::json!({"version":full.state.version,"generation":full.state.generation,"components":full.state.components,"inputs":full.native.inputs})
-            )?
-        );
-        drop(lock);
-        return Ok(());
-    }
     if command == "run" {
         ensure!(
             [

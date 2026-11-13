@@ -59,11 +59,11 @@ When `--reconcile-lock` is used, Devkit prints a concise summary of changed, add
 
 When upgrading across versions (for example `0.3.2 -> 0.4.0`), `devkit update` filters `release.json` migration entries by the version range `(old, target]` and your project's registered component profiles, printing short migration notes with both a local offline path (`~/.cache/docouno/devkit/releases/<ver>/<id>/docs/migrations/...`) and a GitHub link.
 
-Because Devkit never overwrites product-owned `scripts` or configuration files silently, optional improvements to product-owned files are documented in `docs/migrations/<version>.md`.
+Because Devkit never overwrites product-owned `scripts` or configuration files silently, optional improvements to product-owned files are documented in `docs/migrations/<version>.md`. When upgrading `0.3.x` projects to `0.4.0`, `@docouno/env`'s `RunnableTestsReporter` automatically applies cgroup-aware Vitest worker and V8 isolate heap bounds during `make test` even when product-owned `vitest.config.mjs` files remain untouched.
 
 ## Forward-Dispatch Across Releases
 
-- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit describe`, `devkit sync`, and forward-version `add-app`, `add-package`, `register`) automatically dispatch to the project's accepted cached engine so projects pinned to newer or older releases behave consistently regardless of which `devkit` binary is on `PATH`.
+- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit describe`, `devkit status`, `devkit sync`, and forward-version `add-app`, `add-package`, `register`) automatically dispatch to the project's accepted cached engine when pinned to a newer release, while `devkit doctor` runs lock-free against the host and checkout directly.
 - `devkit update --to <version>` resolves and verifies the target release first; when `<version>` is newer than the currently running `devkit` binary, it delegates execution of the update to the verified `<version>` engine automatically.
 
 ## Recovering Interrupted Updates (`devkit recover`)

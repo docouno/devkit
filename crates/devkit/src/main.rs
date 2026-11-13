@@ -10,6 +10,7 @@ fn main() -> std::process::ExitCode {
             e.chain().any(|e| {
                 e.downcast_ref::<devkit::processes::CommandFailure>()
                     .is_some()
+                    || e.downcast_ref::<devkit::cli::SilentExit>().is_some()
             })
         }) {
             return result;
@@ -26,6 +27,12 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(silent) = error
+                .chain()
+                .find_map(|e| e.downcast_ref::<devkit::cli::SilentExit>())
+            {
+                return std::process::ExitCode::from(silent.0);
+            }
             let code = devkit::processes::exit_code(&error);
             if json {
                 println!(

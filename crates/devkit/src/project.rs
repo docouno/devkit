@@ -98,6 +98,8 @@ pub struct UpdateOptions<'a> {
     pub package_mode: Option<PackageMode>,
     pub registry: Option<&'a str>,
     pub compose_inventory: Option<&'a ComposeInventory>,
+    pub compose_normalizer: Option<&'a dyn crate::compose::ComposeNormalizer>,
+    pub runner: Option<&'a crate::processes::ProcessRunner>,
     pub hooks: Option<&'a dyn MutationHooks>,
     pub preview: bool,
     pub reconcile_lock: bool,
@@ -1051,20 +1053,17 @@ pub fn init_project(
     }
     empty_target(&target)?;
     if !exists(&target)? {
-        fs::rename(stage.path(), &target)?;
+        crate::archive::publish_new_directory(stage.path(), &target)?;
+        let _ = stage.keep();
     } else {
         for entry in sorted_entries(stage.path())? {
             let dest = target.join(entry.file_name());
-            ensure!(
-                !exists(&dest)?,
-                "Concurrent init conflict: {}",
-                dest.display()
-            );
-            fs::rename(entry.path(), dest)?;
+            crate::archive::rename_noreplace(&entry.path(), &dest)
+                .with_context(|| format!("Concurrent init conflict: {}", dest.display()))?;
         }
         sync_directory(&target)?;
+        sync_directory(parent)?;
     }
-    sync_directory(parent)?;
     Ok(state)
 }
 
@@ -1146,7 +1145,7 @@ fn verify_old_tools(root: &Path, state: &ProjectState) -> Result<()> {
             for (name, spec) in &c.tool_dependencies {
                 ensure!(
                     deps.get(name) == Some(&json!(spec)),
-                    "Tool dependency conflict: {path}/package.json devDependencies.{name}"
+                    "Tool dependency conflict: {path}/package.json devDependencies.{name} (expected {spec}; restore it or run 'devkit update')"
                 );
             }
         }
@@ -1204,13 +1203,42 @@ fn mutate(
     resolver: &dyn LockResolver,
 ) -> Result<MutationOutcome> {
     let release = admit_release(release_root)?;
-    let lock = CheckoutLock::acquire(target)?;
+    let root_candidate = project_root(target)?;
+    assert_no_pending(&root_candidate)?;
+    let op_label = match &change {
+        Some(Change::Add {
+            role: Role::App, ..
+        }) => "add-app",
+        Some(Change::Add {
+            role: Role::Library,
+            ..
+        }) => "add-package",
+        Some(Change::Register { .. }) => "register",
+        None if options.preview => "preview",
+        None => "sync/update",
+    };
+    let lock = CheckoutLock::acquire_exclusive(target, op_label, options.runner)?;
     let snapshot = AdmissionSnapshot::capture(&lock.root)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
     verify_old_tools(root, &next)?;
-    if let Some(inventory) = options.compose_inventory {
+    let owned_inventory = match (options.compose_inventory, options.compose_normalizer) {
+        (None, Some(normalizer))
+            if matches!(
+                change,
+                Some(Change::Add {
+                    role: Role::App,
+                    ..
+                })
+            ) =>
+        {
+            Some(crate::compose::admit_compose_inventory(root, normalizer)?)
+        }
+        _ => None,
+    };
+    let compose_inventory = options.compose_inventory.or(owned_inventory.as_ref());
+    if let Some(inventory) = compose_inventory {
         assert_compose_inventory(root, inventory)?;
     }
     let adding_node = change.as_ref().is_some_and(|c| match c {
@@ -1301,8 +1329,7 @@ fn mutate(
                 "Component path already exists: {path}"
             );
             if *role == Role::App {
-                let inventory = options
-                    .compose_inventory
+                let inventory = compose_inventory
                     .context("Adding a managed service requires admitted Compose inventory")?;
                 ensure!(
                     !inventory.services.contains(&spec.name),
@@ -1485,7 +1512,7 @@ fn mutate(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
-            if let Some(inventory) = options.compose_inventory {
+            if let Some(inventory) = compose_inventory {
                 assert_compose_inventory(root, inventory)?;
             }
             Ok(())

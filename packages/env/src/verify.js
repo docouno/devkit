@@ -352,7 +352,7 @@ export async function verifyProject(directory = process.cwd(), verifyOptions = {
               add(
                 file,
                 'cross-app-import',
-                `Import ${JSON.stringify(specifier)} crosses an application source boundary.`,
+                `Import ${JSON.stringify(specifier)} crosses an application source boundary; extract shared code into a workspace library with 'devkit add-package'.`,
               );
             }
           }

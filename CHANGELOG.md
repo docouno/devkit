@@ -12,6 +12,9 @@
 - `devkit sync` to reconcile Make/Compose projections and `package-lock.json` after manual `package.json` or `.npmrc` edits, plus three-stage `--reconcile-lock` recovery on `sync`, `update`, `add-app`, `add-package`, and `register`.
 - Support for `npm:` dependency aliases across workspace graphs and private HTTPS npm registries (including GitLab Package Registry subpath endpoints) with `${ENV_VAR}` token expansion, custom TLS root CAs (`DEVKIT_CA_CERT`), and strict secret isolation in offline and Rust containers.
 - Cumulative migration notes in `devkit update`, forward-dispatch to newer target or accepted engines, managed `.devkit/runtime/GUIDE.md`, and complete standalone documentation under `docs/`.
+- Adaptive container resource budgeting (`HostResourceBudget` with `DEVKIT_CPUS` and `DEVKIT_MEMORY_LIMIT` overrides), automatic cgroup v2 delegation probing and DinD fallback, Compose service resource overlays, and retroactive Vitest worker and V8 isolate heap bounding via `RunnableTestsReporter.onInit`.
+- Lock-free `devkit doctor [TARGET] [--json]` host/DinD/cgroup diagnostics, `devkit status [TARGET] [--json]` structured service and URL discovery, enriched zero-Docker `devkit describe [TARGET] [--json]` (`composeProject`, component `selector`, `packageable`, `exposedContainerPort`, and local `receipts`), and automatic `http://127.0.0.1:<port>` output after `make dev` / `make up`.
+- Shared and adaptive checkout locking (`LOCK_SH` for concurrent read-only commands, `.devkit/state/task.owner.json` wait queuing up to `DEVKIT_LOCK_TIMEOUT_MS`, and lock-free log streaming in `make logs follow=1`), plus single-command remediation hints across CLI, Make, and `@docouno/env` error messages.
 
 ### Changed
 

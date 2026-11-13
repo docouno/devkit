@@ -180,7 +180,13 @@ fn verify_new_sources(root: &Path, tx: &UpdateJournal) -> Result<()> {
     Ok(())
 }
 pub fn recover_project(root: &Path) -> Result<bool> {
-    let lock = CheckoutLock::acquire(root)?;
+    recover_project_with(root, None)
+}
+pub fn recover_project_with(
+    root: &Path,
+    runner: Option<&crate::processes::ProcessRunner>,
+) -> Result<bool> {
+    let lock = CheckoutLock::acquire_exclusive(root, "recover", runner)?;
     recover_locked(&lock.root)
 }
 pub(crate) fn recover_locked(root: &Path) -> Result<bool> {

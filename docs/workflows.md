@@ -127,12 +127,22 @@ make package package=ui
 For repositories with runnable applications (`apps/*`):
 
 ```sh
-make dev                    # Start development services (foreground / interactive)
-make up                     # Start development stack in the background and wait for health
-make status                 # Inspect running service containers
-make logs app=playground    # Print recent service logs (add follow=1 to stream)
+make dev                    # Start development services and print http://127.0.0.1:<port> URLs
+make up                     # Start development stack in the background and print service URLs
+make status                 # Inspect running service containers via Docker Compose
+npx @docouno/devkit@0.4.0 status . --json    # Structured services, health, URLs, and receipts
+make logs app=playground    # Print recent service logs (follow=1 streams without holding task.lock)
 make down                   # Stop and remove project containers and networks
 ```
+
+For environment diagnostics and zero-Docker metadata inspection:
+
+```sh
+npx @docouno/devkit@0.4.0 doctor . --json    # Lock-free Docker, cgroup v2, DinD, disk, and checkout checks
+npx @docouno/devkit@0.4.0 describe . --json  # Offline component graph, selectors, ports, and receipts
+```
+
+Read-only commands (`devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs`, and read-only `devkit exec`) use shared checkout locks so multiple terminals or automation tools can inspect the repository concurrently. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).
 
 In zero-app library repositories, `make status`, `make logs`, and `make down` succeed as clean no-ops, while `make dev` and `make up` exit with a hint explaining how to add a playground app via `devkit add-app`.
 

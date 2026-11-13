@@ -148,17 +148,18 @@ pub fn assert_managed(root: &Path, state: &ProjectState) -> Result<()> {
     for (path, id) in &state.managed {
         ensure!(
             identity(&safe_path(root, path)?)?.as_ref() == Some(id),
-            "Managed file conflict: {path}"
+            "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'devkit sync'"
         );
     }
     Ok(())
 }
 pub fn assert_no_pending(root: &Path) -> Result<()> {
-    ensure!(
-        identity(&safe_path(root, PENDING_PATH)?)?.is_none(),
-        "An update is incomplete; run devkit recover first"
-    );
-    Ok(())
+    let path = safe_path(root, ".devkit")?.join("update-pending.json");
+    match fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!("An update is incomplete; run devkit recover first"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 pub fn excluded_snapshot_path(name: &str) -> bool {
     name.split('/')
@@ -320,14 +321,177 @@ pub fn admit_runtime_snapshot(
 pub fn read_runtime_project(root: &Path, expected_version: &str) -> Result<ProjectState> {
     Ok(admit_runtime_project(root, expected_version)?.state)
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutLockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockOwner {
+    pub pid: u32,
+    pub start_time_ticks: u64,
+    pub operation: String,
+    pub started_at_ms: u64,
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = raw.get(raw.rfind(')')? + 1..)?;
+    let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+    if fields.len() <= 19 || fields[0] == "Z" {
+        return None;
+    }
+    let ppid: u32 = fields[1].parse().ok()?;
+    let start_ticks: u64 = fields[19].parse().ok()?;
+    Some((ppid, start_ticks))
+}
+
+fn is_ancestor_or_self(target_pid: u32) -> bool {
+    let mut cur = std::process::id();
+    for _ in 0..64 {
+        if cur == target_pid {
+            return true;
+        }
+        let Some((ppid, _)) = proc_stat_ppid_and_start(cur) else {
+            break;
+        };
+        if ppid <= 1 || ppid == cur {
+            break;
+        }
+        cur = ppid;
+    }
+    false
+}
+
+pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
+    let path = safe_path(root, ".devkit/state/task.owner.json").ok()?;
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    let owner: LockOwner = serde_json::from_slice(&bytes).ok()?;
+    if owner.pid == 0 {
+        return None;
+    }
+    let (_, ticks) = proc_stat_ppid_and_start(owner.pid)?;
+    (ticks == owner.start_time_ticks).then_some(owner)
+}
+
+fn write_owner_sidecar(root: &Path, operation: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    let owner_path = safe_path(root, ".devkit/state/task.owner.json")?;
+    if let Ok(meta) = fs::symlink_metadata(&owner_path) {
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "Expected a regular file for checkout lock owner: {}",
+            owner_path.display()
+        );
+    }
+    let pid = std::process::id();
+    let start_time_ticks = proc_stat_ppid_and_start(pid).map(|(_, t)| t).unwrap_or(0);
+    let payload = serde_json::to_vec(&LockOwner {
+        pid,
+        start_time_ticks,
+        operation: operation.to_owned(),
+        started_at_ms: now_epoch_ms(),
+    })?;
+    let tmp_path = safe_path(
+        root,
+        &format!(
+            ".devkit/state/.task.owner.{pid}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ),
+    )?;
+    let write_res = (|| -> Result<()> {
+        let mut tmp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)?;
+        tmp.write_all(&payload)?;
+        drop(tmp);
+        fs::rename(&tmp_path, &owner_path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res?;
+    Ok(owner_path)
+}
+
+fn lock_timeout_ms() -> Result<u64> {
+    match std::env::var("DEVKIT_LOCK_TIMEOUT_MS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let parsed: u64 = raw.trim().parse().with_context(|| {
+                format!("Invalid DEVKIT_LOCK_TIMEOUT_MS value '{raw}'; expected milliseconds")
+            })?;
+            Ok(parsed)
+        }
+        _ => Ok(120_000),
+    }
+}
+
+fn shared_readers_hold_lock(lock_path: &Path) -> bool {
+    let Ok(probe) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)
+    else {
+        return false;
+    };
+    probe.try_lock_shared().is_ok()
+}
+
 /// Shared by lifecycle operations and native runtime commands. No inherited
 /// process-wide lock protocol is needed; the open file owns the advisory lock.
 pub struct CheckoutLock {
+    owner_path: Option<PathBuf>,
     _file: File,
     pub root: PathBuf,
 }
+impl Drop for CheckoutLock {
+    fn drop(&mut self) {
+        if let Some(owner_path) = &self.owner_path {
+            let _ = fs::remove_file(owner_path);
+        }
+    }
+}
 impl CheckoutLock {
     pub fn acquire(root: &Path) -> Result<Self> {
+        Self::acquire_exclusive(root, "checkout", None)
+    }
+    pub fn acquire_shared(
+        root: &Path,
+        operation: &str,
+        runner: Option<&crate::processes::ProcessRunner>,
+    ) -> Result<Self> {
+        Self::acquire_with(root, CheckoutLockMode::Shared, operation, runner)
+    }
+    pub fn acquire_exclusive(
+        root: &Path,
+        operation: &str,
+        runner: Option<&crate::processes::ProcessRunner>,
+    ) -> Result<Self> {
+        Self::acquire_with(root, CheckoutLockMode::Exclusive, operation, runner)
+    }
+    pub fn acquire_with(
+        root: &Path,
+        mode: CheckoutLockMode,
+        operation: &str,
+        runner: Option<&crate::processes::ProcessRunner>,
+    ) -> Result<Self> {
         let root = project_root(root)?;
         let p = safe_path(&root, ".devkit/state/task.lock")?;
         create_dir_all_durable(p.parent().context("Lock parent")?)?;
@@ -346,13 +510,79 @@ impl CheckoutLock {
             .create(true)
             .truncate(false)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(p)?;
+            .open(&p)?;
         ensure!(
             f.metadata()?.is_file(),
             "Expected a regular file for checkout lock"
         );
-        f.try_lock()
-            .context("Another devkit operation owns this checkout")?;
-        Ok(Self { _file: f, root })
+        let try_acquire = |file: &File| -> std::result::Result<(), fs::TryLockError> {
+            match mode {
+                CheckoutLockMode::Shared => file.try_lock_shared(),
+                CheckoutLockMode::Exclusive => file.try_lock(),
+            }
+        };
+        let timeout_ms = lock_timeout_ms()?;
+        let started = std::time::Instant::now();
+        let mut printed_wait = false;
+        loop {
+            match try_acquire(&f) {
+                Ok(()) => {
+                    let owner_path = if mode == CheckoutLockMode::Exclusive {
+                        Some(write_owner_sidecar(&root, operation)?)
+                    } else {
+                        None
+                    };
+                    return Ok(Self {
+                        owner_path,
+                        _file: f,
+                        root,
+                    });
+                }
+                Err(fs::TryLockError::Error(err)) => {
+                    return Err(err).context("Cannot lock checkout");
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    if let Some(r) = runner {
+                        r.check_cancelled()?;
+                    }
+                    let elapsed = started.elapsed();
+                    if let Some(owner) = read_live_owner(&root) {
+                        ensure!(
+                            !is_ancestor_or_self(owner.pid),
+                            "Recursive devkit invocation detected inside active operation (pid {})",
+                            owner.pid
+                        );
+                        if !printed_wait && elapsed >= std::time::Duration::from_millis(250) {
+                            eprintln!(
+                                "devkit: waiting for active checkout operation ({}, pid {})...",
+                                owner.operation, owner.pid
+                            );
+                            printed_wait = true;
+                        }
+                        if elapsed >= std::time::Duration::from_millis(timeout_ms) {
+                            let held = now_epoch_ms().saturating_sub(owner.started_at_ms) / 1000;
+                            anyhow::bail!(
+                                "Another devkit operation owns this checkout ({}, pid {}, held {}s)",
+                                owner.operation,
+                                owner.pid,
+                                held
+                            );
+                        }
+                    } else {
+                        let unowned_limit_ms = if mode == CheckoutLockMode::Exclusive
+                            && shared_readers_hold_lock(&p)
+                        {
+                            5_000.min(timeout_ms)
+                        } else {
+                            250.min(timeout_ms)
+                        };
+                        if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
+                            anyhow::bail!("Another devkit operation owns this checkout");
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
     }
 }

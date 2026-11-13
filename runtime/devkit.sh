@@ -10,9 +10,17 @@ fail() { printf 'devkit: %s\n' "$*" >&2; exit 1; }
 [ "$(uname -s):$(uname -m)" = Linux:x86_64 ] || fail 'this release requires Linux x86_64'
 command=${1:-help}
 if [ "$mode" = project ] && [ "$command" = help ]; then
-  printf '%s\n' 'make setup | doctor | check | fix | test | build | dev | up | down | logs | status | package' \
-    'Select finite tasks with app=NAME or package=NAME; down stops the project.' \
-    'Use devkit --help for project creation, updates and native exec.'
+  printf '%s\n' \
+    'make setup | check | fix | test | build   [app=NAME | package=NAME]' \
+    'make dev | up                             [app=NAME] [headless=1]' \
+    'make package                              [app=DESKTOP | package=NAME]' \
+    'make status | logs                        [app=NAME] [tail=100] [follow=1]' \
+    'make down                                 (stops services; preserves data)' \
+    'make doctor                               (fast checkout + image check)' \
+    'devkit status [TARGET] [--json]           (live Compose services + HTTP URLs)' \
+    'devkit doctor [TARGET] [--json]           (lock-free host/DinD/cgroup diagnostics)' \
+    'devkit describe [TARGET] [--json]         (offline component + port metadata)' \
+    'devkit exec --component apps/NAME|packages/NAME [--write] [--network none|bridge] [--prepare] -- ARGV'
   exit 0
 fi
 cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}

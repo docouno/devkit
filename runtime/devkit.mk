@@ -12,9 +12,14 @@ export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.j
 devkit_loader := .devkit/runtime/devkit.sh
 include .devkit/project.mk
 
-devkit_selected_apps := $(if $(strip $(app)),$(app),$(DEVKIT_REGISTERED_APPS))
-devkit_selected_packages := $(if $(strip $(package)),$(package),$(DEVKIT_REGISTERED_PACKAGES))
-devkit_targets = $(if $(strip $(app)),$(addprefix $(1)-,$(app)),$(if $(strip $(package)),$(addprefix $(1)/packages/,$(package)),$(addprefix $(1)-,$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES))))
+devkit_app_valid := $(if $(strip $(app)),$(if $(filter 1,$(words $(app))),$(filter $(app),$(DEVKIT_REGISTERED_APPS)),),1)
+devkit_package_valid := $(if $(strip $(package)),$(if $(filter 1,$(words $(package))),$(filter $(package),$(DEVKIT_REGISTERED_PACKAGES)),),1)
+devkit_selectors_valid := $(if $(and $(strip $(app)),$(strip $(package))),,$(and $(devkit_app_valid),$(devkit_package_valid)))
+devkit_dev_selectors_valid := $(if $(strip $(package)),,$(devkit_app_valid))
+
+devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(strip $(app)),$(app),$(DEVKIT_REGISTERED_APPS)),)
+devkit_selected_packages := $(if $(devkit_selectors_valid),$(if $(strip $(package)),$(package),$(DEVKIT_REGISTERED_PACKAGES)),)
+devkit_targets = $(if $(devkit_selectors_valid),$(if $(strip $(app)),$(addprefix $(1)-,$(app)),$(if $(strip $(package)),$(addprefix $(1)/packages/,$(package)),$(addprefix $(1)-,$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
 
 .PHONY: help doctor setup check fix test build dev up down logs status package setup-node-workspace
 # One Make invocation shares dependencies/output paths, even when -j is inherited.
@@ -36,7 +41,7 @@ dev up: $(addprefix dev-,$(devkit_selected_apps))
 dev up:
 	@exec sh $(devkit_loader) dev-snapshot
 package: export DEVKIT_PACKAGE_AGGREGATE := $(if $(strip $(app)$(package)),0,1)
-package: $(if $(strip $(app)),$(addprefix package-,$(app)),$(if $(strip $(package)),$(addprefix package/packages/,$(package)),$(addprefix package-,$(DEVKIT_DESKTOP_APPS)) $(addprefix package/packages/,$(DEVKIT_PACKAGEABLE_PACKAGES))))
+package: $(if $(devkit_selectors_valid),$(if $(strip $(app)),$(addprefix package-,$(app)),$(if $(strip $(package)),$(addprefix package/packages/,$(package)),$(addprefix package-,$(DEVKIT_DESKTOP_APPS)) $(addprefix package/packages/,$(DEVKIT_PACKAGEABLE_PACKAGES)))),)
 	@exec sh $(devkit_loader) package-snapshot
 setup-node-workspace:
 	@exec sh $(devkit_loader) setup-node

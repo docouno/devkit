@@ -4,7 +4,6 @@ use crate::{
     cache::ReleaseCache,
     catalog,
     cli::{Globals, Options, error},
-    compose::admit_compose_inventory,
     files::*,
     model::*,
     processes::ProcessRunner,
@@ -143,7 +142,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     // Recovery is intentionally before manifest/release/cache admission. A valid
     // journal can restore a missing or partially restored accepted manifest.
     if command == "recover" {
-        let recovered = project::recover_project(&root)?;
+        let recovered = crate::transaction::recover_project_with(&root, Some(runner))?;
         runner.check_cancelled()?;
         globals.emit(
             command,
@@ -294,19 +293,14 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         )?;
         (old, release)
     };
-    let inventory = if command == "add-app" {
-        Some(admit_compose_inventory(
-            &root,
-            &crate::runtime::DockerComposeNormalizer {
-                runner: runner.clone(),
-            },
-        )?)
-    } else {
-        None
+    let compose_normalizer = crate::runtime::DockerComposeNormalizer {
+        runner: runner.clone(),
     };
     let update = UpdateOptions {
         package_mode: mode,
-        compose_inventory: inventory.as_ref(),
+        compose_normalizer: (command == "add-app")
+            .then_some(&compose_normalizer as &dyn crate::compose::ComposeNormalizer),
+        runner: Some(runner),
         preview: options.flag("--preview"),
         reconcile_lock: options.flag("--reconcile-lock"),
         hooks: Some(&cancellation),

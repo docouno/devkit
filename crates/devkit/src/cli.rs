@@ -17,7 +17,16 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit describe [--root PATH]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+
+#[derive(Debug)]
+pub struct SilentExit(pub u8);
+impl fmt::Display for SilentExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "exit {}", self.0)
+    }
+}
+impl std::error::Error for SilentExit {}
 
 #[derive(Debug)]
 pub struct CliError {
@@ -319,17 +328,46 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             globals.cache_dir.as_deref(),
         );
     }
-    if command == "describe" {
+    if command == "doctor" {
+        ensure!(!globals.interactive, "doctor does not accept --interactive");
+        let target = resolve_metadata_target(&globals.args[1..])?;
+        let (result, human, ok) = crate::doctor::run_doctor(&target, runner)?;
+        if ok {
+            globals.emit("doctor", result, &human);
+            return Ok(());
+        }
+        if globals.json {
+            println!(
+                "{}",
+                json!({"schemaVersion":1,"ok":false,"command":"doctor","result":result,"exitCode":1})
+            );
+        } else {
+            println!("{human}");
+        }
+        return Err(SilentExit(1).into());
+    }
+    if command == "status" {
+        ensure!(!globals.interactive, "status does not accept --interactive");
         dispatch_accepted(command, &globals, runner)?;
-        let options = Options::parse(&globals.args[1..], &["--root"], &[], &[])?;
-        ensure!(options.target.is_none(), "Describe uses --root PATH");
-        let root = project_root(&options.path("--root").unwrap_or(std::env::current_dir()?))?;
-        let _lock = state::CheckoutLock::acquire(&root)?;
+        let root = project_root(&resolve_metadata_target(&globals.args[1..])?)?;
+        let (result, human) = crate::runtime::inspect_status(&root, runner)?;
+        globals.emit("status", result, &human);
+        return Ok(());
+    }
+    if command == "describe" {
+        ensure!(
+            !globals.interactive,
+            "describe does not accept --interactive"
+        );
+        dispatch_accepted(command, &globals, runner)?;
+        let root = project_root(&resolve_metadata_target(&globals.args[1..])?)?;
+        state::assert_no_pending(&root)?;
+        let _lock = state::CheckoutLock::acquire_shared(&root, "describe", Some(runner))?;
         let manifest = identity(&safe_path(&root, state::MANIFEST_PATH)?)?
             .context("Missing project manifest")?;
         let state = state::read_project_state(&root)?;
         let full = state::admit_runtime_snapshot(&root, state, manifest)?;
-        let result = json!({"root":full.root,"version":full.state.version,"releaseIdentity":full.state.release_identity,"generation":full.state.generation,"components":full.state.components,"inputs":full.native.inputs});
+        let result = crate::runtime::enrich_describe(&full)?;
         full.recheck()?;
         runner.check_cancelled()?;
         if globals.json {
@@ -421,8 +459,22 @@ fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Optio
     Ok((target, release_root))
 }
 
+fn resolve_metadata_target(args: &[OsString]) -> Result<PathBuf> {
+    let options = Options::parse(args, &["--root"], &[], &[])?;
+    let root_opt = options.path("--root");
+    ensure!(
+        !(options.target.is_some() && root_opt.is_some()),
+        "Specify either a positional target path or --root PATH, not both"
+    );
+    Ok(options
+        .target
+        .or(root_opt)
+        .unwrap_or(std::env::current_dir()?))
+}
+
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let is_lifecycle = ["sync", "add-app", "add-package", "register"].contains(&command_name);
+    let is_metadata = ["describe", "status"].contains(&command_name);
     let (root, release_root) = if command_name == "sync" {
         let options = Options::parse(
             &globals.args[1..],
@@ -444,6 +496,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             return Ok(());
         }
         (root, release_root)
+    } else if is_metadata {
+        (
+            project_root(&resolve_metadata_target(&globals.args[1..])?)?,
+            None,
+        )
     } else {
         let before_separator = globals
             .args
@@ -468,22 +525,19 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         (project_root(&root)?, None)
     };
     let header = read_accepted_header(&root)?;
-    if command_name == "describe" && cache::legacy(&header.version) {
-        return Ok(());
-    }
     if ["add-app", "add-package", "register"].contains(&command_name)
         && SemVer::parse(&header.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
     {
         return Ok(());
     }
-    if command_name == "sync" {
-        let min_sync = SemVer {
+    if ["sync", "describe", "status"].contains(&command_name) {
+        let min_040 = SemVer {
             major: 0,
             minor: 4,
             patch: 0,
             prerelease: Vec::new(),
         };
-        if SemVer::parse(&header.version)? < min_sync {
+        if SemVer::parse(&header.version)? < min_040 {
             return Ok(());
         }
     }
@@ -495,7 +549,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     let path = safe_path(&root, name)?;
     ensure!(
         header.managed.get(name) == identity(&path)?.as_ref(),
-        "Managed file conflict: {name}"
+        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'devkit sync'"
     );
     let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
     ensure!(
@@ -503,7 +557,16 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         "Accepted version differs from toolchain pins"
     );
     let Some(pin) = pins.engine else {
-        if ["describe", "sync", "add-app", "add-package", "register"].contains(&command_name) {
+        if [
+            "describe",
+            "status",
+            "sync",
+            "add-app",
+            "add-package",
+            "register",
+        ]
+        .contains(&command_name)
+        {
             return Ok(());
         }
         anyhow::bail!("Missing accepted native engine pin");
@@ -517,7 +580,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         return Ok(());
     }
     let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
-    if command_name == "describe" && !exists(&cache.engine_path(&pin)?)? {
+    if is_metadata && !exists(&cache.engine_path(&pin)?)? {
         return Ok(());
     }
     if is_lifecycle && !exists(&cache.engine_path(&pin)?)? {

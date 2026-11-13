@@ -456,7 +456,7 @@ pub fn admitted_dependency_target(
         });
     ensure!(
         target.is_some() || optional,
-        "Native lock omits dependency {from}:{name}"
+        "Native lock omits dependency {from}:{name}; run 'devkit sync && make setup'"
     );
     if let Some(target_loc) = &target {
         let target_record = packages
@@ -546,7 +546,7 @@ struct CargoLockGraph {
     packages: Vec<LockedCargoPackage>,
 }
 impl CargoLockGraph {
-    fn package_ref(&self, reference: &str, replacement: bool) -> Result<usize> {
+    fn package_ref(&self, component: &str, reference: &str, replacement: bool) -> Result<usize> {
         let (identity, source) = if let Some((identity, source)) = reference.split_once(" (") {
             (
                 identity,
@@ -593,11 +593,11 @@ impl CargoLockGraph {
             .collect();
         ensure!(
             selected.len() == 1,
-            "Cargo lock dependency reference is missing or ambiguous: {reference}; refresh the component Cargo.lock with pinned Cargo"
+            "Cargo lock dependency reference is missing or ambiguous: {reference}; refresh the component Cargo.lock with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile"
         );
         Ok(selected[0])
     }
-    fn local_id(&self, identity: &CargoPackageId) -> Result<usize> {
+    fn local_id(&self, component: &str, identity: &CargoPackageId) -> Result<usize> {
         let selected: Vec<_> = self
             .packages
             .iter()
@@ -607,7 +607,7 @@ impl CargoLockGraph {
             .collect();
         ensure!(
             selected.len() == 1,
-            "Cargo.lock does not uniquely identify workspace package {} {}; refresh the component Cargo.lock with pinned Cargo",
+            "Cargo.lock does not uniquely identify workspace package {} {}; refresh the component Cargo.lock with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile",
             identity.name,
             identity.version
         );
@@ -1066,7 +1066,7 @@ impl<'a> ReadContext<'a> {
             );
             let mut packages = Vec::new();
             let mut seen = BTreeSet::new();
-            for package in data.get("package").and_then(Value::as_array).context("Cargo.lock cannot prove the selected component graph without package records; refresh it with pinned Cargo")? {
+            for package in data.get("package").and_then(Value::as_array).with_context(|| format!("Cargo.lock cannot prove the selected component graph without package records; refresh it with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile"))? {
                 let package = object(package, "locked Cargo package")?;
                 let id = CargoPackageId {
                     name: text(package.get("name").context("Missing locked Cargo package name")?, "locked Cargo package name")?.to_owned(),
@@ -1177,7 +1177,7 @@ impl<'a> ReadContext<'a> {
         let mut queue = VecDeque::new();
         for path in workspace {
             if let Some(id) = self.cargo_package_id(&path)? {
-                let index = lock.local_id(&id)?;
+                let index = lock.local_id(component, &id)?;
                 ensure!(
                     pinned.insert(index, path.clone()).is_none(),
                     "Ambiguous local Cargo workspace package identity: {} {}",
@@ -1208,7 +1208,7 @@ impl<'a> ReadContext<'a> {
                         .map(|reference| (reference, true)),
                 )
             {
-                let target = lock.package_ref(reference, replacement)?;
+                let target = lock.package_ref(component, reference, replacement)?;
                 let id = &lock.packages[target].id;
                 // paths overrides can replace code while the lock preserves a
                 // registry source. Do not silently relabel such a record.
@@ -1755,11 +1755,13 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
             "Root npm workspace membership differs from registered components"
         );
         let packages = context.packages()?;
-        let locked = packages.get("").context("Native lock omits root package")?;
+        let locked = packages
+            .get("")
+            .context("Native lock omits root package; run 'devkit sync && make setup'")?;
         for field in DEPENDENCY_FIELDS {
             ensure!(
                 dependency_table(&manifest, field)? == dependency_table(locked, field)?,
-                "Root native lock is stale: {field}"
+                "Root native lock is stale: {field}; run 'devkit sync && make setup'"
             );
         }
         for field in ["name", "version"] {
@@ -1792,9 +1794,9 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         let manifest = context.manifest(path)?;
         let tools = dependency_table(&manifest, "devDependencies")?;
         let packages = context.packages()?;
-        let locked = packages
-            .get(path)
-            .with_context(|| format!("Native lock omits workspace: {path}"))?;
+        let locked = packages.get(path).with_context(|| {
+            format!("Native lock omits workspace: {path}; run 'devkit sync && make setup'")
+        })?;
         for field in ["name", "version"] {
             ensure!(
                 manifest.get(field) == locked.get(field),
@@ -1827,13 +1829,13 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         for field in DEPENDENCY_FIELDS {
             ensure!(
                 dependency_table(&manifest, field)? == dependency_table(locked, field)?,
-                "Native lock is stale: {path}:{field}"
+                "Native lock is stale: {path}:{field}; run 'devkit sync && make setup'"
             );
         }
         for (name, spec) in &component.tool_dependencies {
             ensure!(
                 tools.get(name) == Some(&Value::String(spec.clone())),
-                "Tool dependency conflict: {path}/package.json devDependencies.{name}"
+                "Tool dependency conflict: {path}/package.json devDependencies.{name} (expected {spec}; restore it or run 'devkit update')"
             );
         }
         let scripts = object(
