@@ -13,7 +13,7 @@
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
-    "test": "node --test --test-reporter=@docouno/env/node-test-reporter 'src/**/*.test.ts'",
+    "test": "node --test --test-concurrency=2 --test-reporter=@docouno/env/node-test-reporter 'src/**/*.test.ts'",
     "build": "tsc -p tsconfig.build.json",
     "dev": "node --watch src/index.ts",
     "start": "node dist/index.js"

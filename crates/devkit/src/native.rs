@@ -2163,6 +2163,8 @@ const RESERVED_NPMRC_ENV_EXACT: &[&str] = &[
     "HTTPS_PROXY",
     "ALL_PROXY",
     "NO_PROXY",
+    "GOMAXPROCS",
+    "UV_THREADPOOL_SIZE",
 ];
 
 const RESERVED_NPMRC_ENV_PREFIXES: &[&str] = &[
@@ -2177,6 +2179,10 @@ const RESERVED_NPMRC_ENV_PREFIXES: &[&str] = &[
     "GIT_",
     "SSH_",
     "SSL_",
+    "RAYON_",
+    "ROLLDOWN_",
+    "VITEST_",
+    "TOKIO_",
 ];
 
 fn valid_nerf_dart_host_path(host_and_path: &str) -> bool {
