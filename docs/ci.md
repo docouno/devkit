@@ -129,8 +129,8 @@ To run lifecycle commands (`init`, `update`, `sync`) without public internet acc
 1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`) and pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` into the runner's Docker daemon (or mirror them carefully by digest).
 2. Prime the local cache once using `--release-root`:
    ```sh
-   /opt/devkit/releases/0.4.0/devkit sync . \
-     --release-root /opt/devkit/releases/0.4.0 \
+   /opt/devkit/releases/0.4.1/devkit sync . \
+     --release-root /opt/devkit/releases/0.4.1 \
      --cache-dir /var/cache/devkit
    ```
 3. Run subsequent lifecycle commands with `--offline --cache-dir /var/cache/devkit`, and point `.npmrc` to your internal npm mirror.

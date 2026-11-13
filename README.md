@@ -9,13 +9,13 @@ Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer,
 Start the interactive CLI:
 
 ```sh
-npx @docouno/devkit@0.4.0
+npx @docouno/devkit@0.4.1
 ```
 
 Or provide the choices explicitly:
 
 ```sh
-npx @docouno/devkit@0.4.0 init my-product --app web=react-web
+npx @docouno/devkit@0.4.1 init my-product --app web=react-web
 cd my-product
 make setup
 make check
@@ -25,7 +25,7 @@ make dev app=web
 Without host Node.js:
 
 ```sh
-curl -fsSL https://github.com/docouno/devkit/releases/download/v0.4.0/install.sh | sh -s -- init my-product --app web=react-web
+curl -fsSL https://github.com/docouno/devkit/releases/download/v0.4.1/install.sh | sh -s -- init my-product --app web=react-web
 ```
 
 Both entry points use the same native CLI. Projects record an exact release and its integrity; ordinary development commands use the verified local cache.
@@ -35,9 +35,9 @@ Both entry points use the same native CLI. Projects record an exact release and 
 Application templates include `node-api`, `rust-api`, `react-web`, and `electron-react`. Package templates include `ts-library`, `react-ui`, and `react-client`. Repositories can host `0..N` applications and `1..M` packages — including standalone library workspaces without applications:
 
 ```sh
-npx @docouno/devkit@0.4.0 init my-sdk --package sdk=ts-library
-npx @docouno/devkit@0.4.0 init my-design-system --preset design-system
-npx @docouno/devkit@0.4.0 init fullstack-product --preset fullstack-desktop
+npx @docouno/devkit@0.4.1 init my-sdk --package sdk=ts-library
+npx @docouno/devkit@0.4.1 init my-design-system --preset design-system
+npx @docouno/devkit@0.4.1 init fullstack-product --preset fullstack-desktop
 ```
 
 ```text
@@ -57,16 +57,16 @@ Applications are runnable product entry points. Packages hold shared or publisha
 Add components as the repository grows:
 
 ```sh
-npx @docouno/devkit@0.4.0 add-app . --name api --template rust-api
-npx @docouno/devkit@0.4.0 add-package . --name ui --template react-ui
-npx @docouno/devkit@0.4.0 add-app . --name desktop --template electron-react --use ui
+npx @docouno/devkit@0.4.1 add-app . --name api --template rust-api
+npx @docouno/devkit@0.4.1 add-package . --name ui --template react-ui
+npx @docouno/devkit@0.4.1 add-app . --name desktop --template electron-react --use ui
 make setup
 ```
 
-Use `register --help` to adopt an existing component without replacing its source, and `sync` after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
+Use `register --help` to adopt an existing component without replacing its source, and `make sync` (or `devkit sync`) after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
 
 ```sh
-npx @docouno/devkit@0.4.0 sync .
+make sync
 ```
 
 ## Development
@@ -74,6 +74,7 @@ npx @docouno/devkit@0.4.0 sync .
 | Command            | Purpose                                                                   |
 | ------------------ | ------------------------------------------------------------------------- |
 | `make setup`       | Prepare accepted images and dependencies                                  |
+| `make sync`        | Synchronize projections and `package-lock.json` after manifest edits      |
 | `make check`       | Check source, types, formatting, lint and applicable native gates         |
 | `make test`        | Run the registered components' native test suites                         |
 | `make build`       | Build the registered components                                           |
@@ -87,10 +88,12 @@ Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package.
 Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 
 ```sh
-npx @docouno/devkit@0.4.0 exec --component apps/web --write --network bridge -- npm install zod
+npx @docouno/devkit@0.4.1 exec --component apps/web --write --network bridge -- npm install zod
 make setup
 make check
 ```
+
+On hosts without a global `devkit` or Node.js installation, run any CLI subcommand directly through `sh .devkit/runtime/devkit.sh cli <subcommand> ...` (for example `sh .devkit/runtime/devkit.sh cli doctor . --json`).
 
 `make package app=desktop` builds a Linux Electron directory and archive; `make package package=ui` builds a verified `.tgz` tarball and receipt (`publint` + `@arethetypeswrong/core`) for publishable libraries.
 
@@ -99,16 +102,16 @@ make check
 Choose the target release, inspect the proposed changes and migration notes, then apply them on a branch:
 
 ```sh
-git switch -c chore/devkit-0.4.0
-npx @docouno/devkit@0.4.0 update . --to 0.4.0 --preview
-npx @docouno/devkit@0.4.0 update . --to 0.4.0
+git switch -c chore/devkit-0.4.1
+npx @docouno/devkit@0.4.1 update . --to 0.4.1 --preview
+npx @docouno/devkit@0.4.1 update . --to 0.4.1
 make setup
 make check
 ```
 
 Pass `--reconcile-lock` when transitive lockfile dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Updating the CLI alone does not update a project's accepted environment. Application source, product dependencies and product-owned Make/Compose files retain their ownership; conflicting edits to managed files stop the update.
 
-After an interrupted update, `npx @docouno/devkit@0.4.0 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
+After an interrupted update, `npx @docouno/devkit@0.4.1 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
 
 The native npm/curl entry points upgrade public `0.2.x` and `0.3.x` projects directly.
 

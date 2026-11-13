@@ -30,7 +30,7 @@
   },
   "devDependencies": {
     "@arethetypeswrong/core": "0.18.5",
-    "@docouno/env": "0.4.0",
+    "@docouno/env": "0.4.1",
     "@types/node": "24.19.2",
     "eslint": "10.13.0",
     "prettier": "3.9.10",

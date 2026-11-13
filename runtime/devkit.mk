@@ -5,6 +5,8 @@ export DEVKIT_PACKAGE := $(package)
 export DEVKIT_FOLLOW := $(follow)
 export DEVKIT_TAIL := $(tail)
 export DEVKIT_HEADLESS := $(or $(headless),0)
+export DEVKIT_SYNC_RECONCILE := $(or $(reconcile),0)
+export DEVKIT_SYNC_PREVIEW := $(or $(preview),0)
 export DEVKIT_PACKAGE_AGGREGATE := 0
 export DEVKIT_TARGET_COMPONENT :=
 export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.json 2>/dev/null))
@@ -21,12 +23,12 @@ devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(strip $(app)),
 devkit_selected_packages := $(if $(devkit_selectors_valid),$(if $(strip $(package)),$(package),$(DEVKIT_REGISTERED_PACKAGES)),)
 devkit_targets = $(if $(devkit_selectors_valid),$(if $(strip $(app)),$(addprefix $(1)-,$(app)),$(if $(strip $(package)),$(addprefix $(1)/packages/,$(package)),$(addprefix $(1)-,$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
 
-.PHONY: help doctor setup check fix test build dev up down logs status package setup-node-workspace
+.PHONY: help doctor setup check fix test build dev up down logs status sync package setup-node-workspace
 # One Make invocation shares dependencies/output paths, even when -j is inherited.
 # Native tools may still parallelize internally; separate invocations use admission.
 .NOTPARALLEL:
 
-help doctor down logs status:
+help doctor down logs status sync:
 	@exec sh $(devkit_loader) $@
 
 setup: $(call devkit_targets,setup)

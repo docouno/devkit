@@ -203,8 +203,10 @@ impl ToolAdmission {
                 || path == ".devkit/compose.apps.yaml"
             {
                 ensure!(
-                    identity(&safe_path(&root, path)?)?.as_ref() == Some(id),
-                    "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'devkit sync'"
+                    identity(&safe_path(&root, path)?)?
+                        .as_ref()
+                        .is_some_and(|actual| actual.matches_git_tracked(id)),
+                    "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'make sync' (or 'devkit sync')"
                 );
             }
         }

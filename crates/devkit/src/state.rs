@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -147,8 +147,10 @@ pub fn read_project_state(root: &Path) -> Result<ProjectState> {
 pub fn assert_managed(root: &Path, state: &ProjectState) -> Result<()> {
     for (path, id) in &state.managed {
         ensure!(
-            identity(&safe_path(root, path)?)?.as_ref() == Some(id),
-            "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'devkit sync'"
+            identity(&safe_path(root, path)?)?
+                .as_ref()
+                .is_some_and(|actual| actual.matches_git_tracked(id)),
+            "Managed file conflict: {path}; restore with 'git checkout -- {path}' before running 'make sync' (or 'devkit sync')"
         );
     }
     Ok(())
@@ -207,6 +209,8 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
                     m.permissions().mode() & 0o777,
                     digest(fs::read(&p)?)
                 ]));
+            } else if m.file_type().is_socket() || m.file_type().is_fifo() {
+                continue;
             } else {
                 anyhow::bail!("Unsupported project input: {n}");
             }

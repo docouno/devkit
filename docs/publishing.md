@@ -53,7 +53,7 @@ Devkit enforces the following rules when `"private": false` is set on a library 
 After editing `packages/<slug>/package.json`, synchronize the workspace lockfile and projections:
 
 ```sh
-npx @docouno/devkit@0.4.0 sync .
+make sync
 make setup
 ```
 
@@ -62,7 +62,7 @@ make setup
 Always bump versions inside the pinned Node container so both `packages/<slug>/package.json` and root `package-lock.json` stay consistent:
 
 ```sh
-npx @docouno/devkit@0.4.0 exec --component packages/ui --write -- \
+npx @docouno/devkit@0.4.1 exec --component packages/ui --write -- \
   npm version 0.2.0 --no-git-tag-version
 make setup
 ```
@@ -132,7 +132,7 @@ jobs:
    //gitlab.example.com/api/v4/projects/42/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}
    //gitlab.example.com/api/v4/projects/42/packages/npm/:always-auth=true
    ```
-3. Run `npx @docouno/devkit@0.4.0 sync .` and commit `package.json`, `.npmrc`, and `package-lock.json`.
+3. Run `make sync` (or `npx @docouno/devkit@0.4.1 sync .`) and commit `package.json`, `.npmrc`, and `package-lock.json`.
 4. In GitLab CI, map `CI_JOB_TOKEN` (or a Deploy Token) to `GITLAB_NPM_TOKEN`, pass `DEVKIT_CA_CERT` if your GitLab instance uses a private enterprise CA, build with `make package`, and publish the verified tarball through the pinned Node container (no host Node.js required):
    ```sh
    export GITLAB_NPM_TOKEN="${CI_JOB_TOKEN}"

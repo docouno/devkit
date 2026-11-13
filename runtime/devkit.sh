@@ -14,13 +14,15 @@ if [ "$mode" = project ] && [ "$command" = help ]; then
     'make setup | check | fix | test | build   [app=NAME | package=NAME]' \
     'make dev | up                             [app=NAME] [headless=1]' \
     'make package                              [app=DESKTOP | package=NAME]' \
+    'make sync                                 [reconcile=1] [preview=1]' \
     'make status | logs                        [app=NAME] [tail=100] [follow=1]' \
     'make down                                 (stops services; preserves data)' \
     'make doctor                               (fast checkout + image check)' \
     'devkit status [TARGET] [--json]           (live Compose services + HTTP URLs)' \
     'devkit doctor [TARGET] [--json]           (lock-free host/DinD/cgroup diagnostics)' \
     'devkit describe [TARGET] [--json]         (offline component + port metadata)' \
-    'devkit exec --component apps/NAME|packages/NAME [--write] [--network none|bridge] [--prepare] -- ARGV'
+    'devkit exec --component apps/NAME|packages/NAME [--write] [--network none|bridge] [--prepare] -- ARGV' \
+    'sh .devkit/runtime/devkit.sh cli ...      (run pinned devkit CLI without global install)'
   exit 0
 fi
 cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
@@ -38,6 +40,7 @@ valid_engine() {
 }
 exec_prepare=0
 exec_has_root=0
+cli_offline=0
 if [ "$command" = exec ]; then
   if [ "$#" -eq 1 ] && [ "${DEVKIT_EXEC_PREPARE:-0}" = 1 ]; then
     exec_prepare=1
@@ -48,11 +51,16 @@ if [ "$command" = exec ]; then
       [ "$arg" != --root ] || exec_has_root=1
     done
   fi
+elif [ "$command" = cli ]; then
+  for arg in "$@"; do
+    [ "$arg" != -- ] || break
+    [ "$arg" != --offline ] || cli_offline=1
+  done
 fi
 if ! valid_engine; then
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
-  [ "$mode" = bootstrap ] || [ "$command" = setup ] || [ "$command" = setup-node ] || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup'
+  [ "$mode" = bootstrap ] || [ "$command" = setup ] || [ "$command" = setup-node ] || [ "$command" = sync ] || [ "$command" = doctor ] || [ "$command" = status ] || { [ "$command" = cli ] && [ "$cli_offline" = 0 ]; } || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup'
   parent=${engine%/*}
   [ "$(realpath -m -- "$parent")" = "$(realpath -ms -- "$parent")" ] || fail 'the engine cache path contains a symbolic link'
   umask 077
@@ -96,6 +104,24 @@ if [ "$mode" = bootstrap ]; then
   exec "$engine" "$@"
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+if [ "$command" = cli ]; then
+  shift
+  [ "$#" -gt 0 ] || set -- --help
+  exec "$engine" "$@"
+fi
+if [ "$command" = sync ]; then
+  if [ "$#" -gt 1 ]; then
+    shift
+    exec "$engine" sync "$@"
+  fi
+  for flag in "${DEVKIT_SYNC_RECONCILE:-0}" "${DEVKIT_SYNC_PREVIEW:-0}"; do
+    [ "$flag" = 0 ] || [ "$flag" = 1 ] || fail 'reconcile and preview must be 0 or 1'
+  done
+  set -- --non-interactive sync "$root"
+  [ "${DEVKIT_SYNC_RECONCILE:-0}" = 0 ] || set -- "$@" --reconcile-lock
+  [ "${DEVKIT_SYNC_PREVIEW:-0}" = 0 ] || set -- "$@" --preview
+  exec "$engine" "$@"
+fi
 if [ "$command" = exec ]; then
   if [ "$#" -gt 1 ]; then
     shift

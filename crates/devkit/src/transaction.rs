@@ -302,7 +302,9 @@ impl PreparedTransaction {
             transaction_path(&name, &created)?;
             let before = identity(&safe_path(root, &name)?)?;
             let after = identity(&safe_path(staged_root, &name)?)?;
-            if before == after {
+            if before == after
+                || FileIdentity::matches_git_tracked_opt(before.as_ref(), after.as_ref())
+            {
                 continue;
             }
             let i = files.len();

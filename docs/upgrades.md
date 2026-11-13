@@ -7,13 +7,13 @@ Devkit pins each repository's accepted environment in `.devkit/manifest.json` an
 Run upgrades on a dedicated Git branch:
 
 ```sh
-git switch -c chore/devkit-0.4.0
+git switch -c chore/devkit-0.4.1
 
 # 1. Inspect planned file changes and applicable migration notes without modifying files
-npx @docouno/devkit@0.4.0 update . --to 0.4.0 --preview
+npx @docouno/devkit@0.4.1 update . --to 0.4.1 --preview
 
 # 2. Apply the environment update
-npx @docouno/devkit@0.4.0 update . --to 0.4.0
+npx @docouno/devkit@0.4.1 update . --to 0.4.1
 
 # 3. Prepare updated containers/dependencies and run all gates
 make setup
@@ -44,7 +44,7 @@ If a managed file under `.devkit/` was edited manually, `devkit update` aborts b
 By default, `devkit update` preserves previously resolved transitive versions in `package-lock.json` where compatible. When a jump across `@docouno/env`, TypeScript, Vite, or ESLint majors causes strict peer-dependency conflicts with stale transitive entries in `package-lock.json`, re-run with `--reconcile-lock`:
 
 ```sh
-npx @docouno/devkit@0.4.0 update . --to 0.4.0 --reconcile-lock
+npx @docouno/devkit@0.4.1 update . --to 0.4.1 --reconcile-lock
 ```
 
 `--reconcile-lock` executes a three-stage fallback strategy:
@@ -71,7 +71,7 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 Updates commit through a crash-safe staging journal (`.devkit/update-pending.json`). If a process crash or power loss interrupts an update mid-commit:
 
 ```sh
-npx @docouno/devkit@0.4.0 recover .
+npx @docouno/devkit@0.4.1 recover .
 ```
 
 `devkit recover` verifies backed-up file digests and rolls the repository back to its exact pre-update state without requiring network access or Docker.

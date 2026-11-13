@@ -714,10 +714,62 @@ impl NativeStructure {
         Ok(())
     }
     fn recheck(&self, root: &Path) -> Result<()> {
-        ensure!(
-            Self::namespace_inventory(root)? == self.namespaces,
-            "Native component namespace changed during admission"
-        );
+        let current = Self::namespace_inventory(root)?;
+        if current == self.namespaces {
+            return Ok(());
+        }
+        for area in ["apps", "packages"] {
+            let old_entries = self.namespaces.get(area).and_then(Option::as_ref);
+            let now_entries = current.get(area).and_then(Option::as_ref);
+            if let Some(old_map) = old_entries {
+                for (name, old_kind) in old_map {
+                    if now_entries.and_then(|m| m.get(name)) == Some(old_kind) {
+                        continue;
+                    }
+                    let removed = now_entries.and_then(|m| m.get(name)).is_none();
+                    let was_plain_dir = old_kind == "directory"
+                        && self.manifests.get(&format!("{area}/{name}/package.json"))
+                            == Some(&None)
+                        && self.manifests.get(&format!("{area}/{name}/Cargo.toml")) == Some(&None);
+                    ensure!(
+                        removed && (old_kind == "file" || was_plain_dir),
+                        "Native component namespace changed during admission"
+                    );
+                }
+            }
+            if let Some(now_map) = now_entries {
+                for (name, now_kind) in now_map {
+                    if old_entries.and_then(|m| m.get(name)) == Some(now_kind) {
+                        if now_kind == "directory" {
+                            for manifest in ["package.json", "Cargo.toml"] {
+                                let rel = format!("{area}/{name}/{manifest}");
+                                if self.manifests.get(&rel) == Some(&None) {
+                                    ensure!(
+                                        !exists(&input_path(root, &rel)?)?,
+                                        "Native component namespace changed during admission"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if now_kind == "file" {
+                        continue;
+                    }
+                    if now_kind == "directory" {
+                        let has_manifest =
+                            exists(&input_path(root, format!("{area}/{name}/package.json"))?)?
+                                || exists(&input_path(root, format!("{area}/{name}/Cargo.toml"))?)?;
+                        ensure!(
+                            !has_manifest,
+                            "Native component namespace changed during admission"
+                        );
+                        continue;
+                    }
+                    anyhow::bail!("Native component namespace changed during admission");
+                }
+            }
+        }
         Ok(())
     }
 }

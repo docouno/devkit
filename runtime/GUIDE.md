@@ -22,15 +22,17 @@ This repository uses a pinned Devkit development environment. Daily commands run
 2. **Read-only gates**: `make check`, `make test`, `make build`, and `make package` mount source and lockfiles read-only with `--network none`. Only `make fix` writes formatting changes back to source files.
 3. **Syncing manual manifest edits**: After editing `package.json` metadata (`name`, `"private": false`, `exports`, `files`, `publishConfig`) or `.npmrc`, run:
    ```sh
-   devkit sync
+   make sync
    make setup
    ```
+4. **Running the pinned CLI without a global install**: On fresh clones or CI hosts where `devkit` is not installed globally on `PATH`, run any CLI subcommand through the checked-in loader (`sh .devkit/runtime/devkit.sh cli <subcommand> ...`, for example `sh .devkit/runtime/devkit.sh cli doctor . --json` or `sh .devkit/runtime/devkit.sh cli describe . --json`).
 
 ## Daily Make Commands
 
 | Command | Purpose |
 | --- | --- |
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
+| `make sync [reconcile=1] [preview=1]` | Synchronize workspace projections and `package-lock.json` after manual `package.json` or `.npmrc` edits |
 | `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |

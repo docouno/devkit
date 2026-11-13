@@ -41,6 +41,20 @@ pub struct FileIdentity {
     pub sha256: String,
     pub mode: u32,
 }
+impl FileIdentity {
+    /// Git tracks content and executable class (`100644` vs `100755`), while worktree
+    /// permissions reflect host `umask` (`0002` -> `0664`/`0775`, `0077` -> `0600`/`0700`).
+    pub fn matches_git_tracked(&self, expected: &Self) -> bool {
+        self.sha256 == expected.sha256 && (self.mode & 0o111 != 0) == (expected.mode & 0o111 != 0)
+    }
+    pub fn matches_git_tracked_opt(actual: Option<&Self>, expected: Option<&Self>) -> bool {
+        match (actual, expected) {
+            (Some(a), Some(e)) => a.matches_git_tracked(e),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

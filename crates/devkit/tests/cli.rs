@@ -648,3 +648,169 @@ fn checkout_lock_supports_concurrent_shared_readers_and_detects_self_recursion()
     assert_eq!(parsed[1].health.as_deref(), Some("healthy"));
     assert_eq!(parsed[1].urls, vec!["http://127.0.0.1:49152"]);
 }
+
+#[test]
+fn umask_modes_pass_cli_forward_dispatch_and_doctor_remediation_uses_make_sync() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha512};
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let rel_future = temp.path().join("release-99.0.1");
+    fs::create_dir_all(&rel_future).unwrap();
+
+    let delegated_stdout =
+        b"{\"schemaVersion\":1,\"ok\":true,\"command\":\"delegated\",\"result\":{\"engine\":\"99.0.1\"}}\n";
+    let elf_bytes = minimal_static_x86_64_elf(delegated_stdout);
+    let elf_sha = digest(&elf_bytes);
+    write_atomic(&rel_future.join("devkit"), &elf_bytes, 0o755).unwrap();
+
+    let env_bytes = b"future env archive bytes";
+    let env_sri = format!("sha512-{}", STANDARD.encode(Sha512::digest(env_bytes)));
+    write_atomic(&rel_future.join("npm/env-99.0.1.tgz"), env_bytes, 0o644).unwrap();
+    let recipe_hash = "b".repeat(64);
+    let toolchains = format!(
+        "DEVKIT_VERSION=99.0.1\nDEVKIT_ENGINE_SHA256={elf_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+    );
+    write_atomic(
+        &rel_future.join("runtime/toolchains.env"),
+        toolchains.as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    write_json(
+        &rel_future.join("release.json"),
+        &devkit::model::Release {
+            schema_version: 1,
+            version: "99.0.1".into(),
+            rust_version: "1.99.1".into(),
+            environment: devkit::model::Environment {
+                name: "@docouno/env".into(),
+                version: "99.0.1".into(),
+                archive: "npm/env-99.0.1.tgz".into(),
+                integrity: env_sri,
+            },
+            files: file_map(&rel_future).unwrap(),
+            migrations: vec![],
+        },
+    )
+    .unwrap();
+    let runner = devkit::processes::ProcessRunner::new().unwrap();
+    let cache = devkit::cache::ReleaseCache::new(Some(&cache_dir), &runner).unwrap();
+    let admitted = cache.import(&rel_future, "99.0.1", None).unwrap();
+    cache.prime_engine(&admitted).unwrap();
+
+    let proj = temp.path().join("proj");
+    fs::create_dir_all(proj.join(".devkit/runtime")).unwrap();
+    for (rel, bytes) in [
+        (".devkit/runtime.sha256", b"checksum\n".as_slice()),
+        (".devkit/runtime/toolchains.env", toolchains.as_bytes()),
+        (".devkit/project.mk", b"# mk\n".as_slice()),
+        (".devkit/compose.apps.yaml", b"{}\n".as_slice()),
+        (".devkit/tooling-profiles.json", b"{}\n".as_slice()),
+    ] {
+        write_atomic(&proj.join(rel), bytes, 0o644).unwrap();
+    }
+    let mut managed_map = serde_json::Map::new();
+    for rel in [
+        ".devkit/runtime.sha256",
+        ".devkit/runtime/toolchains.env",
+        ".devkit/project.mk",
+        ".devkit/compose.apps.yaml",
+        ".devkit/tooling-profiles.json",
+    ] {
+        let id = identity(&proj.join(rel)).unwrap().unwrap();
+        assert_eq!(id.mode, 0o644);
+        managed_map.insert(rel.to_owned(), serde_json::to_value(id).unwrap());
+    }
+    write_json(
+        &proj.join(MANIFEST_PATH),
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "version": "99.0.1",
+            "releaseIdentity": admitted.identity,
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "packageMode": "local",
+            "managed": managed_map,
+            "components": {
+                "apps/api": {
+                    "role": "app",
+                    "toolchain": "rust",
+                    "toolingProfile": "rust",
+                    "origin": { "template": "rust-api", "version": "99.0.1" },
+                    "toolDependencies": {},
+                    "dependencies": []
+                }
+            }
+        }),
+    )
+    .unwrap();
+
+    // Simulate umask 0002 (0o664) on .devkit/runtime/toolchains.env while manifest records 0o644.
+    fs::set_permissions(
+        proj.join(".devkit/runtime/toolchains.env"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    let sync_out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "sync",
+            proj.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(
+        sync_out.status.success(),
+        "sync stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&sync_out.stdout),
+        String::from_utf8_lossy(&sync_out.stderr)
+    );
+    assert_eq!(decoded(&sync_out)["result"]["engine"], "99.0.1");
+
+    // Flipping executable bit (0o755) on toolchains.env fails both forward_if_needed and doctor.
+    fs::set_permissions(
+        proj.join(".devkit/runtime/toolchains.env"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let bad_sync = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "sync",
+            proj.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(!bad_sync.status.success());
+    assert!(
+        decoded(&bad_sync)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Managed file conflict")
+    );
+
+    let doc_out = invoke(temp.path(), &["doctor", proj.to_str().unwrap(), "--json"]);
+    assert_eq!(doc_out.status.code(), Some(1));
+    let doc_json = decoded(&doc_out);
+    let checkout = doc_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(checkout["status"], "fail");
+    assert_eq!(
+        checkout["remediation"],
+        "git checkout -- .devkit && make sync"
+    );
+}

@@ -909,11 +909,11 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                 })
                 .unwrap_or_else(|| {
                     if msg.contains("Managed file conflict") {
-                        "git checkout -- .devkit && devkit sync".into()
+                        "git checkout -- .devkit && make sync".into()
                     } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
                         "make setup".into()
                     } else {
-                        "devkit sync".into()
+                        "make sync".into()
                     }
                 });
             DoctorCheck {
