@@ -12,11 +12,15 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'test') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'test'))
+from docker_flags import author_docker_flags  # noqa: E402
 PINS = dict(line.split('=', 1) for line in (ROOT / 'toolchains.env').read_text().splitlines())
 
 
@@ -63,8 +67,9 @@ def main():
             return [str(engine), 'internal', 'guard', 'devkit-registry-' + token, token, '--',
                     'docker', 'run', '--pull', 'never', '--rm', '--init', '--name', 'devkit-registry-' + token,
                     '--label', 'io.docouno.devkit.invocation=' + token, '--network', 'host',
-                    '--user', f'{os.getuid()}:{os.getgid()}', '--read-only', '--memory', '768m', '--cpus', '2',
-                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777',
+                    '--user', f'{os.getuid()}:{os.getgid()}', '--read-only',
+                    *author_docker_flags(2, 768, pids_limit=512, node_fallback=True),
+                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777,size=256m',
                     '--volume', f'{ROOT}:/source:ro,z', '--volume', f'{engine}:/devkit/devkit:ro,z',
                     '--volume', f'{releases[0]}:/release-v1:ro,z', '--volume', f'{releases[1]}:/release-v2:ro,z',
                     '--volume', f'{scratch}:/proof:z', '--volume', f'{consumer}:/consumer:z',

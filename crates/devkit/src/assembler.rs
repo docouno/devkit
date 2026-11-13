@@ -774,70 +774,86 @@ fn npm_pack(
     runner: &ProcessRunner,
 ) -> Result<Vec<u8>> {
     fs::create_dir(directory)?;
-    let token = uuid::Uuid::new_v4().to_string();
-    let owned = OwnedContainer::new(format!("devkit-pack-{token}"), token);
     let meta = fs::metadata(payload)?;
-    let mut command = Command::new("docker");
-    command.args([
-        "run",
-        "--pull",
-        "never",
-        "--rm",
-        "--init",
-        "--memory",
-        "1g",
-        "--cpus",
-        "2",
-        "--read-only",
-        "--network",
-        "none",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges:true",
-        "--name",
-        &owned.name,
-        "--label",
-        &format!("{}={}", owned.label, owned.token),
-        "--user",
-        &format!("{}:{}", meta.uid(), meta.gid()),
-        "--mount",
-        &mount(payload, "/payload", true)?,
-        "--mount",
-        &mount(directory, "/out", false)?,
-        "--workdir",
-        "/payload",
-        "--tmpfs",
-        "/tmp:mode=1777,size=256m",
-    ]);
-    for value in [
-        "HOME=/tmp/devkit-home",
-        "npm_config_cache=/tmp/npm-cache",
-        "npm_config_userconfig=/tmp/user.npmrc",
-        "npm_config_globalconfig=/tmp/global.npmrc",
-        "npm_config_update_notifier=false",
-        "npm_config_fund=false",
-        "npm_config_audit=false",
-        "npm_config_ignore_scripts=true",
-    ] {
-        command.args(["--env", value]);
+    let mut budget = crate::resources::HostResourceBudget::probe_local()?;
+    let payload_mount = mount(payload, "/payload", true)?;
+    let out_mount = mount(directory, "/out", false)?;
+    for attempt in 0..2 {
+        let token = uuid::Uuid::new_v4().to_string();
+        let owned = OwnedContainer::new(format!("devkit-pack-{token}"), token);
+        let spec = budget.for_npm_pack();
+        let env_plan = budget.toolchain_env_for_resolver(&spec);
+        let mut command = Command::new("docker");
+        command.args([
+            "run",
+            "--pull",
+            "never",
+            "--rm",
+            "--init",
+            "--read-only",
+            "--network",
+            "none",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--name",
+            &owned.name,
+            "--label",
+            &format!("{}={}", owned.label, owned.token),
+            "--user",
+            &format!("{}:{}", meta.uid(), meta.gid()),
+            "--mount",
+            &payload_mount,
+            "--mount",
+            &out_mount,
+            "--workdir",
+            "/payload",
+        ]);
+        spec.write_docker_args(&mut command);
+        for value in [
+            "HOME=/tmp/devkit-home",
+            "npm_config_cache=/tmp/npm-cache",
+            "npm_config_userconfig=/tmp/user.npmrc",
+            "npm_config_globalconfig=/tmp/global.npmrc",
+            "npm_config_update_notifier=false",
+            "npm_config_fund=false",
+            "npm_config_audit=false",
+            "npm_config_ignore_scripts=true",
+        ] {
+            command.args(["--env", value]);
+        }
+        env_plan.write_docker_args(&mut command);
+        command.arg(image).args([
+            "npm",
+            "pack",
+            "--ignore-scripts",
+            "--json",
+            "--pack-destination",
+            "/out",
+        ]);
+        let output = runner.run_owned_unchecked(
+            &mut command,
+            OutputMode::Capture(8 * 1024 * 1024),
+            &owned,
+            Some(Duration::from_secs(180)),
+        )?;
+        if output.code == 0 {
+            return Ok(output.stdout);
+        }
+        if attempt == 0
+            && crate::resources::is_cgroup_delegation_failure(output.code, &output.stderr)
+        {
+            eprintln!(
+                "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying npm pack without container cgroup limits"
+            );
+            budget.disable_cgroup_limits();
+            continue;
+        }
+        let result = output.success("native npm pack")?;
+        return Ok(result.stdout);
     }
-    command.arg(image).args([
-        "npm",
-        "pack",
-        "--ignore-scripts",
-        "--json",
-        "--pack-destination",
-        "/out",
-    ]);
-    let result = runner.run_owned_with_timeout(
-        &mut command,
-        OutputMode::Capture(8 * 1024 * 1024),
-        &owned,
-        Duration::from_secs(180),
-    )?;
-    let result = result.success("native npm pack")?;
-    Ok(result.stdout)
+    unreachable!()
 }
 
 fn asset(path: &Path) -> Result<AssetIdentity> {

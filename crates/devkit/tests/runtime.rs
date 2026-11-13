@@ -228,3 +228,192 @@ fn node_snapshot_is_projected_before_cargo_but_full_recheck_retains_namespace_ba
     std::fs::write(root.join("apps/api/package.json"), "{}").unwrap();
     assert!(archive_changed.recheck(root).is_err());
 }
+
+#[test]
+fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_enabling_node_options()
+{
+    use devkit::{
+        delivery::file_digest,
+        files::{identity, write_atomic, write_json},
+        state::{CHECKSUM_PATH, MANIFEST_PATH},
+    };
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, process::Command};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join(".devkit/runtime")).unwrap();
+    fs::create_dir_all(root.join("apps/web")).unwrap();
+
+    let exe = Path::new(env!("CARGO_BIN_EXE_devkit"));
+    let engine_sha = file_digest(exe).unwrap();
+    let ver = env!("CARGO_PKG_VERSION");
+    let recipe_hash = "b".repeat(64);
+    let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
+
+    let toolchains = format!(
+        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+    );
+    write_atomic(
+        &root.join(".devkit/runtime/toolchains.env"),
+        toolchains.as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    for stub in [
+        ".devkit/project.mk",
+        ".devkit/compose.apps.yaml",
+        ".devkit/compose.workspace.json",
+        ".devkit/tooling-profiles.json",
+        ".devkit/runtime/devkit.mk",
+        ".devkit/runtime/devkit.sh",
+        ".devkit/runtime/compose.tools.yaml",
+    ] {
+        write_atomic(&root.join(stub), b"{}\n", 0o644).unwrap();
+    }
+    write_json(
+        &root.join("apps/web/package.json"),
+        &json!({"name": "web", "version": "1.0.0", "private": true}),
+    )
+    .unwrap();
+
+    let mut managed = BTreeMap::new();
+    for path in [
+        ".devkit/project.mk",
+        ".devkit/compose.apps.yaml",
+        ".devkit/compose.workspace.json",
+        ".devkit/tooling-profiles.json",
+        ".devkit/runtime/devkit.mk",
+        ".devkit/runtime/devkit.sh",
+        ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/toolchains.env",
+    ] {
+        managed.insert(
+            path.to_string(),
+            identity(&root.join(path)).unwrap().unwrap(),
+        );
+    }
+    let checksum_body: String = managed
+        .iter()
+        .map(|(p, id)| format!("{}  {p}\n", id.sha256))
+        .collect();
+    write_atomic(&root.join(CHECKSUM_PATH), checksum_body.as_bytes(), 0o644).unwrap();
+    managed.insert(
+        CHECKSUM_PATH.to_string(),
+        identity(&root.join(CHECKSUM_PATH)).unwrap().unwrap(),
+    );
+
+    let manifest = json!({
+        "schemaVersion": 2,
+        "version": ver,
+        "releaseIdentity": "0".repeat(64),
+        "generation": "00000000-0000-4000-8000-000000000000",
+        "packageMode": "local",
+        "managed": managed,
+        "components": {
+            "apps/web": {
+                "role": "app",
+                "toolchain": "node",
+                "toolingProfile": "web",
+                "origin": { "template": "react-web", "version": ver },
+                "toolDependencies": {},
+                "dependencies": [],
+                "development": { "owner": "managed", "kind": "compose", "service": "web" }
+            }
+        }
+    });
+    write_json(&root.join(MANIFEST_PATH), &manifest).unwrap();
+
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let run_log = temp.path().join("runs.jsonl");
+    let docker_script = fake_bin.join("docker");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
+  printf 'v5.0.2\n'
+  exit 0
+fi
+if [ "$1" = "info" ]; then
+  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  exit 0
+fi
+if [ "$1" = "container" ] && [ "$2" = "ls" ]; then
+  exit 0
+fi
+if [ "$1" = "run" ]; then
+  log="{log}"
+  printf '%s\n' "$*" >> "$log"
+  count=$(wc -l < "$log")
+  if [ "$count" -eq 1 ]; then
+    printf 'docker: Error response from daemon: cannot enter cgroupv2 "/sys/fs/cgroup/docker" with domain controllers -- it is in threaded mode.\n' >&2
+    exit 125
+  fi
+  exit 0
+fi
+printf 'unexpected docker args: %s\n' "$*" >&2
+exit 90
+"#,
+        log = run_log.display()
+    );
+    fs::write(&docker_script, script).unwrap();
+    fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
+    );
+    let out = Command::new(exe)
+        .args([
+            "exec",
+            "--component",
+            "apps/web",
+            "--root",
+            root.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("PATH", path_env)
+        .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "expected reactive retry to succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr_str.contains("retrying without container cgroup limits"));
+
+    let lines: Vec<String> = fs::read_to_string(&run_log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 2, "expected 2 docker run attempts: {lines:?}");
+    assert!(lines[0].contains("--cpus ") && lines[0].contains("--memory "));
+    assert!(!lines[0].contains("NODE_OPTIONS="));
+    for flag in [
+        "--cpus ",
+        "--cpu-shares ",
+        "--memory ",
+        "--memory-swap ",
+        "--pids-limit ",
+    ] {
+        assert!(
+            !lines[1].contains(flag),
+            "retry leaked cgroup flag {flag}: {}",
+            lines[1]
+        );
+    }
+    assert!(
+        lines[1].contains("NODE_OPTIONS=--max-old-space-size="),
+        "retry missing NODE_OPTIONS fallback: {}",
+        lines[1]
+    );
+}

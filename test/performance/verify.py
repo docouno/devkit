@@ -29,6 +29,9 @@ from measure import (digest, docker_kind, docker_logger, exec_counts, execute,
 
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO / "test") not in sys.path:
+    sys.path.insert(0, str(REPO / "test"))
+from docker_flags import author_docker_flags  # noqa: E402
 BASELINE_VERSION = "0.2.1"
 BASELINE_MANIFEST_SHA = "7f9dea1455027e0a0637077c7b040dbd7420a7fbc554d83d4d80ca47e9e849e0"
 BASELINE_ARCHIVE_SHA = "882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb"
@@ -216,12 +219,12 @@ class Gate:
         self.receipt["tools"].update(traceImageId=self.sdk, traceImageRepoDigests=image_data["RepoDigests"],
                                       traceRecipeSha256=sha256(REPO / "tooling/native.Dockerfile"))
         self.receipt["tools"]["sdkVersions"] = self.run("sdk-versions", [
-            docker, "run", "--rm", "--pull", "never", "--network", "none", "--memory", "256m",
-            "--cpus", "1", self.sdk, "sh", "-c", "rustc --version; cargo --version; rustfmt --version; cargo clippy --version"])["stdout"].splitlines()
+            docker, "run", "--rm", "--pull", "never", "--network", "none",
+            *author_docker_flags(1, 256), self.sdk, "sh", "-c", "rustc --version; cargo --version; rustfmt --version; cargo clippy --version"])["stdout"].splitlines()
         # Extract the trusted image's strace and its actual dynamic dependencies.
         # Explicit loader arguments affect only strace, never the traced child env.
         ldd = self.run("trace-ldd", [docker, "run", "--rm", "--pull", "never", "--network", "none",
-                                    "--memory", "256m", "--cpus", "1", "--entrypoint", "/usr/bin/ldd",
+                                    *author_docker_flags(1, 256), "--entrypoint", "/usr/bin/ldd",
                                     self.sdk, "/usr/bin/strace"])["stdout"]
         libraries = sorted(set(re.findall(r"(/[\w/+.\-]+)\s+\(0x", ldd)))
         require(libraries and any("ld-linux" in name for name in libraries), "No strace dynamic loader")
@@ -311,8 +314,8 @@ class Gate:
             f"cd /workspace/apps/app{number:03}; cargo generate-lockfile --offline"
             for number in range(1, count + 1))
         self.run(f"resolve-{shape}-{side}", [
-            self.docker, "run", "--rm", "--pull", "never", "--network", "none", "--cpus", "2",
-            "--memory", "2g", "--pids-limit", "256", "--user", f"{os.getuid()}:{os.getgid()}",
+            self.docker, "run", "--rm", "--pull", "never", "--network", "none",
+            *author_docker_flags(2, 2048, pids_limit=256), "--user", f"{os.getuid()}:{os.getgid()}",
             "--volume", f"{root}:/workspace", "--env", "HOME=/tmp", "--env", "CARGO_HOME=/tmp/cargo",
             "--env", "CARGO_BUILD_JOBS=1", "--env", "RUSTUP_AUTO_INSTALL=0", self.sdk,
             "sh", "-c", script], timeout=600)

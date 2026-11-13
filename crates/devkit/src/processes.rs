@@ -55,6 +55,7 @@ fn status_code(status: ExitStatus) -> u8 {
 pub enum OutputMode {
     Inherit,
     Stderr,
+    TeeStderr(usize),
     Capture(usize),
 }
 pub struct ProcessOutput {
@@ -264,6 +265,9 @@ impl ProcessRunner {
             OutputMode::Stderr => {
                 command.stdout(Stdio::piped()).stderr(Stdio::inherit());
             }
+            OutputMode::TeeStderr(_) => {
+                command.stdout(Stdio::inherit()).stderr(Stdio::piped());
+            }
             OutputMode::Capture(_) => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
@@ -417,7 +421,7 @@ impl ProcessRunner {
     ) -> Result<ProcessOutput> {
         self.run_owned_inner(command, mode, owned, Some(timeout))
     }
-    fn run_owned_inner(
+    pub fn run_owned_unchecked(
         &self,
         command: &mut Command,
         mode: OutputMode,
@@ -432,12 +436,13 @@ impl ProcessRunner {
             "Container name already exists: {}",
             owned.name
         );
-        let result = self
-            .run_inner(command, mode, false, timeout)
-            .and_then(|o| o.success("Container task"));
+        let result = self.run_inner(command, mode, false, timeout);
         // Output/IO failures can also abort an in-flight create request. As with
         // cancellation, observe briefly AFTER its creator group has been reaped.
-        let interrupted = result.is_err();
+        let interrupted = match &result {
+            Ok(o) => o.code != 0,
+            Err(_) => true,
+        };
         let cleanup = self.cleanup(owned, interrupted);
         match (result, cleanup) {
             (Err(primary), Err(cleanup)) => {
@@ -445,12 +450,28 @@ impl ProcessRunner {
                 Err(primary)
             }
             (Err(primary), _) => Err(primary),
+            (Ok(output), Err(cleanup)) if output.code != 0 => {
+                eprintln!("devkit: {cleanup:#}");
+                Ok(output)
+            }
             (Ok(_), Err(error)) => Err(failure(1, format!("{error:#}"))),
             (Ok(output), Ok(())) => {
-                self.check_cancelled()?;
+                if output.code == 0 {
+                    self.check_cancelled()?;
+                }
                 Ok(output)
             }
         }
+    }
+    fn run_owned_inner(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        owned: &OwnedContainer,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessOutput> {
+        self.run_owned_unchecked(command, mode, owned, timeout)?
+            .success("Container task")
     }
     fn cleanup(&self, owned: &OwnedContainer, interrupted: bool) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -548,6 +569,11 @@ fn reader(
                     Ok(0) => break,
                     Ok(count) => match mode {
                         OutputMode::Stderr => io::stderr().write_all(&block[..count])?,
+                        OutputMode::TeeStderr(limit) => {
+                            io::stderr().write_all(&block[..count])?;
+                            let remaining = limit.saturating_sub(saved.len());
+                            saved.extend_from_slice(&block[..count.min(remaining)]);
+                        }
                         OutputMode::Capture(limit) => {
                             let remaining = limit.saturating_sub(saved.len());
                             saved.extend_from_slice(&block[..count.min(remaining)]);

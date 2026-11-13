@@ -25,6 +25,7 @@ pub mod download;
 mod lifecycle_cli;
 pub mod notices;
 pub mod processes;
+pub mod resources;
 pub mod runtime;
 mod runtime_cli;
 pub mod rust_gate;

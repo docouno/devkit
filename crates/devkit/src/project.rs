@@ -262,7 +262,11 @@ impl LockResolver for DockerNpmResolver {
         verify_required_npm_env_vars(&npmrc_policy)?;
         let ca_cert = resolve_ca_cert_path()?;
         let meta = fs::metadata(&root)?;
-        let token = uuid::Uuid::new_v4().to_string();
+        let runner = ProcessRunner::new()?;
+        let mut budget = crate::resources::HostResourceBudget::probe_with_docker(
+            &runner,
+            &mut Command::new("docker"),
+        )?;
         // Docker's --mount value is CSV; quoting keeps spaces and commas in the
         // source path inside one field. No shell interprets any argument.
         let mount = format!(
@@ -271,79 +275,108 @@ impl LockResolver for DockerNpmResolver {
                 .context("Non-UTF8 checkout")?
                 .replace('"', "\"\"")
         );
-        let mut command = Command::new("docker");
-        command.args([
-            "run",
-            "--rm",
-            "--init",
-            "--network",
-            "host",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges:true",
-            "--name",
-            &format!("devkit-resolve-{token}"),
-            "--label",
-            &format!("org.docouno.devkit.operation={token}"),
-            "--user",
-            &format!("{}:{}", meta.uid(), meta.gid()),
-            "--mount",
-            &mount,
-            "--workdir",
-            "/workspace",
-            "--tmpfs",
-            "/tmp:mode=1777",
-        ]);
-        if let Some(ca_path) = &ca_cert {
-            let ca_mount = format!(
-                "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
-                ca_path
-                    .to_str()
-                    .context("Non-UTF8 DEVKIT_CA_CERT path")?
-                    .replace('"', "\"\"")
-            );
-            command.args([
-                "--mount",
-                &ca_mount,
-                "--env",
-                "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
-            ]);
+        let build_command =
+            |budget: &crate::resources::HostResourceBudget, token: &str| -> Result<Command> {
+                let spec = budget.for_npm_resolver();
+                let env_plan = budget.toolchain_env_for_resolver(&spec);
+                let mut command = Command::new("docker");
+                command.args([
+                    "run",
+                    "--rm",
+                    "--init",
+                    "--network",
+                    "host",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "--name",
+                    &format!("devkit-resolve-{token}"),
+                    "--label",
+                    &format!("org.docouno.devkit.operation={token}"),
+                    "--user",
+                    &format!("{}:{}", meta.uid(), meta.gid()),
+                    "--mount",
+                    &mount,
+                    "--workdir",
+                    "/workspace",
+                ]);
+                spec.write_docker_args(&mut command);
+                if let Some(ca_path) = &ca_cert {
+                    let ca_mount = format!(
+                        "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
+                        ca_path
+                            .to_str()
+                            .context("Non-UTF8 DEVKIT_CA_CERT path")?
+                            .replace('"', "\"\"")
+                    );
+                    command.args([
+                        "--mount",
+                        &ca_mount,
+                        "--env",
+                        "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                    ]);
+                }
+                for value in [
+                    "HOME=/tmp/devkit-home",
+                    "npm_config_cache=/tmp/npm-cache",
+                    "npm_config_userconfig=/tmp/devkit-user.npmrc",
+                    "npm_config_globalconfig=/tmp/devkit-global.npmrc",
+                    "npm_config_update_notifier=false",
+                    "npm_config_fund=false",
+                    "npm_config_audit=false",
+                    "npm_config_install_links=false",
+                ] {
+                    command.args(["--env", value]);
+                }
+                env_plan.write_docker_args(&mut command);
+                for var in &npmrc_policy.required_env_vars {
+                    command.args(["--env", var]);
+                }
+                if let Some(registry) = registry {
+                    command.args(["--env", &format!("npm_config_registry={registry}")]);
+                }
+                command.arg(&image).args([
+                    "npm",
+                    "install",
+                    "--package-lock-only",
+                    "--package-lock=true",
+                    "--ignore-scripts",
+                    "--include=dev",
+                    "--strict-peer-deps",
+                    "--legacy-peer-deps=false",
+                    "--force=false",
+                ]);
+                Ok(command)
+            };
+        let mut last_output = None;
+        for attempt in 0..2 {
+            let token = uuid::Uuid::new_v4().to_string();
+            let mut command = build_command(&budget, &token)?;
+            let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token);
+            owned.label = "org.docouno.devkit.operation".into();
+            let output = runner.run_owned_unchecked(
+                &mut command,
+                OutputMode::Capture(16 * 1024 * 1024),
+                &owned,
+                None,
+            )?;
+            if output.code == 0 {
+                return Ok(());
+            }
+            if attempt == 0
+                && crate::resources::is_cgroup_delegation_failure(output.code, &output.stderr)
+            {
+                eprintln!(
+                    "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying npm resolver without container cgroup limits"
+                );
+                budget.disable_cgroup_limits();
+                continue;
+            }
+            last_output = Some(output);
+            break;
         }
-        for value in [
-            "HOME=/tmp/devkit-home",
-            "npm_config_cache=/tmp/npm-cache",
-            "npm_config_userconfig=/tmp/devkit-user.npmrc",
-            "npm_config_globalconfig=/tmp/devkit-global.npmrc",
-            "npm_config_update_notifier=false",
-            "npm_config_fund=false",
-            "npm_config_audit=false",
-            "npm_config_install_links=false",
-        ] {
-            command.args(["--env", value]);
-        }
-        for var in &npmrc_policy.required_env_vars {
-            command.args(["--env", var]);
-        }
-        if let Some(registry) = registry {
-            command.args(["--env", &format!("npm_config_registry={registry}")]);
-        }
-        command.arg(image).args([
-            "npm",
-            "install",
-            "--package-lock-only",
-            "--package-lock=true",
-            "--ignore-scripts",
-            "--include=dev",
-            "--strict-peer-deps",
-            "--legacy-peer-deps=false",
-            "--force=false",
-        ]);
-        let runner = ProcessRunner::new()?;
-        let mut owned = OwnedContainer::new(format!("devkit-resolve-{token}"), token.clone());
-        owned.label = "org.docouno.devkit.operation".into();
-        let output =
-            runner.run_owned(&mut command, OutputMode::Capture(16 * 1024 * 1024), &owned)?;
+        let output = last_output.context("Missing npm resolver output")?;
         if output.code != 0 {
             let mut combined = output.stderr;
             combined.extend_from_slice(&output.stdout);

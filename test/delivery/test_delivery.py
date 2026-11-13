@@ -15,6 +15,7 @@ import signal
 import socketserver
 import ssl
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -23,6 +24,9 @@ import unittest
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO / "test") not in sys.path:
+    sys.path.insert(0, str(REPO / "test"))
+from docker_flags import author_docker_flags  # noqa: E402
 DEFAULT_SET = REPO / ".artifacts/native/p3/local-artifact-proof/build-set"
 BUILD_SET = Path(os.environ.get("DEVKIT_TEST_BUILD_SET", DEFAULT_SET)).resolve()
 RELEASE = Path(os.environ.get("DEVKIT_TEST_RELEASE", BUILD_SET / "payload")).resolve()
@@ -738,7 +742,8 @@ export HTTPS_PROXY
         argv = [ENGINE, "internal", "guard", name, token, "--", "docker", "run",
                 "--pull", "never", "--rm", "--init", "--name", name,
                 "--label", f"io.docouno.devkit.invocation={token}",
-                "--network", "none", "--read-only", "--memory", "1g", "--cpus", "2",
+                "--network", "none", "--read-only",
+                *author_docker_flags(2, 1024, pids_limit=512, node_fallback=True),
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--tmpfs", "/tmp:mode=1777,size=268435456",

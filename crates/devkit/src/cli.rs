@@ -552,6 +552,34 @@ fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<bool> {
             ensure!(args.len() == 1, "Build-info takes no arguments");
             println!("{}", serde_json::to_string(&distribution::build_info())?);
         }
+        "docker-flags" => {
+            let options = Options::parse(
+                &args[1..],
+                &["--cpus", "--memory", "--pids-limit", "--node-fallback"],
+                &[],
+                &["--node-fallback"],
+            )?;
+            ensure!(
+                options.target.is_none(),
+                "Docker-flags takes named options only"
+            );
+            let cpus_milli =
+                crate::resources::parse_cpus_value("--cpus", options.required("--cpus")?)?;
+            let mem_bytes =
+                crate::resources::parse_memory_bytes("--memory", options.required("--memory")?)?;
+            let pids = options
+                .value("--pids-limit")?
+                .map(|v| {
+                    v.trim()
+                        .parse::<u64>()
+                        .context("Invalid --pids-limit integer")
+                })
+                .transpose()?;
+            let budget = crate::resources::HostResourceBudget::probe_local()?;
+            let flags =
+                budget.author_flags(cpus_milli, mem_bytes, pids, options.flag("--node-fallback"));
+            println!("{}", flags.join(" "));
+        }
         "fetch" => {
             let options =
                 Options::parse(&args[1..], &["--url", "--output", "--max-bytes"], &[], &[])?;
