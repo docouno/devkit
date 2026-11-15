@@ -524,7 +524,6 @@ pub fn local_dependency_map(
 #[derive(Default, Clone)]
 struct CargoInputs {
     dependencies: BTreeSet<String>,
-    legacy_dependencies: BTreeSet<String>,
     members: BTreeSet<String>,
     overrides: BTreeSet<String>,
 }
@@ -873,8 +872,7 @@ impl<'a> ReadContext<'a> {
                 if let Some(path) = table.get("path") {
                     let path =
                         cargo_local_path(self.root, base, text(path, "Cargo dependency path")?)?;
-                    result.dependencies.insert(path.clone());
-                    result.legacy_dependencies.insert(path);
+                    result.dependencies.insert(path);
                 } else if inherited && table.get("workspace") == Some(&Value::Bool(true)) {
                     let (workspace_root, workspace) = self.find_cargo_workspace(base)?;
                     let dependencies = dependency_table(&workspace, "dependencies")?;
@@ -1330,18 +1328,11 @@ impl<'a> ReadContext<'a> {
                     }
                 }
             } else {
-                let native = self.cargo_inputs(path)?;
+                self.cargo_inputs(path)?;
                 let mut files = BTreeMap::new();
                 let local =
                     self.cargo_local_context(VecDeque::from([path.clone()]), state, &mut files)?;
                 self.cargo_selected_edges(path, state, &local, &mut deps)?;
-                if matches!(state.version.as_str(), "0.2.0" | "0.2.1") {
-                    let mut legacy = BTreeSet::new();
-                    for target in native.legacy_dependencies {
-                        register_edge(state, path, target, &mut legacy)?;
-                    }
-                    projected.insert(path.clone(), legacy.into_iter().collect());
-                }
             }
             let deps: Vec<_> = deps.into_iter().collect();
             projected

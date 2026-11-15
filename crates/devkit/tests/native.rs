@@ -30,7 +30,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
     use devkit::files::file_map;
     use sha2::{Digest, Sha512};
     let release = root.join("release");
-    let version = "0.3.0";
+    let version = "0.5.0";
     for name in ["devkit.mk", "devkit.sh", "compose.tools.yaml"] {
         put(
             &release,
@@ -41,7 +41,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
     put(
         &release,
         "runtime/toolchains.env",
-        "DEVKIT_VERSION=0.3.0\nDEVKIT_RUST_VERSION=1.99.1\n",
+        "DEVKIT_VERSION=0.5.0\nDEVKIT_RUST_VERSION=1.99.1\n",
     );
     put(
         &release,
@@ -61,7 +61,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
         &release,
         "templates/node-api/package-lock.json",
         &json!({"lockfileVersion":3,"packages":{
-            "":node,"node_modules/@docouno/env":{"version":version,"resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.3.0.tgz","integrity":environment_integrity}
+            "":node,"node_modules/@docouno/env":{"version":version,"resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.5.0.tgz","integrity":environment_integrity}
         }}),
     );
     put(
@@ -81,6 +81,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
         &Release {
             schema_version: 1,
             version: version.into(),
+            min_supported_from_version: Some("0.4.0".into()),
             rust_version: "1.99.1".into(),
             environment: Environment {
                 name: "@docouno/env".into(),
@@ -152,11 +153,11 @@ fn component(path: &str, toolchain: &str) -> ComponentState {
     serde_json::from_value(json!({
         "role":if path.starts_with("apps/") {"app"} else {"library"},"toolchain":toolchain,
         "toolingProfile":if toolchain=="rust" {"rust"} else if path.starts_with("apps/") {"node"} else {"react-library"},
-        "origin":{"template":"adopted","version":"0.2.1"},"toolDependencies":{},"dependencies":[]
+        "origin":{"template":"adopted","version":"0.4.1"},"toolDependencies":{},"dependencies":[]
     })).unwrap()
 }
 fn state(components: &[(&str, &str)]) -> ProjectState {
-    serde_json::from_value(json!({"schemaVersion":2,"version":"0.2.1","releaseIdentity":"0".repeat(64),
+    serde_json::from_value(json!({"schemaVersion":2,"version":"0.4.1","releaseIdentity":"0".repeat(64),
         "generation":"00000000-0000-4000-8000-000000000000","packageMode":"registry","managed":{},
         "components":components.iter().map(|(p,t)| (p.to_string(),serde_json::to_value(component(p,t)).unwrap())).collect::<BTreeMap<_,_>>()
     })).unwrap()
@@ -556,7 +557,7 @@ fn cargo_virtual_workspace_context_does_not_change_component_lock_authority() {
         "apps/api",
         json!([{"name":"api","version":"1.0.0","dependencies":["common"]},{"name":"common","version":"1.0.0"}]),
     );
-    for version in ["0.2.1", "0.3.0"] {
+    for version in ["0.4.1", "0.5.0"] {
         state.version = version.into();
         assert!(
             derive_component_dependencies(root, &state)
@@ -813,7 +814,7 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
             "{location}"
         );
         assert!(
-            admit_runtime_project(&root, "0.3.0")
+            admit_runtime_project(&root, "0.5.0")
                 .err()
                 .unwrap()
                 .to_string()
@@ -881,7 +882,7 @@ fn runtime_snapshot_refuses_late_alternate_manifests_and_namespace_changes() {
         } else {
             ("apps/api", "package.json")
         };
-        let admitted = admit_runtime_project(&root, "0.3.0").unwrap();
+        let admitted = admit_runtime_project(&root, "0.5.0").unwrap();
         assert_eq!(
             admitted.native.inputs.files[&format!("{path}/{alternate}")],
             None
@@ -898,7 +899,7 @@ fn runtime_snapshot_refuses_late_alternate_manifests_and_namespace_changes() {
         );
         assert!(admitted.recheck().is_err());
         assert!(
-            admit_runtime_project(&root, "0.3.0")
+            admit_runtime_project(&root, "0.5.0")
                 .err()
                 .unwrap()
                 .to_string()
@@ -924,7 +925,7 @@ fn runtime_snapshot_refuses_late_alternate_manifests_and_namespace_changes() {
                 .contains("namespace changed")
         );
         assert!(
-            admit_runtime_project(&root, "0.3.0")
+            admit_runtime_project(&root, "0.5.0")
                 .err()
                 .unwrap()
                 .to_string()
@@ -938,7 +939,7 @@ fn runtime_snapshot_refuses_late_alternate_manifests_and_namespace_changes() {
         "packages/notes/readme.txt",
         "ordinary project data\n",
     );
-    let admitted = admit_runtime_project(&root, "0.3.0").unwrap();
+    let admitted = admit_runtime_project(&root, "0.5.0").unwrap();
     assert_eq!(
         admitted.native.inputs.files["packages/notes/Cargo.toml"],
         None
@@ -954,7 +955,7 @@ fn runtime_snapshot_refuses_late_alternate_manifests_and_namespace_changes() {
         collect_native_input_closure(&root, &state).unwrap().digest
     );
     assert!(
-        admit_runtime_project(&root, "0.3.0")
+        admit_runtime_project(&root, "0.5.0")
             .err()
             .unwrap()
             .to_string()
@@ -1182,7 +1183,7 @@ fn internal_cargo_roots_require_an_exact_locked_package() {
         let f = TempDir::new().unwrap();
         let root = f.path();
         let mut state = state(&[(path, "rust")]);
-        state.version = "0.3.0".into();
+        state.version = "0.5.0".into();
         rust(
             root,
             path,
@@ -1216,7 +1217,7 @@ fn internal_cargo_chain_validates_every_reachable_lock_reference() {
     let root = f.path();
     let path = "apps/main";
     let mut state = state(&[(path, "rust")]);
-    state.version = "0.3.0".into();
+    state.version = "0.5.0".into();
     rust(
         root,
         path,
@@ -1296,7 +1297,7 @@ fn internal_cargo_workspace_members_use_the_component_lock_authority() {
     let f = TempDir::new().unwrap();
     let root = f.path();
     let mut state = state(&[("apps/main", "rust")]);
-    state.version = "0.3.0".into();
+    state.version = "0.5.0".into();
     rust(
         root,
         "apps/main",
@@ -1361,7 +1362,7 @@ fn internal_cargo_unused_declarations_remain_inputs_without_selected_edges() {
         let f = TempDir::new().unwrap();
         let root = f.path();
         let mut state = state(&[(path, "rust")]);
-        state.version = "0.3.0".into();
+        state.version = "0.5.0".into();
         rust(
             root,
             path,
@@ -1400,7 +1401,7 @@ fn selected_cargo_fixture(root: &Path, role: Role) -> ProjectState {
         "packages/helper"
     };
     let mut state = state(&[("apps/main", "rust"), (target, "rust")]);
-    state.version = "0.3.0".into();
+    state.version = "0.5.0".into();
     let relative = if role == Role::App {
         "../helper"
     } else {
@@ -1469,7 +1470,7 @@ fn inherited_virtual_workspace_source_guard_matches_direct_declaration() {
 }
 
 #[test]
-fn selected_cargo_patch_role_and_legacy_projection_are_separate() {
+fn selected_cargo_patch_role_and_projection_follow_selected_graph() {
     let f = TempDir::new().unwrap();
     let root = f.path();
     let mut state = selected_cargo_fixture(root, Role::Library);
@@ -1480,7 +1481,7 @@ fn selected_cargo_patch_role_and_legacy_projection_are_separate() {
         native.effective_dependencies["apps/main"],
         vec!["packages/helper"]
     );
-    state.version = "0.2.1".into();
+    state.version = "0.4.1".into();
     state
         .components
         .get_mut("apps/main")
@@ -1488,11 +1489,12 @@ fn selected_cargo_patch_role_and_legacy_projection_are_separate() {
         .dependencies
         .clear();
     profiles(root, &state);
-    let native = admit_native_components(root, &state).unwrap();
-    assert!(native.dependencies["apps/main"].is_empty());
-    assert_eq!(
-        native.effective_dependencies["apps/main"],
-        vec!["packages/helper"]
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("projection is stale")
     );
     let f = TempDir::new().unwrap();
     let root = f.path();
@@ -1653,12 +1655,16 @@ fn graph_authority_unused_workspace_path_is_input_not_modern_edge() {
     );
     let admitted = admit_native_components(root, &state).unwrap();
     assert!(admitted.effective_dependencies["apps/main"].is_empty());
-    state.version = "0.2.1".into();
+    state.version = "0.4.1".into();
     state.components.get_mut("apps/main").unwrap().dependencies = vec!["packages/helper".into()];
     profiles(root, &state);
-    let admitted = admit_native_components(root, &state).unwrap();
-    assert_eq!(admitted.dependencies["apps/main"], vec!["packages/helper"]);
-    assert!(admitted.effective_dependencies["apps/main"].is_empty());
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("projection is stale")
+    );
 }
 
 #[test]
@@ -1671,7 +1677,7 @@ fn graph_authority_component_workspace_inheritance_uses_full_lock_records() {
         "apps/main/Cargo.toml",
         "[package]\nname=\"main\"\nversion=\"1.0.0\"\n[workspace]\n[workspace.dependencies]\nhelper={path=\"../../packages/helper\"}\n[dependencies]\nhelper={workspace=true}\n",
     );
-    for version in ["0.2.1", "0.3.0"] {
+    for version in ["0.4.1", "0.5.0"] {
         state.version = version.into();
         state.components.get_mut("apps/main").unwrap().dependencies =
             vec!["packages/helper".into()];
@@ -1889,7 +1895,7 @@ fn cargo_paths_registered_selection_is_actionably_uncertain_and_cycles_are_check
         ("packages/a", "rust"),
         ("packages/b", "rust"),
     ]);
-    state.version = "0.3.0".into();
+    state.version = "0.5.0".into();
     rust(
         root,
         "apps/main",
@@ -1968,7 +1974,7 @@ fn full_runtime_rejects_patch_app_edge_and_synchronizes_modern_library_edge() {
         json!([{"name":"helper","version":"1.0.0"}]),
     );
     assert!(
-        admit_runtime_project(&root, "0.3.0")
+        admit_runtime_project(&root, "0.5.0")
             .err()
             .unwrap()
             .to_string()
@@ -2021,7 +2027,7 @@ fn full_runtime_rejects_patch_app_edge_and_synchronizes_modern_library_edge() {
     );
     let before = devkit::state::read_project_state(&root).unwrap();
     assert!(
-        admit_runtime_project(&root, "0.3.0")
+        admit_runtime_project(&root, "0.5.0")
             .err()
             .unwrap()
             .to_string()
@@ -2035,7 +2041,7 @@ fn full_runtime_rejects_patch_app_edge_and_synchronizes_modern_library_edge() {
         vec!["packages/helper"]
     );
     assert_eq!(
-        admit_runtime_project(&root, "0.3.0")
+        admit_runtime_project(&root, "0.5.0")
             .unwrap()
             .native
             .effective_dependencies["apps/api"],
@@ -2174,7 +2180,7 @@ fn pinned_cargo_metadata_confirms_ordinary_graph_and_unused_patch_neutrality() {
     }
     if let Ok(directory) = std::env::var("DEVKIT_PROOF_DIR") {
         write_json(&Path::new(&directory).join("cargo-path-authority-proof.json"),&json!({"toolchain":"1.99.1","offline":true,"cases":proof,
-            "authority":"Only selected Cargo.lock dependency/replacement edges activate modern/effective Rust component relationships; raw declarations remain inputs and exact legacy0.2 projection."})).unwrap();
+            "authority":"Only selected Cargo.lock dependency/replacement edges activate Rust component relationships; raw declarations remain inputs."})).unwrap();
     }
 }
 
@@ -2963,7 +2969,7 @@ fn plain_non_component_directories_and_files_in_namespaces_pass_recheck() {
     let f = TempDir::new().unwrap();
     let (_, root, _) = runtime_project(f.path(), "node");
     assert!(!root.join("packages").exists());
-    let admitted = admit_runtime_project(&root, "0.3.0").unwrap();
+    let admitted = admit_runtime_project(&root, "0.5.0").unwrap();
 
     // Creating a plain non-component folder and file under packages/ and apps/ passes recheck.
     put(&root, "packages/notes/scratch.md", "temporary notes\n");

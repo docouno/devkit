@@ -43,12 +43,44 @@ runs:
         chmod 755 .artifacts/release-ops/devkit-release .artifacts/frozen/devkit-x86_64-unknown-linux-musl
         .artifacts/release-ops/devkit-release hydrate --root "$PWD" --version "$VERSION" \
           --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" --build-set "$PWD/.artifacts/frozen"
+    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: .artifacts/baseline/v0.4.1/downloads
+        key: devkit-baseline-v0.4.1-0f95ce2c5a51c9f1
     - name: Preserve the genuine public baseline
       shell: bash
       run: |
         set -euo pipefail
-        mkdir -p .artifacts/legacy
-        curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 180 --max-filesize 1048576 --output .artifacts/legacy/devkit-0.2.1.tar.gz https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz
-        printf '%s\n' '882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb  devkit-0.2.1.tar.gz' > .artifacts/legacy/devkit-0.2.1.tar.gz.sha256
-        (cd .artifacts/legacy && sha256sum --check devkit-0.2.1.tar.gz.sha256)
-        tar --extract --gzip --file .artifacts/legacy/devkit-0.2.1.tar.gz --directory .artifacts/legacy
+        umask 022
+        mkdir -p .artifacts/baseline/v0.4.1/downloads
+        for asset in release-index.json devkit-0.4.1.tar.gz devkit-x86_64-unknown-linux-musl; do
+          if ! test -f ".artifacts/baseline/v0.4.1/downloads/$asset"; then
+            curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --max-time 180 --max-filesize 134217728 \
+              --output ".artifacts/baseline/v0.4.1/downloads/$asset" \
+              "https://github.com/docouno/devkit/releases/download/v0.4.1/$asset"
+          fi
+        done
+        (
+          cd .artifacts/baseline/v0.4.1/downloads
+          sha256sum --check <<'EOF'
+        0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa  release-index.json
+        4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a  devkit-0.4.1.tar.gz
+        206f66322e7ae009bc9368a05df64cfef0285ec30e32e9b9dbf0ffbe1069f929  devkit-x86_64-unknown-linux-musl
+        EOF
+        )
+        cp -f .artifacts/baseline/v0.4.1/downloads/release-index.json .artifacts/baseline/v0.4.1/release-index.json
+        cp -f .artifacts/baseline/v0.4.1/downloads/devkit-0.4.1.tar.gz .artifacts/baseline/v0.4.1/devkit-0.4.1.tar.gz
+        cp -f .artifacts/baseline/v0.4.1/downloads/devkit-x86_64-unknown-linux-musl .artifacts/baseline/v0.4.1/devkit-x86_64-unknown-linux-musl
+        chmod 755 .artifacts/baseline/v0.4.1/devkit-x86_64-unknown-linux-musl
+        rm -rf .artifacts/baseline/v0.4.1/payload
+        mkdir -p .artifacts/baseline/v0.4.1/payload
+        tar --extract --gzip --strip-components=1 --file .artifacts/baseline/v0.4.1/devkit-0.4.1.tar.gz --directory .artifacts/baseline/v0.4.1/payload
+        chmod 755 .artifacts/baseline/v0.4.1/payload/devkit
+        (
+          cd .artifacts/baseline/v0.4.1/payload
+          sha256sum --check <<'EOF'
+        0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a  release.json
+        206f66322e7ae009bc9368a05df64cfef0285ec30e32e9b9dbf0ffbe1069f929  devkit
+        EOF
+        )

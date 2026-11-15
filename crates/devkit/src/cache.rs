@@ -24,10 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn legacy(version: &str) -> bool {
-    version.starts_with("0.2.")
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReleaseRef {
@@ -205,9 +201,6 @@ impl<'a> ReleaseCache<'a> {
         )
     }
     pub fn prime_engine(&self, release: &AdmittedRelease) -> Result<()> {
-        if legacy(&release.manifest.version) {
-            return Ok(());
-        }
         let pin = EnginePin {
             version: release.manifest.version.clone(),
             target: TARGET.to_owned(),
@@ -221,7 +214,7 @@ impl<'a> ReleaseCache<'a> {
         };
         let pins = crate::runtime::ToolPins::parse(&release.bytes("runtime/toolchains.env")?)?;
         ensure!(
-            pins.engine.as_ref() == Some(&pin),
+            pins.engine == pin,
             "Release engine pin differs from its actual payload"
         );
         let _lock = self.lock(&format!(
@@ -334,7 +327,6 @@ impl<'a> ReleaseCache<'a> {
             && let Some(release) = self.cached(version, &identity)?
         {
             let engine_matches = version != env!("CARGO_PKG_VERSION")
-                || legacy(version)
                 || release.manifest.files.get("devkit").is_some_and(|id| {
                     file_digest(&self.executable).is_ok_and(|hash| hash == id.sha256)
                 });
@@ -354,48 +346,26 @@ impl<'a> ReleaseCache<'a> {
         let base = format!("{RELEASE_BASE}/v{version}");
         let archive_name = format!("devkit-{version}.tar.gz");
         let archive = stage.path().join(&archive_name);
-        let identity;
-        let archive_hash;
-        if legacy(version) {
-            let manifest = stage.path().join("release.json");
-            self.fetch(&format!("{base}/release.json"), &manifest, 4 * 1024 * 1024)?;
-            identity = file_digest(&manifest)?;
-            let checksum = stage.path().join("checksum");
-            self.fetch(&format!("{base}/{archive_name}.sha256"), &checksum, 256)?;
-            let value = fs::read_to_string(checksum)?;
-            let (hash, name) = value
-                .trim_end_matches('\n')
-                .split_once("  ")
-                .context("Invalid archive checksum record")?;
+        let index_path = stage.path().join("release-index.json");
+        self.fetch(
+            &format!("{base}/release-index.json"),
+            &index_path,
+            64 * 1024,
+        )?;
+        let index: ReleaseIndex = read_json(&index_path)?;
+        index.validate()?;
+        ensure!(
+            index.version == version && index.publication_eligible,
+            "Release index version/provenance differs"
+        );
+        if version == env!("CARGO_PKG_VERSION") && expected.is_none() {
             ensure!(
-                SHA256_RE.is_match(hash)
-                    && name == archive_name
-                    && value == format!("{hash}  {name}\n"),
-                "Invalid archive checksum record"
+                index.files[&index.engine].sha256 == file_digest(&self.executable)?,
+                "Published engine differs from the running release"
             );
-            archive_hash = hash.to_owned();
-        } else {
-            let index_path = stage.path().join("release-index.json");
-            self.fetch(
-                &format!("{base}/release-index.json"),
-                &index_path,
-                64 * 1024,
-            )?;
-            let index: ReleaseIndex = read_json(&index_path)?;
-            index.validate()?;
-            ensure!(
-                index.version == version && index.publication_eligible,
-                "Release index version/provenance differs"
-            );
-            if version == env!("CARGO_PKG_VERSION") && expected.is_none() {
-                ensure!(
-                    index.files[&index.engine].sha256 == file_digest(&self.executable)?,
-                    "Published engine differs from the running release"
-                );
-            }
-            identity = index.release_identity;
-            archive_hash = index.files[&index.archive].sha256.clone();
         }
+        let identity = index.release_identity;
+        let archive_hash = index.files[&index.archive].sha256.clone();
         ensure!(
             expected.is_none_or(|expected| expected == identity),
             "Downloaded release differs from the accepted project identity"

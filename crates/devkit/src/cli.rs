@@ -1,12 +1,7 @@
 //! Public CLI policy and output. Runtime streams keep their original Make/argv
 //! process boundary; JSON is a bounded lifecycle/metadata protocol.
 use crate::{
-    Result,
-    cache::{self, ReleaseCache},
-    delivery, distribution,
-    files::*,
-    processes::ProcessRunner,
-    state,
+    Result, cache::ReleaseCache, delivery, distribution, files::*, processes::ProcessRunner, state,
 };
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
@@ -331,6 +326,18 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
     if command == "doctor" {
         ensure!(!globals.interactive, "doctor does not accept --interactive");
         let target = resolve_metadata_target(&globals.args[1..])?;
+        if target.exists() {
+            let root = project_root(&target)?;
+            if !exists(&safe_path(&root, state::PENDING_PATH)?)?
+                && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
+            {
+                state::ensure_supported_checkout_floor(
+                    &root,
+                    false,
+                    state::MIN_SUPPORTED_PROJECT_VERSION,
+                )?;
+            }
+        }
         let (result, human, ok) = crate::doctor::run_doctor(&target, runner)?;
         if ok {
             globals.emit("doctor", result, &human);
@@ -407,6 +414,7 @@ struct AcceptedManifestHeader {
 
 fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
     let path = safe_path(root, state::MANIFEST_PATH)?;
+    state::check_manifest_regular_bounded(&path)?;
     let before = identity(&path)?.context("Missing project manifest")?;
     let bytes = fs::read(&path)?;
     ensure!(
@@ -492,6 +500,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             return Ok(());
         }
         let root = project_root(&candidate)?;
+        state::assert_no_pending(&root)?;
         if !exists(&safe_path(&root, state::MANIFEST_PATH)?)? {
             return Ok(());
         }
@@ -524,27 +533,8 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         }
         (project_root(&root)?, None)
     };
+    state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
     let header = read_accepted_header(&root)?;
-    if ["add-app", "add-package", "register"].contains(&command_name)
-        && SemVer::parse(&header.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
-    {
-        return Ok(());
-    }
-    if ["sync", "describe", "status"].contains(&command_name) {
-        let min_040 = SemVer {
-            major: 0,
-            minor: 4,
-            patch: 0,
-            prerelease: Vec::new(),
-        };
-        if SemVer::parse(&header.version)? < min_040 {
-            return Ok(());
-        }
-    }
-    ensure!(
-        !cache::legacy(&header.version),
-        "Native exec/task requires Devkit 0.3 or newer; use run for legacy Make tasks or update --to VERSION"
-    );
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
     ensure!(
@@ -559,21 +549,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         pins.version == header.version,
         "Accepted version differs from toolchain pins"
     );
-    let Some(pin) = pins.engine else {
-        if [
-            "describe",
-            "status",
-            "sync",
-            "add-app",
-            "add-package",
-            "register",
-        ]
-        .contains(&command_name)
-        {
-            return Ok(());
-        }
-        anyhow::bail!("Missing accepted native engine pin");
-    };
+    let pin = pins.engine;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::file_digest(&current)? == pin.sha256 {
         ensure!(
@@ -583,7 +559,10 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         return Ok(());
     }
     let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
-    if is_metadata && !exists(&cache.engine_path(&pin)?)? {
+    if is_metadata
+        && !exists(&cache.engine_path(&pin)?)?
+        && SemVer::parse(&pin.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
+    {
         return Ok(());
     }
     if is_lifecycle && !exists(&cache.engine_path(&pin)?)? {

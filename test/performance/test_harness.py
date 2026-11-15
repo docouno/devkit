@@ -217,6 +217,125 @@ finally:
         self.assertEqual([entry["argv"] for entry in case["trace"]["dockerRecords"]], records)
         self.assertEqual(case["trace"]["hostExecSummaryText"], " 100.00 0.01 5 4 execve\n")
 
+    def test_symmetric_describe_and_control_container_invariants(self):
+        for side in ("baseline", "native"):
+            gate, case = self.traced_gate([["info"]], operation="describe")
+            case["side"] = side
+            with self.assertRaisesRegex(RuntimeError, "called Docker"):
+                gate.trace(case)
+            gate, case = self.traced_gate(
+                [["compose", "--file", "compose.yaml", "run", "--rm", "control", "node"]],
+                operation="doctor",
+            )
+            case["side"] = side
+            with self.assertRaisesRegex(RuntimeError, "control container"):
+                gate.trace(case)
+
+    def synthetic_benchmark_gate(self, *, samples, warmups, timings):
+        directory = Path(tempfile.mkdtemp(prefix="devkit-perf-synth-"))
+        self.addCleanup(shutil.rmtree, directory)
+        args = argparse.Namespace(output=directory / "receipt.json", samples=samples, warmups=warmups)
+        gate = Gate(args)
+        self.addCleanup(shutil.rmtree, gate.scratch)
+        gate.baseline_release = directory / "baseline-rel"
+        gate.native_release = directory / "native-rel"
+        roots = {}
+        snapshots = {}
+        for side in ("baseline", "native"):
+            root = directory / side
+            (root / ".devkit").mkdir(parents=True)
+            (root / ".devkit/manifest.json").write_text(json.dumps({"components": {"apps/app001": {}}}))
+            roots[side] = root
+            snapshots[side] = snapshot(root)
+
+        def fake_run(label, argv, **kwargs):
+            for op in ("describe", "doctor", "build"):
+                if f"-{op}-baseline-" in label:
+                    return {"seconds": timings[(op, "baseline")], "exitCode": 0, "stdout": "", "stderr": ""}
+                if f"-{op}-native-" in label:
+                    return {"seconds": timings[(op, "native")], "exitCode": 0, "stdout": "", "stderr": ""}
+            return {"seconds": 0.01, "exitCode": 0, "stdout": "", "stderr": ""}
+
+        def fake_trace(case):
+            is_build = case["operation"] == "build"
+            case["trace"] = {
+                "dockerCliCalls": 1 if is_build else 0,
+                "oneShotContainers": 1 if is_build else 0,
+                "controlContainers": 0,
+                "toolContainers": case["componentCount"] if is_build else 0,
+                "otherContainers": 0,
+                "execSyscallAttempts": 4,
+                "execSyscallErrors": 0,
+                "successfulExecs": 4,
+                "instrumentedTotalSeconds": 0.05,
+                "instrumentedToolContainerSeconds": 0.04 if is_build else 0.0,
+                "instrumentedOutsideToolSeconds": 0.01,
+            }
+
+        gate.run = fake_run
+        gate.trace = fake_trace
+        return gate, roots, snapshots
+
+    def test_paired_non_regression_passes_within_tolerance_and_rejects_regression(self):
+        # (a) samples == 30, native <= baseline * 1.20 + 0.020 -> passes and can report success=True.
+        gate, roots, snapshots = self.synthetic_benchmark_gate(
+            samples=30,
+            warmups=2,
+            timings={
+                ("doctor", "baseline"): 0.100,
+                ("doctor", "native"): 0.135,  # <= 0.100 * 1.20 + 0.020 = 0.140
+                ("describe", "baseline"): 0.010,
+                ("describe", "native"): 0.028,  # <= 0.010 * 1.20 + 0.020 = 0.032
+                ("build", "baseline"): 0.500,
+                ("build", "native"): 0.610,  # <= 0.500 * 1.20 + 0.020 = 0.620
+            },
+        )
+        gate.benchmark("five", roots, snapshots, 1)
+        gate.receipt["success"] = gate.is_publication_sampled()
+        gate.save()
+        saved = json.loads(gate.args.output.read_text())
+        self.assertTrue(saved["success"])
+        self.assertEqual([c["operation"] for c in saved["comparisons"]], ["doctor", "describe", "build"])
+        self.assertTrue(all(c["nonRegressionPassed"] for c in saved["comparisons"]))
+
+        # (b) native > baseline * 1.20 + 0.020 on describe -> rejected.
+        bad_gate, bad_roots, bad_snapshots = self.synthetic_benchmark_gate(
+            samples=30,
+            warmups=2,
+            timings={
+                ("doctor", "baseline"): 0.100,
+                ("doctor", "native"): 0.100,
+                ("describe", "baseline"): 0.010,
+                ("describe", "native"): 0.040,  # > 0.032
+                ("build", "baseline"): 0.500,
+                ("build", "native"): 0.500,
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "Native median regressed on matched five/describe"):
+            bad_gate.benchmark("five", bad_roots, bad_snapshots, 1)
+        bad_gate.save()
+        self.assertFalse(json.loads(bad_gate.args.output.read_text())["success"])
+
+    def test_diagnostic_under_sampled_run_forces_success_false(self):
+        gate, roots, snapshots = self.synthetic_benchmark_gate(
+            samples=5,
+            warmups=1,
+            timings={
+                ("doctor", "baseline"): 0.100,
+                ("doctor", "native"): 0.100,
+                ("describe", "baseline"): 0.010,
+                ("describe", "native"): 0.010,
+                ("build", "baseline"): 0.500,
+                ("build", "native"): 0.500,
+            },
+        )
+        gate.benchmark("five", roots, snapshots, 1)
+        gate.receipt["success"] = True
+        gate.save()
+        saved = json.loads(gate.args.output.read_text())
+        self.assertFalse(saved["success"])
+        self.assertTrue(saved["diagnosticUnderSampled"])
+
 
 if __name__ == "__main__":
     unittest.main()

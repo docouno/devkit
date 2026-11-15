@@ -31,9 +31,6 @@ DEFAULT_SET = REPO / ".artifacts/native/p3/local-artifact-proof/build-set"
 BUILD_SET = Path(os.environ.get("DEVKIT_TEST_BUILD_SET", DEFAULT_SET)).resolve()
 RELEASE = Path(os.environ.get("DEVKIT_TEST_RELEASE", BUILD_SET / "payload")).resolve()
 ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", RELEASE / "devkit")).resolve()
-LEGACY_RECORD = Path(os.environ.get(
-    "DEVKIT_TEST_LEGACY_FIXTURES",
-    REPO.parent / "devkit/.artifacts/v3/legacy-fixtures.json"))
 DOCKER_ENABLED = os.environ.get("DEVKIT_TEST_DOCKER") == "1"
 PROOF = Path(os.environ.get("DEVKIT_DELIVERY_PROOF_DIR",
                            REPO / ".artifacts/native/p3/delivery-tests")) / uuid.uuid4().hex
@@ -798,68 +795,6 @@ export HTTPS_PROXY
 
     def test_npx_direct_elf_with_ignore_scripts_umask_077(self):
         self.npx_mode("077")
-
-
-@unittest.skipUnless(LEGACY_RECORD.is_file(), "Genuine public 0.2.1 consumer fixtures are not configured")
-class LegacyTests(ReleaseFixture, unittest.TestCase):
-    def legacy(self, kind):
-        record = json.loads(LEGACY_RECORD.read_text())
-        project = record["projects"][kind]
-        source = Path(project["path"])
-        if not source.is_dir():
-            self.skipTest("Genuine legacy fixture directory is unavailable; restore its verified backup")
-        for name, expected in project["preservedFiles"].items():
-            self.assertEqual(digest(source / name), expected, "Legacy baseline changed")
-        state = json.loads((source / ".devkit/manifest.json").read_text())
-        excluded = {".git", ".artifacts", ".devkit/state", ".devkit/cache", "target", "dist", "release"}
-        for component in state["components"]:
-            excluded.update(f"{component}/{directory}" for directory in ("target", "dist", "release"))
-
-        def ignore(directory, names):
-            relative = Path(directory).relative_to(source)
-            return [name for name in names if name == "node_modules"
-                    or (relative / name).as_posix() in excluded]
-
-        target = self.root / (kind + " legacy with spaces")
-        shutil.copytree(source, target, ignore=ignore)
-        return target, project, state
-
-    def test_native_metadata_reads_genuine_old_data_without_sdk_or_cache(self):
-        for kind in ("node", "rust"):
-            root, project, state = self.legacy(kind)
-            before = (root / ".devkit/manifest.json").read_bytes()
-            result = self.cli("describe", "--root", root, "--json", env=dict(self.env, PATH=""))
-            self.assertEqual(json_result(result)["result"]["version"], "0.2.1")
-            self.assertEqual(json_result(result)["result"]["releaseIdentity"], state["releaseIdentity"])
-            self.assertEqual((root / ".devkit/manifest.json").read_bytes(), before)
-            first = next(iter(state["components"]))
-            rejected = self.cli("exec", "--root", root, "--component", first, "--", "true",
-                                check=False, env=dict(self.env, PATH=""))
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("requires Devkit 0.3", rejected.stderr)
-            self.assertFalse((self.root / "cache").exists())
-            for name, expected in project["preservedFiles"].items():
-                self.assertEqual(digest(root / name), expected)
-
-    def test_genuine_old_rust_project_updates_to_local_native_payload_with_preservation(self):
-        root, project, state = self.legacy("rust")
-        result = self.cli("update", root, "--to", self.version, "--release-root", RELEASE,
-                          "--json", env=dict(self.env, PATH=""))
-        self.assertEqual(json_result(result)["result"]["releaseIdentity"], self.identity)
-        updated = json.loads((root / ".devkit/manifest.json").read_text())
-        self.assertEqual(updated["version"], self.version)
-        self.assertEqual(updated["productMetadata"], state["productMetadata"])
-        for name, previous in state["components"].items():
-            self.assertEqual(updated["components"][name]["productMetadata"], previous["productMetadata"])
-            self.assertEqual(updated["components"][name]["origin"], previous["origin"])
-            self.assertEqual(updated["components"][name]["development"], previous["development"])
-        for name, expected in project["preservedFiles"].items():
-            self.assertEqual(digest(root / name), expected)
-        EVIDENCE.append({"case": "genuine-legacy-rust-to-local-native",
-                         "fromVersion": state["version"], "fromIdentity": state["releaseIdentity"],
-                         "toVersion": self.version, "toIdentity": self.identity,
-                         "preservedFiles": project["preservedFiles"], "unknownMetadataPreserved": True,
-                         "hostSdkPath": "empty", "scope": "local prototype, not public 0.3 publication"})
 
 
 class RecordingResult(unittest.TextTestResult):

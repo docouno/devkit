@@ -21,7 +21,15 @@ REPO = Path(__file__).resolve().parents[2]
 BASE = "https://github.com/docouno/devkit/releases/download"
 TARGET = "x86_64-unknown-linux-musl"
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-z0-9][a-z0-9.-]*)?")
+STABLE_VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 HEX256 = re.compile(r"[a-f0-9]{64}")
+BASELINE_041_INDEX_SHA256 = "0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa"
+BASELINE_041_RELEASE_IDENTITY = "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+
+
+def stable_tuple(value):
+    require(STABLE_VERSION.fullmatch(value), f"Expected an exact stable version: {value}")
+    return tuple(int(part) for part in value.split("."))
 
 
 def require(condition, message):
@@ -121,11 +129,13 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True, choices=("0.2.0", "0.2.1"))
+    parser.add_argument("--version", required=True, help="Published baseline version (>= 0.4.0)")
     parser.add_argument("--next-version", required=True)
     parser.add_argument("--expected-index-sha256", required=True,
                         help="Digest of the frozen build-set index before publication")
+    parser.add_argument("--output", type=Path, help="Optional path for atomic receipt output")
     args = parser.parse_args()
+    require(stable_tuple(args.version) >= (0, 4, 0), "Public baseline version must be >= 0.4.0")
     require(VERSION.fullmatch(args.next_version) and args.version != args.next_version,
             "Use an exact, distinct native target version")
     require(HEX256.fullmatch(args.expected_index_sha256), "Use a frozen SHA256 index identity")
@@ -178,17 +188,43 @@ def main():
         old = args.version
         old_name = f"devkit-{old}.tar.gz"
         old_archive = scratch / old_name
-        checksum = download(f"{BASE}/v{old}/{old_name}.sha256", scratch / (old_name + ".sha256"), 256)
+        raw_old_index = download(f"{BASE}/v{old}/release-index.json",
+                                 scratch / f"release-index-{old}.json", 4 * 1024 * 1024)
+        if old == "0.4.1":
+            require(sha256(raw_old_index) == BASELINE_041_INDEX_SHA256,
+                    "Genuine v0.4.1 baseline release-index.json SHA256 changed")
+        old_index = json.loads(raw_old_index)
+        require(old_index["schemaVersion"] == 1 and old_index["version"] == old
+                and old_index["target"] == TARGET and old_index["publicationEligible"] is True,
+                "Public baseline is not a publication-eligible native build-set")
+        if old == "0.4.1":
+            require(old_index["releaseIdentity"] == BASELINE_041_RELEASE_IDENTITY,
+                    "Genuine v0.4.1 baseline releaseIdentity changed")
+        old_release = json.loads(download(
+            f"https://api.github.com/repos/docouno/devkit/releases/tags/v{old}",
+            scratch / f"github-release-{old}.json", 4 * 1024 * 1024))
+        require(old_release["immutable"] is True and old_release["draft"] is False
+                and old_release["tag_name"] == f"v{old}",
+                "Public baseline release is not immutable")
+        old_gh_assets = {asset["name"]: asset for asset in old_release["assets"]}
+        require(old_gh_assets["release-index.json"]["digest"] == "sha256:" + sha256(raw_old_index),
+                "GitHub baseline release-index.json digest differs")
         old_bytes = download(f"{BASE}/v{old}/{old_name}", old_archive, 128 * 1024 * 1024)
-        require(checksum.decode() == f"{sha256(old_bytes)}  {old_name}\n", "Legacy archive checksum mismatch")
+        require(old_index["archive"] == old_name
+                and sha256(old_bytes) == old_index["files"][old_name]["sha256"]
+                and len(old_bytes) == old_index["files"][old_name]["size"],
+                "Public baseline archive differs from baseline release-index.json")
+        require(old_gh_assets[old_name]["digest"] == "sha256:" + sha256(old_bytes),
+                "GitHub baseline archive digest differs")
         old_manifest, old_raw = archive_json(old_archive, f"devkit-{old}", "release.json")
-        legacy_identity = {
-            "0.2.0": "39b085a22605e99e457c8c945866dc8f987afa4ef493dbe188d4dd2b59f21092",
-            "0.2.1": "7f9dea1455027e0a0637077c7b040dbd7420a7fbc554d83d4d80ca47e9e849e0",
-        }
-        require(old_manifest["version"] == old and sha256(old_raw) == legacy_identity[old],
-                "Genuine public baseline identity changed")
-        npm_package("@docouno/env", old, old_manifest["environment"]["integrity"])
+        require(old_manifest["version"] == old and sha256(old_raw) == old_index["releaseIdentity"],
+                "Genuine public baseline manifest identity differs")
+        require(set(old_index["packages"]) == {"cli", "environment"}, "Unexpected baseline npm artifact set")
+        for kind, pkg_name in (("environment", "@docouno/env"), ("cli", "@docouno/devkit")):
+            pkg = old_index["packages"][kind]
+            require(pkg["name"] == pkg_name and pkg["version"] == old,
+                    f"Wrong baseline npm/index identity: {kind}")
+            npm_package(pkg_name, old, pkg["integrity"], expected_sha1=pkg["shasum"])
 
         target = args.next_version
         raw_index = download(f"{BASE}/v{target}/release-index.json", scratch / "release-index.json",
@@ -287,7 +323,13 @@ def main():
                               "Synthetic recovery journals do not reproduce physical power loss"],
                    "harnessSourceSha256": {str(path.relative_to(REPO)): sha256(path.read_bytes())
                                           for path in (Path(__file__), REPO / "test/packaged/verify.py")}}
-        (evidence / "receipt.json").write_text(json.dumps(summary, indent=2) + "\n")
+        encoded_summary = json.dumps(summary, indent=2) + "\n"
+        (evidence / "receipt.json").write_text(encoded_summary)
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            temp_output = args.output.with_name(f".{args.output.name}.{uuid.uuid4().hex}.tmp")
+            temp_output.write_text(encoded_summary)
+            temp_output.replace(args.output)
         print(f"Public receipt: {evidence / 'receipt.json'}", flush=True)
         if success:
             shutil.rmtree(scratch)

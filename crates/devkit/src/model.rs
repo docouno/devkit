@@ -56,18 +56,20 @@ impl FileIdentity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Release {
     pub schema_version: u32,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_supported_from_version: Option<String>,
     pub files: BTreeMap<String, FileIdentity>,
     pub environment: Environment,
     pub rust_version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<MigrationEntry>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
     pub version: String,

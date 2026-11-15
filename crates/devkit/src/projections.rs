@@ -174,16 +174,12 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
         let command = if rust {
             vec!["cargo", "run", "--locked", "--offline"]
         } else if desktop {
-            if matches!(state.version.as_str(), "0.2.0" | "0.2.1" | "0.2.2") {
-                vec!["bash", "/workspace/.devkit/runtime/desktop-dev.sh"]
-            } else {
-                vec!["/devkit/devkit", "internal", "desktop"]
-            }
+            vec!["/devkit/devkit", "internal", "desktop"]
         } else {
             vec!["npm", "run", "dev"]
         };
         let mut service = json!({"image":if rust{"${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"}else if desktop{"${DEVKIT_DESKTOP_IMAGE:-devkit-unprepared-desktop}"}else{"${DEVKIT_NODE_IMAGE:?}"},"init":true,"user":"${DEVKIT_UID:?}:${DEVKIT_GID:?}","working_dir":format!("/workspace/{path}"),"command":command,"environment":env,"volumes":volumes});
-        if desktop && !matches!(state.version.as_str(), "0.2.0" | "0.2.1" | "0.2.2") {
+        if desktop {
             service["volumes"].as_array_mut().unwrap().push(volume(
                 "${DEVKIT_ENGINE_PATH:?}".into(),
                 "/devkit/devkit".into(),

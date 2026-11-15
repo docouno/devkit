@@ -15,8 +15,11 @@ endif
 ifneq ($(origin release),undefined)
 override release := $(value release)
 endif
-ifneq ($(origin legacy_archive),undefined)
-override legacy_archive := $(value legacy_archive)
+ifneq ($(origin baseline_set),undefined)
+override baseline_set := $(value baseline_set)
+endif
+ifneq ($(origin fixtures),undefined)
+override fixtures := $(value fixtures)
 endif
 ifneq ($(origin template),undefined)
 override template := $(value template)
@@ -56,16 +59,24 @@ export DEVKIT_AUTHOR_CARGO_HOME
 export DEVKIT_AUTHOR_TARGET := $(CURDIR)/.artifacts/author/target
 export DEVKIT_AUTHOR_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit
 export DEVKIT_RELEASE_VERSION := $(if $(filter undefined,$(origin version)),$(strip $(file <VERSION)),$(value version))
-export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.2.1,$(value from_version))
+export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.4.1,$(value from_version))
 export DEVKIT_BUILD_ID := $(if $(filter undefined,$(origin build_id)),$(shell cat /proc/sys/kernel/random/uuid),$(value build_id))
 export DEVKIT_BUILD_RUN := $(if $(filter undefined,$(origin build_run)),local-author,$(value build_run))
 export DEVKIT_ASSEMBLY_OUTPUT := $(value output)
 export DEVKIT_BUILD_SET := $(value build_set)
 export DEVKIT_VERIFY_RELEASE := $(value release)
 export DEVKIT_VERIFY_PREVIOUS := $(value previous)
-export DEVKIT_LEGACY_ARCHIVE := $(value legacy_archive)
+export DEVKIT_BASELINE_SET := $(value baseline_set)
 export DEVKIT_INIT_TARGET := $(value target)
 export DEVKIT_INIT_TEMPLATE := $(if $(filter undefined,$(origin template)),node-api,$(value template))
+
+ifneq ($(origin fixtures),undefined)
+export DEVKIT_AUTHOR_FIXTURES := $(value fixtures)
+author_fixtures_build :=
+else
+export DEVKIT_AUTHOR_FIXTURES := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/examples
+author_fixtures_build := build-fixtures
+endif
 
 ifneq ($(origin release),undefined)
 export DEVKIT_VERIFY_ENGINE := $(value release)/devkit

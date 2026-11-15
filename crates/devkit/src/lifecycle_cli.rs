@@ -28,6 +28,20 @@ impl crate::transaction::MutationHooks for Cancellation<'_> {
     }
 }
 
+fn ensure_supported_target_version(ver: &str) -> Result<()> {
+    crate::files::version(ver)?;
+    if SemVer::parse(ver)? < SemVer::parse(crate::state::MIN_SUPPORTED_PROJECT_VERSION)? {
+        return Err(error(
+            "UNSUPPORTED_PROJECT_VERSION",
+            format!(
+                "Target version {ver} is older than the minimum supported version {}. Use @docouno/devkit@0.4.1 when working with releases before 0.4.0.",
+                crate::state::MIN_SUPPORTED_PROJECT_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let args = if globals.args.is_empty() {
         &[][..]
@@ -83,6 +97,55 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         _ => &[],
     };
     let mut options = Options::parse(args, allowed, repeat, &["--preview", "--reconcile-lock"])?;
+    if command == "init" {
+        if let Some(to_ver) = options.value("--to")? {
+            ensure_supported_target_version(to_ver)?;
+            if to_ver != env!("CARGO_PKG_VERSION") {
+                let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
+                let source = options.path("--release-root");
+                let release = cache.acquire(to_ver, None, source.as_deref(), globals.offline)?;
+                let target_engine = safe_path(&release.root, "devkit")?;
+                let target_sha = crate::delivery::file_digest(&target_engine)?;
+                ensure!(
+                    std::env::var("DEVKIT_INIT_DELEGATED").ok().as_deref()
+                        != Some(target_sha.as_str()),
+                    "Init delegation did not converge"
+                );
+                crate::processes::restore_exec_pdeathsig(runner)?;
+                let mut delegated = std::process::Command::new(&target_engine);
+                globals.write_flags(&mut delegated);
+                delegated
+                    .args(&globals.args)
+                    .env("DEVKIT_INIT_DELEGATED", &target_sha);
+                use std::os::unix::process::CommandExt;
+                return Err(delegated.exec()).context("Cannot execute target release engine");
+            }
+        }
+    } else if command == "update" {
+        if let Some(to_ver) = options.value("--to")? {
+            ensure_supported_target_version(to_ver)?;
+        }
+        let candidate = options.target.clone().unwrap_or(std::env::current_dir()?);
+        if candidate.exists() {
+            let pre_root = project_root(&candidate)?;
+            if exists(&safe_path(&pre_root, crate::state::PENDING_PATH)?)?
+                || exists(&safe_path(&pre_root, crate::state::MANIFEST_PATH)?)?
+            {
+                crate::state::ensure_supported_checkout_floor(
+                    &pre_root,
+                    true,
+                    crate::state::MIN_SUPPORTED_PROJECT_VERSION,
+                )?;
+            }
+        }
+    } else if command == "sync" {
+        let pre_root = project_root(&options.target.clone().unwrap_or(std::env::current_dir()?))?;
+        crate::state::ensure_supported_checkout_floor(
+            &pre_root,
+            false,
+            crate::state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
+    }
     let mut missing = Vec::new();
     match command {
         "init" => {
@@ -241,21 +304,21 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         return Ok(());
     }
     let (old, release) = if command == "update" {
-        ensure!(
-            exists(&safe_path(&root, crate::state::MANIFEST_PATH)?)?,
-            "Missing project manifest"
-        );
+        crate::state::ensure_supported_checkout_floor(
+            &root,
+            true,
+            crate::state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
         let target_version = options.required("--to")?;
+        ensure_supported_target_version(target_version)?;
         let release = cache.acquire(target_version, None, source.as_deref(), globals.offline)?;
-        if !crate::cache::legacy(&release.manifest.version)
-            && SemVer::parse(&release.manifest.version)? > SemVer::parse(env!("CARGO_PKG_VERSION"))?
-        {
+        if release.manifest.version != env!("CARGO_PKG_VERSION") {
             let target_engine = safe_path(&release.root, "devkit")?;
             let target_sha = crate::delivery::file_digest(&target_engine)?;
             ensure!(
                 std::env::var("DEVKIT_UPDATE_DELEGATED").ok().as_deref()
                     != Some(target_sha.as_str()),
-                "Forward update delegation did not converge"
+                "Update delegation did not converge"
             );
             crate::processes::restore_exec_pdeathsig(runner)?;
             let mut delegated = std::process::Command::new(&target_engine);
@@ -284,6 +347,11 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         let old = crate::state::read_project_state(&root)?;
         (old, release)
     } else {
+        crate::state::ensure_supported_checkout_floor(
+            &root,
+            false,
+            crate::state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
         let old = crate::state::read_project_state(&root)?;
         let release = cache.acquire(
             &old.version,
@@ -602,7 +670,7 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
             "Exact Devkit version to accept",
             Some(env!("CARGO_PKG_VERSION")),
         )?;
-        crate::files::version(&version)?;
+        ensure_supported_target_version(&version)?;
         options.set("--to", version);
     }
     Ok(())

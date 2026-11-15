@@ -193,6 +193,13 @@ fn parse_release(root: &Path) -> Result<Release> {
         "Unsupported release schemaVersion"
     );
     version(&release.version)?;
+    if let Some(min) = &release.min_supported_from_version {
+        version(min)?;
+        ensure!(
+            SemVer::parse(min)? <= SemVer::parse(&release.version)?,
+            "Release minSupportedFromVersion exceeds release version"
+        );
+    }
     version(&release.rust_version)?;
     ensure!(
         release.environment.name == "@docouno/env"

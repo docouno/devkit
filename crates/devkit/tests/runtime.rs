@@ -47,7 +47,7 @@ fn state(version: &str) -> ProjectState {
 }
 #[test]
 fn compose_selected_profiles_and_optional_dependencies_match_native_reachability() {
-    let state = state("0.3.0");
+    let state = state("0.5.0");
     let model = json!({"services":{"web":{"profiles":["client"],"depends_on":{"api":{"required":true},"extra":{"required":false}}},"api":{},"extra":{"profiles":["unused"]},"desktop":{}}});
     assert_eq!(
         development_components(&state, &model, "web").unwrap(),
@@ -62,65 +62,49 @@ fn compose_selected_profiles_and_optional_dependencies_match_native_reachability
     );
 }
 #[test]
-fn old_desktop_projection_stays_shell_compatible_while_native_uses_same_elf() {
-    let old = render_app_compose_value(&state("0.2.1")).unwrap();
-    assert_eq!(
-        old["services"]["desktop"]["command"],
-        json!(["bash", "/workspace/.devkit/runtime/desktop-dev.sh"])
-    );
-    let new = render_app_compose_value(&state("0.3.0")).unwrap();
-    assert_eq!(
-        new["services"]["desktop"]["command"],
-        json!(["/devkit/devkit", "internal", "desktop"])
-    );
-    assert!(
-        new["services"]["desktop"]["volumes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["target"] == "/devkit/devkit" && v["read_only"] == true)
-    );
-    assert!(
-        !old["services"]["desktop"]["volumes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["target"] == "/devkit/devkit")
-    );
+fn desktop_projection_always_mounts_accepted_native_engine_read_only() {
+    for ver in ["0.4.1", "0.5.0"] {
+        let rendered = render_app_compose_value(&state(ver)).unwrap();
+        assert_eq!(
+            rendered["services"]["desktop"]["command"],
+            json!(["/devkit/devkit", "internal", "desktop"])
+        );
+        assert!(
+            rendered["services"]["desktop"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["target"] == "/devkit/devkit" && v["read_only"] == true)
+        );
+    }
 }
 #[test]
-fn tool_pin_parser_never_evaluates_shell_and_rejects_duplicate_or_unpinned_images() {
+fn tool_pin_parser_never_evaluates_shell_and_requires_pinned_engine_and_images() {
     let source = format!(
-        "DEVKIT_VERSION=0.3.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
+        "DEVKIT_VERSION=0.5.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
         "a".repeat(64),
         "b".repeat(64),
         "c".repeat(64),
         "d".repeat(64)
     );
-    assert!(ToolPins::parse(source.as_bytes()).is_ok());
-    let legacy = source
+    let parsed = ToolPins::parse(source.as_bytes()).unwrap();
+    assert_eq!(parsed.engine.version, "0.5.0");
+    let without_engine = source
         .lines()
         .filter(|line| !line.starts_with("DEVKIT_ENGINE_"))
         .collect::<Vec<_>>()
-        .join("\n")
-        .replace("DEVKIT_VERSION=0.3.0", "DEVKIT_VERSION=0.2.1");
-    assert!(ToolPins::parse(legacy.as_bytes()).unwrap().engine.is_none());
-    assert!(
-        ToolPins::parse(
-            legacy
-                .replace("DEVKIT_VERSION=0.2.1", "DEVKIT_VERSION=0.3.0")
-                .as_bytes()
-        )
-        .is_err()
-    );
-    assert!(
-        ToolPins::parse(
-            source
-                .replace("DEVKIT_VERSION=0.3.0", "DEVKIT_VERSION=0.2.1")
-                .as_bytes()
-        )
-        .is_err()
-    );
+        .join("\n");
+    for ver in ["0.2.1", "0.4.1", "0.5.0"] {
+        assert!(
+            ToolPins::parse(
+                without_engine
+                    .replace("DEVKIT_VERSION=0.5.0", &format!("DEVKIT_VERSION={ver}"))
+                    .as_bytes()
+            )
+            .is_err(),
+            "missing DEVKIT_ENGINE_* must fail for {ver}"
+        );
+    }
     assert!(
         ToolPins::parse(
             source
@@ -129,7 +113,7 @@ fn tool_pin_parser_never_evaluates_shell_and_rejects_duplicate_or_unpinned_image
         )
         .is_err()
     );
-    assert!(ToolPins::parse(format!("{source}DEVKIT_VERSION=0.3.0\n").as_bytes()).is_err());
+    assert!(ToolPins::parse(format!("{source}DEVKIT_VERSION=0.5.0\n").as_bytes()).is_err());
     assert!(
         ToolPins::parse(
             source
@@ -167,7 +151,7 @@ fn node_snapshot_is_projected_before_cargo_but_full_recheck_retains_namespace_ba
     use devkit::{files::write_json, native::admit_native_components};
     let temp = tempfile::TempDir::new().unwrap();
     let root = temp.path();
-    let state = state("0.3.0");
+    let state = state("0.5.0");
     let root_manifest = json!({"name":"fixture","version":"1.0.0","private":true,"workspaces":["apps/desktop","apps/web"]});
     write_json(&root.join("package.json"), &root_manifest).unwrap();
     let mut lock = json!({"lockfileVersion":3,"packages":{"":root_manifest}});
@@ -202,7 +186,7 @@ fn node_snapshot_is_projected_before_cargo_but_full_recheck_retains_namespace_ba
     ] {
         std::fs::write(root.join("apps/api").join(name), contents).unwrap();
     }
-    write_json(&root.join(".devkit/tooling-profiles.json"),&json!({"schemaVersion":1,"version":"0.3.0","packageMode":"registry","profiles":{"web":{},"electron":{},"rust":{}}})).unwrap();
+    write_json(&root.join(".devkit/tooling-profiles.json"),&json!({"schemaVersion":1,"version":"0.5.0","packageMode":"registry","profiles":{"web":{},"electron":{},"rust":{}}})).unwrap();
     let first = admit_native_components(root, &state).unwrap();
     std::fs::write(
         root.join("apps/api/rustfmt.toml"),
@@ -691,5 +675,328 @@ exit 90
             .as_str()
             .is_some_and(|v| v.starts_with("--max-old-space-size=")),
         "attempt 2 missing fallback NODE_OPTIONS: {svc2}"
+    );
+}
+
+#[test]
+fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_build() {
+    use devkit::{
+        delivery::file_digest,
+        files::{digest, identity, write_atomic, write_json},
+        native::admit_native_components,
+        projections::{render_app_compose_value, render_project_make, render_workspace_compose},
+        state::{CHECKSUM_PATH, MANIFEST_PATH},
+    };
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, process::Command};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join(".devkit/runtime")).unwrap();
+    fs::create_dir_all(root.join(".devkit/state")).unwrap();
+    fs::create_dir_all(root.join("apps/api/src")).unwrap();
+
+    let exe = Path::new(env!("CARGO_BIN_EXE_devkit"));
+    let engine_sha = file_digest(exe).unwrap();
+    let ver = env!("CARGO_PKG_VERSION");
+    let rust_dockerfile = b"FROM rust:1.99.1-bookworm\n";
+    let rust_recipe = digest(rust_dockerfile);
+    let desktop_recipe = "c".repeat(64);
+    let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
+
+    let toolchains = format!(
+        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_recipe}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_recipe}\n"
+    );
+    write_atomic(
+        &root.join(".devkit/runtime/toolchains.env"),
+        toolchains.as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    write_atomic(
+        &root.join(".devkit/runtime/rust.Dockerfile"),
+        rust_dockerfile,
+        0o644,
+    )
+    .unwrap();
+    for stub in [
+        ".devkit/runtime/devkit.mk",
+        ".devkit/runtime/devkit.sh",
+        ".devkit/runtime/compose.tools.yaml",
+    ] {
+        write_atomic(&root.join(stub), b"{}\n", 0o644).unwrap();
+    }
+    write_json(
+        &root.join(".devkit/tooling-profiles.json"),
+        &json!({"schemaVersion":1,"version":ver,"packageMode":"local","profiles":{"rust":{}}}),
+    )
+    .unwrap();
+    write_atomic(
+        &root.join("apps/api/Cargo.toml"),
+        b"[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        0o644,
+    )
+    .unwrap();
+    write_atomic(
+        &root.join("apps/api/Cargo.lock"),
+        b"version = 4\n\n[[package]]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        0o644,
+    )
+    .unwrap();
+    write_atomic(
+        &root.join("apps/api/rust-toolchain.toml"),
+        b"[toolchain]\nchannel = \"1.99.1\"\n",
+        0o644,
+    )
+    .unwrap();
+    write_atomic(
+        &root.join("apps/api/rustfmt.toml"),
+        b"edition = \"2024\"\n",
+        0o644,
+    )
+    .unwrap();
+    write_atomic(&root.join("apps/api/src/main.rs"), b"fn main() {}\n", 0o644).unwrap();
+
+    let seed_state: ProjectState = serde_json::from_value(json!({
+        "schemaVersion": 2,
+        "version": ver,
+        "releaseIdentity": "0".repeat(64),
+        "generation": "00000000-0000-4000-8000-000000000000",
+        "packageMode": "local",
+        "managed": {},
+        "components": {
+            "apps/api": {
+                "role": "app",
+                "toolchain": "rust",
+                "toolingProfile": "rust",
+                "origin": { "template": "rust-api", "version": ver },
+                "toolDependencies": {},
+                "dependencies": [],
+                "development": { "owner": "managed", "kind": "compose", "service": "api" }
+            }
+        }
+    }))
+    .unwrap();
+    let native = admit_native_components(&root, &seed_state).unwrap();
+    write_atomic(
+        &root.join(".devkit/project.mk"),
+        render_project_make(&seed_state).as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    write_json(
+        &root.join(".devkit/compose.apps.yaml"),
+        &render_app_compose_value(&seed_state).unwrap(),
+    )
+    .unwrap();
+    write_atomic(
+        &root.join(".devkit/compose.workspace.json"),
+        &render_workspace_compose(&seed_state, &native.inputs).unwrap(),
+        0o644,
+    )
+    .unwrap();
+
+    let mut managed = BTreeMap::new();
+    for path in [
+        ".devkit/project.mk",
+        ".devkit/compose.apps.yaml",
+        ".devkit/compose.workspace.json",
+        ".devkit/tooling-profiles.json",
+        ".devkit/runtime/devkit.mk",
+        ".devkit/runtime/devkit.sh",
+        ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/toolchains.env",
+        ".devkit/runtime/rust.Dockerfile",
+        "apps/api/rust-toolchain.toml",
+    ] {
+        managed.insert(
+            path.to_string(),
+            identity(&root.join(path)).unwrap().unwrap(),
+        );
+    }
+    let checksum_body: String = managed
+        .iter()
+        .map(|(p, id)| format!("{}  {p}\n", id.sha256))
+        .collect();
+    write_atomic(&root.join(CHECKSUM_PATH), checksum_body.as_bytes(), 0o644).unwrap();
+    managed.insert(
+        CHECKSUM_PATH.to_string(),
+        identity(&root.join(CHECKSUM_PATH)).unwrap().unwrap(),
+    );
+    let mut final_state = seed_state;
+    final_state.managed = managed;
+    write_json(
+        &root.join(MANIFEST_PATH),
+        &serde_json::to_value(&final_state).unwrap(),
+    )
+    .unwrap();
+
+    let img_id = format!("sha256:{}", "e".repeat(64));
+    let derived_tag = format!("devkit-derived-rust:{rust_recipe}");
+    write_atomic(
+        &root.join(".devkit/state/rust-image"),
+        format!("{img_id}\n").as_bytes(),
+        0o644,
+    )
+    .unwrap();
+
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let docker_log = temp.path().join("docker.log");
+    let mode_file = temp.path().join("tag-mode");
+    fs::write(&mode_file, "present").unwrap();
+    let docker_script = fake_bin.join("docker");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
+  printf 'v5.0.2\n'
+  exit 0
+fi
+if [ "$1" = "info" ]; then
+  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "tag" ]; then
+  exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  if [ "$last" = "{img_id}" ]; then
+    printf '{pin}\n'
+    exit 0
+  fi
+  if [ "$last" = "{tag}" ]; then
+    if [ "$(cat "{mode}")" = "present" ]; then
+      printf '{img_id}\n{pin}\n'
+      exit 0
+    fi
+    exit 1
+  fi
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--iidfile" ]; then
+      printf '{img_id}\n' > "$arg"
+    fi
+    prev="$arg"
+  done
+  exit 0
+fi
+if [ "$1" = "run" ]; then
+  exit 0
+fi
+exit 0
+"#,
+        log = docker_log.display(),
+        img_id = img_id,
+        pin = rust_recipe,
+        tag = derived_tag,
+        mode = mode_file.display(),
+    );
+    fs::write(&docker_script, script).unwrap();
+    fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
+    );
+
+    // 1. Non-prepare (`exec` without `--prepare`) hits `.devkit/state/rust-image` without mutating daemon tags.
+    fs::write(&docker_log, "").unwrap();
+    let check_out = Command::new(exe)
+        .args([
+            "exec",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        check_out.status.success(),
+        "exec failed: {}",
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+    let log1 = fs::read_to_string(&docker_log).unwrap();
+    assert!(
+        !log1.contains("image tag"),
+        "non-prepare tagged image: {log1}"
+    );
+    assert!(!log1.contains("build "), "non-prepare built image: {log1}");
+
+    // 2. Prepare (`task setup`) hits `.devkit/state/rust-image` and idempotently applies `devkit-derived-rust:<pin>`.
+    fs::write(&docker_log, "").unwrap();
+    let setup_hit = Command::new(exe)
+        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .env("PATH", &path_env)
+        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .output()
+        .unwrap();
+    assert!(
+        setup_hit.status.success(),
+        "task setup (state hit) failed: {}",
+        String::from_utf8_lossy(&setup_hit.stderr)
+    );
+    let log2 = fs::read_to_string(&docker_log).unwrap();
+    assert!(
+        log2.contains(&format!("image tag {img_id} {derived_tag}")),
+        "prepare on existing state did not apply local tag: {log2}"
+    );
+    assert!(
+        !log2.contains("build "),
+        "prepare on existing state ran build: {log2}"
+    );
+
+    // 3. Fresh checkout without `.devkit/state/rust-image` reuses local tag without `docker build`.
+    fs::remove_file(root.join(".devkit/state/rust-image")).unwrap();
+    fs::write(&docker_log, "").unwrap();
+    let setup_tag_hit = Command::new(exe)
+        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .env("PATH", &path_env)
+        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .output()
+        .unwrap();
+    assert!(
+        setup_tag_hit.status.success(),
+        "task setup (tag hit) failed: {}",
+        String::from_utf8_lossy(&setup_tag_hit.stderr)
+    );
+    let log3 = fs::read_to_string(&docker_log).unwrap();
+    assert!(
+        !log3.contains("build "),
+        "tag hit unexpectedly ran docker build: {log3}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".devkit/state/rust-image")).unwrap(),
+        format!("{img_id}\n")
+    );
+
+    // 4. Cold daemon without state or local tag runs `docker build --tag devkit-derived-rust:<pin>`.
+    fs::remove_file(root.join(".devkit/state/rust-image")).unwrap();
+    fs::write(&mode_file, "absent").unwrap();
+    fs::write(&docker_log, "").unwrap();
+    let setup_cold = Command::new(exe)
+        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .env("PATH", &path_env)
+        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .output()
+        .unwrap();
+    assert!(
+        setup_cold.status.success(),
+        "task setup (cold build) failed: {}",
+        String::from_utf8_lossy(&setup_cold.stderr)
+    );
+    let log4 = fs::read_to_string(&docker_log).unwrap();
+    assert!(
+        log4.contains(&format!("--tag {derived_tag}")),
+        "cold docker build missing --tag {derived_tag}: {log4}"
     );
 }

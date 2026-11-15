@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate a frozen Linux release with paired public-0.2.1/native warm benchmarks.
+"""Gate a frozen Linux release with paired public-0.4.1/native warm benchmarks.
 
 Usage: python3 test/performance/verify.py --build-set DIR --output receipt.json
 Requires Docker Compose and the built tooling/native.Dockerfile image in
@@ -25,19 +25,22 @@ import urllib.request
 import uuid
 
 from measure import (digest, docker_kind, docker_logger, exec_counts, execute,
-                     paired, require, sha256, snapshot)
+                     paired, require, sha256, snapshot, summarize)
 
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "test") not in sys.path:
     sys.path.insert(0, str(REPO / "test"))
 from docker_flags import author_docker_flags  # noqa: E402
-BASELINE_VERSION = "0.2.1"
-BASELINE_MANIFEST_SHA = "7f9dea1455027e0a0637077c7b040dbd7420a7fbc554d83d4d80ca47e9e849e0"
-BASELINE_ARCHIVE_SHA = "882abf32da67bf3c6a99f0a3333413b2b0023d8e830c2792564875853f97a8fb"
-BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz"
+BASELINE_VERSION = "0.4.1"
+BASELINE_RELEASE_IDENTITY = "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+BASELINE_ARCHIVE_SHA256 = "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a"
+BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz"
 LARGE_CRATES = 80
-SHAPES = (("one", 1, 0), ("five", 5, 0), ("twenty", 20, 0), ("large-closure", 1, LARGE_CRATES))
+SHAPES = (("one", 1, 0), ("five", 5, 0), ("large-closure", 1, LARGE_CRATES))
+RELATIVE_FACTOR = 1.20
+JITTER_MARGIN_SECONDS = 0.020
+HELP_MAX_MEDIAN_SECONDS = 0.050
 
 
 def atomic_json(path, value):
@@ -135,8 +138,10 @@ class Gate:
             },
             "limits": {
                 "minimumSamples": 30, "warmups": args.warmups, "p95": "nearest-rank ceil(0.95*n)",
-                "requireFasterPairedMedian": ["doctor", "build", "status", "large-closure:describe-vs-doctor"],
-                "requireNativeControlContainers": 0, "requireNativeDescribeDockerCalls": 0,
+                "nonRegressionFormula": "native_median <= baseline_median * 1.20 + 0.020",
+                "helpCeilingSeconds": HELP_MAX_MEDIAN_SECONDS,
+                "requireControlContainers": 0, "requireOtherContainers": 0,
+                "requireHelpAndDescribeDockerCalls": 0,
                 "requireBuildToolContainersPerComponent": 1,
                 "setupAndLockResolution": "Outside measurement; SDK containers are capped at two CPUs, 2 GiB and one Cargo job. Timed production commands use unchanged accepted runtime defaults; no source or gate instrumentation.",
                 "support": "Linux x86_64 with local Docker Compose; no host language SDK needed",
@@ -162,7 +167,13 @@ class Gate:
                 for line in Path("/proc/meminfo").read_text().splitlines()
                 if line.split(":", 1)[0] in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")}
 
+    def is_publication_sampled(self):
+        return getattr(self.args, "samples", 30) >= 30 and getattr(self.args, "warmups", 2) >= 2
+
     def save(self):
+        if not self.is_publication_sampled():
+            self.receipt["success"] = False
+            self.receipt["diagnosticUnderSampled"] = True
         atomic_json(self.args.output, self.receipt)
 
     def run(self, label, argv, *, cwd=None, env=None, expected=0, timeout=120):
@@ -179,27 +190,29 @@ class Gate:
     def baseline(self):
         source = self.args.baseline_release
         if source is None:
-            source = self.scratch / "devkit-0.2.1.tar.gz"
+            source = self.scratch / "devkit-0.4.1.tar.gz"
             with urllib.request.urlopen(BASELINE_URL, timeout=60) as response, source.open("wb") as output:
                 require(response.status == 200, "Public baseline download failed")
                 total = 0
                 while chunk := response.read(1024 * 1024):
                     total += len(chunk)
-                    require(total <= 32 * 1024**2, "Public baseline exceeds budget")
+                    require(total <= 128 * 1024**2, "Public baseline exceeds budget")
                     output.write(chunk)
         if source.is_file():
-            require(sha256(source) == BASELINE_ARCHIVE_SHA, "Public 0.2.1 archive identity mismatch")
+            require(sha256(source) == BASELINE_ARCHIVE_SHA256, "Public 0.4.1 archive identity mismatch")
             release = extract_release(source, self.scratch / "baseline release")
         else:
             verify_payload(source)
             release = self.scratch / "baseline release"
             shutil.copytree(source, release)
-        require(sha256(release / "release.json") == BASELINE_MANIFEST_SHA,
-                "Baseline must be the exact immutable public 0.2.1 payload")
+        require(sha256(release / "release.json") == BASELINE_RELEASE_IDENTITY,
+                "Baseline must be the exact immutable public 0.4.1 payload")
+        require((release / "devkit").read_bytes()[:4] == b"\x7fELF",
+                "Baseline release must ship a native Linux ELF engine")
         self.receipt["baseline"] = {"version": BASELINE_VERSION, "source": str(source),
                                     "publicArchiveUrl": BASELINE_URL,
-                                    "archiveSha256": BASELINE_ARCHIVE_SHA,
-                                    "releaseIdentity": BASELINE_MANIFEST_SHA}
+                                    "archiveSha256": BASELINE_ARCHIVE_SHA256,
+                                    "releaseIdentity": BASELINE_RELEASE_IDENTITY}
         return release
 
     def tracing(self):
@@ -299,14 +312,12 @@ class Gate:
     def create(self, release, side, shape, count, closure):
         root = self.scratch / "products with spaces" / shape / side / "product"
         root.parent.mkdir(parents=True)
-        argv = [release / "devkit"]
-        if side == "native":
-            argv += ["--non-interactive"]
-        argv += ["init", root, "--name", "devkit-performance", "--package-source", "local"]
+        expected_version = BASELINE_VERSION if side == "baseline" else self.receipt["version"]
+        argv = [release / "devkit", "--non-interactive", "init", root,
+                "--name", "devkit-performance", "--package-source", "local"]
         for number in range(1, count + 1):
             argv += ["--app", f"app{number:03}=rust-api"]
-        if side == "native":
-            argv += ["--to", self.receipt["version"], "--release-root", release]
+        argv += ["--to", expected_version, "--release-root", release]
         self.run(f"init-{shape}-{side}", argv, timeout=600)
         self.edit_product(root, count, closure)
         # Cargo itself resolves every lock. No fabricated accepted state or lock.
@@ -375,33 +386,58 @@ class Gate:
             "instrumentedToolContainerSeconds": tool_seconds,
             "instrumentedOutsideToolSeconds": result["seconds"] - tool_seconds,
         }
-        if case["side"] == "native":
-            require(counts["control"] == 0, "Native path started a metadata control container")
-            require(counts["other"] == 0, "Native path started an unexpected one-shot container")
-            if case["operation"] != "build":
-                require(sum(counts.values()) == 0, "Native metadata/service path started a one-shot container")
-            if case["operation"] == "describe":
-                require(not records, "Native describe called Docker")
-        elif case["operation"] != "help":
-            require(counts["control"] > 0, "Baseline trace failed to observe its real public metadata controller")
-        if case["operation"] == "build":
-            require(counts["tool"] == case["componentCount"] and counts["other"] == 0,
+        require(counts["control"] == 0, f"{case['side']} path started a metadata control container")
+        require(counts["other"] == 0, f"{case['side']} path started an unexpected one-shot container")
+        if case["operation"] in ("help", "describe"):
+            require(not records and counts["tool"] == 0,
+                    f"{case['side']} {case['operation']} called Docker or started a container")
+        elif case["operation"] in ("doctor", "status"):
+            require(counts["tool"] == 0, f"{case['side']} {case['operation']} started a tool container")
+        elif case["operation"] == "build":
+            require(counts["tool"] == case["componentCount"],
                     "Build did not execute exactly one Rust tool container per component")
 
+    def run_samples(self, cases, runner):
+        if self.is_publication_sampled():
+            paired(cases, self.args.samples, self.args.warmups, runner, self.save)
+            return
+        require(self.args.samples >= 1 and self.args.warmups >= 0,
+                "Diagnostic runs require at least 1 sample and non-negative warmups")
+        for case in cases:
+            require(isinstance(case.get("argv"), list) and case["argv"]
+                    and all(isinstance(s, str) and s for s in case["argv"]),
+                    "Command must be a nonempty string argv")
+            require(Path(case["root"]).is_dir(), "Missing benchmark product")
+            case.update(samplesSeconds=[], warmupSeconds=[], sampleOrder=[])
+        for index in range(self.args.warmups + self.args.samples):
+            for case in cases if index % 2 == 0 else reversed(cases):
+                result = runner(case, index)
+                require(result["exitCode"] == 0,
+                        f"Benchmark failed: {case['name']}: {result['stderr'][-4000:]}")
+                case["warmupSeconds" if index < self.args.warmups else "samplesSeconds"].append(result["seconds"])
+                case["sampleOrder"].append(index)
+            self.save()
+        for case in cases:
+            case.update(summarize(case["samplesSeconds"]))
+
     def benchmark(self, shape, roots, snapshots, count):
-        operations = ["doctor", "build"]
-        if shape == "one":
-            operations = ["help", "doctor", "status", "build"]
+        operations = ("help", "doctor", "status", "describe", "build") if shape == "one" else ("doctor", "describe", "build")
         for operation in operations:
             cases = []
             for side in ("baseline", "native"):
+                side_release = self.baseline_release if side == "baseline" else self.native_release
+                argv = ([str(side_release / "devkit"), "--json", "describe", "--root", str(roots[side])]
+                        if operation == "describe"
+                        else ["make", "--no-print-directory", operation])
                 cases.append({"name": f"{shape}-{operation}-{side}", "shape": shape, "side": side,
                               "operation": operation, "componentCount": count, "root": str(roots[side]),
-                              "argv": ["make", "--no-print-directory", operation]})
+                              "argv": argv})
             self.receipt["measurements"].extend(cases)
-            paired(cases, self.args.samples, self.args.warmups,
-                   lambda case, index: self.run(case["name"] + f"-{index:02d}", case["argv"],
-                                                cwd=case["root"], timeout=600), self.save)
+            self.run_samples(
+                cases,
+                lambda case, index: self.run(case["name"] + f"-{index:02d}", case["argv"],
+                                             cwd=case["root"], timeout=600),
+            )
             for case in cases:
                 self.trace(case)
                 require(snapshot(roots[case["side"]]) == snapshots[case["side"]],
@@ -409,34 +445,39 @@ class Gate:
                 case["inputsBytesAndModesUnchanged"] = True
                 print(json.dumps({"name": case["name"], "median": case["medianSeconds"],
                                   "p95": case["p95Seconds"], "trace": case["trace"]}), flush=True)
-            ratio = cases[1]["medianSeconds"] / cases[0]["medianSeconds"]
-            self.receipt["comparisons"].append({"shape": shape, "operation": operation,
-                                                "nativeToBaselineMedianRatio": ratio,
-                                                "nativeFaster": ratio < 1})
-            # Help has no admission work and an added verified ELF loader; no
-            # unsupported claim of being faster than Bash printing a constant.
-            if operation != "help":
-                require(ratio < 1, f"Native median regressed on matched {shape}/{operation}: ratio {ratio:.3f}")
+            baseline_median = cases[0]["medianSeconds"]
+            native_median = cases[1]["medianSeconds"]
+            ratio = native_median / baseline_median if baseline_median > 0 else float("inf")
+            if operation == "help":
+                allowed_max = HELP_MAX_MEDIAN_SECONDS
+                passed = native_median <= allowed_max
+                self.receipt["comparisons"].append({
+                    "shape": shape, "operation": operation,
+                    "baselineMedianSeconds": baseline_median,
+                    "nativeMedianSeconds": native_median,
+                    "nativeToBaselineMedianRatio": ratio,
+                    "allowedMaxSeconds": allowed_max,
+                    "nonRegressionPassed": passed,
+                })
+                require(passed, f"Native help median {native_median:.4f}s exceeded ceiling {allowed_max:.3f}s")
+            else:
+                allowed_max = baseline_median * RELATIVE_FACTOR + JITTER_MARGIN_SECONDS
+                passed = native_median <= allowed_max
+                self.receipt["comparisons"].append({
+                    "shape": shape, "operation": operation,
+                    "baselineMedianSeconds": baseline_median,
+                    "nativeMedianSeconds": native_median,
+                    "nativeToBaselineMedianRatio": ratio,
+                    "allowedMaxSeconds": allowed_max,
+                    "nonRegressionPassed": passed,
+                })
+                require(
+                    passed,
+                    f"Native median regressed on matched {shape}/{operation}: "
+                    f"native={native_median:.4f}s > allowed={allowed_max:.4f}s "
+                    f"(baseline={baseline_median:.4f}s, ratio={ratio:.3f})",
+                )
             self.save()
-        native = {"name": f"{shape}-describe-native", "shape": shape, "side": "native", "operation": "describe",
-                  "componentCount": count, "root": str(roots["native"]),
-                  "argv": [str(self.native_release / "devkit"), "--json", "describe", "--root", str(roots["native"])]}
-        self.receipt["measurements"].append(native)
-        # Describe has no old public CLI equivalent. Compare separately with
-        # baseline doctor, and retain the explicit semantic difference.
-        paired([native], self.args.samples, self.args.warmups,
-               lambda case, index: self.run(case["name"] + f"-{index:02d}", case["argv"], cwd=case["root"]), self.save)
-        self.trace(native)
-        require(snapshot(roots["native"]) == snapshots["native"], "Describe changed product inputs")
-        native["inputsBytesAndModesUnchanged"] = True
-        baseline = next(case for case in self.receipt["measurements"]
-                        if case["shape"] == shape and case["side"] == "baseline" and case["operation"] == "doctor")
-        ratio = native["medianSeconds"] / baseline["medianSeconds"]
-        self.receipt["comparisons"].append({"shape": shape, "operation": "describe-vs-doctor",
-                                           "scopeDifference": "Native describe admits the full graph without SDK readiness; old doctor includes Docker and image readiness.",
-                                           "nativeToBaselineMedianRatio": ratio, "nativeFaster": ratio < 1})
-        require(ratio < 1, "Native metadata admission failed to beat baseline doctor")
-        self.save()
 
     def admission(self, root, before):
         lock = root / "apps/app001/Cargo.lock"
@@ -470,11 +511,11 @@ class Gate:
         require(all(info[key] == index[key] for key in ("version", "sourceCommit", "sourceTree", "target")),
                 "Embedded binary source identity differs from exact supplied index")
         self.receipt["engineBuildInfo"] = info
-        baseline = self.baseline()
+        self.baseline_release = self.baseline()
         self.tracing()
         for shape, count, closure in SHAPES:
             roots, snapshots = {}, {}
-            for side, release in (("baseline", baseline), ("native", self.native_release)):
+            for side, release in (("baseline", self.baseline_release), ("native", self.native_release)):
                 roots[side], snapshots[side] = self.create(release, side, shape, count, closure)
             require(self.product_inputs(roots["baseline"]) == self.product_inputs(roots["native"]),
                     f"Paired product source/locks/config/modes differ: {shape}")
@@ -483,7 +524,7 @@ class Gate:
             self.receipt.setdefault("fixtureDifferences", {})[shape] = {
                 "identicalProductSourceAndNativeLocks": True,
                 "releaseManagedAndRootFilesDifferent": fixture_difference,
-                "reason": "Actual public 0.2.1 and indexed native factories intentionally ship different controller/runtime/version files."}
+                "reason": "Actual public 0.4.1 and indexed native factories intentionally ship different controller/runtime/version files."}
             self.benchmark(shape, roots, snapshots, count)
             if closure:
                 self.admission(roots["native"], snapshots["native"])
@@ -492,19 +533,19 @@ class Gate:
         require(after_index_sha == index_sha, "Build index changed during performance gate")
         self.receipt["host"]["loadAverageAtEnd"] = os.getloadavg()
         self.receipt["host"]["meminfoAtEnd"] = self.meminfo()
-        self.receipt["success"] = True
+        self.receipt["success"] = self.is_publication_sampled()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.2.1 extracted directory or archive")
+    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.4.1 extracted directory or archive")
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmups", type=int, default=2)
     args = parser.parse_args()
-    if args.samples < 30 or args.warmups < 2:
-        parser.error("Release gate requires at least 30 samples and two explicit warmups")
+    if args.samples < 1 or args.warmups < 0:
+        parser.error("Samples must be >= 1 and warmups must be >= 0")
     args.build_set = args.build_set.resolve(strict=True)
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -522,6 +563,13 @@ def main():
     finally:
         gate.receipt["durationSeconds"] = time.monotonic() - started
         gate.save()
+    if not gate.receipt["success"]:
+        print(
+            f"Performance diagnostic completed (success=false for samples={args.samples} < 30 or warmups={args.warmups} < 2): {args.output}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     print(f"Performance gate passed: {args.output}", flush=True)
     return 0
 

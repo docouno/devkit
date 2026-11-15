@@ -14,9 +14,9 @@ use sha2::{Digest, Sha512};
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 use tempfile::TempDir;
 
@@ -32,11 +32,15 @@ fn sri(bytes: &[u8]) -> String {
 fn seal(root: &Path, version: &str) {
     remove_file(&root.join("release.json")).unwrap();
     let archive = format!("npm/env-{version}.tgz");
+    let min_supported_from_version = (SemVer::parse(version).unwrap()
+        >= SemVer::parse("0.5.0").unwrap())
+    .then(|| "0.4.0".to_string());
     write_json(
         &root.join("release.json"),
         &Release {
             schema_version: 1,
             version: version.to_string(),
+            min_supported_from_version,
             rust_version: "1.99.1".to_string(),
             environment: Environment {
                 name: "@docouno/env".to_string(),
@@ -60,10 +64,16 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             format!("fixture {name} {version}\n").as_bytes(),
         );
     }
-    if version.starts_with("0.2.") {
-        put(&root, "runtime/project.mjs", b"legacy managed controller\n");
-    }
-    put(&root, "runtime/toolchains.env", format!("DEVKIT_VERSION={version}\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\n").as_bytes());
+    let engine_sha = digest(format!("fixture-engine-{version}").as_bytes());
+    let recipe_hash = "b".repeat(64);
+    put(
+        &root,
+        "runtime/toolchains.env",
+        format!(
+            "DEVKIT_VERSION={version}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        )
+        .as_bytes(),
+    );
     // These tests prove engine identity and transactions, not npm installation.
     put(
         &root,
@@ -208,8 +218,12 @@ fn preserved(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn release_admission_is_exact_and_npm_import_normalizes_only_modes() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let admitted = admit_release(&release).unwrap();
+    assert_eq!(
+        admitted.manifest.min_supported_from_version.as_deref(),
+        Some("0.4.0")
+    );
     let raw = fs::read(release.join("release.json")).unwrap();
     assert_eq!(admitted.identity, digest(&raw));
     put(&release, "extra", b"unknown");
@@ -224,12 +238,12 @@ fn release_admission_is_exact_and_npm_import_normalizes_only_modes() {
     let canonical = f.path().join("canonical");
     let imported = import_npm_payload(&source, &canonical).unwrap();
     assert_eq!(imported.identity, admitted.identity);
-    put(&source, "npm/env-0.3.0.tgz", b"changed env bytes");
+    put(&source, "npm/env-0.5.0.tgz", b"changed env bytes");
     assert!(import_npm_payload(&source, &f.path().join("rejected")).is_err());
     assert!(!f.path().join("rejected").exists());
     let mut forged: Value = read_json(&release.join("release.json")).unwrap();
-    put(&release, "npm/env-0.3.0.tgz", b"new env archive");
-    forged["files"]["npm/env-0.3.0.tgz"]["sha256"] = json!(digest(b"new env archive"));
+    put(&release, "npm/env-0.5.0.tgz", b"new env archive");
+    forged["files"]["npm/env-0.5.0.tgz"]["sha256"] = json!(digest(b"new env archive"));
     put_json(&release, "release.json", &forged);
     assert!(
         admit_release(&release)
@@ -242,10 +256,13 @@ fn release_admission_is_exact_and_npm_import_normalizes_only_modes() {
 #[test]
 fn public_schema2_update_preserves_unknown_fields_and_product_bytes() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    put(&old, "runtime/obsolete-helper.sh", b"old helper\n");
+    seal(&old, "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("rust product with spaces");
     init(&old, &target, "rust", PackageMode::Local);
+    assert!(target.join(".devkit/runtime/obsolete-helper.sh").exists());
     let mut state: Value = read_json(&target.join(MANIFEST_PATH)).unwrap();
     state["future"] = json!({"flag":false,"n":null});
     state["components"]["apps/api"]["future"] = json!([1, 2]);
@@ -285,8 +302,8 @@ fn public_schema2_update_preserves_unknown_fields_and_product_bytes() {
     let bytes = preserved(&target, &names);
     let outcome = update_project(&new, &target, &UpdateOptions::default(), &NoResolver).unwrap();
     assert!(outcome.applied);
-    assert_eq!(outcome.state.version, "0.3.0");
-    assert!(!target.join(".devkit/runtime/project.mjs").exists());
+    assert_eq!(outcome.state.version, "0.5.0");
+    assert!(!target.join(".devkit/runtime/obsolete-helper.sh").exists());
     assert_eq!(preserved(&target, &names), bytes);
     let accepted: Value = read_json(&target.join(MANIFEST_PATH)).unwrap();
     assert_eq!(accepted["future"], state["future"]);
@@ -296,14 +313,14 @@ fn public_schema2_update_preserves_unknown_fields_and_product_bytes() {
             state["components"]["apps/api"][field]
         );
     }
-    read_runtime_project(&target, "0.3.0").unwrap();
+    read_runtime_project(&target, "0.5.0").unwrap();
 }
 
 #[test]
 fn preview_is_read_only_noop_is_byte_stable_and_local_registry_is_transactional() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.0");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("project");
     let initial = init(&old, &target, "node", PackageMode::Local);
     let before = source_signature(&target, Some(&initial)).unwrap();
@@ -341,10 +358,10 @@ fn preview_is_read_only_noop_is_byte_stable_and_local_registry_is_transactional(
     .unwrap();
     assert!(registry.applied && !registry.no_op);
     assert_ne!(registry.state.generation, no_op.state.generation);
-    assert!(!target.join(".devkit/npm/env-0.3.0.tgz").exists());
+    assert!(!target.join(".devkit/npm/env-0.5.0.tgz").exists());
     assert_eq!(
         read_json::<Value>(&target.join("apps/main/package.json")).unwrap()["devDependencies"]["@docouno/env"],
-        "0.3.0"
+        "0.5.0"
     );
     update_project(
         &new,
@@ -356,13 +373,13 @@ fn preview_is_read_only_noop_is_byte_stable_and_local_registry_is_transactional(
         &FixtureResolver,
     )
     .unwrap();
-    read_runtime_project(&target, "0.3.0").unwrap();
+    read_runtime_project(&target, "0.5.0").unwrap();
 }
 
 #[test]
 fn same_release_updates_native_name_links_but_preserves_root_product_graph() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     let initial = init(&release, &target, "node", PackageMode::Registry);
     let mut root: Value = read_json(&target.join("package.json")).unwrap();
@@ -424,8 +441,8 @@ impl MutationHooks for ConcurrentEdit {
 #[test]
 fn conflicts_and_concurrent_inputs_fail_before_any_payload_write() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     let initial = init(&old, &target, "rust", PackageMode::Registry);
     let manifest = fs::read(target.join(MANIFEST_PATH)).unwrap();
@@ -481,7 +498,7 @@ impl MutationHooks for FailAt {
 #[test]
 fn rollback_removes_only_created_namespaces_even_after_manifest_write() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     for existing in [false, true] {
         for at_manifest in [false, true] {
             let target = f.path().join(format!("{existing}-{at_manifest}"));
@@ -549,10 +566,10 @@ fn interruption_worker() {
     .unwrap();
 }
 #[test]
-fn durable_journal1_and2_recovery_preflights_every_saved_and_current_identity() {
+fn durable_journal2_recovery_preflights_identities_and_rejects_journal1() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     for at_manifest in [false, true] {
         let target = f.path().join(format!("interrupted-{at_manifest}"));
         let state = init(&old, &target, "rust", PackageMode::Registry);
@@ -602,9 +619,19 @@ fn durable_journal1_and2_recovery_preflights_every_saved_and_current_identity() 
         } else {
             remove_file(&target.join(&changed.path)).unwrap();
         }
-        // Public journal1 and journal2 share the same exact saved-path contract.
+        // Journal schemaVersion 1 (< 0.4.0) is rejected without rolling back; schemaVersion 2 recovers.
         let mut raw: Value = read_json(&target.join(PENDING_PATH)).unwrap();
-        raw["schemaVersion"] = json!(if at_manifest { 1 } else { 2 });
+        raw["schemaVersion"] = json!(1);
+        put_json(&target, PENDING_PATH, &raw);
+        let partial = source_signature(&target, Some(&state)).unwrap();
+        assert!(
+            recover_project(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported update journal")
+        );
+        assert_eq!(source_signature(&target, Some(&state)).unwrap(), partial);
+        raw["schemaVersion"] = json!(2);
         put_json(&target, PENDING_PATH, &raw);
         assert!(recover_project(&target).unwrap());
         assert!(!recover_project(&target).unwrap());
@@ -628,7 +655,7 @@ impl MutationHooks for UnknownSource {
 #[test]
 fn unknown_new_component_source_blocks_all_rollback_writes() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("new source");
     let state = init(&release, &target, "rust", PackageMode::Registry);
     let before = source_signature(&target, Some(&state)).unwrap();
@@ -668,8 +695,8 @@ fn unknown_new_component_source_blocks_all_rollback_writes() {
 #[test]
 fn accepted_release_policy_and_registration_preserve_native_manifests() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     init(&old, &target, "rust", PackageMode::Registry);
     copy_tree(
@@ -716,7 +743,7 @@ fn accepted_release_policy_and_registration_preserve_native_manifests() {
     let duplicate = f.path().join("different-same-version");
     copy_tree(&new, &duplicate, &|_| false, false).unwrap();
     put(&duplicate, "runtime/devkit.mk", b"different release");
-    seal(&duplicate, "0.3.0");
+    seal(&duplicate, "0.5.0");
     assert!(
         update_project(&duplicate, &target, &UpdateOptions::default(), &NoResolver)
             .unwrap_err()
@@ -736,7 +763,7 @@ impl ComposeNormalizer for CollisionNormalizer {
 #[test]
 fn compose_closure_is_confined_budgeted_and_normalized_inventory_blocks_collisions() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     let state = init(&release, &target, "rust", PackageMode::Registry);
     put(
@@ -801,7 +828,7 @@ impl MutationHooks for PopulateTarget {
 #[test]
 fn init_rechecks_empty_target_preserves_git_and_rejects_symlink_ancestors() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("empty");
     fs::create_dir_all(target.join(".git")).unwrap();
     put(&target, ".git/config", b"existing git metadata");
@@ -849,352 +876,9 @@ fn init_rechecks_empty_target_preserves_git_and_rejects_symlink_ancestors() {
 }
 
 #[test]
-#[ignore = "requires explicit genuine public0.2 release/consumer fixtures and Docker CLI; run the compiled test binary without a host SDK"]
-fn genuine_accepted_legacy_add_passes_old_runtime_doctor() {
-    let release = PathBuf::from(
-        std::env::var_os("DEVKIT_TEST_LEGACY_RELEASE").expect("legacy release fixture"),
-    );
-    let consumer = PathBuf::from(
-        std::env::var_os("DEVKIT_TEST_LEGACY_CONSUMER").expect("legacy consumer fixture"),
-    );
-    let f = TempDir::new().unwrap();
-    let target = f.path().join("native old-version operation");
-    let old = read_project_state(&consumer).unwrap();
-    copy_tree(&consumer, &target, &|p| snapshot_excluded(&old, p), true).unwrap();
-    let mut inventory = capture_compose_inputs(&target).unwrap();
-    inventory.services = old
-        .components
-        .values()
-        .filter_map(|c| c.development.as_ref()?.service.clone())
-        .collect();
-    let outcome = add_project_component(
-        &release,
-        &target,
-        Role::App,
-        ComponentSpec {
-            name: "native-added".to_string(),
-            template: "rust-api".to_string(),
-            uses: vec![],
-        },
-        &UpdateOptions {
-            compose_inventory: Some(&inventory),
-            ..Default::default()
-        },
-        &DockerNpmResolver,
-    )
-    .unwrap();
-    assert_eq!(outcome.state.version, old.version);
-    assert_eq!(outcome.state.release_identity, old.release_identity);
-    for (key, value) in old.extra {
-        assert_eq!(outcome.state.extra.get(&key), Some(&value));
-    }
-    let setup = Command::new("make")
-        .arg("setup")
-        .env("CARGO_BUILD_JOBS", "2")
-        .current_dir(&target)
-        .stdin(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(
-        setup.success(),
-        "Old public runtime setup failed after native accepted-version add"
-    );
-    let status = Command::new("make")
-        .arg("doctor")
-        .current_dir(&target)
-        .stdin(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "Old public runtime rejected native-generated accepted-version projections"
-    );
-}
-
-fn pinned_test_cargo(root: &Path, component: &str, args: &[&str]) -> std::process::Output {
-    let metadata = fs::metadata(root).unwrap();
-    let budget = devkit::resources::HostResourceBudget::probe_local().unwrap();
-    let res_flags = budget.author_flags(1000, 768 * devkit::resources::MIB, Some(256), false);
-    let mut cmd = Command::new("docker");
-    cmd.args(["run", "--rm", "--pull=never", "--network", "none"]);
-    cmd.args(&res_flags);
-    let output = cmd
-        .args([
-            "--user",
-            &format!("{}:{}", metadata.uid(), metadata.gid()),
-            "--volume",
-            &format!("{}:/workspace:Z", root.display()),
-            "--workdir",
-            &format!("/workspace/{component}"),
-            "--env",
-            "CARGO_HOME=/tmp/devkit-cargo",
-            "--env",
-            "CARGO_TARGET_DIR=/tmp/devkit-target",
-            "--env",
-            "CARGO_BUILD_JOBS=1",
-            "--env",
-            "RUSTUP_AUTO_INSTALL=0",
-            &std::env::var("DEVKIT_TEST_RUST_IMAGE")
-                .expect("explicit pinned DEVKIT_TEST_RUST_IMAGE for author Cargo fixture"),
-            "cargo",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Pinned Cargo failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-fn old_runtime_metadata_oracle(root: &Path, version: &str) {
-    let pins = fs::read_to_string(root.join(".devkit/runtime/toolchains.env")).unwrap();
-    let image = pins
-        .lines()
-        .find_map(|line| line.strip_prefix("DEVKIT_NODE_IMAGE="))
-        .unwrap();
-    let metadata = fs::metadata(root).unwrap();
-    // This immutable old Node helper is a test oracle only. Production project
-    // management never calls it or the old factory/controller.
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--pull=never",
-            "--network",
-            "none",
-            "--user",
-            &format!("{}:{}", metadata.uid(), metadata.gid()),
-            "--volume",
-            &format!("{}:/workspace:ro,Z", root.display()),
-            "--workdir",
-            "/workspace",
-            image,
-            "node",
-            "/workspace/.devkit/runtime/project.mjs",
-            "verify",
-            "/workspace",
-            version,
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Immutable old runtime rejected native projection: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "requires genuine public0.2.1 release/Rust consumer fixtures and Docker; old Node runtime is a compatibility oracle only"]
-fn legacy_library_patch_registration_add_and_modern_migration_preserve_native_ownership() {
-    let release = PathBuf::from(
-        std::env::var_os("DEVKIT_TEST_LEGACY_RELEASE").expect("legacy release fixture"),
-    );
-    let consumer = PathBuf::from(
-        std::env::var_os("DEVKIT_TEST_LEGACY_CONSUMER").expect("legacy Rust consumer fixture"),
-    );
-    let old = read_project_state(&consumer).unwrap();
-    assert_eq!(old.version, "0.2.1");
-    assert_eq!(old.components.len(), 1);
-    let component = old.components.keys().next().unwrap().clone();
-    assert_eq!(old.components[&component].toolchain, Toolchain::Rust);
-    let f = TempDir::new().unwrap();
-    let target = f.path().join("legacy effective graph");
-    copy_tree(
-        &consumer,
-        &target,
-        &|name| snapshot_excluded(&old, name),
-        true,
-    )
-    .unwrap();
-    put(&target,&format!("{component}/Cargo.toml"),b"[package]\nname = \"main\"\nversion = \"1.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\nhelper = \"=1.0.0\"\n[patch.crates-io]\nhelper = { path = \"../../packages/helper\" }\n[package.metadata.owner]\nkeep = true\n");
-    put(
-        &target,
-        &format!("{component}/src/main.rs"),
-        b"fn main() { println!(\"{}\", helper::value()); }\n",
-    );
-    put(
-        &target,
-        &format!("{component}/src/lib.rs"),
-        b"pub const OWNER_MARKER: bool = true;\n",
-    );
-    put(&target,"packages/helper/Cargo.toml",b"[package]\nname = \"helper\"\nversion = \"1.0.0\"\nedition = \"2024\"\n[workspace]\n[package.metadata.owner]\nkeep = true\n");
-    put(
-        &target,
-        "packages/helper/src/lib.rs",
-        b"pub fn value() -> u32 { 42 }\n",
-    );
-    for name in ["rustfmt.toml", "rust-toolchain.toml"] {
-        write_atomic(
-            &target.join("packages/helper").join(name),
-            &fs::read(release.join("templates/rust-api").join(name)).unwrap(),
-            0o644,
-        )
-        .unwrap();
-    }
-    let selected: Value = serde_json::from_slice(
-        &pinned_test_cargo(
-            &target,
-            &component,
-            &["metadata", "--offline", "--format-version", "1"],
-        )
-        .stdout,
-    )
-    .unwrap();
-    let helper_id = selected["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|package| package["name"] == "helper")
-        .unwrap()["id"]
-        .clone();
-    let main = selected["resolve"]["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["id"] == selected["resolve"]["root"])
-        .unwrap();
-    assert!(
-        main["dependencies"]
-            .as_array()
-            .unwrap()
-            .contains(&helper_id)
-    );
-    pinned_test_cargo(
-        &target,
-        "packages/helper",
-        &["metadata", "--offline", "--format-version", "1"],
-    );
-    pinned_test_cargo(
-        &target,
-        &component,
-        &["check", "--workspace", "--locked", "--offline"],
-    );
-    let names = vec![
-        format!("{component}/Cargo.toml"),
-        format!("{component}/Cargo.lock"),
-        format!("{component}/src/main.rs"),
-        format!("{component}/src/lib.rs"),
-        "packages/helper/Cargo.toml".to_string(),
-        "packages/helper/Cargo.lock".to_string(),
-        "packages/helper/src/lib.rs".to_string(),
-        "Makefile".to_string(),
-        ".gitignore".to_string(),
-        ".env".to_string(),
-    ];
-    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
-    let owner_bytes = preserved(&target, &names);
-    let registered = register_project_component(
-        &release,
-        &target,
-        Role::Library,
-        "helper".to_string(),
-        ToolingProfile::Rust,
-        &UpdateOptions::default(),
-        &NoResolver,
-    )
-    .unwrap();
-    assert!(
-        registered.state.components[&component]
-            .dependencies
-            .is_empty()
-    );
-    assert_eq!(preserved(&target, &names), owner_bytes);
-    old_runtime_metadata_oracle(&target, "0.2.1");
-    let admission = admit_runtime_project(&target, "0.2.1").unwrap();
-    assert!(admission.native.dependencies[&component].is_empty());
-    assert_eq!(
-        admission.native.effective_dependencies[&component],
-        vec!["packages/helper"]
-    );
-    let before_noop = fs::read(target.join(MANIFEST_PATH)).unwrap();
-    let noop = update_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
-    assert!(noop.no_op);
-    assert_eq!(fs::read(target.join(MANIFEST_PATH)).unwrap(), before_noop);
-    let mut inventory = capture_compose_inputs(&target).unwrap();
-    inventory.services = registered
-        .state
-        .components
-        .values()
-        .filter_map(|c| c.development.as_ref()?.service.clone())
-        .collect();
-    let added = add_project_component(
-        &release,
-        &target,
-        Role::App,
-        ComponentSpec {
-            name: "worker".to_string(),
-            template: "rust-api".to_string(),
-            uses: vec![],
-        },
-        &UpdateOptions {
-            compose_inventory: Some(&inventory),
-            ..Default::default()
-        },
-        &NoResolver,
-    )
-    .unwrap();
-    assert!(added.state.components[&component].dependencies.is_empty());
-    assert_eq!(preserved(&target, &names), owner_bytes);
-    old_runtime_metadata_oracle(&target, "0.2.1");
-    for command in ["setup", "doctor"] {
-        let status = Command::new("make")
-            .arg(command)
-            .env("CARGO_BUILD_JOBS", "1")
-            .current_dir(&target)
-            .stdin(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "Old make {command} failed after accepted native add/register"
-        );
-    }
-    let modern = fixture_release(f.path(), "0.3.0");
-    let migrated =
-        update_project(&modern, &target, &UpdateOptions::default(), &NoResolver).unwrap();
-    assert_eq!(
-        migrated.state.components[&component].dependencies,
-        vec!["packages/helper"]
-    );
-    assert_eq!(preserved(&target, &names), owner_bytes);
-    let accepted = admit_runtime_project(&target, "0.3.0").unwrap();
-    assert_eq!(
-        accepted.native.dependencies[&component],
-        vec!["packages/helper"]
-    );
-    assert_eq!(
-        accepted.native.effective_dependencies[&component],
-        vec!["packages/helper"]
-    );
-    for (key, value) in &old.extra {
-        assert_eq!(migrated.state.extra.get(key), Some(value));
-    }
-    assert_eq!(
-        migrated.state.components[&component].origin,
-        old.components[&component].origin
-    );
-    assert_eq!(
-        migrated.state.components[&component].extra,
-        old.components[&component].extra
-    );
-    assert_eq!(
-        migrated.state.components[&component].development,
-        old.components[&component].development
-    );
-    let make = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
-    assert!(make.contains("build/packages/helper"));
-    if let Some(directory) = std::env::var_os("DEVKIT_PROOF_DIR") {
-        write_json(&Path::new(&directory).join("legacy-effective-graph.json"),&json!({"legacyVersion":"0.2.1","legacyProjectedEdges":registered.state.components[&component].dependencies,"effectiveEdges":admission.native.effective_dependencies[&component],"modernVersion":"0.3.0","modernProjectedEdges":migrated.state.components[&component].dependencies,"cargoSelectedHelperId":helper_id,"oldMetadataOracle":true,"oldMakeSetupDoctor":true,"ownerNativeBytesPreserved":true,"modernTarget":"synthetic admitted core release fixture; no P2/runtime delivery claim"})).unwrap();
-    }
-}
-
-#[test]
 fn native_lifecycle_lock_is_shared_and_recovery_refuses_a_linked_lock() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("locked");
     init(&release, &target, "rust", PackageMode::Registry);
     let lock = CheckoutLock::acquire(&target).unwrap();
@@ -1211,10 +895,10 @@ fn native_lifecycle_lock_is_shared_and_recovery_refuses_a_linked_lock() {
 #[test]
 fn rollback_removes_a_new_runtime_directory_without_pruning_existing_parents() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     put(&new, "runtime/nested/helper", b"new managed helper\n");
-    seal(&new, "0.3.0");
+    seal(&new, "0.5.0");
     let target = f.path().join("runtime parent");
     let state = init(&old, &target, "rust", PackageMode::Registry);
     let before = source_signature(&target, Some(&state)).unwrap();
@@ -1240,8 +924,8 @@ fn rollback_removes_a_new_runtime_directory_without_pruning_existing_parents() {
 #[test]
 fn component_named_target_is_source_while_its_rust_target_output_is_excluded() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("named target");
     let initial = init_project(
         &old,
@@ -1283,7 +967,7 @@ fn component_named_target_is_source_while_its_rust_target_output_is_excluded() {
 #[test]
 fn rust_add_ignores_numeric_unicode_and_renamed_checkout_basenames() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     for basename in ["123", "Проект", "renamed Ω"] {
         let original = f.path().join(format!("initial-{basename}"));
         init_project(
@@ -1333,7 +1017,7 @@ fn rust_add_ignores_numeric_unicode_and_renamed_checkout_basenames() {
 #[test]
 fn node_add_preserves_declared_scoped_namespace_after_checkout_move() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let original = f.path().join("123");
     init_project(
         &release,
@@ -1390,7 +1074,7 @@ fn node_add_preserves_declared_scoped_namespace_after_checkout_move() {
 #[test]
 fn first_node_member_in_rust_project_establishes_a_stable_private_namespace() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("123");
     init_project(
         &release,
@@ -1452,7 +1136,7 @@ fn first_node_member_in_rust_project_establishes_a_stable_private_namespace() {
 #[test]
 fn node_add_keeps_an_existing_private_root_manifest_without_a_name() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("123");
     init_project(
         &release,
@@ -1500,7 +1184,7 @@ fn accepted_legacy_default_ignore_blocks_only_unsafe_new_sources_without_writes(
         "348c45ac15b10cd537bea277b83411de9885329b6aa53570b04c42590c2e4a92"
     );
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.2.1");
+    let release = fixture_release(f.path(), "0.4.1");
     let target = f.path().join("legacy");
     let initial = init(&release, &target, "rust", PackageMode::Registry);
     put(&target, ".gitignore", legacy);
@@ -1616,7 +1300,7 @@ fn git_ignored(root: &Path, path: &str) -> bool {
 #[ignore = "requires Git; run the compiled native test executable on the Linux host"]
 fn git_tracks_output_named_component_sources_and_ignores_scoped_outputs() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     for (name, component, source) in [
         ("target", "apps/target", "Cargo.toml"),
         ("dist", "apps/dist", "package.json"),
@@ -1706,10 +1390,12 @@ impl MutationHooks for RetainRecoveryStage {
 #[ignore = "test-only worker invoked by the Linux strace ordering test"]
 fn durability_order_worker() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    put(&old, "runtime/obsolete-helper.sh", b"old helper\n");
+    seal(&old, "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     put(&new, "runtime/nested/helper", b"new managed helper");
-    seal(&new, "0.3.0");
+    seal(&new, "0.5.0");
     let committed = f.path().join("committed");
     init(&old, &committed, "rust", PackageMode::Registry);
     update_project(&new, &committed, &UpdateOptions::default(), &NoResolver).unwrap();
@@ -1855,7 +1541,7 @@ fn assert_durable_transaction_trace(trace: &str) {
                 })
             })
         {
-            let deleted = format!("{devkit}/runtime/project.mjs");
+            let deleted = format!("{devkit}/runtime/obsolete-helper.sh");
             let deletion = lines[published + 1..manifest]
                 .iter()
                 .position(|line| {
@@ -1929,7 +1615,7 @@ fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
 fn author_port_same_component_basename_keeps_both_namespace_orders_and_owner_names() {
     for package_first in [false, true] {
         let f = TempDir::new().unwrap();
-        let release = fixture_release(f.path(), "0.3.0");
+        let release = fixture_release(f.path(), "0.5.0");
         let target = f.path().join("consumer");
         let first = if package_first { "starter" } else { "client" };
         init_project(
@@ -2003,9 +1689,16 @@ fn author_port_same_component_basename_keeps_both_namespace_orders_and_owner_nam
 
 #[test]
 fn author_port_release_admission_refuses_unsafe_manifest_and_source_shapes() {
-    for case in ["parent", "symlink", "environment", "mode", "schema"] {
+    for case in [
+        "parent",
+        "symlink",
+        "environment",
+        "mode",
+        "schema",
+        "min_supported",
+    ] {
         let f = TempDir::new().unwrap();
-        let release = fixture_release(f.path(), "0.3.0");
+        let release = fixture_release(f.path(), "0.5.0");
         let outside = f.path().join("outside");
         let loader = release.join("runtime/devkit.sh");
         fs::write(&outside, fs::read(&loader).unwrap()).unwrap();
@@ -2019,9 +1712,10 @@ fn author_port_release_admission_refuses_unsafe_manifest_and_source_shapes() {
                 fs::remove_file(&loader).unwrap();
                 symlink(&outside, &loader).unwrap();
             }
-            "environment" => manifest["environment"]["version"] = json!("0.2.0"),
+            "environment" => manifest["environment"]["version"] = json!("0.4.0"),
             "mode" => manifest["files"]["runtime/devkit.sh"]["mode"] = json!(0o777),
             "schema" => manifest["schemaVersion"] = json!(2),
+            "min_supported" => manifest["minSupportedFromVersion"] = json!("0.6.0"),
             _ => unreachable!(),
         }
         put_json(&release, "release.json", &manifest);
@@ -2047,8 +1741,8 @@ fn author_port_release_admission_refuses_unsafe_manifest_and_source_shapes() {
 #[test]
 fn author_port_opaque_product_links_survive_copy_and_native_update() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     let source = f.path().join("opaque");
     put(&source, "source.ts", b"export const owner = true;\n");
     put(&source, "node_modules/cache", b"discard cache\n");
@@ -2136,7 +1830,7 @@ fn author_port_payload(root: &Path) -> BTreeMap<String, FileIdentity> {
 fn author_port_tool_profile_and_native_tool_edits_refuse_without_payload_writes() {
     for accepted_profile in [true, false] {
         let f = TempDir::new().unwrap();
-        let release = fixture_release(f.path(), "0.3.0");
+        let release = fixture_release(f.path(), "0.5.0");
         let target = f.path().join("consumer");
         init(&release, &target, "node", PackageMode::Local);
         if accepted_profile {
@@ -2173,7 +1867,7 @@ fn author_port_tool_profile_and_native_tool_edits_refuse_without_payload_writes(
 #[test]
 fn author_port_register_existing_node_workspace_preserves_owner_identity_and_source() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     init(&release, &target, "node", PackageMode::Local);
     copy_tree(
@@ -2251,10 +1945,10 @@ impl LockResolver for AuthorPortResolutionFailure {
 #[test]
 fn author_port_new_managed_collision_and_native_failures_preserve_payload_and_pending() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
     put(&new, "runtime/new-helper.sh", b"release helper\n");
-    seal(&new, "0.3.0");
+    seal(&new, "0.5.0");
     let target = f.path().join("consumer");
     init(&old, &target, "node", PackageMode::Local);
     put(&target, ".devkit/runtime/new-helper.sh", b"owner helper\n");
@@ -2296,9 +1990,9 @@ fn author_port_new_managed_collision_and_native_failures_preserve_payload_and_pe
 #[test]
 fn author_port_mixed_alias_keeps_api_web_wiring_and_edited_web_source_on_update() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.2.1");
-    let new = fixture_release(f.path(), "0.3.0");
-    for (release, version) in [(&old, "0.2.1"), (&new, "0.3.0")] {
+    let old = fixture_release(f.path(), "0.4.1");
+    let new = fixture_release(f.path(), "0.5.0");
+    for (release, version) in [(&old, "0.4.1"), (&new, "0.5.0")] {
         put(
             release,
             "templates/react-web/src/main.tsx",
@@ -2361,7 +2055,7 @@ fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_a
     }
 
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.3.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     init(&release, &target, "react-web", PackageMode::Registry);
     let initial = add_project_component(
@@ -2529,8 +2223,8 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
     }
 
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.3.0");
-    let next = fixture_release(f.path(), "0.4.0");
+    let old = fixture_release(f.path(), "0.4.1");
+    let next = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
     init(&old, &target, "node", PackageMode::Registry);
 
@@ -2697,7 +2391,7 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
 #[test]
 fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.4.0");
+    let release = fixture_release(f.path(), "0.5.0");
 
     // 1. Single --template ts-library creates a 0-app repository at packages/lib.
     let lib_only = f.path().join("lib-only");
@@ -2862,7 +2556,7 @@ fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() 
 #[test]
 fn project_make_stays_byte_identical_without_packageable_libraries() {
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.4.0");
+    let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("fullstack");
     init_project(
         &release,
@@ -2879,11 +2573,11 @@ fn project_make_stays_byte_identical_without_packageable_libraries() {
     let legacy_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
     assert!(
         !legacy_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES"),
-        "0.3.2 profile set must not emit DEVKIT_PACKAGEABLE_PACKAGES:\n{legacy_mk}"
+        "non-packageable profile set must not emit DEVKIT_PACKAGEABLE_PACKAGES:\n{legacy_mk}"
     );
     assert!(
         !legacy_mk.contains("package/packages/"),
-        "0.3.2 profile set must not emit library package targets:\n{legacy_mk}"
+        "non-packageable profile set must not emit library package targets:\n{legacy_mk}"
     );
     assert_eq!(
         legacy_mk,
@@ -2933,59 +2627,60 @@ fn project_make_stays_byte_identical_without_packageable_libraries() {
 #[test]
 fn applicable_migrations_filters_by_semver_window_profile_and_component_origin() {
     let temp = TempDir::new().unwrap();
-    let rel_032 = fixture_release(temp.path(), "0.3.2");
     let rel_040 = fixture_release(temp.path(), "0.4.0");
+    let rel_050 = fixture_release(temp.path(), "0.5.0");
     put(
-        &rel_040,
-        "docs/migrations/0.4.0.md",
-        b"# Migration 0.4.0\n\n## Glob Scripts and Single-Pass Checks\n\nBody.\n\n## Rust Notes\n\nBody.\n",
+        &rel_050,
+        "docs/migrations/0.5.0.md",
+        b"# Migration 0.5.0\n\n## Glob Scripts and Single-Pass Checks\n\nBody.\n\n## Rust Notes\n\nBody.\n",
     );
-    remove_file(&rel_040.join("release.json")).unwrap();
-    let archive = "npm/env-0.4.0.tgz".to_string();
+    remove_file(&rel_050.join("release.json")).unwrap();
+    let archive = "npm/env-0.5.0.tgz".to_string();
     write_json(
-        &rel_040.join("release.json"),
+        &rel_050.join("release.json"),
         &Release {
             schema_version: 1,
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
+            min_supported_from_version: Some("0.4.0".into()),
             rust_version: "1.99.1".into(),
             environment: Environment {
                 name: "@docouno/env".into(),
-                version: "0.4.0".into(),
+                version: "0.5.0".into(),
                 archive: archive.clone(),
-                integrity: sri(&fs::read(rel_040.join(&archive)).unwrap()),
+                integrity: sri(&fs::read(rel_050.join(&archive)).unwrap()),
             },
-            files: file_map(&rel_040).unwrap(),
+            files: file_map(&rel_050).unwrap(),
             migrations: vec![
                 MigrationEntry {
-                    id: "glob-scripts-040".into(),
-                    version: "0.4.0".into(),
+                    id: "glob-scripts-050".into(),
+                    version: "0.5.0".into(),
                     severity: MigrationSeverity::Recommended,
                     title: "Adopt glob lint/format scripts".into(),
                     summary: "Update package.json lint and check scripts.".into(),
                     profiles: vec!["web".into(), "node".into()],
-                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    doc_path: "docs/migrations/0.5.0.md".into(),
                     anchor: "glob-scripts-and-single-pass-checks".into(),
                 },
                 MigrationEntry {
-                    id: "rust-notes-040".into(),
-                    version: "0.4.0".into(),
+                    id: "rust-notes-050".into(),
+                    version: "0.5.0".into(),
                     severity: MigrationSeverity::Info,
                     title: "Rust notes".into(),
                     summary: "Applies to Rust components.".into(),
                     profiles: vec!["rust".into()],
-                    doc_path: "docs/migrations/0.4.0.md".into(),
+                    doc_path: "docs/migrations/0.5.0.md".into(),
                     anchor: "rust-notes".into(),
                 },
             ],
         },
     )
     .unwrap();
-    let admitted_040 = devkit::release::admit_release(&rel_040).unwrap();
+    let admitted_050 = devkit::release::admit_release(&rel_050).unwrap();
 
-    // 1. Web-only 0.3.2 project receives glob-scripts-040 but NOT rust-notes-040.
+    // 1. Web-only 0.4.0 project receives glob-scripts-050 but NOT rust-notes-050.
     let web_proj = temp.path().join("web-proj");
-    let web_state_032 = init_project(
-        &rel_032,
+    let web_state_040 = init_project(
+        &rel_040,
         &web_proj,
         &InitOptions {
             apps: Some(vec![ComponentSpec {
@@ -2998,24 +2693,24 @@ fn applicable_migrations_filters_by_semver_window_profile_and_component_origin()
         &FixtureResolver,
     )
     .unwrap();
-    let applicable = devkit::project::applicable_migrations(&web_state_032, &admitted_040).unwrap();
+    let applicable = devkit::project::applicable_migrations(&web_state_040, &admitted_050).unwrap();
     assert_eq!(applicable.len(), 1);
-    assert_eq!(applicable[0].id, "glob-scripts-040");
+    assert_eq!(applicable[0].id, "glob-scripts-050");
     assert!(
         applicable[0]
             .local_path
-            .ends_with("docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks")
+            .ends_with("docs/migrations/0.5.0.md#glob-scripts-and-single-pass-checks")
     );
     assert_eq!(
         applicable[0].url,
-        "https://github.com/docouno/devkit/blob/v0.4.0/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks"
+        "https://github.com/docouno/devkit/blob/v0.5.0/docs/migrations/0.5.0.md#glob-scripts-and-single-pass-checks"
     );
 
-    // 2. Same-version update (0.4.0 -> 0.4.0) returns 0 migrations.
-    let mut web_state_040 = web_state_032.clone();
-    web_state_040.version = "0.4.0".into();
+    // 2. Same-version update (0.5.0 -> 0.5.0) returns 0 migrations.
+    let mut web_state_050 = web_state_040.clone();
+    web_state_050.version = "0.5.0".into();
     assert!(
-        devkit::project::applicable_migrations(&web_state_040, &admitted_040)
+        devkit::project::applicable_migrations(&web_state_050, &admitted_050)
             .unwrap()
             .is_empty()
     );
@@ -3146,4 +2841,89 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
         sync_project(&release, &proj, &UpdateOptions::default(), &FixtureResolver).unwrap();
     assert!(applied.applied);
     admit_runtime_project(&proj, "0.4.1").unwrap();
+}
+
+#[test]
+fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() {
+    use devkit::cli::error_code;
+
+    let temp = TempDir::new().unwrap();
+    let rel_050 = fixture_release(temp.path(), "0.5.0");
+
+    for (label, manifest_val) in [
+        ("schema1", json!({"schemaVersion": 1, "version": "0.1.0"})),
+        ("v021", json!({"schemaVersion": 2, "version": "0.2.1"})),
+        ("v032", json!({"schemaVersion": 2, "version": "0.3.2"})),
+    ] {
+        let proj = temp.path().join(label);
+        fs::create_dir_all(proj.join(".devkit")).unwrap();
+        put_json(&proj, MANIFEST_PATH, &manifest_val);
+        let snapshot = file_map(&proj).unwrap();
+
+        let upd_err =
+            update_project(&rel_050, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
+        assert_eq!(error_code(&upd_err), "UNSUPPORTED_UPGRADE_PATH");
+        assert!(
+            upd_err
+                .to_string()
+                .contains("npx @docouno/devkit@0.4.1 update . --to 0.4.1")
+        );
+
+        let sync_err =
+            sync_project(&rel_050, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
+        assert_eq!(error_code(&sync_err), "UNSUPPORTED_PROJECT_VERSION");
+
+        let add_err = add_project_component(
+            &rel_050,
+            &proj,
+            Role::App,
+            ComponentSpec {
+                name: "extra".into(),
+                template: "rust-api".into(),
+                uses: vec![],
+            },
+            &UpdateOptions::default(),
+            &NoResolver,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&add_err), "UNSUPPORTED_PROJECT_VERSION");
+
+        let reg_err = register_project_component(
+            &rel_050,
+            &proj,
+            Role::Library,
+            "shared".into(),
+            ToolingProfile::Rust,
+            &UpdateOptions::default(),
+            &NoResolver,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&reg_err), "UNSUPPORTED_PROJECT_VERSION");
+
+        assert!(!proj.join(".devkit/state").exists(), "{label}");
+        assert_eq!(file_map(&proj).unwrap(), snapshot, "{label}");
+    }
+
+    // Also verify release.manifest.min_supported_from_version higher than 0.4.0 (e.g. 0.4.1) rejects 0.4.0 before CheckoutLock.
+    let rel_strict = fixture_release(temp.path(), "0.5.1");
+    let mut strict_json: Value = read_json(&rel_strict.join("release.json")).unwrap();
+    strict_json["minSupportedFromVersion"] = json!("0.4.1");
+    put_json(&rel_strict, "release.json", &strict_json);
+
+    let proj_040 = temp.path().join("proj-040");
+    fs::create_dir_all(proj_040.join(".devkit")).unwrap();
+    put_json(
+        &proj_040,
+        MANIFEST_PATH,
+        &json!({"schemaVersion": 2, "version": "0.4.0"}),
+    );
+    let strict_err = update_project(
+        &rel_strict,
+        &proj_040,
+        &UpdateOptions::default(),
+        &NoResolver,
+    )
+    .unwrap_err();
+    assert_eq!(error_code(&strict_err), "UNSUPPORTED_UPGRADE_PATH");
+    assert!(!proj_040.join(".devkit/state").exists());
 }

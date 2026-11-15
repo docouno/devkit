@@ -1,6 +1,6 @@
 # Daily Workflows
 
-This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.4.1`.
+This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.5.0`.
 
 ## 1. Create a New Repository
 
@@ -9,13 +9,13 @@ This guide covers day-to-day repository creation, component wiring, dependency m
 Initialize a single-app or multi-app workspace:
 
 ```sh
-npx @docouno/devkit@0.4.1 init my-product --app web=react-web
+npx @docouno/devkit@0.5.0 init my-product --app web=react-web
 ```
 
 Or scaffold the fullstack preset (`apps/api` Rust API + `apps/web` React SPA + `apps/desktop` Electron app + `packages/client` shared React library):
 
 ```sh
-npx @docouno/devkit@0.4.1 init my-suite --preset fullstack-desktop
+npx @docouno/devkit@0.5.0 init my-suite --preset fullstack-desktop
 ```
 
 ### Standalone Libraries (Zero-App Workspace)
@@ -23,13 +23,13 @@ npx @docouno/devkit@0.4.1 init my-suite --preset fullstack-desktop
 Create a package-only repository without scaffolding a dummy runnable application:
 
 ```sh
-npx @docouno/devkit@0.4.1 init acme-sdk --package sdk=ts-library
+npx @docouno/devkit@0.5.0 init acme-sdk --package sdk=ts-library
 ```
 
 Create a React component library repository:
 
 ```sh
-npx @docouno/devkit@0.4.1 init acme-ui --package ui=react-ui
+npx @docouno/devkit@0.5.0 init acme-ui --package ui=react-ui
 ```
 
 ### Design System with Interactive Playground
@@ -37,7 +37,7 @@ npx @docouno/devkit@0.4.1 init acme-ui --package ui=react-ui
 Scaffold `packages/ui` (`react-ui`) pre-wired to `apps/playground` (`react-web`) with instant source HMR:
 
 ```sh
-npx @docouno/devkit@0.4.1 init acme-design --preset design-system
+npx @docouno/devkit@0.5.0 init acme-design --preset design-system
 ```
 
 After initialization, prepare pinned toolchains and workspace dependencies:
@@ -52,9 +52,9 @@ make setup
 Add libraries or applications at any time and wire them to existing `packages/<slug>` components with repeatable `--use`:
 
 ```sh
-npx @docouno/devkit@0.4.1 add-package . --name tokens --template ts-library
-npx @docouno/devkit@0.4.1 add-package . --name ui --template react-ui --use tokens
-npx @docouno/devkit@0.4.1 add-app . --name docs --template react-web --use tokens --use ui
+npx @docouno/devkit@0.5.0 add-package . --name tokens --template ts-library
+npx @docouno/devkit@0.5.0 add-package . --name ui --template react-ui --use tokens
+npx @docouno/devkit@0.5.0 add-app . --name docs --template react-web --use tokens --use ui
 make setup
 ```
 
@@ -66,14 +66,14 @@ Never run host `npm install` or `cargo` directly on the checkout. Always execute
 
 ```sh
 # Node.js / React / TypeScript component (including npm: aliases)
-npx @docouno/devkit@0.4.1 exec --component packages/ui --write --network bridge -- \
+npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
   npm install clsx
 
-npx @docouno/devkit@0.4.1 exec --component packages/ui --write --network bridge -- \
+npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
   npm install legacy-zod@npm:zod@^3.24.0
 
 # Rust component
-npx @docouno/devkit@0.4.1 exec --component apps/api --write --network bridge -- \
+npx @docouno/devkit@0.5.0 exec --component apps/api --write --network bridge -- \
   cargo update --manifest-path Cargo.toml
 ```
 
@@ -102,7 +102,7 @@ make sync reconcile=1
 make setup
 ```
 
-You can also invoke `npx @docouno/devkit@0.4.1 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
+You can also invoke `npx @docouno/devkit@0.5.0 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
 
 ## 5. Run Daily Gates and Development Services
 
@@ -132,7 +132,7 @@ For repositories with runnable applications (`apps/*`):
 make dev                    # Start development services and print http://127.0.0.1:<port> URLs
 make up                     # Start development stack in the background and print service URLs
 make status                 # Inspect running service containers via Docker Compose
-npx @docouno/devkit@0.4.1 status . --json    # Structured services, health, URLs, and receipts
+npx @docouno/devkit@0.5.0 status . --json    # Structured services, health, URLs, and receipts
 make logs app=playground    # Print recent service logs (follow=1 streams without holding task.lock)
 make down                   # Stop and remove project containers and networks
 ```

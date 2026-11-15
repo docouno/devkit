@@ -79,7 +79,7 @@ pub struct ToolPins {
     pub rust_version: String,
     pub rust_recipe: String,
     pub desktop_recipe: String,
-    pub engine: Option<crate::delivery::EnginePin>,
+    pub engine: crate::delivery::EnginePin,
 }
 impl ToolPins {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -115,22 +115,12 @@ impl ToolPins {
             Ok(values.get(k).context("Missing toolchain pin")?.to_string())
         };
         let release_version = get("DEVKIT_VERSION")?;
-        let engine = if crate::cache::legacy(&release_version) {
-            ensure!(
-                !values.contains_key("DEVKIT_ENGINE_SHA256")
-                    && !values.contains_key("DEVKIT_ENGINE_TARGET"),
-                "Legacy tool pins cannot select a native engine"
-            );
-            None
-        } else {
-            let engine = crate::delivery::EnginePin {
-                version: release_version.clone(),
-                target: get("DEVKIT_ENGINE_TARGET")?,
-                sha256: get("DEVKIT_ENGINE_SHA256")?,
-            };
-            engine.validate()?;
-            Some(engine)
+        let engine = crate::delivery::EnginePin {
+            version: release_version.clone(),
+            target: get("DEVKIT_ENGINE_TARGET")?,
+            sha256: get("DEVKIT_ENGINE_SHA256")?,
         };
+        engine.validate()?;
         let s = Self {
             version: release_version,
             node_image: get("DEVKIT_NODE_IMAGE")?,
@@ -356,8 +346,8 @@ impl<'a> PreparedContext<'a> {
             identity(&engine)?.is_some(),
             "Current native engine is not a regular executable"
         );
-        if verify_pin && let Some(pin) = &admission.pins.engine {
-            crate::delivery::verify_engine(&engine, pin)?;
+        if verify_pin {
+            crate::delivery::verify_engine(&engine, &admission.pins.engine)?;
         }
         let project = crate::doctor::compose_project_name(&admission.root);
         Ok(Self {
@@ -516,6 +506,7 @@ impl<'a> PreparedContext<'a> {
             identity(&recipe_path)?.is_some_and(|id| &id.sha256 == pin),
             "{recipe} differs from the accepted recipe"
         );
+        let derived_tag = format!("devkit-derived-{kind}:{pin}");
         let state = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
         if let Some(id) = identity(&state)? {
             let recorded = fs::read_to_string(&state)?;
@@ -535,6 +526,12 @@ impl<'a> PreparedContext<'a> {
                     OutputMode::Capture(1024 * 1024),
                 )?;
                 if inspected.code == 0 && inspected.text()?.trim() == pin {
+                    if prepare {
+                        self.runner.checked(
+                            self.docker().args(["image", "tag", recorded, &derived_tag]),
+                            OutputMode::Capture(1024 * 1024),
+                        )?;
+                    }
                     let result = recorded.to_owned();
                     self.set_image(kind, result.clone());
                     return Ok(result);
@@ -546,6 +543,31 @@ impl<'a> PreparedContext<'a> {
             prepare,
             "accepted {kind} image is absent/stale; run make setup (or exec --prepare)"
         );
+        let tag_inspected = self.runner.run(
+            self.docker().args([
+                "image",
+                "inspect",
+                "--format",
+                &format!("{{{{.Id}}}}\n{{{{index .Config.Labels \"{label}\"}}}}"),
+                &derived_tag,
+            ]),
+            OutputMode::Capture(1024 * 1024),
+        )?;
+        if tag_inspected.code == 0
+            && let Ok(text) = tag_inspected.text()
+            && let Some((id_line, label_line)) = text.trim().split_once('\n')
+            && id_line
+                .trim()
+                .strip_prefix("sha256:")
+                .is_some_and(|h| SHA256_RE.is_match(h))
+            && label_line.trim() == pin
+        {
+            let image = id_line.trim().to_owned();
+            self.admission.recheck()?;
+            write_atomic(&state, format!("{image}\n").as_bytes(), 0o644)?;
+            self.set_image(kind, image.clone());
+            return Ok(image);
+        }
         let tmp = tempfile::Builder::new()
             .prefix("image-")
             .tempfile_in(state.parent().context("Image state parent")?)?;
@@ -558,6 +580,8 @@ impl<'a> PreparedContext<'a> {
                     &format!("DEVKIT_RECIPE_SHA={pin}"),
                     "--label",
                     &format!("{label}={pin}"),
+                    "--tag",
+                    &derived_tag,
                     "--iidfile",
                 ])
                 .arg(tmp.path())
@@ -1012,7 +1036,9 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         request.command
     );
     // Pending objects block before creating/opening a lock, regardless of type.
-    runtime_pending(&project_root(&request.root)?)?;
+    let pre_root = project_root(&request.root)?;
+    runtime_pending(&pre_root)?;
+    ensure_supported_checkout_floor(&pre_root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let shared_lock = matches!(request.command.as_str(), "doctor" | "status" | "logs");
     let lock_op = format!("task {}", request.command);
     let lock = if shared_lock {
@@ -1347,7 +1373,9 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         ["none", "bridge"].contains(&request.network.as_str()),
         "network must be none or bridge"
     );
-    runtime_pending(&project_root(&request.runtime.root)?)?;
+    let pre_root = project_root(&request.runtime.root)?;
+    runtime_pending(&pre_root)?;
+    ensure_supported_checkout_floor(&pre_root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let lock_mode = if request.write || request.prepare {
         CheckoutLockMode::Exclusive
     } else {

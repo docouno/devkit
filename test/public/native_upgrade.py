@@ -21,8 +21,8 @@ def stable_version(value):
 
 
 def validate_versions(from_version, to_version):
-    require((0, 3, 0) <= stable_version(from_version) < stable_version(to_version),
-            "Native upgrade proof requires an older native environment")
+    require((0, 4, 0) <= stable_version(from_version) < stable_version(to_version),
+            "Native upgrade proof requires a supported older native environment (>= 0.4.0)")
 
 
 def read_json(path):

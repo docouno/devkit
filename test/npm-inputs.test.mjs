@@ -50,11 +50,11 @@ function put(path, value) {
 function fixture(t) {
   const parent = temporary(t),
     root = join(parent, 'source with spaces');
-  put(join(root, 'VERSION'), '0.2.1\n');
+  put(join(root, 'VERSION'), '0.4.1\n');
   put(join(root, 'LICENSE'), 'MIT test fixture\n');
   put(join(root, 'packages/env/package.json'), {
     name: '@docouno/env',
-    version: '0.2.1',
+    version: '0.4.1',
     type: 'module',
     files: ['index.js'],
     scripts: {
@@ -68,7 +68,7 @@ function fixture(t) {
       name: `fixture-${name}`,
       version: '1.0.0',
       private: true,
-      devDependencies: { '@docouno/env': '0.2.1' },
+      devDependencies: { '@docouno/env': '0.4.1' },
     };
     put(join(root, `templates/${name}/package.json`), manifest);
     put(join(root, `templates/${name}/package-lock.json`), {
@@ -77,7 +77,7 @@ function fixture(t) {
       lockfileVersion: 3,
       packages: {
         '': { ...manifest },
-        'node_modules/@docouno/env': identity('@docouno/env', '0.2.1'),
+        'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
       },
     });
   }
@@ -85,17 +85,17 @@ function fixture(t) {
 }
 
 test('release authority must be one exact SemVer, including numeric prerelease rules', () => {
-  for (const version of ['0.3.0', '0.3.0-rc.1', '1.2.3+Build.123', '1.2.3-rc-A']) {
+  for (const version of ['0.5.0', '0.5.0-rc.1', '1.2.3+Build.123', '1.2.3-rc-A']) {
     assert.equal(exactVersion(version), version);
   }
   for (const version of [
     undefined,
     '',
     'latest',
-    '^0.3.0',
-    'v0.3.0',
-    '0.3',
-    '00.3.0',
+    '^0.5.0',
+    'v0.5.0',
+    '0.5',
+    '00.5.0',
     '1.2.3-01',
     '1.2.3-rc..1',
     '1.2.3\n',
@@ -107,8 +107,8 @@ test('release authority must be one exact SemVer, including numeric prerelease r
 
 test('unsafe output and symlinked inputs fail before npm or staging', async (t) => {
   const f = fixture(t);
-  const options = { root: f.root, version: '0.3.0', output: f.output };
-  await assert.rejects(prepareNpmInputs({ ...options, version: '^0.3.0' }), /Invalid exact/);
+  const options = { root: f.root, version: '0.5.0', output: f.output };
+  await assert.rejects(prepareNpmInputs({ ...options, version: '^0.5.0' }), /Invalid exact/);
   for (const output of [
     f.root,
     join(f.root, 'templates/new'),
@@ -142,7 +142,7 @@ test('unsafe output and symlinked inputs fail before npm or staging', async (t) 
 
 test('pack result is checked against actual bytes, filename, package/version, size and SHA512', (t) => {
   const root = temporary(t),
-    version = '0.3.0',
+    version = '0.5.0',
     filename = `docouno-env-${version}.tgz`;
   const bytes = Buffer.from('unit identity bytes, not an npm pack integration proof');
   writeFileSync(join(root, filename), bytes);
@@ -156,7 +156,7 @@ test('pack result is checked against actual bytes, filename, package/version, si
   };
   assert.equal(validatePack([record], root, version).filename, filename);
   for (const replacement of [
-    { version: '0.2.1' },
+    { version: '0.4.1' },
     { name: '@docouno/other' },
     { filename: '../escape.tgz' },
     { filename: 'env.tgz' },
@@ -253,61 +253,61 @@ test('templates replace only accepted env version and reject manifest/lock disag
   const manifest = {
     name: 'app',
     version: '9.8.7',
-    devDependencies: { '@docouno/env': '0.2.1' },
+    devDependencies: { '@docouno/env': '0.4.1' },
     dependencies: { zod: '^1.2.3' },
     custom: { untouched: true },
   };
   const input = lock({
-    'node_modules/@docouno/env': identity('@docouno/env', '0.2.1'),
+    'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
     'node_modules/zod': identity('zod'),
   });
   input.packages[''] = {
     dependencies: manifest.dependencies,
     devDependencies: manifest.devDependencies,
   };
-  const next = prepareTemplate(manifest, input, '0.2.1', '0.3.0');
-  assert.deepEqual(next.manifest, { ...manifest, devDependencies: { '@docouno/env': '0.3.0' } });
+  const next = prepareTemplate(manifest, input, '0.4.1', '0.5.0');
+  assert.deepEqual(next.manifest, { ...manifest, devDependencies: { '@docouno/env': '0.5.0' } });
   assert.equal(next.lock.packages['node_modules/@docouno/env'], undefined);
   assert.deepEqual(next.lock.packages['node_modules/zod'], input.packages['node_modules/zod']);
-  assert.equal(manifest.devDependencies['@docouno/env'], '0.2.1');
+  assert.equal(manifest.devDependencies['@docouno/env'], '0.4.1');
   assert.throws(
     () =>
       prepareTemplate(
         { ...manifest, dependencies: { zod: 'file:../zod' } },
         input,
-        '0.2.1',
-        '0.3.0',
+        '0.4.1',
+        '0.5.0',
       ),
     /Source\/local/,
   );
   assert.throws(
     () =>
-      prepareTemplate({ ...manifest, dependencies: { zod: '^2.0.0' } }, input, '0.2.1', '0.3.0'),
+      prepareTemplate({ ...manifest, dependencies: { zod: '^2.0.0' } }, input, '0.4.1', '0.5.0'),
     /disagree/,
   );
-  assert.throws(() => prepareTemplate(manifest, input, '0.2.0', '0.3.0'), /exact source/);
+  assert.throws(() => prepareTemplate(manifest, input, '0.4.0', '0.5.0'), /exact source/);
 });
 
 test('normalization removes only exact fixture origin and preserves every external identity', () => {
   const registry = 'http://127.0.0.1:4321/';
   const input = lock({ 'node_modules/zod': identity('zod') });
   const next = structuredClone(input);
-  next.packages[''].devDependencies = { '@docouno/env': '0.3.0' };
+  next.packages[''].devDependencies = { '@docouno/env': '0.5.0' };
   next.packages['node_modules/@docouno/env'] = {
-    ...identity('@docouno/env', '0.3.0'),
-    resolved: `${registry}@docouno/env/-/env-0.3.0.tgz`,
+    ...identity('@docouno/env', '0.5.0'),
+    resolved: `${registry}@docouno/env/-/env-0.5.0.tgz`,
   };
   const canonical = canonicalizeLock(next, registry);
   assert.equal(
     canonical.packages['node_modules/@docouno/env'].resolved,
-    registryUrl('@docouno/env', '0.3.0'),
+    registryUrl('@docouno/env', '0.5.0'),
   );
-  assertSelectedIdentities(input, canonical, '0.3.0', integrity);
+  assertSelectedIdentities(input, canonical, '0.5.0', integrity);
   for (const field of ['version', 'resolved', 'integrity']) {
     const changed = structuredClone(canonical);
     changed.packages['node_modules/zod'][field] = 'changed';
     assert.throws(
-      () => assertSelectedIdentities(input, changed, '0.3.0', integrity),
+      () => assertSelectedIdentities(input, changed, '0.5.0', integrity),
       /selected external/,
     );
   }
@@ -319,7 +319,7 @@ test('npm: alias dependencies hydrate, preserve target name, and reject spoofed 
   const manifest = {
     name: 'app',
     version: '1.0.0',
-    devDependencies: { '@docouno/env': '0.2.1' },
+    devDependencies: { '@docouno/env': '0.4.1' },
     dependencies: {
       'string-width-cjs': 'npm:string-width@^4.2.0',
       'scoped-alias': 'npm:@acme/core@^1.0.0',
@@ -332,7 +332,7 @@ test('npm: alias dependencies hydrate, preserve target name, and reject spoofed 
         dependencies: manifest.dependencies,
         devDependencies: manifest.devDependencies,
       },
-      'node_modules/@docouno/env': identity('@docouno/env', '0.2.1'),
+      'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
       'node_modules/string-width-cjs': {
         name: 'string-width',
         version: '4.2.3',
@@ -358,17 +358,17 @@ test('npm: alias dependencies hydrate, preserve target name, and reject spoofed 
     registryUrl('@acme/core', '1.0.2'),
   );
   assertCanonicalLock(hydrated);
-  const prepared = prepareTemplate(manifest, hydrated, '0.2.1', '0.3.0');
+  const prepared = prepareTemplate(manifest, hydrated, '0.4.1', '0.5.0');
   assert.equal(prepared.lock.packages['node_modules/string-width-cjs'].name, 'string-width');
 
   const withEnv = structuredClone(hydrated);
-  withEnv.packages[''].devDependencies = { '@docouno/env': '0.3.0' };
-  withEnv.packages['node_modules/@docouno/env'] = identity('@docouno/env', '0.3.0');
-  assertSelectedIdentities(hydrated, withEnv, '0.3.0', integrity);
+  withEnv.packages[''].devDependencies = { '@docouno/env': '0.5.0' };
+  withEnv.packages['node_modules/@docouno/env'] = identity('@docouno/env', '0.5.0');
+  assertSelectedIdentities(hydrated, withEnv, '0.5.0', integrity);
   const renamedAlias = structuredClone(withEnv);
   renamedAlias.packages['node_modules/string-width-cjs'].name = 'evil-pkg';
   assert.throws(
-    () => assertSelectedIdentities(hydrated, renamedAlias, '0.3.0', integrity),
+    () => assertSelectedIdentities(hydrated, renamedAlias, '0.5.0', integrity),
     /selected external/,
   );
 
@@ -406,8 +406,8 @@ test('npm: alias dependencies hydrate, preserve target name, and reject spoofed 
         prepareTemplate(
           { ...manifest, dependencies: { bad: badSpec } },
           hydrated,
-          '0.2.1',
-          '0.3.0',
+          '0.4.1',
+          '0.5.0',
         ),
       /alias|Source\/local/,
     );
@@ -445,11 +445,11 @@ test('bounded registry serves those exact bytes, rejects own-scope misses and cl
   writeFileSync(archive, bytes);
   let origin;
   await assert.rejects(
-    withEnvRegistry({ name: '@docouno/env', version: '0.3.0' }, archive, async (registry) => {
+    withEnvRegistry({ name: '@docouno/env', version: '0.5.0' }, archive, async (registry) => {
       origin = registry;
       const response = await fetch(`${registry}@docouno%2fenv`);
       const metadata = await response.json();
-      const dist = metadata.versions['0.3.0'].dist;
+      const dist = metadata.versions['0.5.0'].dist;
       assert.deepEqual(Buffer.from(await (await fetch(dist.tarball)).arrayBuffer()), bytes);
       assert.equal(dist.integrity, `sha512-${createHash('sha512').update(bytes).digest('base64')}`);
       assert.equal((await fetch(`${registry}@docouno%2fmissing`)).status, 404);
@@ -494,13 +494,13 @@ npmTest(
   async (t) => {
     const f = fixture(t);
     const original = readFileSync(join(f.root, 'packages/env/package.json'), 'utf8');
-    const receipt = await prepareNpmInputs({ ...f, version: '0.3.0' });
-    assert.equal(receipt.sourceVersion, '0.2.1');
-    assert.equal(receipt.version, '0.3.0');
+    const receipt = await prepareNpmInputs({ ...f, version: '0.5.0' });
+    assert.equal(receipt.sourceVersion, '0.4.1');
+    assert.equal(receipt.version, '0.5.0');
     assert.deepEqual(verifyNpmInputs(f.output), receipt);
     const archive = join(f.output, receipt.environment.archive),
       bytes = readFileSync(archive);
-    assert.equal(JSON.parse(tarFile(bytes, 'package/package.json')).version, '0.3.0');
+    assert.equal(JSON.parse(tarFile(bytes, 'package/package.json')).version, '0.5.0');
     assert.equal(
       tarFile(bytes, 'package/index.js').toString(),
       'export const version = "source";\n',
@@ -531,7 +531,7 @@ npmTest('native npm failure and input changes publish no output and clean stagin
   const manifest = JSON.parse(readFileSync(manifestPath));
   manifest.peerDependencies = { '@docouno/missing': '1.0.0' };
   put(manifestPath, manifest);
-  await assert.rejects(prepareNpmInputs({ ...f, version: '0.3.0' }), /npm install failed/);
+  await assert.rejects(prepareNpmInputs({ ...f, version: '0.5.0' }), /npm install failed/);
   assert.equal(existsSync(f.output), false);
   assert.equal(
     readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
@@ -539,7 +539,7 @@ npmTest('native npm failure and input changes publish no output and clean stagin
   );
   delete manifest.peerDependencies;
   put(manifestPath, manifest);
-  const pending = prepareNpmInputs({ ...f, version: '0.3.0' });
+  const pending = prepareNpmInputs({ ...f, version: '0.5.0' });
   put(join(f.root, 'packages/env/index.js'), 'changed while npm runs\n');
   await assert.rejects(pending, /Source inputs changed/);
   assert.equal(existsSync(f.output), false);
@@ -565,7 +565,7 @@ npmTest('cancellation reaps native npm before staging cleanup', async (t) => {
   await assert.rejects(pending, /test cancellation/);
   const f = fixture(t),
     abort = new AbortController();
-  const preparing = prepareNpmInputs({ ...f, version: '0.3.0', signal: abort.signal });
+  const preparing = prepareNpmInputs({ ...f, version: '0.5.0', signal: abort.signal });
   abort.abort(new Error('test prepare cancellation'));
   await assert.rejects(preparing, /test prepare cancellation/);
   assert.equal(existsSync(f.output), false);
