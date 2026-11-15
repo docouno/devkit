@@ -869,7 +869,8 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
                 !comparisons.is_empty()
                     && comparisons
                         .iter()
-                        .all(|cmp| cmp["operation"] == "help" || cmp["nonRegressionPassed"] == true),
+                        .all(|cmp| cmp["nonRegressionPassed"] == true)
+                    && comparisons.iter().any(|cmp| cmp["operation"] != "help"),
                 "Performance non-regression comparisons did not pass"
             );
             validate_performance_trace(value)?;

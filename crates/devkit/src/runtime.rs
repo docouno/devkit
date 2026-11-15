@@ -176,8 +176,9 @@ impl ToolAdmission {
         let root = project_root(&request.root)?;
         ensure!(root.is_dir(), "Checkout does not exist");
         runtime_pending(&root)?;
-        let manifest_identity =
-            identity(&safe_path(&root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
+        let manifest_path = safe_path(&root, MANIFEST_PATH)?;
+        check_manifest_regular_bounded(&manifest_path)?;
+        let manifest_identity = identity(&manifest_path)?.context("Missing project manifest")?;
         if let Some(expected) = &request.expected_manifest {
             ensure!(
                 SHA256_RE.is_match(expected) && expected == &manifest_identity.sha256,
@@ -1858,7 +1859,7 @@ pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
 
 pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, String)> {
     let root = project_root(root)?;
-    assert_no_pending(&root)?;
+    ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let lock = CheckoutLock::acquire_shared(&root, "status", Some(runner))?;
     let req = RuntimeRequest::new(root.clone(), "status".into());
     let tool = ToolAdmission::capture_status_compat(&req)?;

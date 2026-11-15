@@ -71,19 +71,30 @@ class RustCheckTests(unittest.TestCase):
         cls.commands = []
         cls.recipe_sha = hashlib.sha256(RECIPE.read_bytes()).hexdigest()
         cls.image = None
-        # Acquisition is explicit and uses the actual shipping recipe. Docker may
-        # reuse build cache; all subsequent native probes have network disabled.
-        iidfile = cls.artifacts / "rust-image.id"
-        build_args = ["docker", "build", "--file", str(RECIPE), "--iidfile", str(iidfile),
-                      "--build-arg", "DEVKIT_RECIPE_SHA=" + cls.recipe_sha,
-                      "--label", LABEL + "=" + cls.token, str(REPO / "runtime")]
-        build = run(*build_args, timeout=300)
-        (cls.artifacts / "build.stdout").write_text(build.stdout)
-        (cls.artifacts / "build.stderr").write_text(build.stderr)
-        if build.returncode:
-            cls.temp.cleanup()
-            raise AssertionError(f"shipping Rust image build failed: {build.stderr}")
-        cls.image = iidfile.read_text().strip()
+        derived_tag = f"devkit-derived-rust:{cls.recipe_sha}"
+        inspected = run("docker", "image", "inspect", derived_tag)
+        if inspected.returncode == 0:
+            loaded = json.loads(inspected.stdout)
+            if loaded and loaded[0].get("Config", {}).get("Labels", {}).get(RECIPE_LABEL) == cls.recipe_sha:
+                cls.image = loaded[0]["Id"]
+                (cls.artifacts / "rust-image.id").write_text(cls.image + "\n")
+                (cls.artifacts / "build.stdout").write_text(f"reused {derived_tag} -> {cls.image}\n")
+                (cls.artifacts / "build.stderr").write_text("")
+        if cls.image is None:
+            # Acquisition is explicit and uses the actual shipping recipe. Docker may
+            # reuse build cache; all subsequent native probes have network disabled.
+            iidfile = cls.artifacts / "rust-image.id"
+            build_args = ["docker", "build", "--file", str(RECIPE), "--iidfile", str(iidfile),
+                          "--tag", derived_tag,
+                          "--build-arg", "DEVKIT_RECIPE_SHA=" + cls.recipe_sha,
+                          str(REPO / "runtime")]
+            build = run(*build_args, timeout=300)
+            (cls.artifacts / "build.stdout").write_text(build.stdout)
+            (cls.artifacts / "build.stderr").write_text(build.stderr)
+            if build.returncode:
+                cls.temp.cleanup()
+                raise AssertionError(f"shipping Rust image build failed: {build.stderr}")
+            cls.image = iidfile.read_text().strip()
         image = json.loads(checked("docker", "image", "inspect", cls.image).stdout)[0]
         if image["Id"] != cls.image or image["Config"]["Labels"].get(RECIPE_LABEL) != cls.recipe_sha:
             raise AssertionError("derived image does not match the shipping recipe identity")

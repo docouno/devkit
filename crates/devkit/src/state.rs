@@ -373,8 +373,9 @@ pub fn admit_runtime_project(root: &Path, expected_version: &str) -> Result<Runt
     let root = project_root(root)?;
     let root = root.as_path();
     assert_no_pending(root)?;
-    let manifest_identity =
-        identity(&safe_path(root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
+    let manifest_path = safe_path(root, MANIFEST_PATH)?;
+    check_manifest_regular_bounded(&manifest_path)?;
+    let manifest_identity = identity(&manifest_path)?.context("Missing project manifest")?;
     let s = read_project_state(root)?;
     ensure!(
         s.version == expected_version,

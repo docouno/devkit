@@ -1805,9 +1805,25 @@ fn public_baseline_and_performance_contract_reject_stale_versions_and_under_samp
     under_sampled["measurements"][0]["sampleCount"] = json!(29);
     assert!(validate_gate("performance", &under_sampled, c).is_err());
 
-    let mut regressed = perf;
+    let mut regressed = perf.clone();
     regressed["comparisons"][1]["nonRegressionPassed"] = json!(false);
     assert!(validate_gate("performance", &regressed, c).is_err());
+
+    let mut regressed_help = perf.clone();
+    regressed_help["comparisons"][0]["nonRegressionPassed"] = json!(false);
+    assert!(validate_gate("performance", &regressed_help, c).is_err());
+
+    let mut help_only = perf;
+    help_only["comparisons"] = json!([
+        {
+            "shape": "one",
+            "operation": "help",
+            "nativeToBaselineMedianRatio": 1.0,
+            "allowedMaxSeconds": 0.05,
+            "nonRegressionPassed": true
+        }
+    ]);
+    assert!(validate_gate("performance", &help_only, c).is_err());
 }
 
 #[test]

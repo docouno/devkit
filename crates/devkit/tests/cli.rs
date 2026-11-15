@@ -1047,6 +1047,125 @@ fn pre_0_4_checkouts_fail_before_lock_prompt_network_or_make_across_all_commands
             .contains("Project manifest exceeds 4 MiB byte budget")
     );
     assert!(!huge.join(".devkit/state").exists());
+    let huge_doc = run_cli(&huge, &["doctor", ".", "--json"]);
+    assert_eq!(huge_doc.status.code(), Some(1));
+    let huge_check = decoded(&huge_doc)["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap()
+        .clone();
+    assert_eq!(huge_check["status"], "fail");
+    assert!(
+        huge_check["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Project manifest exceeds 4 MiB byte budget")
+    );
+    assert!(!huge.join(".devkit/state").exists());
+}
+
+#[test]
+fn doctor_preserves_structured_checks_for_symlinked_and_corrupt_targets_and_inspect_status_enforces_floor()
+ {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+
+    // 1. Symlinked empty directory outside any checkout still runs structured host diagnostics.
+    let real_empty = temp.path().join("real-empty");
+    fs::create_dir_all(&real_empty).unwrap();
+    let link_empty = temp.path().join("link-empty");
+    symlink(&real_empty, &link_empty).unwrap();
+    let empty_out = invoke(
+        temp.path(),
+        &["doctor", link_empty.to_str().unwrap(), "--json"],
+    );
+    let empty_json = decoded(&empty_out);
+    assert!(
+        empty_json.get("error").is_none(),
+        "doctor on symlinked empty dir fell out of structured checks: {empty_json}"
+    );
+    let empty_check = empty_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(empty_check["status"], "ok");
+    assert_eq!(empty_check["details"]["present"], false);
+
+    // 2. Symlinked checkout hits inspect_checkout_lockfree symlink remediation instead of CLI abort.
+    let real_proj = temp.path().join("real-proj");
+    fs::create_dir_all(real_proj.join(".devkit")).unwrap();
+    write_atomic(
+        &real_proj.join(MANIFEST_PATH),
+        br#"{"schemaVersion":2,"version":"0.5.0"}"#,
+        0o644,
+    )
+    .unwrap();
+    let link_proj = temp.path().join("link-proj");
+    symlink(&real_proj, &link_proj).unwrap();
+    let link_out = invoke(
+        temp.path(),
+        &["doctor", link_proj.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(link_out.status.code(), Some(1));
+    let link_json = decoded(&link_out);
+    assert!(link_json.get("error").is_none(), "{link_json}");
+    let link_check = link_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(link_check["status"], "fail");
+    assert!(
+        link_check["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Refusing a symlink in path")
+    );
+    assert_eq!(
+        link_check["remediation"],
+        "Verify directory permissions and symlinks on the checkout path"
+    );
+
+    // 3. Supported checkout with corrupt/conflicted manifest reports structured checkout_state fail.
+    let corrupt = temp.path().join("corrupt-proj");
+    fs::create_dir_all(corrupt.join(".devkit")).unwrap();
+    write_atomic(&corrupt.join(MANIFEST_PATH), b"<<<<<<< HEAD\n", 0o644).unwrap();
+    let corrupt_out = invoke(
+        temp.path(),
+        &["doctor", corrupt.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(corrupt_out.status.code(), Some(1));
+    let corrupt_json = decoded(&corrupt_out);
+    assert!(corrupt_json.get("error").is_none(), "{corrupt_json}");
+    let corrupt_check = corrupt_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(corrupt_check["status"], "fail");
+    assert_eq!(corrupt_check["remediation"], "make sync");
+    assert!(!corrupt.join(".devkit/state").exists());
+
+    // 4. Direct library call runtime::inspect_status enforces >= 0.4.0 floor before CheckoutLock.
+    let pre_040 = temp.path().join("pre-040-lib");
+    fs::create_dir_all(pre_040.join(".devkit")).unwrap();
+    write_atomic(
+        &pre_040.join(MANIFEST_PATH),
+        br#"{"schemaVersion":2,"version":"0.3.2","releaseIdentity":"0000000000000000000000000000000000000000000000000000000000000000","generation":"gen-0","packageMode":"local","managed":{},"components":{}}"#,
+        0o644,
+    )
+    .unwrap();
+    let runner = devkit::processes::ProcessRunner::new().unwrap();
+    let err = devkit::runtime::inspect_status(&pre_040, &runner).unwrap_err();
+    assert_eq!(devkit::cli::error_code(&err), "UNSUPPORTED_PROJECT_VERSION");
+    assert!(!pre_040.join(".devkit/state").exists());
 }
 
 #[test]

@@ -246,9 +246,15 @@ class Harness:
             'managed': {},
             'components': {},
         }))
+        pre_040_before = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        requests_before = len(self.fixture.requests)
         self.run('refuse-pre-040-project-zero-mutation', [self.engine, 'status', '--root', pre_040], expected='0.4.0')
-        self.run('refuse-pre-040-update-zero-mutation', [self.engine, 'update', pre_040, '--to', self.version, '--release-root', self.payload, '--non-interactive'], expected='0.4.1')
-        require(not (pre_040 / '.devkit/state').exists(), 'Pre-0.4.0 refusal created lock or state directory')
+        self.run('refuse-pre-040-update-zero-mutation', [self.engine, 'update', pre_040, '--to', self.old_version, '--non-interactive'], expected='0.4.1')
+        require(len(self.fixture.requests) == requests_before, 'Pre-0.4.0 refusal issued unexpected release HTTP requests')
+        pre_040_after = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        require(pre_040_after == pre_040_before, 'Pre-0.4.0 refusal mutated project checkout')
+        require(not (self.scratch / 'cache refuse-pre-040-project-zero-mutation').exists(), 'Pre-0.4.0 status refusal created cache directory')
+        require(not (self.scratch / 'cache refuse-pre-040-update-zero-mutation').exists(), 'Pre-0.4.0 update refusal created cache directory')
     def finish(self, passed):
         self.fixture.close()
         require(self.source_before == {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}, 'Modified source build-set')

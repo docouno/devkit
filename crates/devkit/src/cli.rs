@@ -326,17 +326,23 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
     if command == "doctor" {
         ensure!(!globals.interactive, "doctor does not accept --interactive");
         let target = resolve_metadata_target(&globals.args[1..])?;
-        if target.exists() {
-            let root = project_root(&target)?;
-            if !exists(&safe_path(&root, state::PENDING_PATH)?)?
-                && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
-            {
-                state::ensure_supported_checkout_floor(
-                    &root,
-                    false,
-                    state::MIN_SUPPORTED_PROJECT_VERSION,
-                )?;
+        if let Err(err) = (|| -> Result<()> {
+            if fs::symlink_metadata(target.join(".devkit")).is_ok() {
+                let root = project_root(&target)?;
+                if !exists(&safe_path(&root, state::PENDING_PATH)?)?
+                    && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
+                {
+                    state::ensure_supported_checkout_floor(
+                        &root,
+                        false,
+                        state::MIN_SUPPORTED_PROJECT_VERSION,
+                    )?;
+                }
             }
+            Ok(())
+        })() && error_code(&err) == "UNSUPPORTED_PROJECT_VERSION"
+        {
+            return Err(err);
         }
         let (result, human, ok) = crate::doctor::run_doctor(&target, runner)?;
         if ok {
