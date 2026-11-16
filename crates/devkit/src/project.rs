@@ -385,6 +385,7 @@ impl LockResolver for DockerPnpmResolver {
                     "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
                     "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
                     "PNPM_CONFIG_IGNORE_PNPMFILE=true",
+                    "PNPM_CONFIG_PM_ON_FAIL=ignore",
                     "PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                     "npm_config_globalconfig=/tmp/devkit-global.npmrc",
                     "npm_config_update_notifier=false",
@@ -1321,6 +1322,18 @@ fn mutate(
         None => "sync/update",
     };
     let lock = CheckoutLock::acquire_exclusive(target, op_label, options.runner)?;
+    let candidate_state = read_project_state(&lock.root)?;
+    if !node_components(&candidate_state).is_empty()
+        && SemVer::parse(&candidate_state.version)? < SemVer::parse("0.5.0")?
+        && SemVer::parse(&release.manifest.version)? >= SemVer::parse("0.5.0")?
+    {
+        for destination in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+            ensure!(
+                !exists(&safe_path(&lock.root, destination)?)?,
+                "npm migration destination already exists: {destination}; move it aside before updating"
+            );
+        }
+    }
     let snapshot = AdmissionSnapshot::capture(&lock.root)?;
     let root = &snapshot.root;
     let old = &snapshot.state;

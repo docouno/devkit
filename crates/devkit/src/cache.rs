@@ -159,13 +159,26 @@ impl<'a> ReleaseCache<'a> {
             .arg("--output")
             .arg(&archive)
             .args(["--max-bytes", "67108864"])
-            .env_remove("DEVKIT_INTERNAL_FETCH_BEARER");
-        if let Some(token) = npmrc_policy
-            .map(|p| npm_bearer(p, &url))
+            .env_remove("DEVKIT_INTERNAL_FETCH_BEARER")
+            .env_remove("DEVKIT_INTERNAL_FETCH_BASIC");
+        if let Some(auth) = npmrc_policy
+            .map(|p| npm_authentication(p, &url))
             .transpose()?
             .flatten()
         {
-            command.env("DEVKIT_INTERNAL_FETCH_BEARER", token);
+            let value = std::env::var(&auth.variable).with_context(|| {
+                format!(
+                    "Required registry auth variable is absent: {}",
+                    auth.variable
+                )
+            })?;
+            command.env(
+                match auth.kind {
+                    crate::native::NpmAuthKind::Bearer => "DEVKIT_INTERNAL_FETCH_BEARER",
+                    crate::native::NpmAuthKind::Basic => "DEVKIT_INTERNAL_FETCH_BASIC",
+                },
+                value,
+            );
         }
         self.runner.checked_with_timeout(
             &mut command,
@@ -565,36 +578,28 @@ pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock
     }
 }
 
-fn npm_bearer(policy: &crate::native::NpmrcPolicy, url: &str) -> Result<Option<String>> {
+fn npm_authentication<'a>(
+    policy: &'a crate::native::NpmrcPolicy,
+    url: &str,
+) -> Result<Option<&'a crate::native::NpmAuthentication>> {
     let uri: ureq::http::Uri = url.parse()?;
     let address = format!(
         "{}{}",
         uri.authority().context("Registry authority")?,
         uri.path()
     );
-    let mut selected = None;
-    for line in &policy.sanitized_lines {
-        if let Some((prefix, value)) = line
-            .strip_prefix("//")
-            .and_then(|l| l.split_once(":_authToken="))
-            && address.starts_with(prefix)
-            && selected
-                .as_ref()
-                .is_none_or(|(length, _)| prefix.len() > *length)
-        {
-            selected = Some((prefix.len(), value));
-        }
-    }
-    selected
-        .map(|(_, value)| {
-            let var = value
-                .strip_prefix("${")
-                .and_then(|v| v.strip_suffix('}'))
-                .context("Invalid registry auth interpolation")?;
-            std::env::var(var)
-                .with_context(|| format!("Required registry auth variable is absent: {var}"))
-        })
-        .transpose()
+    // npm chooses the longest matching scope, preferring a token when both
+    // authentication forms are configured at that same scope.
+    Ok(policy
+        .authentication
+        .iter()
+        .filter(|auth| address.starts_with(&auth.prefix))
+        .max_by_key(|auth| {
+            (
+                auth.prefix.len(),
+                auth.kind == crate::native::NpmAuthKind::Bearer,
+            )
+        }))
 }
 
 fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunner) -> Result<()> {
@@ -691,4 +696,41 @@ fn payload_budget(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod npm_auth_tests {
+    use super::*;
+    use crate::native::{NpmAuthKind, parse_manifest_npmrc_policy};
+
+    #[test]
+    fn registry_auth_uses_typed_longest_scope_and_prefers_bearer_at_equal_scope() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        fs::write(temporary.path().join(".npmrc"),
+            "//registry.example/:_authToken=${ROOT_TOKEN}\n//registry.example/private/:_auth=${PRIVATE_BASIC}\n//registry.example/both/:_authToken=${SCOPED_TOKEN}\n//registry.example/both/:_auth=${SCOPED_BASIC}\n").unwrap();
+        let policy = parse_manifest_npmrc_policy(temporary.path()).unwrap();
+        for (path, kind, variable) in [
+            ("/pkg", NpmAuthKind::Bearer, "ROOT_TOKEN"),
+            ("/private/pkg", NpmAuthKind::Basic, "PRIVATE_BASIC"),
+            ("/both/pkg", NpmAuthKind::Bearer, "SCOPED_TOKEN"),
+        ] {
+            let selected = npm_authentication(&policy, &format!("https://registry.example{path}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.kind, kind);
+            assert_eq!(selected.variable, variable);
+        }
+        assert!(
+            npm_authentication(&policy, "https://registry.example.evil/private/pkg")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            npm_authentication(&policy, "https://registry.example/private-other/pkg")
+                .unwrap()
+                .unwrap()
+                .variable,
+            "ROOT_TOKEN"
+        );
+    }
 }

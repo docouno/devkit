@@ -327,6 +327,109 @@ mod tests {
     }
 
     #[test]
+    fn retained_peers_wait_for_changed_root_providers_and_reconcile_external_versions() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let mut lock = fixture(root);
+        let before_graph = lock.native_graph(root).unwrap();
+        let before = crate::graph::ProductGraph {
+            roots: before_graph.roots.clone(),
+            graph: before_graph.clone(),
+        };
+        let mut after = before_graph.clone();
+        let node = after.nodes.remove("react@19.3.1").unwrap();
+        after.nodes.insert("react@19.3.2".into(), node);
+        for edges in after.roots.values_mut() {
+            for edge in edges {
+                if edge.to.as_deref() == Some("react@19.3.1") {
+                    edge.to = Some("react@19.3.2".into());
+                }
+            }
+        }
+        crate::graph::assert_direct_product_roots_preserved(&before, &after).unwrap();
+        after
+            .nodes
+            .get_mut("packages/ui")
+            .unwrap()
+            .identity
+            .insert("local".into(), json!("packages/other"));
+        assert!(crate::graph::assert_direct_product_roots_preserved(&before, &after).is_err());
+
+        let mut web = native::native_manifest(root, "apps/web").unwrap();
+        web.get_mut("dependencies")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("react");
+        write_json(&root.join("apps/web/package.json"), &web).unwrap();
+        lock.importers
+            .get_mut("apps/web")
+            .unwrap()
+            .dependencies
+            .remove("react");
+        lock.importers
+            .get_mut(".")
+            .unwrap()
+            .dev_dependencies
+            .insert(
+                "react".into(),
+                Dependency {
+                    specifier: "19.3.1".into(),
+                    version: "19.3.1".into(),
+                },
+            );
+        write_json(
+            &root.join("package.json"),
+            &json!({"name":"fixture","private":true,"devDependencies":{"react":"19.3.1"}}),
+        )
+        .unwrap();
+        assert!(
+            lock.retained_graph(root).unwrap().roots["apps/web"]
+                .iter()
+                .any(|e| e.field == "peerDependencies")
+        );
+        write_json(
+            &root.join("package.json"),
+            &json!({"name":"fixture","private":true,"devDependencies":{"react":"19.3.2"}}),
+        )
+        .unwrap();
+        assert!(
+            !lock.retained_graph(root).unwrap().roots["apps/web"]
+                .iter()
+                .any(|e| e.field == "peerDependencies")
+        );
+        assert!(lock.native_graph(root).is_err());
+    }
+
+    #[test]
+    fn producer_age_exclusions_are_exact_bounded_and_survive_workspace_roundtrip() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let mut workspace = Workspace::new(vec![]);
+        workspace.minimum_release_age_exclude = vec![
+            "browserslist@4.29.6".into(),
+            "@scope/pkg@1.0.0-beta.1".into(),
+        ];
+        write_yaml(root, "pnpm-workspace.yaml", &workspace).unwrap();
+        assert_eq!(
+            Workspace::read(root).unwrap().minimum_release_age_exclude,
+            workspace.minimum_release_age_exclude
+        );
+        for invalid in [
+            "*",
+            "pkg@*",
+            "pkg@^1.0.0",
+            "@scope/*@1.0.0",
+            "https://example.com/pkg@1.0.0",
+        ] {
+            workspace.minimum_release_age_exclude = vec![invalid.into()];
+            assert!(workspace.validate(root).is_err(), "{invalid}");
+        }
+        workspace.minimum_release_age_exclude = vec!["pkg@1.0.0".into(); 4097];
+        assert!(workspace.validate(root).is_err());
+    }
+
+    #[test]
     fn parser_rejects_aliases_anchors_extra_workspace_settings_and_unsafe_protocols() {
         assert!(parse_yaml::<Value>(b"a: &anchor [1]\nb: *anchor\n").is_err());
         let workspace = b"packages: []\nnodeLinker: isolated\npackageImportMethod: hardlink\nverifyDepsBeforeRun: false\nstrictSsl: false\n";
@@ -413,6 +516,8 @@ pub struct Workspace {
     pub patched_dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub only_built_dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimum_release_age_exclude: Vec<String>,
 }
 impl Workspace {
     pub fn new(packages: Vec<String>) -> Self {
@@ -424,6 +529,7 @@ impl Workspace {
             overrides: BTreeMap::new(),
             patched_dependencies: BTreeMap::new(),
             only_built_dependencies: vec![],
+            minimum_release_age_exclude: vec![],
         }
     }
     pub fn validate(&self, root: &Path) -> Result<()> {
@@ -458,6 +564,21 @@ impl Workspace {
                 .all(|n| native::valid_npm_package_name(n)),
             "Invalid onlyBuiltDependencies package name"
         );
+        ensure!(
+            self.minimum_release_age_exclude.len() <= 4096,
+            "Too many minimumReleaseAgeExclude entries"
+        );
+        for selector in &self.minimum_release_age_exclude {
+            let (name, version) = selector
+                .rsplit_once('@')
+                .context("minimumReleaseAgeExclude requires an exact package version")?;
+            ensure!(
+                native::valid_npm_package_name(name),
+                "Invalid minimumReleaseAgeExclude package name"
+            );
+            SemVer::parse(version)
+                .context("minimumReleaseAgeExclude requires an exact package version")?;
+        }
         Ok(())
     }
     pub fn read(root: &Path) -> Result<Self> {
@@ -1110,7 +1231,20 @@ impl Lock {
         self.graph(root, true)
     }
     pub fn retained_graph(&self, root: &Path) -> Result<crate::graph::NativeGraph> {
-        self.graph(root, false)
+        // Retain only selections whose physical declaration still matches.
+        // Peer fallback must use that same partial view, including the root.
+        let mut retained = self.clone();
+        for (id, importer) in &mut retained.importers {
+            let manifest = native::native_manifest(root, root_path(id))?;
+            for field in PHYSICAL_FIELDS {
+                let declarations = native::dependency_table(&manifest, field)?;
+                importer.field_mut(field).retain(|name, dependency| {
+                    declarations.get(name).and_then(Value::as_str)
+                        == Some(dependency.specifier.as_str())
+                });
+            }
+        }
+        retained.graph(root, false)
     }
     fn graph(&self, root: &Path, strict: bool) -> Result<crate::graph::NativeGraph> {
         use crate::graph::{Edge, NativeGraph, Node};
@@ -1126,6 +1260,19 @@ impl Lock {
             for field in native::DEPENDENCY_FIELDS {
                 for (name, value) in native::dependency_table(&manifest, field)? {
                     let spec = text(&value, "dependency specifier")?;
+                    if !strict
+                        && field == "peerDependencies"
+                        && self.importers[id].dependency(&name).is_none()
+                        && self
+                            .importers
+                            .get(".")
+                            .and_then(|i| i.dependency(&name))
+                            .is_none()
+                    {
+                        // An unresolved new peer is a resolver input, not a
+                        // previously selected product artifact to preserve.
+                        continue;
+                    }
                     if !strict
                         && field != "peerDependencies"
                         && self.importers[id]

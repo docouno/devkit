@@ -2358,6 +2358,20 @@ pub struct NpmrcPolicy {
     pub scoped_registries: BTreeMap<String, String>,
     pub required_env_vars: BTreeSet<String>,
     pub sanitized_lines: Vec<String>,
+    pub authentication: Vec<NpmAuthentication>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NpmAuthKind {
+    Basic,
+    Bearer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpmAuthentication {
+    pub prefix: String,
+    pub kind: NpmAuthKind,
+    pub variable: String,
 }
 
 const NPMRC_SAFE_DEFAULTS: &[(&str, &str)] = &[
@@ -2562,6 +2576,15 @@ pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
                 "_authToken" | "_auth" => {
                     let var = parse_npmrc_env_var(key, value)?;
                     policy.required_env_vars.insert(var.to_owned());
+                    policy.authentication.push(NpmAuthentication {
+                        prefix: format!("{host_and_path}/"),
+                        kind: if option == "_authToken" {
+                            NpmAuthKind::Bearer
+                        } else {
+                            NpmAuthKind::Basic
+                        },
+                        variable: var.to_owned(),
+                    });
                     continue;
                 }
                 "always-auth" => {

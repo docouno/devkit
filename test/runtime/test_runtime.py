@@ -525,6 +525,18 @@ class RuntimeTests(unittest.TestCase):
             finally:
                 hook.unlink()
 
+    def test_setup_preserves_package_manager_metadata_and_uses_the_release_pin(self):
+        write_fixture(self.root)
+        path = self.root / "package.json"
+        manifest = json.loads(path.read_text())
+        for manager in ("pnpm@0.0.0", "npm@11.21.1"):
+            manifest["packageManager"] = manager
+            path.write_text(json.dumps(manifest, indent=2) + "\n")
+            before = path.read_bytes()
+            self.make("setup")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue((self.root / ".devkit/state/node-workspace.lock").is_file())
+
     def test_shared_store_hardlinks_offline_worktree_and_masks(self):
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w:gz") as package:

@@ -118,6 +118,10 @@ pub fn read_native_graph(root: &Path) -> Result<NativeGraph> {
     if exists(&input_path(root, "pnpm-lock.yaml")?)? {
         return crate::pnpm::Lock::read(root)?.native_graph(root);
     }
+    read_npm_graph(root)
+}
+
+fn read_npm_graph(root: &Path) -> Result<NativeGraph> {
     let packages = package_lock(root)?;
     let mut nodes = BTreeMap::new();
     for (location, raw) in &packages {
@@ -166,6 +170,10 @@ pub fn read_native_graph(root: &Path) -> Result<NativeGraph> {
 
 pub fn capture_product_graph(root: &Path, state: &ProjectState) -> Result<ProductGraph> {
     let graph = read_native_graph(root)?;
+    Ok(product_graph(graph, state))
+}
+
+fn product_graph(graph: NativeGraph, state: &ProjectState) -> ProductGraph {
     let mut roots = BTreeMap::new();
     for (path, edges) in &graph.roots {
         if !path.is_empty() && !state.components.contains_key(path) {
@@ -184,19 +192,21 @@ pub fn capture_product_graph(root: &Path, state: &ProjectState) -> Result<Produc
                 .collect(),
         );
     }
-    Ok(ProductGraph { graph, roots })
+    ProductGraph { graph, roots }
 }
 
 /// Capture the v3 baseline independently of conversion so a faulty importer
 /// cannot silently redefine the product graph that an upgrade must preserve.
 pub fn read_legacy_npm_product_graph(root: &Path, state: &ProjectState) -> Result<ProductGraph> {
     let packages = package_lock(root)?;
-    let mut product = capture_product_graph(root, state)?;
+    let mut product = product_graph(read_npm_graph(root)?, state);
     for (location, node) in &mut product.graph.nodes {
         if location.is_empty() || state.components.contains_key(location) {
             continue;
         }
-        let raw = &packages[location];
+        let raw = packages
+            .get(location)
+            .context("Legacy npm graph node is absent from its lock")?;
         let local = !location.contains("node_modules/");
         let mut identity = if local {
             node.identity.clone()
@@ -926,12 +936,23 @@ pub fn assert_direct_product_roots_preserved(
                 "Product dependency conflict: {root_label}:{}",
                 old.name
             );
-            if old.spec.starts_with("file:")
-                || old
+            let local = old
+                .to
+                .as_ref()
+                .and_then(|target| before.graph.nodes.get(target))
+                .and_then(|node| node.identity.get("local"));
+            if let Some(local) = local {
+                let next_local = next
                     .to
                     .as_ref()
-                    .is_some_and(|target| !target.contains("node_modules/"))
-            {
+                    .and_then(|target| after.nodes.get(target))
+                    .and_then(|node| node.identity.get("local"));
+                ensure!(
+                    Some(local) == next_local,
+                    "Local workspace dependency target changed: {root_label}:{}",
+                    old.name
+                );
+            } else if old.spec.starts_with("file:") {
                 ensure!(
                     old.to == next.to,
                     "Local workspace dependency target changed: {root_label}:{}",

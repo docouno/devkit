@@ -23,6 +23,8 @@ export function npmEnvironment(directory, registry = publicRegistry, inherited =
     XDG_CACHE_HOME: join(directory, 'pnpm-cache'),
     PNPM_CONFIG_REGISTRY: registry,
     PNPM_CONFIG_NPMRC_AUTH_FILE: userconfig,
+    PNPM_CONFIG_IGNORE_PNPMFILE: 'true',
+    PNPM_CONFIG_PM_ON_FAIL: 'ignore',
     npm_config_userconfig: userconfig,
     npm_config_globalconfig: globalconfig,
     npm_config_cache: join(directory, 'cache'),

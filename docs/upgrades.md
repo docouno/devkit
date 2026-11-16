@@ -76,6 +76,8 @@ npx @docouno/devkit@0.5.0 update . --to 0.5.0 --reconcile-lock
 
 When `--reconcile-lock` is used, Devkit prints a concise summary of changed, added, and removed lockfile packages (and includes `lockReconciliation` in `--json` output).
 
+Reconciliation may select different external package versions while retaining direct dependency declarations and local workspace target paths. Preview the report before applying it.
+
 ## Cumulative Migration Notes
 
 When upgrading across supported releases (for example `0.4.1 -> 0.5.0`), `devkit update` filters `release.json` migration entries by the version range `(old, target]` and your project's registered component profiles, printing short migration notes with both a local offline path (`~/.cache/docouno/devkit/releases/<ver>/<id>/docs/migrations/...`) and a GitHub link.

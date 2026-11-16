@@ -202,6 +202,21 @@ pub fn fetch_with_options(
     runner.check_cancelled()?;
     let primary = agent(allow_loopback_http)?;
     let bearer = std::env::var("DEVKIT_INTERNAL_FETCH_BEARER").ok();
+    let basic = std::env::var("DEVKIT_INTERNAL_FETCH_BASIC").ok();
+    ensure!(
+        bearer.is_none() || basic.is_none(),
+        "Ambiguous download authentication"
+    );
+    let authorization = bearer
+        .map(|token| format!("Bearer {token}"))
+        .or_else(|| basic.map(|auth| format!("Basic {auth}")))
+        .map(|value| {
+            let mut header = ureq::http::HeaderValue::from_str(&value)
+                .map_err(|_| anyhow::anyhow!("Invalid download authentication value"))?;
+            header.set_sensitive(true);
+            Ok::<_, anyhow::Error>(header)
+        })
+        .transpose()?;
     let mut hop = uri.clone();
     let mut redirects = 0;
     let mut response = loop {
@@ -212,9 +227,9 @@ pub fn fetch_with_options(
                 .header("accept-encoding", "identity");
             if hop.scheme() == uri.scheme()
                 && hop.authority() == uri.authority()
-                && let Some(token) = &bearer
+                && let Some(authorization) = &authorization
             {
-                request = request.header("authorization", format!("Bearer {token}"));
+                request = request.header("authorization", authorization.clone());
             }
             request.call()
         };

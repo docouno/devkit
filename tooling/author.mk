@@ -124,6 +124,7 @@ define author_node
 	    --env npm_config_cache=/tmp/devkit-author-npm-cache \
 	    --env npm_config_userconfig=/tmp/devkit-author-user.npmrc \
 	    --env PNPM_CONFIG_IGNORE_PNPMFILE=true \
+	    --env PNPM_CONFIG_PM_ON_FAIL=ignore \
 	    --env npm_config_globalconfig=/tmp/devkit-author-global.npmrc \
 	    --env npm_config_update_notifier=false --env npm_config_fund=false --env npm_config_audit=false \
 	    $(3) "$$DEVKIT_AUTHOR_NODE_IMAGE" /devkit/devkit internal node "$$DEVKIT_NODE_VERSION" -- $(2)
@@ -157,6 +158,7 @@ define author_node_setup
 	    --env PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	    --env "XDG_CACHE_HOME=$$cache" --env "PNPM_CONFIG_STORE_DIR=$$store" \
 	    --env PNPM_CONFIG_IGNORE_PNPMFILE=true \
+	    --env PNPM_CONFIG_PM_ON_FAIL=ignore \
 	    --env npm_config_cache=/tmp/devkit-author-npm-cache \
 	    "$$DEVKIT_AUTHOR_NODE_IMAGE" /devkit/devkit internal node "$$DEVKIT_NODE_VERSION" -- \
 	    $(2) --config.package-import-method="$$method"

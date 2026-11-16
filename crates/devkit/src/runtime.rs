@@ -507,7 +507,10 @@ impl<'a> PreparedContext<'a> {
             package.starts_with(root.join("node_modules/.pnpm")),
             "Electron package resolves outside the isolated workspace store"
         );
-        let manifest: Value = read_json(&package.join("package.json"))?;
+        let manifest: Value = serde_json::from_slice(
+            &read_electron_metadata(&package.join("package.json"), 1024 * 1024)?
+                .context("Electron package manifest is missing")?,
+        )?;
         let version = text(&manifest["version"], "Electron version")?;
         crate::files::version(version)?;
         let plan = crate::shared_cache::UnifiedStorePlan::resolve(root, &self.cache_root()?)?;
@@ -598,8 +601,11 @@ impl<'a> PreparedContext<'a> {
         let copied_across_mounts = local.is_file()
             && crate::shared_cache::mount_identity(&local)?
                 != crate::shared_cache::mount_identity(&source)?;
+        let installed = read_electron_metadata(&package.join("path.txt"), 256)?;
         let ready = (linked || copied_across_mounts)
-            && fs::read_to_string(package.join("path.txt")).is_ok_and(|p| p.trim() == "electron")
+            && installed.as_deref().is_some_and(|bytes| {
+                std::str::from_utf8(bytes).is_ok_and(|p| p.trim() == "electron")
+            })
             && distribution_inventory(&package.join("dist"), self.runner)
                 .is_ok_and(|inventory| inventory == receipt.entries);
         if ready {
@@ -1179,6 +1185,7 @@ impl<'a> PreparedContext<'a> {
                 "PATH=/devkit/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
                 "PNPM_CONFIG_IGNORE_PNPMFILE=true",
+                "PNPM_CONFIG_PM_ON_FAIL=ignore",
                 "XDG_CACHE_HOME=/cache/pnpm",
                 "NPM_CONFIG_CACHE=/tmp/devkit-npm-cache",
                 "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
@@ -1315,22 +1322,35 @@ fn ensure_electron_executable(entries: &BTreeMap<String, DistributionEntry>) -> 
     Ok(())
 }
 
-fn read_distribution_receipt(path: &Path) -> Result<ElectronDistributionReceipt> {
+fn read_electron_metadata(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
-    let file = fs::OpenOptions::new()
+    let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     ensure!(
         file.metadata()?.is_file(),
-        "Invalid Electron distribution marker"
+        "Electron metadata must be a regular file: {}",
+        path.display()
     );
     let mut bytes = Vec::new();
-    file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= 4 * 1024 * 1024,
-        "Electron marker exceeds its byte budget"
+        bytes.len() as u64 <= maximum,
+        "Electron metadata exceeds its byte budget: {}",
+        path.display()
     );
+    Ok(Some(bytes))
+}
+
+fn read_distribution_receipt(path: &Path) -> Result<ElectronDistributionReceipt> {
+    let bytes = read_electron_metadata(path, 4 * 1024 * 1024)?
+        .context("Electron distribution marker is missing")?;
     let receipt: ElectronDistributionReceipt = serde_json::from_slice(&bytes)
         .context("Invalid Electron distribution marker; remove the cache and rerun make setup")?;
     ensure!(
@@ -2741,6 +2761,31 @@ mod tests {
 mod electron_cache_tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn generated_metadata_refuses_fifos_symlinks_and_oversized_files_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let path = temporary.path().join("path.txt");
+        assert!(read_electron_metadata(&path, 256).unwrap().is_none());
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a live, NUL-terminated temporary checkout path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::remove_file(&path).unwrap();
+        let target = temporary.path().join("target");
+        fs::write(&target, b"electron").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, vec![b'x'; 257]).unwrap();
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::write(&path, b"electron").unwrap();
+        assert_eq!(
+            read_electron_metadata(&path, 256).unwrap().unwrap(),
+            b"electron"
+        );
+    }
 
     #[test]
     fn inventory_detects_missing_changed_and_unexpected_distribution_entries() {

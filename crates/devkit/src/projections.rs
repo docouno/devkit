@@ -186,6 +186,8 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
                     ("PATH".into(),json!("/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")),
                     ("XDG_CACHE_HOME".into(),json!("/tmp/devkit-xdg-cache")),
                     ("NPM_CONFIG_CACHE".into(),json!("/tmp/devkit-npm-cache")),
+                    ("PNPM_CONFIG_PM_ON_FAIL".into(),json!("ignore")),
+                    ("PNPM_CONFIG_IGNORE_PNPMFILE".into(),json!("true")),
                 ]);
             }
         }

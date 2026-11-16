@@ -184,6 +184,7 @@ class HttpsFixture:
     def __init__(self, directory):
         self.root = directory
         self.requests = []
+        self.auth_headers = []
         self.connections = []
         self.ready = threading.Event()
         self.release = threading.Event()
@@ -226,6 +227,7 @@ class HttpsFixture:
 
             def do_GET(self):
                 fixture.requests.append(self.path)
+                fixture.auth_headers.append(self.headers.get("Authorization"))
                 try:
                     if self.path == "/ok":
                         self.send_response(200)
@@ -588,6 +590,18 @@ class TransportTests(unittest.TestCase):
             output = self.fetch(path, maximum=128)
             self.assertNotEqual(output.returncode, 0, path)
             self.assertFalse(self.output.exists(), path)
+
+    def test_scoped_download_worker_transports_basic_and_bearer_without_logging_values(self):
+        for variable, value, expected in (
+                ("DEVKIT_INTERNAL_FETCH_BASIC", "dXNlcjpwYXNz", "Basic dXNlcjpwYXNz"),
+                ("DEVKIT_INTERNAL_FETCH_BEARER", "fixture-token", "Bearer fixture-token")):
+            env = {key: item for key, item in self.env.items()
+                   if key not in ("DEVKIT_INTERNAL_FETCH_BASIC", "DEVKIT_INTERNAL_FETCH_BEARER")}
+            env[variable] = value
+            result = self.fetch("/redirect", check=True, env=env)
+            self.assertEqual(self.fixture.auth_headers[-2:], [expected, expected])
+            self.assertNotIn(value, result.stdout + result.stderr)
+            self.output.unlink()
 
     def test_additional_ca_and_explicit_standard_bundle_have_distinct_trust_semantics(self):
         extra = environment(self.root, DEVKIT_CA_CERT=self.fixture.root / "ca.pem")

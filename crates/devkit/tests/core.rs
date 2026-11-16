@@ -429,6 +429,49 @@ fn preview_is_read_only_noop_is_byte_stable_and_local_registry_is_transactional(
 }
 
 #[test]
+fn npm_migration_refuses_destination_collisions_before_creating_a_stage() {
+    let temporary = TempDir::new().unwrap();
+    let old = fixture_release(temporary.path(), "0.4.1");
+    let next = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("consumer");
+    let state = init(&old, &target, "node", PackageMode::Local);
+    for destination in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        put(&target, destination, b"consumer-owned collision\n");
+        let before = source_signature(&target, None).unwrap();
+        let error = update_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                preview: true,
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("migration destination already exists"),
+            "{error:#}"
+        );
+        assert_eq!(source_signature(&target, None).unwrap(), before);
+        assert!(
+            !fs::read_dir(target.join(".devkit/state"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("update-"))
+        );
+        if destination == "pnpm-lock.yaml" {
+            devkit::graph::read_legacy_npm_product_graph(&target, &state).unwrap();
+        }
+        fs::remove_file(target.join(destination)).unwrap();
+    }
+}
+
+#[test]
 fn npm_upgrade_migrates_linked_public_ranges_and_config_without_touching_preview_receipts() {
     let temporary = TempDir::new().unwrap();
     let old = fixture_release(temporary.path(), "0.4.1");
@@ -593,6 +636,36 @@ fn sync_resolves_new_ranges_aliases_and_sections_without_changing_preview_inputs
     }
     let temporary = TempDir::new().unwrap();
     let release = fixture_release(temporary.path(), "0.5.0");
+    for optional in [false, true] {
+        let peer_target = temporary.path().join(format!("peer-{optional}"));
+        init(&release, &peer_target, "node", PackageMode::Registry);
+        let mut manifest: Value = read_json(&peer_target.join("apps/main/package.json")).unwrap();
+        manifest["peerDependencies"] = json!({"fresh":"^1.0.0"});
+        manifest["devDependencies"]["fresh"] = json!("1.2.3");
+        if optional {
+            manifest["peerDependenciesMeta"] = json!({"fresh":{"optional":true}});
+        }
+        put_json(&peer_target, "apps/main/package.json", &manifest);
+        let before = source_signature(&peer_target, None).unwrap();
+        let resolver = SelectedArtifact(Cell::new(0));
+        for reconcile_lock in [false, true] {
+            sync_project(
+                &release,
+                &peer_target,
+                &UpdateOptions {
+                    preview: true,
+                    reconcile_lock,
+                    ..Default::default()
+                },
+                &resolver,
+            )
+            .unwrap();
+            assert_eq!(source_signature(&peer_target, None).unwrap(), before);
+        }
+        assert_eq!(resolver.0.get(), 2);
+        sync_project(&release, &peer_target, &UpdateOptions::default(), &resolver).unwrap();
+        read_runtime_project(&peer_target, "0.5.0").unwrap();
+    }
     let target = temporary.path().join("consumer");
     init(&release, &target, "node", PackageMode::Registry);
     let resolver = SelectedArtifact(Cell::new(0));
