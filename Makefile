@@ -4,7 +4,7 @@ SHELL := /bin/sh
 include toolchains.env
 include tooling/author.mk
 
-.PHONY: verify-engine fix-rust-format verify-core-legacy pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
+.PHONY: verify-engine fix-rust-format pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
 	test-env test-npm-inputs build build-fixtures build-controller npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
@@ -16,9 +16,9 @@ help:
 	  'make build          Build the attributed static release ELF, offline' \
 	  'make pack output=/absolute/new/build-set  Assemble clean committed source' \
 	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished preview' \
-	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/old/payload legacy_archive=/absolute/0.2.1.tar.gz' \
-	  'make verify-bootstrap build_set=/absolute/set legacy_archive=/absolute/0.2.1.tar.gz' \
-	  'make verify-public from_version=0.2.1 version=0.4.1 expected_index_sha256=SHA256' \
+	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.4.1/payload baseline_set=/absolute/v0.4.1' \
+	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.4.1' \
+	  'make verify-public from_version=0.4.1 version=0.5.0 expected_index_sha256=SHA256' \
 	  'make init release=/absolute/set/payload target=/absolute/new/project' \
 	  'Ordinary checks use cached SDKs. Only setup prepares images and dependencies.'
 setup: bootstrap
@@ -129,34 +129,31 @@ pack-guard:
 	@test -n "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Set output=/absolute/new/build-set.' >&2; exit 1; }
 	@test ! -e "$$DEVKIT_ASSEMBLY_OUTPUT" -a ! -L "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Assembly output must be new.' >&2; exit 1; }
 verify: verify-source-gates verify-runtime-gates verify-delivery-gates verify-packaged verify-registry
-verify-source-gates: check test verify-author verify-core-legacy
+verify-source-gates: check test verify-author
 verify-runtime-gates: verify-runtime verify-rust
 verify-delivery-gates: verify-delivery verify-bootstrap
-verify-core-legacy:
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core --no-run)
-	@set -eu; image=$$(docker image inspect --format '{{.Id}}' "$$DEVKIT_AUTHOR_RUST_IMAGE"); DEVKIT_TEST_RUST_IMAGE="$$image" DEVKIT_VERIFY_PREVIOUS="$$DEVKIT_VERIFY_PREVIOUS" python3 test/core_legacy.py < /dev/null
 verify-author:
 	@python3 test/author.py < /dev/null
 verify-engine:
 	@python3 test/author.py --engine-only < /dev/null
-verify-runtime: $(author_blackbox_build) build-fixtures verify-engine
-	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_TEST_FIXTURE="$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/examples/runtime_fixture" python3 test/runtime/test_runtime.py < /dev/null
+verify-runtime: $(author_blackbox_build) $(author_fixtures_build) verify-engine
+	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_TEST_FIXTURE="$$DEVKIT_AUTHOR_FIXTURES/runtime_fixture" python3 test/runtime/test_runtime.py < /dev/null
 verify-rust: $(author_blackbox_build) verify-engine
 	@DEVKIT_TEST_ENGINE="$$DEVKIT_VERIFY_ENGINE" python3 test/rust-check/test_rust_check.py < /dev/null
 verify-delivery:
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
 	@DEVKIT_TEST_BUILD_SET="$$DEVKIT_BUILD_SET" DEVKIT_TEST_DOCKER=1 python3 test/delivery/test_delivery.py < /dev/null
 verify-bootstrap:
-	@test -n "$$DEVKIT_LEGACY_ARCHIVE" || { printf '%s\n' 'Set legacy_archive=/absolute/public-0.2.1.tar.gz with adjacent checksum.' >&2; exit 1; }
+	@test -n "$$DEVKIT_BASELINE_SET" || { printf '%s\n' 'Set baseline_set=/absolute/v0.4.1.' >&2; exit 1; }
 	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
-	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --legacy-release "$$DEVKIT_LEGACY_ARCHIVE" < /dev/null
+	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --baseline-set "$$DEVKIT_BASELINE_SET" < /dev/null
 verify-packaged:
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
 	@DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS" < /dev/null
-verify-registry: build-fixtures
+verify-registry: $(author_blackbox_build) $(author_fixtures_build) verify-engine
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
-	@bash test/verify-registry.sh "$$DEVKIT_VERIFY_PREVIOUS" "$$DEVKIT_VERIFY_RELEASE" < /dev/null
+	@DEVKIT_AUTHOR_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_REGISTRY_FIXTURE="$$DEVKIT_AUTHOR_FIXTURES/registry_fixture" bash test/verify-registry.sh "$$DEVKIT_VERIFY_PREVIOUS" "$$DEVKIT_VERIFY_RELEASE" < /dev/null
 verify-public:
 	@test -n "$$DEVKIT_EXPECTED_INDEX_SHA256" || { printf '%s\n' 'Set expected_index_sha256= to the frozen release-index.json SHA256.' >&2; exit 1; }
 	@python3 test/public/verify.py --version "$$DEVKIT_FROM_VERSION" --next-version "$$DEVKIT_RELEASE_VERSION" --expected-index-sha256 "$$DEVKIT_EXPECTED_INDEX_SHA256" < /dev/null

@@ -26,11 +26,11 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
     let prepared = base.join("prepared");
     fs::create_dir(&root).unwrap();
     fs::create_dir(&prepared).unwrap();
-    write_atomic(&root.join("VERSION"), b"0.2.1\n", 0o644).unwrap();
+    write_atomic(&root.join("VERSION"), b"0.4.1\n", 0o644).unwrap();
     write_atomic(&root.join("LICENSE"), b"Original MIT license\n", 0o644).unwrap();
     write_json(
         &root.join("packages/env/package.json"),
-        &json!({"name":"@docouno/env","version":"0.2.1"}),
+        &json!({"name":"@docouno/env","version":"0.4.1"}),
     )
     .unwrap();
     write_atomic(
@@ -42,7 +42,7 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
     let env_bytes = b"opaque frozen native npm archive bytes";
     let env_integrity = sri(env_bytes);
     write_atomic(
-        &prepared.join("npm/docouno-env-0.3.0.tgz"),
+        &prepared.join("npm/docouno-env-0.5.0.tgz"),
         env_bytes,
         0o644,
     )
@@ -57,24 +57,24 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
         "ts-library",
         "react-ui",
     ] {
-        let manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","devDependencies":{"@docouno/env":"0.2.1","external":"1.2.3"}});
-        let lock = json!({"lockfileVersion":3,"packages":{"":manifest,"node_modules/@docouno/env":{"version":"0.2.1","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.2.1.tgz","integrity":sri(b"old environment")},"node_modules/external":external}});
+        let manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","devDependencies":{"@docouno/env":"0.4.1","external":"1.2.3"}});
+        let lock = json!({"lockfileVersion":3,"packages":{"":manifest,"node_modules/@docouno/env":{"version":"0.4.1","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.4.1.tgz","integrity":sri(b"old environment")},"node_modules/external":external}});
         let manifest_name = format!("templates/{name}/package.json");
         let lock_name = format!("templates/{name}/package-lock.json");
         write_json(&root.join(&manifest_name), &manifest).unwrap();
         write_json(&root.join(&lock_name), &lock).unwrap();
         let mut new_manifest = manifest;
-        new_manifest["devDependencies"]["@docouno/env"] = json!("0.3.0");
+        new_manifest["devDependencies"]["@docouno/env"] = json!("0.5.0");
         let mut new_lock = lock;
         new_lock["packages"][""] = new_manifest.clone();
-        new_lock["packages"]["node_modules/@docouno/env"] = json!({"version":"0.3.0","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.3.0.tgz","integrity":env_integrity});
+        new_lock["packages"]["node_modules/@docouno/env"] = json!({"version":"0.5.0","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.5.0.tgz","integrity":env_integrity});
         write_json(&prepared.join(&manifest_name), &new_manifest).unwrap();
         write_json(&prepared.join(&lock_name), &new_lock).unwrap();
         templates.insert(name, json!({"manifest":manifest_name,"lock":lock_name}));
     }
     write_json(&prepared.join("inputs.json"), &json!({
-        "schemaVersion":1,"version":"0.3.0","sourceVersion":"0.2.1","sourceEnvironmentVersion":"0.2.1",
-        "environment":{"name":"@docouno/env","version":"0.3.0","archive":"npm/docouno-env-0.3.0.tgz","integrity":env_integrity},
+        "schemaVersion":1,"version":"0.5.0","sourceVersion":"0.4.1","sourceEnvironmentVersion":"0.4.1",
+        "environment":{"name":"@docouno/env","version":"0.5.0","archive":"npm/docouno-env-0.5.0.tgz","integrity":env_integrity},
         "templates":templates,"sources":file_map(&root).unwrap(),"files":file_map(&prepared).unwrap()
     })).unwrap();
     (root, prepared)
@@ -577,7 +577,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
         &json!({ "schemaVersion": 1, "migrations": [valid_entry.clone()] }),
     )
     .unwrap();
-    let parsed = verify_migration_index(root, "0.4.0").unwrap();
+    let parsed = verify_migration_index(root, "0.5.0").unwrap();
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].id, "glob-scripts-040");
 
@@ -590,7 +590,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
     )
     .unwrap();
     assert!(
-        verify_migration_index(root, "0.4.0")
+        verify_migration_index(root, "0.5.0")
             .unwrap_err()
             .to_string()
             .contains("anchor #fake-heading-inside-fence not found")
@@ -598,14 +598,14 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
 
     // Version newer than release is rejected.
     let mut future_ver = valid_entry.clone();
-    future_ver["version"] = json!("0.5.0");
+    future_ver["version"] = json!("0.6.0");
     write_json(
         &root.join("docs/migrations/index.json"),
         &json!({ "schemaVersion": 1, "migrations": [future_ver] }),
     )
     .unwrap();
     assert!(
-        verify_migration_index(root, "0.4.0")
+        verify_migration_index(root, "0.5.0")
             .unwrap_err()
             .to_string()
             .contains("newer than release")
@@ -618,7 +618,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
     )
     .unwrap();
     assert!(
-        verify_migration_index(root, "0.4.0")
+        verify_migration_index(root, "0.5.0")
             .unwrap_err()
             .to_string()
             .contains("Duplicate migration id")

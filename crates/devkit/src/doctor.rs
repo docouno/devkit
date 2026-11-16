@@ -879,8 +879,9 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
     }
 
     let admitted = (|| -> Result<(ProjectState, String, Value)> {
-        let manifest_id = identity(&safe_path(&root, state::MANIFEST_PATH)?)?
-            .context("Missing project manifest")?;
+        let manifest_path = safe_path(&root, state::MANIFEST_PATH)?;
+        state::check_manifest_regular_bounded(&manifest_path)?;
+        let manifest_id = identity(&manifest_path)?.context("Missing project manifest")?;
         let s = state::read_project_state(&root)?;
         state::assert_managed(&root, &s)?;
         state::verify_managed_set(&root, &s)?;

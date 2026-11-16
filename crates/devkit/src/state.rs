@@ -11,6 +11,84 @@ use std::{
 pub const MANIFEST_PATH: &str = ".devkit/manifest.json";
 pub const PENDING_PATH: &str = ".devkit/update-pending.json";
 pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
+pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
+pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+pub fn check_manifest_regular_bounded(path: &Path) -> Result<()> {
+    let info = match fs::symlink_metadata(path) {
+        Ok(i) => i,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("Missing project manifest")
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        info.is_file() && !info.file_type().is_symlink(),
+        "Expected a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        info.len() <= MAX_MANIFEST_BYTES,
+        "Project manifest exceeds 4 MiB byte budget"
+    );
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MinimalManifestFloor {
+    schema_version: u32,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+fn unsupported_floor_error(is_update: bool, found: &str, min_from: &str) -> anyhow::Error {
+    let code = if is_update {
+        "UNSUPPORTED_UPGRADE_PATH"
+    } else {
+        "UNSUPPORTED_PROJECT_VERSION"
+    };
+    crate::cli::error(
+        code,
+        format!(
+            "Project uses Devkit {found}, which is older than the minimum supported version {min_from}. Upgrade through the 0.4.1 bridge release first: npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check (append --reconcile-lock if transitive npm peer dependencies conflict)."
+        ),
+    )
+}
+
+pub fn ensure_supported_checkout_floor(
+    root: &Path,
+    is_update: bool,
+    min_from: &str,
+) -> Result<String> {
+    assert_no_pending(root)?;
+    let path = safe_path(root, MANIFEST_PATH)?;
+    check_manifest_regular_bounded(&path)?;
+    let before = identity(&path)?.context("Missing project manifest")?;
+    let bytes = fs::read(&path)?;
+    ensure!(
+        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
+        "Project manifest changed during admission"
+    );
+    let raw: MinimalManifestFloor = serde_json::from_slice(&bytes)?;
+    if raw.schema_version == 1 {
+        return Err(unsupported_floor_error(
+            is_update,
+            "schemaVersion 1 (< 0.2.0)",
+            min_from,
+        ));
+    }
+    ensure!(
+        raw.schema_version == 2,
+        "Unsupported project schemaVersion; only published schema2 is supported"
+    );
+    let ver = raw.version.context("Missing project manifest version")?;
+    version(&ver)?;
+    if SemVer::parse(&ver)? < SemVer::parse(min_from)? {
+        return Err(unsupported_floor_error(is_update, &ver, min_from));
+    }
+    Ok(ver)
+}
 pub fn managed_path(name: &str) -> Result<&str> {
     relative_path(name)?;
     ensure!(
@@ -134,6 +212,7 @@ pub fn validate_project_state(s: &ProjectState) -> Result<()> {
 }
 pub fn read_project_state(root: &Path) -> Result<ProjectState> {
     let path = safe_path(root, MANIFEST_PATH)?;
+    check_manifest_regular_bounded(&path)?;
     let before = identity(&path)?.context("Missing project manifest")?;
     let bytes = fs::read(&path)?;
     ensure!(
@@ -294,8 +373,9 @@ pub fn admit_runtime_project(root: &Path, expected_version: &str) -> Result<Runt
     let root = project_root(root)?;
     let root = root.as_path();
     assert_no_pending(root)?;
-    let manifest_identity =
-        identity(&safe_path(root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
+    let manifest_path = safe_path(root, MANIFEST_PATH)?;
+    check_manifest_regular_bounded(&manifest_path)?;
+    let manifest_identity = identity(&manifest_path)?.context("Missing project manifest")?;
     let s = read_project_state(root)?;
     ensure!(
         s.version == expected_version,

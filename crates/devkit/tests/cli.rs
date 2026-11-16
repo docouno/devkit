@@ -324,6 +324,7 @@ fn update_and_sync_forward_dispatch_to_synthetic_99_0_0_release_with_unknown_pro
         &devkit::model::Release {
             schema_version: 1,
             version: "99.0.0".into(),
+            min_supported_from_version: Some("0.4.0".into()),
             rust_version: "1.99.1".into(),
             environment: devkit::model::Environment {
                 name: "@docouno/env".into(),
@@ -684,6 +685,7 @@ fn umask_modes_pass_cli_forward_dispatch_and_doctor_remediation_uses_make_sync()
         &devkit::model::Release {
             schema_version: 1,
             version: "99.0.1".into(),
+            min_supported_from_version: Some("0.4.0".into()),
             rust_version: "1.99.1".into(),
             environment: devkit::model::Environment {
                 name: "@docouno/env".into(),
@@ -813,4 +815,794 @@ fn umask_modes_pass_cli_forward_dispatch_and_doctor_remediation_uses_make_sync()
         checkout["remediation"],
         "git checkout -- .devkit && make sync"
     );
+}
+
+#[test]
+fn pre_0_4_checkouts_fail_before_lock_prompt_network_or_make_across_all_commands() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let make_marker = temp.path().join("make-invoked");
+    let fake_make = fake_bin.join("make");
+    fs::write(
+        &fake_make,
+        format!(
+            "#!/bin/sh\nprintf 'invoked' > '{}'\nexit 99\n",
+            make_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_make, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_cli = |cwd: &Path, args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .env("CI", "true")
+            .env("PATH", &fake_bin)
+            .env("DEVKIT_CACHE_DIR", temp.path().join("unused-cache"))
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .output()
+            .unwrap()
+    };
+
+    for (label, manifest_val) in [
+        (
+            "schema1",
+            serde_json::json!({"schemaVersion": 1, "version": "0.1.0"}),
+        ),
+        (
+            "v021",
+            serde_json::json!({"schemaVersion": 2, "version": "0.2.1"}),
+        ),
+        (
+            "v032",
+            serde_json::json!({"schemaVersion": 2, "version": "0.3.2"}),
+        ),
+    ] {
+        let proj = temp.path().join(label);
+        fs::create_dir_all(proj.join(".devkit")).unwrap();
+        write_json(&proj.join(MANIFEST_PATH), &manifest_val).unwrap();
+        write_atomic(&proj.join("Makefile"), b"check:\n\t@true\n", 0o644).unwrap();
+        let snapshot = file_map(&proj).unwrap();
+
+        let json_cases: &[(&[&str], &str)] = &[
+            (
+                &["update", ".", "--to", "0.5.0"],
+                "UNSUPPORTED_UPGRADE_PATH",
+            ),
+            (&["update", "."], "UNSUPPORTED_UPGRADE_PATH"),
+            (&["sync", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["add-app", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["add-package", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["register", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["describe", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["status", "."], "UNSUPPORTED_PROJECT_VERSION"),
+            (&["doctor", "."], "UNSUPPORTED_PROJECT_VERSION"),
+        ];
+
+        for (base_args, expected_code) in json_cases {
+            let mut with_json = base_args.to_vec();
+            with_json.push("--json");
+            let j_out = run_cli(&proj, &with_json);
+            assert!(
+                !j_out.status.success(),
+                "{label} {with_json:?} unexpectedly succeeded"
+            );
+            assert!(j_out.stderr.is_empty(), "{label} {with_json:?}");
+            let payload = decoded(&j_out);
+            assert_eq!(
+                payload["error"]["code"], *expected_code,
+                "{label} {with_json:?}"
+            );
+            let msg = payload["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("0.4.1"), "{msg}");
+            assert!(
+                msg.contains("npx @docouno/devkit@0.4.1 update . --to 0.4.1"),
+                "{msg}"
+            );
+            assert!(!make_marker.exists(), "{label} {with_json:?}");
+            assert!(
+                !proj.join(".devkit/state").exists(),
+                "{label} {with_json:?}"
+            );
+            assert_eq!(file_map(&proj).unwrap(), snapshot, "{label} {with_json:?}");
+
+            let h_out = run_cli(&proj, base_args);
+            assert!(!h_out.status.success(), "{label} {base_args:?}");
+            let stderr = String::from_utf8_lossy(&h_out.stderr);
+            assert!(
+                stderr.contains("npx @docouno/devkit@0.4.1 update . --to 0.4.1"),
+                "{label} {base_args:?}: {stderr}"
+            );
+            assert!(!make_marker.exists(), "{label} {base_args:?}");
+            assert!(
+                !proj.join(".devkit/state").exists(),
+                "{label} {base_args:?}"
+            );
+            assert_eq!(file_map(&proj).unwrap(), snapshot, "{label} {base_args:?}");
+        }
+
+        for stream_args in [
+            vec!["run", "check"],
+            vec!["exec", "--component", "apps/api", "--", "true"],
+            vec!["task", "check"],
+        ] {
+            let s_out = run_cli(&proj, &stream_args);
+            assert!(!s_out.status.success(), "{label} {stream_args:?}");
+            let stderr = String::from_utf8_lossy(&s_out.stderr);
+            assert!(
+                stderr.contains("npx @docouno/devkit@0.4.1 update . --to 0.4.1"),
+                "{label} {stream_args:?}: {stderr}"
+            );
+            assert!(!make_marker.exists(), "{label} {stream_args:?}");
+            assert!(
+                !proj.join(".devkit/state").exists(),
+                "{label} {stream_args:?}"
+            );
+            assert_eq!(
+                file_map(&proj).unwrap(),
+                snapshot,
+                "{label} {stream_args:?}"
+            );
+        }
+    }
+
+    // Verify PENDING_PATH priority over both live old/current manifests (at_manifest == false)
+    // and missing manifests (at_manifest == true).
+    for (label, missing_manifest, version) in [
+        ("pending-live-021", false, "0.2.1"),
+        ("pending-live-041", false, "0.4.1"),
+        ("pending-missing", true, "0.4.1"),
+    ] {
+        let proj = temp.path().join(label);
+        fs::create_dir_all(proj.join(".devkit/runtime")).unwrap();
+        write_atomic(&proj.join(PENDING_PATH), b"{}\n", 0o644).unwrap();
+        write_atomic(
+            &proj.join(".devkit/runtime/toolchains.env"),
+            b"DEVKIT_VERSION=0.5.0\n",
+            0o644,
+        )
+        .unwrap();
+        write_atomic(&proj.join("Makefile"), b"check:\n\t@true\n", 0o644).unwrap();
+        if !missing_manifest {
+            write_json(
+                &proj.join(MANIFEST_PATH),
+                &serde_json::json!({
+                    "schemaVersion": 2,
+                    "version": version,
+                    "releaseIdentity": "a".repeat(64),
+                    "managed": {
+                        ".devkit/runtime/toolchains.env": {
+                            "sha256": "b".repeat(64),
+                            "mode": 0o644
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        }
+        for args in [
+            vec!["update", ".", "--to", "0.5.0", "--json"],
+            vec!["sync", ".", "--json"],
+            vec!["add-app", ".", "--json"],
+            vec!["describe", ".", "--json"],
+            vec!["status", ".", "--json"],
+        ] {
+            let out = run_cli(&proj, &args);
+            assert!(!out.status.success(), "{label} {args:?}");
+            let msg = decoded(&out)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                msg.contains("An update is incomplete; run devkit recover first"),
+                "{label} {args:?}: {msg}"
+            );
+        }
+        for args in [
+            vec!["run", "check"],
+            vec!["task", "check"],
+            vec!["exec", "--component", "apps/api", "--", "true"],
+        ] {
+            let out = run_cli(&proj, &args);
+            assert!(!out.status.success(), "{label} {args:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("An update is incomplete; run devkit recover first"),
+                "{label} {args:?}: {stderr}"
+            );
+            assert!(!make_marker.exists(), "{label} {args:?}");
+        }
+        let doc = run_cli(&proj, &["doctor", ".", "--json"]);
+        assert_eq!(doc.status.code(), Some(1), "{label}");
+        let doc_check = decoded(&doc)["result"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "checkout_state")
+            .unwrap()
+            .clone();
+        assert_eq!(doc_check["remediation"], "devkit recover", "{label}");
+    }
+
+    // Verify > 4 MiB valid JSON manifest bound before fs::read/identity.
+    let huge = temp.path().join("huge-manifest");
+    fs::create_dir_all(huge.join(".devkit")).unwrap();
+    let mut big = Vec::with_capacity(4 * 1024 * 1024 + 256);
+    big.extend_from_slice(br#"{"schemaVersion":2,"version":"0.4.1","pad":""#);
+    big.resize(4 * 1024 * 1024 + 128, b'x');
+    big.extend_from_slice(b"\"}\n");
+    write_atomic(&huge.join(MANIFEST_PATH), &big, 0o644).unwrap();
+    let huge_out = run_cli(&huge, &["describe", ".", "--json"]);
+    assert!(!huge_out.status.success());
+    assert!(
+        decoded(&huge_out)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Project manifest exceeds 4 MiB byte budget")
+    );
+    assert!(!huge.join(".devkit/state").exists());
+    let huge_doc = run_cli(&huge, &["doctor", ".", "--json"]);
+    assert_eq!(huge_doc.status.code(), Some(1));
+    let huge_check = decoded(&huge_doc)["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap()
+        .clone();
+    assert_eq!(huge_check["status"], "fail");
+    assert!(
+        huge_check["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Project manifest exceeds 4 MiB byte budget")
+    );
+    assert!(!huge.join(".devkit/state").exists());
+}
+
+#[test]
+fn doctor_preserves_structured_checks_for_symlinked_and_corrupt_targets_and_inspect_status_enforces_floor()
+ {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+
+    // 1. Symlinked empty directory outside any checkout still runs structured host diagnostics.
+    let real_empty = temp.path().join("real-empty");
+    fs::create_dir_all(&real_empty).unwrap();
+    let link_empty = temp.path().join("link-empty");
+    symlink(&real_empty, &link_empty).unwrap();
+    let empty_out = invoke(
+        temp.path(),
+        &["doctor", link_empty.to_str().unwrap(), "--json"],
+    );
+    let empty_json = decoded(&empty_out);
+    assert!(
+        empty_json.get("error").is_none(),
+        "doctor on symlinked empty dir fell out of structured checks: {empty_json}"
+    );
+    let empty_check = empty_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(empty_check["status"], "ok");
+    assert_eq!(empty_check["details"]["present"], false);
+
+    // 2. Symlinked checkout hits inspect_checkout_lockfree symlink remediation instead of CLI abort.
+    let real_proj = temp.path().join("real-proj");
+    fs::create_dir_all(real_proj.join(".devkit")).unwrap();
+    write_atomic(
+        &real_proj.join(MANIFEST_PATH),
+        br#"{"schemaVersion":2,"version":"0.5.0"}"#,
+        0o644,
+    )
+    .unwrap();
+    let link_proj = temp.path().join("link-proj");
+    symlink(&real_proj, &link_proj).unwrap();
+    let link_out = invoke(
+        temp.path(),
+        &["doctor", link_proj.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(link_out.status.code(), Some(1));
+    let link_json = decoded(&link_out);
+    assert!(link_json.get("error").is_none(), "{link_json}");
+    let link_check = link_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(link_check["status"], "fail");
+    assert!(
+        link_check["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Refusing a symlink in path")
+    );
+    assert_eq!(
+        link_check["remediation"],
+        "Verify directory permissions and symlinks on the checkout path"
+    );
+
+    // 3. Supported checkout with corrupt/conflicted manifest reports structured checkout_state fail.
+    let corrupt = temp.path().join("corrupt-proj");
+    fs::create_dir_all(corrupt.join(".devkit")).unwrap();
+    write_atomic(&corrupt.join(MANIFEST_PATH), b"<<<<<<< HEAD\n", 0o644).unwrap();
+    let corrupt_out = invoke(
+        temp.path(),
+        &["doctor", corrupt.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(corrupt_out.status.code(), Some(1));
+    let corrupt_json = decoded(&corrupt_out);
+    assert!(corrupt_json.get("error").is_none(), "{corrupt_json}");
+    let corrupt_check = corrupt_json["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "checkout_state")
+        .unwrap();
+    assert_eq!(corrupt_check["status"], "fail");
+    assert_eq!(corrupt_check["remediation"], "make sync");
+    assert!(!corrupt.join(".devkit/state").exists());
+
+    // 4. Direct library call runtime::inspect_status enforces >= 0.4.0 floor before CheckoutLock.
+    let pre_040 = temp.path().join("pre-040-lib");
+    fs::create_dir_all(pre_040.join(".devkit")).unwrap();
+    write_atomic(
+        &pre_040.join(MANIFEST_PATH),
+        br#"{"schemaVersion":2,"version":"0.3.2","releaseIdentity":"0000000000000000000000000000000000000000000000000000000000000000","generation":"gen-0","packageMode":"local","managed":{},"components":{}}"#,
+        0o644,
+    )
+    .unwrap();
+    let runner = devkit::processes::ProcessRunner::new().unwrap();
+    let err = devkit::runtime::inspect_status(&pre_040, &runner).unwrap_err();
+    assert_eq!(devkit::cli::error_code(&err), "UNSUPPORTED_PROJECT_VERSION");
+    assert!(!pre_040.join(".devkit/state").exists());
+}
+
+#[test]
+fn init_and_update_reject_target_versions_below_0_4_0_before_prompts_or_network() {
+    let temp = TempDir::new().unwrap();
+    let new_dir = temp.path().join("never-created");
+
+    let init_json = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args(["init", new_dir.to_str().unwrap(), "--to", "0.3.2", "--json"])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("CI", "true")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    assert!(!init_json.status.success());
+    let init_payload = decoded(&init_json);
+    assert_eq!(init_payload["error"]["code"], "UNSUPPORTED_PROJECT_VERSION");
+    assert!(
+        init_payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("@docouno/devkit@0.4.1")
+    );
+    assert!(!new_dir.exists());
+
+    let proj_041 = temp.path().join("proj-041");
+    fs::create_dir_all(proj_041.join(".devkit")).unwrap();
+    write_json(
+        &proj_041.join(MANIFEST_PATH),
+        &serde_json::json!({"schemaVersion": 2, "version": "0.4.1"}),
+    )
+    .unwrap();
+    let upd_json = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "update",
+            proj_041.to_str().unwrap(),
+            "--to",
+            "0.2.1",
+            "--json",
+        ])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("CI", "true")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    assert!(!upd_json.status.success());
+    let upd_payload = decoded(&upd_json);
+    assert_eq!(upd_payload["error"]["code"], "UNSUPPORTED_PROJECT_VERSION");
+    assert!(
+        upd_payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("@docouno/devkit@0.4.1")
+    );
+    assert!(!proj_041.join(".devkit/state").exists());
+}
+
+#[test]
+fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadata_contract() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use devkit::project::{InitOptions, LockResolver, init_project};
+    use sha2::{Digest, Sha512};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct NoResolver;
+    impl LockResolver for NoResolver {
+        fn regenerate(
+            &self,
+            _: &Path,
+            _: &devkit::release::AdmittedRelease,
+            _: Option<&str>,
+        ) -> devkit::Result<()> {
+            anyhow::bail!("unexpected npm lock resolution")
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_docker = fake_bin.join("docker");
+    fs::write(
+        &fake_docker,
+        "#!/bin/sh\ncase \"$*\" in\n  *'compose version --short'*) printf '5.0.0\\n' ;;\n  *'info --format'*) printf 'linux\\n' ;;\n  *'ps --all --format json'*) printf '[]\\n' ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let build_release = |version: &str, use_real_current_engine: bool| -> std::path::PathBuf {
+        let rel = temp.path().join(format!("release-{version}"));
+        fs::create_dir_all(&rel).unwrap();
+        let elf_bytes = if use_real_current_engine {
+            fs::read(env!("CARGO_BIN_EXE_devkit")).unwrap()
+        } else {
+            let marker = format!(
+                "{{\"schemaVersion\":1,\"ok\":true,\"command\":\"delegated\",\"result\":{{\"engine\":\"{version}\"}}}}\n"
+            );
+            minimal_static_x86_64_elf(marker.as_bytes())
+        };
+        let elf_sha = digest(&elf_bytes);
+        write_atomic(&rel.join("devkit"), &elf_bytes, 0o755).unwrap();
+
+        let rust_df = b"FROM scratch\n";
+        let desktop_df = b"FROM scratch\n";
+        write_atomic(&rel.join("runtime/rust.Dockerfile"), rust_df, 0o644).unwrap();
+        write_atomic(&rel.join("runtime/desktop.Dockerfile"), desktop_df, 0o644).unwrap();
+        let rust_hash = digest(rust_df);
+        let desktop_hash = digest(desktop_df);
+        let toolchains = format!(
+            "DEVKIT_VERSION={version}\nDEVKIT_ENGINE_SHA256={elf_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_hash}\n"
+        );
+        write_atomic(
+            &rel.join("runtime/toolchains.env"),
+            toolchains.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        for name in ["devkit.mk", "devkit.sh", "compose.tools.yaml"] {
+            write_atomic(
+                &rel.join(format!("runtime/{name}")),
+                b"services: {}\n",
+                0o644,
+            )
+            .unwrap();
+        }
+        for (name, body) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fixture-api\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"fixture-api\"\nversion = \"1.0.0\"\n",
+            ),
+            ("rustfmt.toml", "edition = \"2024\"\n"),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.99.1\"\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ] {
+            write_atomic(
+                &rel.join(format!("templates/rust-api/{name}")),
+                body.as_bytes(),
+                0o644,
+            )
+            .unwrap();
+        }
+        let env_bytes = format!("env-{version}");
+        let env_sri = format!("sha512-{}", STANDARD.encode(Sha512::digest(&env_bytes)));
+        let archive = format!("npm/env-{version}.tgz");
+        write_atomic(&rel.join(&archive), env_bytes.as_bytes(), 0o644).unwrap();
+        let min_from = (devkit::files::SemVer::parse(version).unwrap()
+            >= devkit::files::SemVer::parse("0.5.0").unwrap())
+        .then(|| "0.4.0".into());
+        write_json(
+            &rel.join("release.json"),
+            &devkit::model::Release {
+                schema_version: 1,
+                version: version.into(),
+                min_supported_from_version: min_from,
+                rust_version: "1.99.1".into(),
+                environment: devkit::model::Environment {
+                    name: "@docouno/env".into(),
+                    version: version.into(),
+                    archive,
+                    integrity: env_sri,
+                },
+                files: file_map(&rel).unwrap(),
+                migrations: vec![],
+            },
+        )
+        .unwrap();
+        rel
+    };
+
+    let rel_040 = build_release("0.4.0", false);
+    let rel_041 = build_release("0.4.1", false);
+    let rel_050 = build_release("0.5.0", true);
+    let rel_990 = build_release("99.0.0", false);
+
+    let primed_cache = temp.path().join("primed-cache");
+    let runner = devkit::processes::ProcessRunner::new().unwrap();
+    let cache = devkit::cache::ReleaseCache::new(Some(&primed_cache), &runner).unwrap();
+    let adm_041 = cache.import(&rel_041, "0.4.1", None).unwrap();
+    cache.prime_engine(&adm_041).unwrap();
+    let adm_990 = cache.import(&rel_990, "99.0.0", None).unwrap();
+    cache.prime_engine(&adm_990).unwrap();
+
+    // 1. `devkit init --to 0.4.1` delegates to 0.4.1 engine BEFORE prompt/missing-template check.
+    let init_delegated = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "--json",
+            "--cache-dir",
+            primed_cache.to_str().unwrap(),
+            "init",
+            temp.path().join("delegated-init").to_str().unwrap(),
+            "--to",
+            "0.4.1",
+            "--release-root",
+            rel_041.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(init_delegated.status.success());
+    assert_eq!(decoded(&init_delegated)["result"]["engine"], "0.4.1");
+
+    let make_proj = |rel: &Path, name: &str| -> std::path::PathBuf {
+        let p = temp.path().join(name);
+        init_project(
+            rel,
+            &p,
+            &InitOptions {
+                template: Some("rust-api".into()),
+                package_mode: Some(devkit::model::PackageMode::Registry),
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap();
+        p
+    };
+    let proj_040 = make_proj(&rel_040, "proj-040");
+    let proj_041 = make_proj(&rel_041, "proj-041");
+    let proj_050 = make_proj(&rel_050, "proj-050");
+    let proj_990 = make_proj(&rel_990, "proj-990");
+
+    // 2. `devkit update <proj-040> --to 0.4.1` symmetrically delegates downward to 0.4.1 engine.
+    let upd_041 = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args([
+            "--json",
+            "--cache-dir",
+            primed_cache.to_str().unwrap(),
+            "update",
+            proj_040.to_str().unwrap(),
+            "--to",
+            "0.4.1",
+            "--release-root",
+            rel_041.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(upd_041.status.success());
+    assert_eq!(decoded(&upd_041)["result"]["engine"], "0.4.1");
+
+    // 3. With primed cache, project commands on 0.4.1 delegate to 0.4.1 engine.
+    for cmd_args in [
+        vec!["--json", "sync", proj_041.to_str().unwrap()],
+        vec!["--json", "add-app", proj_041.to_str().unwrap()],
+        vec!["--json", "add-package", proj_041.to_str().unwrap()],
+        vec!["--json", "register", proj_041.to_str().unwrap()],
+        vec!["--json", "describe", proj_041.to_str().unwrap()],
+        vec!["--json", "status", proj_041.to_str().unwrap()],
+        vec![
+            "exec",
+            "--root",
+            proj_041.to_str().unwrap(),
+            "--component",
+            "apps/api",
+            "--",
+            "true",
+        ],
+        vec!["task", "check", "--root", proj_041.to_str().unwrap()],
+    ] {
+        let mut full_args = vec!["--cache-dir", primed_cache.to_str().unwrap()];
+        full_args.extend_from_slice(&cmd_args);
+        let out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args(&full_args)
+            .env_clear()
+            .env("CI", "true")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{cmd_args:?}");
+        assert_eq!(decoded(&out)["result"]["engine"], "0.4.1", "{cmd_args:?}");
+    }
+
+    // With primed cache, describe and status on 99.0.0 delegate to 99.0.0 engine.
+    for meta_cmd in ["describe", "status"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args([
+                "--json",
+                "--cache-dir",
+                primed_cache.to_str().unwrap(),
+                meta_cmd,
+                proj_990.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("CI", "true")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{meta_cmd}");
+        assert_eq!(decoded(&out)["result"]["engine"], "99.0.0", "{meta_cmd}");
+    }
+
+    // 4. With EMPTY cache and dead network proxy, describe and status NEVER touch the network:
+    //    - 0.4.1 and 0.5.0 succeed locally;
+    //    - unprimed 99.0.0 fails locally with "run make setup".
+    let empty_cache = temp.path().join("empty-cache");
+    for (proj, expected_ver) in [(&proj_041, "0.4.1"), (&proj_050, "0.5.0")] {
+        let desc = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args([
+                "--json",
+                "--cache-dir",
+                empty_cache.to_str().unwrap(),
+                "describe",
+                proj.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("CI", "true")
+            .env("PATH", &fake_bin)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .output()
+            .unwrap();
+        assert!(
+            desc.status.success(),
+            "describe {expected_ver}: {}",
+            String::from_utf8_lossy(&desc.stdout)
+        );
+        assert_eq!(decoded(&desc)["result"]["version"], expected_ver);
+
+        let stat = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args([
+                "--json",
+                "--cache-dir",
+                empty_cache.to_str().unwrap(),
+                "status",
+                proj.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("CI", "true")
+            .env("PATH", &fake_bin)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .output()
+            .unwrap();
+        assert!(
+            stat.status.success(),
+            "status {expected_ver}: {}",
+            String::from_utf8_lossy(&stat.stdout)
+        );
+        assert_eq!(decoded(&stat)["ok"], true);
+        assert!(!empty_cache.exists());
+    }
+
+    for meta_cmd in ["describe", "status"] {
+        let unprimed = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args([
+                "--json",
+                "--cache-dir",
+                empty_cache.to_str().unwrap(),
+                meta_cmd,
+                proj_990.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("CI", "true")
+            .env("PATH", &fake_bin)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .output()
+            .unwrap();
+        assert!(!unprimed.status.success(), "{meta_cmd}");
+        assert!(
+            decoded(&unprimed)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("run make setup"),
+            "{meta_cmd}"
+        );
+    }
+
+    // 5. If the genuine v0.4.1 baseline ELF is staged locally, prove it parses 0.5.0 release.json
+    //    with minSupportedFromVersion and forward-delegates cleanly to 0.5.0.
+    let genuine_041 = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts/baseline/v0.4.1/payload/devkit");
+    if genuine_041.is_file() {
+        let rel_050_marker = temp.path().join("release-0.5.0-marker");
+        fs::create_dir_all(&rel_050_marker).unwrap();
+        let marker_elf = minimal_static_x86_64_elf(
+            b"{\"schemaVersion\":1,\"ok\":true,\"command\":\"delegated\",\"result\":{\"engine\":\"0.5.0-target\"}}\n",
+        );
+        let marker_sha = digest(&marker_elf);
+        write_atomic(&rel_050_marker.join("devkit"), &marker_elf, 0o755).unwrap();
+        let recipe_hash = "c".repeat(64);
+        let tc = format!(
+            "DEVKIT_VERSION=0.5.0\nDEVKIT_ENGINE_SHA256={marker_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        );
+        write_atomic(
+            &rel_050_marker.join("runtime/toolchains.env"),
+            tc.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        let env_b = b"env-0.5.0";
+        let env_s = format!("sha512-{}", STANDARD.encode(Sha512::digest(env_b)));
+        write_atomic(&rel_050_marker.join("npm/env-0.5.0.tgz"), env_b, 0o644).unwrap();
+        write_json(
+            &rel_050_marker.join("release.json"),
+            &devkit::model::Release {
+                schema_version: 1,
+                version: "0.5.0".into(),
+                min_supported_from_version: Some("0.4.0".into()),
+                rust_version: "1.99.1".into(),
+                environment: devkit::model::Environment {
+                    name: "@docouno/env".into(),
+                    version: "0.5.0".into(),
+                    archive: "npm/env-0.5.0.tgz".into(),
+                    integrity: env_s,
+                },
+                files: file_map(&rel_050_marker).unwrap(),
+                migrations: vec![],
+            },
+        )
+        .unwrap();
+        let from_041 = Command::new(&genuine_041)
+            .args([
+                "--json",
+                "--cache-dir",
+                temp.path().join("genuine-041-cache").to_str().unwrap(),
+                "update",
+                proj_041.to_str().unwrap(),
+                "--to",
+                "0.5.0",
+                "--release-root",
+                rel_050_marker.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("CI", "true")
+            .output()
+            .unwrap();
+        assert!(
+            from_041.status.success(),
+            "genuine 0.4.1 failed to forward-delegate to 0.5.0: stdout={} stderr={}",
+            String::from_utf8_lossy(&from_041.stdout),
+            String::from_utf8_lossy(&from_041.stderr)
+        );
+        assert_eq!(decoded(&from_041)["result"]["engine"], "0.5.0-target");
+    }
 }

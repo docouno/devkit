@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Native loader/download/archive bounds and cancellation regressions."""
 from __future__ import annotations
+import copy
 import gzip
 import io
+import json
 import os
 from pathlib import Path
 import signal
@@ -21,11 +23,27 @@ class Safety(Harness):
                 item.type, item.mode, item.size = kind, mode, len(data)
                 archive.addfile(item, io.BytesIO(data))
         return stream.getvalue()
+    def index_for_archive(self, *, sha256, size):
+        patched = copy.deepcopy(self.old_index)
+        patched['files'][self.old_index['archive']] = {'sha256': sha256, 'size': size}
+        return json.dumps(patched).encode()
     def reject_archive(self, name, data):
+        original_archive = self.fixture.routes[self.archive_route]
+        original_index = self.fixture.routes[self.old_index_route]
         self.fixture.routes[self.archive_route] = data
-        self.fixture.routes[self.archive_route + '.sha256'] = f'{digest(data)}  devkit-{self.old_version}.tar.gz\n'.encode()
-        result = self.cold_old(name, expected='devkit:')
-        require('Downloaded archive checksum mismatch' not in result.stderr, 'Archive attack stopped at transport hash rather than archive admission')
+        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(data), size=len(data))
+        try:
+            result = self.cold_old(name, expected='devkit:')
+            require(
+                'Downloaded archive checksum mismatch' not in result.stderr
+                and 'Invalid release asset' not in result.stderr
+                and 'Release index' not in result.stderr
+                and 'Downloaded payload differs' not in result.stderr,
+                f'Archive attack stopped outside archive admission: {result.stderr}',
+            )
+        finally:
+            self.fixture.routes[self.archive_route] = original_archive
+            self.fixture.routes[self.old_index_route] = original_index
     def cancel(self, name, argv, route):
         self.fixture.ready.clear(); self.fixture.resume.clear()
         original = self.fixture.routes.get(route)
@@ -63,7 +81,7 @@ class Safety(Harness):
             require(not list(cache.rglob('devkit')) and not list(cache.rglob('.engine.*')), 'Bad ELF became a cached engine')
         self.fixture.routes[self.engine_route] = real_engine
         self.cancel('cancel-initial-curl', ['sh', self.script, '--version'], self.engine_route)
-        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.old_version, '--app', 'api=rust-api', '--non-interactive'], self.old_base + '/release.json')
+        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.old_version, '--app', 'api=rust-api', '--non-interactive'], self.old_index_route)
         # The native HTTP reader has one bounded path for known/unknown lengths.
         def unknown(handler):
             handler.send_response(200); handler.send_header('Connection', 'close'); handler.end_headers()
@@ -85,18 +103,21 @@ class Safety(Harness):
         require(time.monotonic() - started < 15 and not output.exists(), 'Stalled reader outlived its bound')
         self.fixture.resume.set()
         original_archive = self.fixture.routes[self.archive_route]
-        original_checksum = self.fixture.routes[self.archive_route + '.sha256']
-        self.fixture.routes[self.archive_route] = None
-        self.cold_old('missing-release-archive', expected='devkit:')
-        def partial(handler):
-            handler.send_response(200); handler.send_header('Content-Length', str(len(original_archive))); handler.end_headers()
-            handler.wfile.write(original_archive[:128]); handler.wfile.flush(); handler.close_connection = True
-        self.fixture.routes[self.archive_route] = partial
-        self.cold_old('truncated-HTTP-archive', expected='devkit:')
-        self.fixture.routes[self.archive_route] = original_archive
-        self.fixture.routes[self.archive_route + '.sha256'] = f"{'0' * 64}  devkit-{self.old_version}.tar.gz\n".encode()
-        self.cold_old('archive-checksum-mismatch', expected='checksum mismatch')
-        self.fixture.routes[self.archive_route + '.sha256'] = original_checksum
+        original_index = self.fixture.routes[self.old_index_route]
+        try:
+            self.fixture.routes[self.archive_route] = None
+            self.cold_old('missing-release-archive', expected='devkit:')
+            def partial(handler):
+                handler.send_response(200); handler.send_header('Content-Length', str(len(original_archive))); handler.end_headers()
+                handler.wfile.write(original_archive[:128]); handler.wfile.flush(); handler.close_connection = True
+            self.fixture.routes[self.archive_route] = partial
+            self.cold_old('truncated-HTTP-archive', expected='devkit:')
+            self.fixture.routes[self.archive_route] = original_archive
+            self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256='0' * 64, size=len(original_archive))
+            self.cold_old('archive-checksum-mismatch', expected='Downloaded archive checksum mismatch')
+        finally:
+            self.fixture.routes[self.archive_route] = original_archive
+            self.fixture.routes[self.old_index_route] = original_index
         prefix = f'devkit-{self.old_version}/'
         base = [(prefix, tarfile.DIRTYPE, 0o755, b'')]
         for name, path, kind, mode in (
@@ -129,10 +150,15 @@ class Safety(Harness):
                 item = tarfile.TarInfo(prefix + f'large-{index}')
                 item.mode, item.size = 0o644, 60 * 1024 * 1024
                 archive.addfile(item, Zeros())
-        self.reject_archive('native-expanded-budget', expanded.getvalue())
+        expanded_bytes = expanded.getvalue()
+        self.reject_archive('native-expanded-budget', expanded_bytes)
         # Interrupt the actual in-process archive reader, with no external tar.
+        # Mount the 300 MiB zero-filled archive so extraction streams actively on disk
+        # and cannot finish or exec into the target binary before SIGTERM arrives.
         env = self.environment('cancel-native-extraction')
         target = self.scratch / 'cancel-native-extraction'
+        self.fixture.routes[self.archive_route] = expanded_bytes
+        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(expanded_bytes), size=len(expanded_bytes))
         process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.old_version,
             '--app', 'api=rust-api', '--non-interactive'], cwd=self.scratch, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -150,14 +176,17 @@ class Safety(Harness):
             print('PASS cancel-native-extraction', flush=True)
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=5)
-        valid = self.legacy.read_bytes()
+            self.fixture.routes[self.archive_route] = original_archive
+            self.fixture.routes[self.old_index_route] = original_index
+        valid = self.baseline_archive.read_bytes()
         # CRC/truncation reach the actual native reader with a matching transport hash.
         changed = bytearray(valid); changed[-8] ^= 1
         self.reject_archive('native-CRC', bytes(changed))
         self.reject_archive('native-truncated-gzip', valid[:-1])
-        # Oversized metadata is refused before any project write or SDK process.
+        # Oversized metadata is refused before any project write, lock, or SDK process.
         project = self.scratch / 'oversized manifest'
         (project / '.devkit').mkdir(parents=True)
-        (project / '.devkit/manifest.json').write_bytes(b' ' * (4 * 1024 * 1024 + 1))
-        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='devkit:')
+        (project / '.devkit/manifest.json').write_bytes(b'{"schemaVersion":2,"pad":"' + b'a' * (4 * 1024 * 1024) + b'"}')
+        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='4 MiB byte budget')
+        require(not (project / '.devkit/state').exists(), 'Oversized manifest created state or lock directory')
         require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')

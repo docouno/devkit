@@ -70,9 +70,6 @@ export function workspaceContext(componentRoot) {
     return null;
   }
   const state = read(file);
-  if (state.schemaVersion === 1) {
-    return null;
-  }
   if (state.schemaVersion !== 2 || !object(state.components)) {
     throw new Error('Unsupported Devkit workspace metadata.');
   }

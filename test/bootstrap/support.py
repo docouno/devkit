@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable 0.2 archive."""
+"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.4.1 baseline."""
 from __future__ import annotations
 import hashlib
 import http.server
@@ -22,6 +22,16 @@ import uuid
 AUTHOR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHOR / 'test/delivery'))
 from test_delivery import HttpsFixture  # noqa: E402
+
+BASELINE_VERSION = '0.4.1'
+BASELINE_INDEX_SHA256 = '0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa'
+BASELINE_INDEX_SIZE = 2255
+BASELINE_RELEASE_IDENTITY = '0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a'
+BASELINE_RELEASE_SIZE = 58547
+BASELINE_ARCHIVE_SHA256 = '4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a'
+BASELINE_ARCHIVE_SIZE = 4003689
+BASELINE_ENGINE_SHA256 = '206f66322e7ae009bc9368a05df64cfef0285ec30e32e9b9dbf0ffbe1069f929'
+BASELINE_ENGINE_SIZE = 7960008
 
 
 def require(value, message):
@@ -100,7 +110,7 @@ class Fixture:
 
 
 class Harness:
-    def __init__(self, build_set, legacy_release):
+    def __init__(self, build_set, baseline_set):
         self.build_set = Path(build_set).resolve()
         self.payload = self.build_set / 'payload'
         self.index = json.loads((self.build_set / 'release-index.json').read_text())
@@ -110,16 +120,42 @@ class Harness:
             data = (self.build_set / name).read_bytes()
             require(len(data) == identity['size'] and digest(data) == identity['sha256'], f'Build-set identity differs: {name}')
         self.source_before = {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}
-        self.legacy = Path(legacy_release).resolve()
-        self.legacy_before = digest(self.legacy.read_bytes())
-        with tarfile.open(self.legacy, 'r:gz') as archive:
+        self.baseline = Path(baseline_set).resolve()
+        index_bytes = (self.baseline / 'release-index.json').read_bytes()
+        require(len(index_bytes) == BASELINE_INDEX_SIZE and digest(index_bytes) == BASELINE_INDEX_SHA256, 'Baseline release-index.json identity differs')
+        self.old_index = json.loads(index_bytes)
+        self.old_version = self.old_index['version']
+        require(self.old_version == BASELINE_VERSION and self.old_index['publicationEligible'] is True, 'Unexpected baseline release-index metadata')
+        require(self.old_index['releaseIdentity'] == BASELINE_RELEASE_IDENTITY, 'Unexpected baseline releaseIdentity')
+        archive_name = self.old_index['archive']
+        engine_name = self.old_index['engine']
+        self.baseline_archive = self.baseline / archive_name
+        archive_bytes = self.baseline_archive.read_bytes()
+        engine_bytes = (self.baseline / engine_name).read_bytes()
+        require(
+            len(archive_bytes) == BASELINE_ARCHIVE_SIZE
+            and digest(archive_bytes) == BASELINE_ARCHIVE_SHA256
+            and self.old_index['files'][archive_name] == {'sha256': BASELINE_ARCHIVE_SHA256, 'size': BASELINE_ARCHIVE_SIZE},
+            'Baseline archive identity differs',
+        )
+        require(
+            len(engine_bytes) == BASELINE_ENGINE_SIZE
+            and digest(engine_bytes) == BASELINE_ENGINE_SHA256
+            and self.old_index['files'][engine_name] == {'sha256': BASELINE_ENGINE_SHA256, 'size': BASELINE_ENGINE_SIZE},
+            'Baseline engine identity differs',
+        )
+        with tarfile.open(self.baseline_archive, 'r:gz') as archive:
             names = [e for e in archive.getmembers() if e.name.endswith('/release.json')]
-            require(len(names) == 1 and names[0].isfile(), 'Expected one genuine legacy manifest')
-            self.legacy_manifest = archive.extractfile(names[0]).read()
-        self.old_version = json.loads(self.legacy_manifest)['version']
-        require(self.old_version in ('0.2.0', '0.2.1'), 'Only published schema2 legacy releases are supported')
-        expected = f'{self.legacy_before}  devkit-{self.old_version}.tar.gz\n'
-        require(Path(str(self.legacy) + '.sha256').read_text() == expected, 'Legacy checksum differs')
+            require(len(names) == 1 and names[0].isfile(), 'Expected one genuine baseline manifest')
+            manifest_bytes = archive.extractfile(names[0]).read()
+        require(len(manifest_bytes) == BASELINE_RELEASE_SIZE and digest(manifest_bytes) == BASELINE_RELEASE_IDENTITY, 'Baseline manifest inside archive differs')
+        if (self.baseline / 'payload/release.json').exists():
+            payload_manifest = (self.baseline / 'payload/release.json').read_bytes()
+            require(len(payload_manifest) == BASELINE_RELEASE_SIZE and digest(payload_manifest) == BASELINE_RELEASE_IDENTITY, 'Unpacked baseline payload/release.json differs')
+        self.baseline_before = {
+            name: digest((self.baseline / name).read_bytes())
+            for name in ('release-index.json', archive_name, engine_name)
+        }
         self.temp = tempfile.TemporaryDirectory(prefix='devkit bootstrap ')
         self.scratch = Path(self.temp.name)
         self.logs = AUTHOR / '.artifacts/bootstrap' / uuid.uuid4().hex
@@ -130,10 +166,12 @@ class Harness:
         self.fixture.routes[self.engine_route] = self.engine.read_bytes()
         self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
         self.old_base = f'{self.base}/v{self.old_version}'
-        self.archive_route = f'{self.old_base}/devkit-{self.old_version}.tar.gz'
-        self.fixture.routes[self.archive_route] = self.legacy.read_bytes()
-        self.fixture.routes[self.archive_route + '.sha256'] = expected.encode()
-        self.fixture.routes[self.old_base + '/release.json'] = self.legacy_manifest
+        self.old_index_route = f'{self.old_base}/release-index.json'
+        self.archive_route = f'{self.old_base}/{archive_name}'
+        self.old_engine_route = f'{self.old_base}/{engine_name}'
+        self.fixture.routes[self.old_index_route] = index_bytes
+        self.fixture.routes[self.archive_route] = archive_bytes
+        self.fixture.routes[self.old_engine_route] = engine_bytes
         self.forbidden = self.scratch / 'host-sdk-attempts'
         blockers = self.scratch / 'without host SDK'
         blockers.mkdir()
@@ -186,23 +224,43 @@ class Harness:
         require(state['version'] == self.version and not (self.scratch / 'injected').exists(), 'Wrong accepted version or shell expansion')
         self.boot('cached-bootstrap-offline-metadata', 'describe', '--root', target, env=dict(env, HTTPS_PROXY='http://127.0.0.1:1'))
         self.boot('recover-local-journal-no-cache', 'recover', target, env=self.environment('empty'))
-        self.cold_old('genuine-legacy-http-init')
-        legacy = self.scratch / 'genuine-legacy-http-init'
-        source = legacy / 'apps/api/src/main.rs'
+        self.cold_old('genuine-baseline-http-init')
+        baseline = self.scratch / 'genuine-baseline-http-init'
+        source = baseline / 'apps/api/src/main.rs'
         source.write_text(source.read_text() + '\n// Preserve the product change.\n')
-        (legacy / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
-        before = {p: p.read_bytes() for p in (source, legacy / '.env', legacy / 'Makefile', legacy / 'compose.yaml')}
-        self.run('native-accepted-legacy-add', [self.engine, 'add-app', legacy, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-legacy-http-init'))
-        self.run('explicit-legacy-preview', [self.engine, 'update', legacy, '--to', self.version, '--release-root', self.payload, '--preview', '--non-interactive'])
-        self.run('explicit-legacy-native-update', [self.engine, 'update', legacy, '--to', self.version, '--release-root', self.payload, '--non-interactive'])
+        (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
+        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml')}
+        self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
+        self.run('explicit-baseline-preview', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--preview', '--non-interactive'])
+        self.run('explicit-baseline-native-update', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--non-interactive'])
         require(all(p.read_bytes() == data for p, data in before.items()), 'Migration changed product inputs')
-        require(json.loads((legacy / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+        require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+        pre_040 = self.scratch / 'pre-040-checkout'
+        (pre_040 / '.devkit').mkdir(parents=True)
+        (pre_040 / '.devkit/manifest.json').write_text(json.dumps({
+            'schemaVersion': 2,
+            'version': '0.3.2',
+            'releaseIdentity': '0' * 64,
+            'generation': 'gen-0',
+            'packageMode': 'local',
+            'managed': {},
+            'components': {},
+        }))
+        pre_040_before = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        requests_before = len(self.fixture.requests)
+        self.run('refuse-pre-040-project-zero-mutation', [self.engine, 'status', '--root', pre_040], expected='0.4.0')
+        self.run('refuse-pre-040-update-zero-mutation', [self.engine, 'update', pre_040, '--to', self.old_version, '--non-interactive'], expected='0.4.1')
+        require(len(self.fixture.requests) == requests_before, 'Pre-0.4.0 refusal issued unexpected release HTTP requests')
+        pre_040_after = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        require(pre_040_after == pre_040_before, 'Pre-0.4.0 refusal mutated project checkout')
+        require(not (self.scratch / 'cache refuse-pre-040-project-zero-mutation').exists(), 'Pre-0.4.0 status refusal created cache directory')
+        require(not (self.scratch / 'cache refuse-pre-040-update-zero-mutation').exists(), 'Pre-0.4.0 update refusal created cache directory')
     def finish(self, passed):
         self.fixture.close()
         require(self.source_before == {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}, 'Modified source build-set')
-        require(digest(self.legacy.read_bytes()) == self.legacy_before, 'Modified legacy archive')
+        require(self.baseline_before == {name: digest((self.baseline / name).read_bytes()) for name in self.baseline_before}, 'Modified baseline set')
         (self.logs / 'receipt.json').write_text(json.dumps(dict(passed=passed, cases=self.results, hostSdkAttempts=0,
             sourceCommit=self.index['sourceCommit'], sourceTree=self.index['sourceTree'], releaseIdentity=self.index['releaseIdentity'],
-            legacyArchiveSha256=self.legacy_before, engineSha256=digest(self.engine.read_bytes()),
+            baselineArchiveSha256=BASELINE_ARCHIVE_SHA256, engineSha256=digest(self.engine.read_bytes()),
             limits=['Temporary local CA/proxy; immutable input bytes. Public transport is a separate release gate.']), indent=2) + '\n')
         self.temp.cleanup()

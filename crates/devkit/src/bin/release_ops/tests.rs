@@ -29,8 +29,8 @@ fn release_notes_select_only_the_requested_version() {
 fn release_body_uses_changelog_and_collapses_only_verification() {
     let f = Fixture::native_update();
     let body = f.contract.body().unwrap();
-    assert!(body.contains("Wait for newly published npm versions"));
-    assert!(!body.contains("Compact verification receipts"));
+    assert!(body.contains("Raise the minimum supported project checkout"));
+    assert!(!body.contains("Compare Git-tracked managed files"));
     assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
     let set = f.set();
     let mut remote = f.remote();
@@ -44,7 +44,12 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     assert_eq!(saved.matches(VERIFICATION_OPEN).count(), 1);
     assert_eq!(saved.matches(VERIFICATION_CLOSE).count(), 1);
     let details = saved.find(VERIFICATION_OPEN).unwrap();
-    assert!(details > saved.find("Wait for newly published npm versions").unwrap());
+    assert!(
+        details
+            > saved
+                .find("Raise the minimum supported project checkout")
+                .unwrap()
+    );
     assert!(saved.find("Public verification: passed.").unwrap() > details);
     for _ in 0..3 {
         record_proof(&mut remote, &set, &f.contract, &proof).unwrap();
@@ -65,11 +70,11 @@ impl Fixture {
         Self::with_version("0.3.0")
     }
     fn native_update() -> Self {
-        let mut fixture = Self::with_version("0.3.1");
+        let mut fixture = Self::with_version("0.5.0");
         fixture.contract.previous = Selectors {
-            environment: Some("0.3.0".into()),
-            cli: Some("0.3.0".into()),
-            github: Some("v0.3.0".into()),
+            environment: Some("0.4.1".into()),
+            cli: Some("0.4.1".into()),
+            github: Some("v0.4.1".into()),
         };
         fixture
     }
@@ -224,6 +229,7 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
         &devkit::model::Release {
             schema_version: 1,
             version: "0.3.0".into(),
+            min_supported_from_version: None,
             rust_version: "1.99.1".into(),
             environment: devkit::model::Environment {
                 name: ENVIRONMENT.into(),
@@ -362,16 +368,15 @@ impl Fake {
     fn proof(&mut self, c: &Contract) {
         let mut gates = BTreeMap::new();
         for name in [
-            "public-0.2.0",
-            "public-0.2.1",
+            "public-baseline",
             "npx-pinned",
             "performance",
             "transport-cold",
             "readme",
         ] {
             let mut summary = json!({"schemaVersion":1,"success":true,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256});
-            if let Some(old) = name.strip_prefix("public-") {
-                summary = json!({"schemaVersion":3,"success":true,"version":old,"nextVersion":c.version,"expectedIndexSha256":c.index_sha256,"authenticationUsedForDownloads":false,"defaultReleaseBaseTested":true,"consumerSuccess":true,"identities":[{"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256}]});
+            if name == "public-baseline" {
+                summary = json!({"schemaVersion":3,"success":true,"version":c.previous.cli,"nextVersion":c.version,"expectedIndexSha256":c.index_sha256,"authenticationUsedForDownloads":false,"defaultReleaseBaseTested":true,"consumerSuccess":true,"identities":[{"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256}]});
             }
             if name == "npx-pinned" {
                 summary["selectorMode"] = json!("pinned");
@@ -380,7 +385,10 @@ impl Fake {
                 summary["umasks"] = json!(["022", "077"]);
             }
             if name == "performance" {
-                summary["measurements"] = json!([{"case":"warm","samples":30}]);
+                summary["baseline"] = json!({"version": "0.4.1"});
+                summary["comparisons"] =
+                    json!([{"shape":"one","operation":"doctor","nonRegressionPassed":true}]);
+                summary["measurements"] = json!([{"case":"warm","sampleCount":30}]);
             }
             if name == "transport-cold" {
                 summary["authenticationUsed"] = json!(false);
@@ -817,8 +825,9 @@ fn native_readme_requires_every_bound_upgrade_assertion() {
     validate_gate("readme", &original, c).unwrap();
     let mut variants = vec![Value::Null, json!({})];
     for (key, value) in [
-        ("fromVersion", json!("0.2.1")),
-        ("toVersion", json!("0.4.0")),
+        ("fromVersion", json!("0.4.0")),
+        ("fromVersion", json!("0.3.2")),
+        ("toVersion", json!("0.5.1")),
         ("fromReleaseIdentity", json!("bad")),
         ("toReleaseIdentity", json!("bad")),
         (
@@ -909,8 +918,8 @@ fn native_upgrade_target_binding_blocks_proof_and_promotion_before_writes() {
     .unwrap();
     record_proof(&mut remote, &set, &fixture.contract, &proof).unwrap();
     promote(&mut remote, &set, &fixture.contract).unwrap();
-    assert_eq!(remote.selectors.environment.as_deref(), Some("0.3.1"));
-    assert_eq!(remote.selectors.cli.as_deref(), Some("0.3.1"));
+    assert_eq!(remote.selectors.environment.as_deref(), Some("0.5.0"));
+    assert_eq!(remote.selectors.cli.as_deref(), Some("0.5.0"));
 }
 
 #[test]
@@ -1332,7 +1341,34 @@ fn timed_provider_reads_preserve_nonzero_output_and_enforce_deadlines() {
 }
 
 fn generated_performance(c: &Contract) -> Value {
-    let mut raw = json!({"schemaVersion":1,"success":true,"version":c.version,"sourceCommit":c.source_commit,"sourceTree":c.source_tree,"indexSha256":c.index_sha256,"measurements":[],"fixtures":[],"commands":[],"definitions":{"warm":"two warmups, alternating old/new, plain samples","cold":"actual public transport required separately"}});
+    let mut raw = json!({
+        "schemaVersion": 1,
+        "success": true,
+        "version": c.version,
+        "sourceCommit": c.source_commit,
+        "sourceTree": c.source_tree,
+        "indexSha256": c.index_sha256,
+        "baseline": {
+            "version": "0.4.1",
+            "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+        },
+        "comparisons": [
+            {
+                "shape": "one",
+                "operation": "doctor",
+                "nativeToBaselineMedianRatio": 1.0,
+                "allowedMaxSeconds": 0.16,
+                "nonRegressionPassed": true
+            }
+        ],
+        "measurements": [],
+        "fixtures": [],
+        "commands": [],
+        "definitions": {
+            "warm": "two warmups, alternating old/new, plain samples",
+            "cold": "actual public transport required separately"
+        }
+    });
     for index in 0..24 {
         raw["measurements"].as_array_mut().unwrap().push(json!({
             "name":format!("large-closure-doctor-native-{index}"),"shape":"large-closure","side":"native","operation":"doctor","componentCount":20,
@@ -1420,7 +1456,7 @@ fn npx_receipt(c: &Contract, mode: &str) -> Value {
         "umasks": ["022", "077"],
         "durationSeconds": 4.944376594999994,
         "harnessSha256": "d".repeat(64),
-        "diagnostics": "/home/runner/work/project/project/.artifacts/release-proof/npx-public-diagnostics",
+        "diagnostics": "/home/runner/work/project/project/.artifacts/release-proof/npx-public-diagnostics/".repeat(8),
         "cases": cases
     })
 }
@@ -1658,18 +1694,19 @@ fn varied_performance(c: &Contract) -> Value {
             measurement["trace"][*key] = json!(0.123_456_789_012_345_66);
         }
     }
-    raw["comparisons"] = json!((0..14).map(|i| {
-        let mut comparison = json!({
-            "shape": format!("component-shape-{i}"),
-            "operation": "describe-vs-doctor",
-            "nativeToBaselineMedianRatio": 0.123_456_789_012_345_66,
-            "nativeFaster": true
-        });
-        if i % 4 == 0 {
-            comparison["scopeDifference"] = json!("Native describe admits the full graph without SDK readiness; baseline doctor includes Docker and image readiness.");
-        }
-        comparison
-    }).collect::<Vec<_>>());
+    raw["comparisons"] = json!(
+        (0..14)
+            .map(|i| {
+                json!({
+                    "shape": format!("component-shape-{i}"),
+                    "operation": if i == 0 { "help" } else { "doctor" },
+                    "nativeToBaselineMedianRatio": 0.987_654_321_012_345_6,
+                    "allowedMaxSeconds": 0.180_000_000_000_000_02,
+                    "nonRegressionPassed": true
+                })
+            })
+            .collect::<Vec<_>>()
+    );
     raw["definitions"] = json!(["warm","latency","hostProcesses","containers","tooling","cold","inputs","fixture"].map(|key| (key.to_owned(), format!("{key}: Plain warm measurements alternate old and new release factories with two warmups. Instrumented tracing is a separate diagnostic run; source, mode and product identities are unchanged. Raw samples and complete diagnostics remain in the original receipt."))).into_iter().collect::<BTreeMap<_,_>>());
     raw["limits"] = json!({
         "minimumSamples": 30,
@@ -1719,13 +1756,74 @@ fn varied_performance(c: &Contract) -> Value {
     raw["buildRun"] = json!(c.build_run);
     raw["releaseIdentity"] = json!("e".repeat(64));
     raw["baseline"] = json!({
-        "version": "0.2.1",
-        "source": "/home/runner/work/project/project/.artifacts/legacy/devkit-0.2.1",
-        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.2.1/devkit-0.2.1.tar.gz",
-        "archiveSha256": "f".repeat(64),
-        "releaseIdentity": "a".repeat(64)
+        "version": "0.4.1",
+        "source": "/home/runner/work/project/project/.artifacts/baseline/v0.4.1/payload",
+        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz",
+        "archiveSha256": "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a",
+        "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
     });
     raw
+}
+
+#[test]
+fn public_baseline_and_performance_contract_reject_stale_versions_and_under_sampled_proofs() {
+    let f = Fixture::native_update();
+    let c = &f.contract;
+    let set = f.set();
+    let mut remote = f.remote();
+    stage(&mut remote, &set, c).unwrap();
+    publish(&mut remote, &set, c).unwrap();
+    remote.proof(c);
+    let proof = read_proof(&remote);
+    proof.validate(c).unwrap();
+
+    // Wrong baseline version in public-baseline is rejected.
+    let mut wrong_baseline = proof.clone();
+    wrong_baseline
+        .gates
+        .get_mut("public-baseline")
+        .unwrap()
+        .summary["version"] = json!("0.4.0");
+    assert!(wrong_baseline.validate(c).is_err());
+
+    // Legacy public-0.2.1 gate key is rejected.
+    let mut legacy_key = proof.clone();
+    let gate = legacy_key.gates.remove("public-baseline").unwrap();
+    legacy_key.gates.insert("public-0.2.1".into(), gate);
+    assert!(legacy_key.validate(c).is_err());
+
+    // Performance receipt with non-0.4.1 baseline, < 30 samples, or failed non-regression is rejected.
+    let perf = varied_performance(c);
+    let perf_bytes = serde_json::to_vec(&perf).unwrap();
+    gate_from_receipt("performance", &perf_bytes, perf.clone(), c).unwrap();
+
+    let mut bad_base = perf.clone();
+    bad_base["baseline"]["version"] = json!("0.2.1");
+    assert!(validate_gate("performance", &bad_base, c).is_err());
+
+    let mut under_sampled = perf.clone();
+    under_sampled["measurements"][0]["sampleCount"] = json!(29);
+    assert!(validate_gate("performance", &under_sampled, c).is_err());
+
+    let mut regressed = perf.clone();
+    regressed["comparisons"][1]["nonRegressionPassed"] = json!(false);
+    assert!(validate_gate("performance", &regressed, c).is_err());
+
+    let mut regressed_help = perf.clone();
+    regressed_help["comparisons"][0]["nonRegressionPassed"] = json!(false);
+    assert!(validate_gate("performance", &regressed_help, c).is_err());
+
+    let mut help_only = perf;
+    help_only["comparisons"] = json!([
+        {
+            "shape": "one",
+            "operation": "help",
+            "nativeToBaselineMedianRatio": 1.0,
+            "allowedMaxSeconds": 0.05,
+            "nonRegressionPassed": true
+        }
+    ]);
+    assert!(validate_gate("performance", &help_only, c).is_err());
 }
 
 #[test]
@@ -1753,12 +1851,8 @@ fn complete_generated_proof_compacts_latest_and_retains_all_required_facts_with_
     proof.gates.get_mut("readme").unwrap().summary["exampleResults"] = json!((0..56).map(|index| json!({"label":format!("README example {index}: accepted source state"),"passed":true,"durationSeconds":0.123_456_789_012_345_66,"exitCode":0})).collect::<Vec<_>>());
     proof.gates.get_mut("npx-pinned").unwrap().summary =
         compact_gate("npx-pinned", npx_receipt(c, "pinned")).unwrap();
-    for old in ["0.2.0", "0.2.1"] {
-        let summary = &mut proof
-            .gates
-            .get_mut(&format!("public-{old}"))
-            .unwrap()
-            .summary;
+    {
+        let summary = &mut proof.gates.get_mut("public-baseline").unwrap().summary;
         let identity = &mut summary["identities"][0];
         identity["version"] = json!(c.version);
         identity["releaseIdentity"] = json!(set.index.release_identity);
@@ -1767,7 +1861,7 @@ fn complete_generated_proof_compacts_latest_and_retains_all_required_facts_with_
         identity["tarAndNpmCanonicalPayloadEqual"] = json!(true);
         identity["packages"] = json!([ENVIRONMENT,CLI].map(|name| json!({"name":name,"version":c.version,"integrity":format!("sha512-{}", "a".repeat(88)),"shasum":"b".repeat(40)})));
         summary["limits"] = json!([
-            "Actual public legacy factory; source and complete package identities verified",
+            "Actual public v0.4.1 baseline factory; source and complete package identities verified",
             "No host language SDK and no authenticated downloads"
         ]);
         summary["consumerReceiptSha256"] = json!("c".repeat(64));

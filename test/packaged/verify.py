@@ -45,6 +45,12 @@ def native_release(release):
         return stream.read(4) == b"\x7fELF"
 
 
+def semver_tuple(value):
+    parts = value.split("-", 1)[0].split(".")
+    require(len(parts) == 3 and all(part.isdigit() for part in parts), f"Invalid version: {value}")
+    return tuple(int(part) for part in parts)
+
+
 def verify_creation_hint(output):
     hints = [line for line in output.splitlines()
              if re.search(r"\bmake\b", line) and re.search(r"\bsetup\b", line)]
@@ -96,6 +102,16 @@ class Verification:
         self.release = self.copy_release(release, "release")
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
+        self.release_identity = sha256((self.release / "release.json").read_bytes())
+        self.next_release_identity = (
+            sha256((self.next_release / "release.json").read_bytes()) if self.next_release else None
+        )
+        require(native_release(self.release) and semver_tuple(self.version) >= (0, 4, 0),
+                "The baseline release must be a supported native release (>= 0.4.0)")
+        if self.next_release is not None:
+            next_version = json.loads((self.next_release / "release.json").read_text())["version"]
+            require(self.version != next_version and self.release_identity != self.next_release_identity,
+                    "Baseline and target releases must have distinct versions and release identities")
         require(package_source in ("local", "registry"), "Unknown package source")
         self.package_source = package_source
         self.public_bootstrap = None
@@ -135,11 +151,12 @@ class Verification:
 
     def cli(self, release, operation, root, *arguments):
         version = json.loads((release / "release.json").read_text())["version"]
-        legacy_input = not native_release(release)
-        # A genuine old project must be created by its actual released factory.
-        # All subsequent lifecycle operations use the new Rust management core.
-        if operation == "init" and legacy_input:
-            return [release / "devkit", operation, root, *arguments]
+        # A genuine baseline project in offline packaged verification is created
+        # directly by its actual released native binary; public_bootstrap exercises
+        # cross-version init delegation through the target bootstrap script.
+        if operation == "init" and release == self.release and not self.public_bootstrap:
+            return [release / "devkit", "--non-interactive", "init", root,
+                    "--to", version, "--release-root", release, *arguments]
         command = (["sh", self.public_bootstrap] if self.public_bootstrap
                    else [self.manager / "devkit"])
         command += ["--non-interactive", operation, root]
@@ -729,21 +746,9 @@ class Verification:
                 native_dev_dependencies[path] = dict(package.get("devDependencies", {}))
         state_file.write_text(json.dumps(state, indent=2) + "\n")
         before = source_snapshot(root)
-        preview_out = self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
+        self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
         require(source_snapshot(root) == before, f"{kind} preview changed project bytes")
-        apply_out = self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
-        if state["version"].startswith("0.3.") and version.startswith("0.4."):
-            if kind in ("node", "mixed"):
-                for out_text in (preview_out, apply_out):
-                    require(f"Migration notes ({state['version']} -> {version}):" in out_text,
-                            f"{kind} upgrade missing Migration notes header")
-                    require("local: " in out_text and "docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
-                            f"{kind} upgrade missing local migration doc pointer")
-                    require(f"url:   https://github.com/docouno/devkit/blob/v{version}/docs/migrations/0.4.0.md#glob-scripts-and-single-pass-checks" in out_text,
-                            f"{kind} upgrade missing GitHub migration doc URL")
-            elif kind == "rust":
-                require("Migration notes" not in preview_out and "Migration notes" not in apply_out,
-                        "Rust-only upgrade unexpectedly emitted Node migration notes")
+        self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
         after = json.loads(state_file.read_text())
         require(after["version"] == version and after["packageMode"] == self.package_source,
                 f"{kind} accepted wrong environment")
@@ -966,7 +971,10 @@ class Verification:
                        "passed": failure is None, "error": str(failure) if failure else None,
                        "hostLanguageSDKAttempted": self.forbidden_log.exists(),
                        "nextVersionTested": bool(self.next_release),
-                       "baselineUsesGenuineReleasedFactory": not native_release(self.release),
+                       "baselineUsesGenuineReleasedFactory": bool(
+                           self.next_release and native_release(self.release)
+                           and self.release_identity != self.next_release_identity
+                       ),
                        "results": self.results,
                        "limits": (["Transport archive-failure cases are a separate suite"] if self.public_bootstrap else ["Registry and remote bootstrap are separate suites"]) +
                                  ["Recovery journal is synthetic; live crash timing is covered by core tests"]}

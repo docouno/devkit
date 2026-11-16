@@ -703,7 +703,7 @@ fn native_upgrade_from(c: &Contract) -> Option<&str> {
     c.previous
         .environment
         .as_deref()
-        .filter(|previous| stable(previous).is_ok_and(|version| version >= [0, 3, 0]))
+        .filter(|previous| stable(previous).is_ok_and(|version| version >= [0, 4, 0]))
 }
 fn validate_native_upgrade(
     readme: &Value,
@@ -764,8 +764,7 @@ impl Proof {
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>()
                 == BTreeSet::from([
-                    "public-0.2.0",
-                    "public-0.2.1",
+                    "public-baseline",
                     "npx-pinned",
                     "performance",
                     "transport-cold",
@@ -796,10 +795,15 @@ impl Proof {
 }
 fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
     ensure!(value["success"] == true, "Gate failed: {name}");
-    if let Some(old) = name.strip_prefix("public-") {
+    if name == "public-baseline" {
+        let expected_old = c
+            .previous
+            .cli
+            .as_deref()
+            .context("Missing previous CLI version for public-baseline")?;
         ensure!(
             value["schemaVersion"] == 3
-                && value["version"] == old
+                && value["version"] == expected_old
                 && value["nextVersion"] == c.version
                 && value["expectedIndexSha256"] == c.index_sha256
                 && value["authenticationUsedForDownloads"] == false
@@ -844,11 +848,30 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
             );
         }
         if name == "performance" {
+            let measurements = value["measurements"]
+                .as_array()
+                .context("Performance measurements missing")?;
+            ensure!(!measurements.is_empty(), "Performance measurements missing");
             ensure!(
-                value["measurements"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty()),
-                "Performance measurements missing"
+                value["baseline"]["version"] == "0.4.1",
+                "Performance baseline version must be 0.4.1"
+            );
+            ensure!(
+                measurements
+                    .iter()
+                    .all(|m| m["sampleCount"].as_u64().is_some_and(|n| n >= 30)),
+                "Performance measurements require at least 30 samples"
+            );
+            let comparisons = value["comparisons"]
+                .as_array()
+                .context("Performance comparisons missing")?;
+            ensure!(
+                !comparisons.is_empty()
+                    && comparisons
+                        .iter()
+                        .all(|cmp| cmp["nonRegressionPassed"] == true)
+                    && comparisons.iter().any(|cmp| cmp["operation"] != "help"),
+                "Performance non-regression comparisons did not pass"
             );
             validate_performance_trace(value)?;
         }
@@ -1111,7 +1134,7 @@ fn proof_from_files(c: &Contract, run: &str, paths: &BTreeMap<String, PathBuf>) 
     for (name, path) in paths {
         let bytes = read_bounded(path, 16 * 1024 * 1024)?;
         let mut value: Value = serde_json::from_slice(&bytes)?;
-        if name.starts_with("public-") {
+        if name == "public-baseline" {
             let receipt_path = value["consumerReceipt"]
                 .as_str()
                 .context("Public consumer receipt missing")?
@@ -1344,8 +1367,7 @@ impl Args {
             "--build-set",
             "--output",
             "--publication-run",
-            "--public-020",
-            "--public-021",
+            "--public-baseline",
             "--npx",
             "--performance",
             "--transport",
@@ -1501,12 +1523,8 @@ fn run_args(args: Args) -> Result<()> {
             "record-proof" => {
                 let paths = BTreeMap::from([
                     (
-                        "public-0.2.0".into(),
-                        PathBuf::from(args.get("--public-020")?),
-                    ),
-                    (
-                        "public-0.2.1".into(),
-                        PathBuf::from(args.get("--public-021")?),
+                        "public-baseline".into(),
+                        PathBuf::from(args.get("--public-baseline")?),
                     ),
                     ("npx-pinned".into(), PathBuf::from(args.get("--npx")?)),
                     (

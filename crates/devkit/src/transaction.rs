@@ -27,10 +27,7 @@ pub fn transaction_path<'a>(name: &'a str, created: &[String]) -> Result<&'a str
     managed_path(name)
 }
 fn validate_journal(tx: &UpdateJournal) -> Result<()> {
-    ensure!(
-        [1, 2].contains(&tx.schema_version),
-        "Unsupported update journal"
-    );
+    ensure!(tx.schema_version == 2, "Unsupported update journal");
     let suffix = tx
         .stage
         .strip_prefix(".devkit/state/update-")

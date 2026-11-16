@@ -160,7 +160,6 @@ REQUIRED_DOCS = (
     "docs/ci.md",
     "docs/upgrades.md",
     "docs/migrations/index.json",
-    "docs/migrations/0.4.0.md",
 )
 
 

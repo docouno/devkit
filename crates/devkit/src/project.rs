@@ -1205,6 +1205,12 @@ fn mutate(
     let release = admit_release(release_root)?;
     let root_candidate = project_root(target)?;
     assert_no_pending(&root_candidate)?;
+    let min_from = release
+        .manifest
+        .min_supported_from_version
+        .as_deref()
+        .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
+    ensure_supported_checkout_floor(&root_candidate, change.is_none(), min_from)?;
     let op_label = match &change {
         Some(Change::Add {
             role: Role::App, ..
@@ -1652,6 +1658,13 @@ pub fn sync_project(
     resolver: &dyn LockResolver,
 ) -> Result<MutationOutcome> {
     let release = admit_release(release_root)?;
+    let root_candidate = project_root(target)?;
+    let min_from = release
+        .manifest
+        .min_supported_from_version
+        .as_deref()
+        .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
+    ensure_supported_checkout_floor(&root_candidate, false, min_from)?;
     let lock = CheckoutLock::acquire(target)?;
     let snapshot = AdmissionSnapshot::capture(&lock.root)?;
     let root = &snapshot.root;

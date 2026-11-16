@@ -195,6 +195,11 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         if let Some(cache_dir) = cache_dir {
             make.env("DEVKIT_CACHE_DIR", cache_dir);
         }
+        crate::state::ensure_supported_checkout_floor(
+            &crate::files::project_root(&request.root)?,
+            false,
+            crate::state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
         crate::processes::restore_exec_pdeathsig(runner)?;
         // Make owns its signal/exit behavior and the actual DAG. Native leaves
         // supervise their own children; no second controller kills their cleanup.

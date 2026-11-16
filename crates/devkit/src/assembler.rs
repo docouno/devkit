@@ -1070,6 +1070,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     let manifest = Release {
         schema_version: 1,
         version: version.clone(),
+        min_supported_from_version: Some(crate::state::MIN_SUPPORTED_PROJECT_VERSION.into()),
         files: file_map(&payload)?,
         environment: inputs.environment.clone(),
         rust_version: settings["DEVKIT_RUST_VERSION"].clone(),

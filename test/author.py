@@ -51,7 +51,8 @@ def main():
         # operator path/argument as data, including literal Make function syntax.
         fields = {'target': 'DEVKIT_INIT_TARGET', 'output': 'DEVKIT_ASSEMBLY_OUTPUT',
             'build_set': 'DEVKIT_BUILD_SET', 'previous': 'DEVKIT_VERIFY_PREVIOUS',
-            'release': 'DEVKIT_VERIFY_RELEASE', 'legacy_archive': 'DEVKIT_LEGACY_ARCHIVE',
+            'release': 'DEVKIT_VERIFY_RELEASE', 'baseline_set': 'DEVKIT_BASELINE_SET',
+            'fixtures': 'DEVKIT_AUTHOR_FIXTURES',
             'template': 'DEVKIT_INIT_TEMPLATE', 'version': 'DEVKIT_RELEASE_VERSION',
             'from_version': 'DEVKIT_FROM_VERSION', 'build_id': 'DEVKIT_BUILD_ID',
             'build_run': 'DEVKIT_BUILD_RUN', 'expected_index_sha256': 'DEVKIT_EXPECTED_INDEX_SHA256',

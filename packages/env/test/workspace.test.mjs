@@ -306,7 +306,7 @@ test('library src forbids runtime devDependency imports, gates public type leaks
       [],
     );
 
-    // 0.3.2 compatibility: apps/* may still consume file: workspace libraries declared in devDependencies
+    // apps/* may still consume file: workspace libraries declared in devDependencies
     write('apps/web/package.json', {
       ...pkg,
       dependencies: {},
@@ -321,4 +321,15 @@ test('library src forbids runtime devDependency imports, gates public type leaks
       ),
       [],
     );
+  }));
+
+test('workspaceContext rejects legacy schemaVersion 1 and unknown schema metadata', () =>
+  fixture(({ app, write }) => {
+    for (const schemaVersion of [1, 3]) {
+      write('.devkit/manifest.json', {
+        schemaVersion,
+        components: { 'apps/web': { role: 'app' } },
+      });
+      assert.throws(() => workspaceContext(app), /Unsupported Devkit workspace metadata\./);
+    }
   }));

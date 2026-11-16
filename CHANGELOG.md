@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.5.0]
+
+### Breaking
+
+- Raise the minimum supported project checkout and `--to` release floor to `0.4.0` (`minSupportedFromVersion: "0.4.0"` in `release.json`) and remove pre-`0.4.0` compatibility branches (`0.1.x`–`0.3.x`, `schemaVersion: 1` manifests and update journals, legacy `.sha256` archive metadata, and `0.2.x` runtime projections). Projects on `0.2.x` or `0.3.x` fail fast before taking checkout locks or touching the filesystem and can upgrade through the `0.4.1` bridge release first (`npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check`).
+
+### Changed
+
+- Delegate `devkit init --to`, `devkit update --to`, and project lifecycle/inspection commands symmetrically across `0.4.x` and `0.5.0+` releases while keeping `describe` and `status` strictly offline when the accepted engine is not yet cached.
+- Tag consumer derived Docker images (`devkit-derived-{rust,desktop}:<recipe_sha>`) during `make setup` / `exec --prepare` so clean checkouts and linked worktrees reuse verified local images without rebuilding Dockerfiles.
+- Move verification, bootstrap, packaged consumer, registry, `public-baseline`, and symmetric native-vs-native performance non-regression gates from `0.2.x` to the immutable `v0.4.1` baseline, eliminate redundant `make setup` runs across non-source verification jobs via pre-built `devkit-author-fixtures`, and cache pinned baseline downloads, Cargo registries, and derived Docker images across GitHub Actions workflows.
+
 ## [0.4.1] - 2026-11-13
 
 ### Added
