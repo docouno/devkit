@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { workspaceContext } from './workspace.js';
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const assetEntrypointPattern = /\.(?:css|svg|png|jpg|jpeg|webp|woff2?|ttf|eot)$/iu;
@@ -141,25 +142,73 @@ function formatAttwProblem(problem, problemKindInfo) {
 
 export async function verifyPackableComponent(componentDir, options = {}) {
   const resolvedComponent = fs.realpathSync(path.resolve(componentDir));
+  const sourceManifest = JSON.parse(
+    fs.readFileSync(path.join(resolvedComponent, 'package.json'), 'utf8'),
+  );
+  const allowPrivateLocal =
+    options.allowPrivateLocalDeps === true && sourceManifest.private === true;
+  const errors = [];
+  if (!allowPrivateLocal) {
+    let ctx;
+    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+      for (const [name, spec] of Object.entries(sourceManifest[field] ?? {})) {
+        if (typeof spec !== 'string') {
+          continue;
+        }
+        if (spec.startsWith('file:')) {
+          errors.push(
+            `[devkit:LOCAL_DEPENDENCY] Runtime dependency "${name}" uses unpublishable local file specifier "${spec}".`,
+          );
+        } else if (spec.startsWith('workspace:')) {
+          ctx ??= workspaceContext(resolvedComponent);
+          const target = ctx?.components.find((entry) => {
+            if (entry.role !== 'library') {
+              return false;
+            }
+            const manifest = JSON.parse(
+              fs.readFileSync(path.join(entry.root, 'package.json'), 'utf8'),
+            );
+            return manifest.name === name && manifest.private === false;
+          });
+          if (!target) {
+            errors.push(
+              `[devkit:PRIVATE_WORKSPACE_DEPENDENCY] Publishable package cannot depend on private or unregistered workspace package "${name}".`,
+            );
+          }
+        }
+      }
+    }
+  }
   const ownWorkDir = !options.outputDir;
   const workDir = options.outputDir
     ? path.resolve(options.outputDir)
     : fs.mkdtempSync(path.join(os.tmpdir(), 'devkit-pack-verify-'));
   fs.mkdirSync(workDir, { recursive: true });
-  const cacheDir = process.env.NPM_CONFIG_CACHE ?? path.join(workDir, '.npm-cache');
+  const cacheDir = process.env.XDG_CACHE_HOME ?? path.join(workDir, '.pnpm-cache');
 
   try {
-    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const npmCmd = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
     const packed = spawnSync(
       npmCmd,
-      ['pack', '--pack-destination', workDir, '--json', '--ignore-scripts'],
+      [
+        'pack',
+        '--pack-destination',
+        workDir,
+        '--config.ignore-scripts=true',
+        '--config.ignore-pnpmfile=true',
+        '--config.pm-on-fail=ignore',
+        '--config.runtime=false',
+        '--config.runtime-on-fail=ignore',
+        '--json',
+      ],
       {
         cwd: resolvedComponent,
         encoding: 'utf8',
         timeout: 60_000,
         env: {
           ...process.env,
-          NPM_CONFIG_CACHE: cacheDir,
+          XDG_CACHE_HOME: cacheDir,
+          CI: 'true',
           NPM_CONFIG_OFFLINE: 'true',
           NPM_CONFIG_UPDATE_NOTIFIER: 'false',
           NPM_CONFIG_FUND: 'false',
@@ -169,7 +218,7 @@ export async function verifyPackableComponent(componentDir, options = {}) {
     );
     if (packed.status !== 0) {
       throw new Error(
-        `npm pack failed (${packed.status ?? 'signal'}): ${(packed.stderr || packed.stdout || '').trim()}`,
+        `${errors.length ? `${errors.join('\n')}\n` : ''}pnpm pack failed (${packed.status ?? 'signal'}): ${(packed.stderr || packed.stdout || '').trim()}`,
       );
     }
 
@@ -177,14 +226,14 @@ export async function verifyPackableComponent(componentDir, options = {}) {
     try {
       packList = JSON.parse(packed.stdout);
     } catch {
-      throw new Error(`npm pack returned invalid JSON: ${packed.stdout.slice(0, 200)}`);
+      throw new Error(`pnpm pack returned invalid JSON: ${packed.stdout.slice(0, 200)}`);
     }
-    if (!Array.isArray(packList) || packList.length !== 1 || !object(packList[0])) {
-      throw new Error('npm pack returned an unexpected archive descriptor.');
+    const descriptor = Array.isArray(packList) && packList.length === 1 ? packList[0] : packList;
+    if (!object(descriptor)) {
+      throw new Error('pnpm pack returned an unexpected archive descriptor.');
     }
-    const descriptor = packList[0];
     if (typeof descriptor.filename !== 'string' || !descriptor.filename) {
-      throw new Error('npm pack did not report an output filename.');
+      throw new Error('pnpm pack did not report an output filename.');
     }
     const tarballPath = path.join(workDir, path.basename(descriptor.filename));
     if (!fs.existsSync(tarballPath) || !fs.statSync(tarballPath).isFile()) {
@@ -212,7 +261,6 @@ export async function verifyPackableComponent(componentDir, options = {}) {
       .map((entry) => entry.slice(virtualPrefix.length))
       .sort();
 
-    const errors = [];
     if (!relFiles.some((file) => file !== 'package.json')) {
       errors.push('Packed tarball contains no distributable files besides package.json.');
     }
@@ -255,8 +303,6 @@ export async function verifyPackableComponent(componentDir, options = {}) {
       strict: true,
       level: 'error',
     });
-    const allowPrivateLocal =
-      options.allowPrivateLocalDeps === true && packedManifest.private === true;
     const publintErrors = publintResult.messages.filter(
       (msg) => !(allowPrivateLocal && msg.code === 'LOCAL_DEPENDENCY'),
     );

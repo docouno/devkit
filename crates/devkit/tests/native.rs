@@ -9,7 +9,7 @@ use devkit::{
         ComponentState, Environment, PackageMode, ProjectState, Release, Role, ToolingProfile,
     },
     native::{
-        admit_native_components, assert_input_identities, assert_native_components,
+        NodeLockKind, admit_native_components, assert_input_identities, assert_native_components,
         assert_npmrc_compatibility, collect_native_input_closure, derive_component_dependencies,
         package_lock, parse_and_admit_npmrc, valid_integrity,
     },
@@ -76,6 +76,15 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
         true,
     );
     put(&release, "templates/rust-api/src/main.rs", "fn main() {}\n");
+    let pin = devkit::runtime::PnpmPin::from_source_pins(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    put(&release, "runtime/pnpm.env", &pin.encode());
     write_json(
         &release.join("release.json"),
         &Release {
@@ -101,7 +110,11 @@ impl LockResolver for SeedFixtureResolver {
     fn regenerate(&self, root: &Path, _: &AdmittedRelease, _: Option<&str>) -> devkit::Result<()> {
         // The fixture release supplies the full selected graph. Admit it rather
         // than implementing an alternate ecosystem resolver in the test.
-        package_lock(root)?;
+        if root.join("pnpm-lock.yaml").is_file() {
+            devkit::pnpm::Lock::read(root)?;
+        } else {
+            package_lock(root)?;
+        }
         Ok(())
     }
 }
@@ -210,6 +223,562 @@ fn node_project(root: &Path, state: &ProjectState, members: &[(&str, Value)], ar
         &json!({"lockfileVersion":3,"packages":packages}),
     );
     profiles(root, state);
+}
+
+#[test]
+fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
+    const WORKER: &str = "DEVKIT_TEST_PNPM_BUDGET_WORKER";
+    if std::env::var(WORKER).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks",
+                "--test-threads=1",
+            ])
+            .env(WORKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let pages = fs::read_to_string("/proc/self/statm")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    // SAFETY: the isolated worker lowers only its own address-space limit;
+    // sparse rejected inputs must never allocate their declared GiB size.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let maximum = pages * page_size + 96 * 1024 * 1024;
+    let limit = libc::rlimit {
+        rlim_cur: maximum,
+        rlim_max: maximum,
+    };
+    // SAFETY: a live rlimit pointer and this disposable worker process only.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let mut state = state(&[("apps/main", "node")]);
+    state.version = "0.5.0".into();
+    node_project(
+        root,
+        &state,
+        &[("apps/main", manifest("main", json!({}), false))],
+        json!({}),
+    );
+    let packages = package_lock(root).unwrap();
+    devkit::pnpm::import_legacy_npm_lock_seed(root, &packages)
+        .unwrap()
+        .write(root)
+        .unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    let mut root_manifest: Value = read_json(&root.join("package.json")).unwrap();
+    root_manifest.as_object_mut().unwrap().remove("workspaces");
+    put_json(root, "package.json", &root_manifest);
+    devkit::pnpm::write_yaml(
+        root,
+        "pnpm-workspace.yaml",
+        &devkit::pnpm::Workspace::new(vec!["apps/main".into()]),
+    )
+    .unwrap();
+    let admitted = admit_native_components(root, &state).unwrap();
+    for name in ["pnpm-workspace.yaml", "pnpm-lock.yaml"] {
+        let path = root.join(name);
+        let original = fs::read(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        let error = admit_native_components(root, &state).err().unwrap();
+        assert!(
+            error.to_string().contains("pnpm YAML exceeds byte budget"),
+            "{error:#}"
+        );
+        let error = assert_input_identities(root, &admitted.inputs).unwrap_err();
+        assert!(
+            error.to_string().contains("pnpm YAML exceeds byte budget"),
+            "{error:#}"
+        );
+        fs::write(path, original).unwrap();
+    }
+    assert_input_identities(root, &admitted.inputs).unwrap();
+
+    // The public lifecycle snapshot and numeric journal slots must retain the
+    // same input budget, even when no native parser is about to read them.
+    let (_, project, _) = runtime_project(&root.join("lifecycle"), "node-api");
+    let snapshot = devkit::project::AdmissionSnapshot::capture(&project).unwrap();
+    let yaml = project.join("pnpm-workspace.yaml");
+    let original = fs::read(&yaml).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&yaml)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        snapshot
+            .recheck()
+            .unwrap_err()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::write(&yaml, &original).unwrap();
+    snapshot.recheck().unwrap();
+
+    put_json(
+        &project,
+        "apps/extra/package.json",
+        &manifest("extra", json!({}), false),
+    );
+    let adopted_lock = project.join("apps/extra/pnpm-lock.yaml");
+    fs::File::create(&adopted_lock)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        devkit::project::AdmissionSnapshot::capture(&project)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::remove_dir_all(project.join("apps/extra")).unwrap();
+
+    let staged = root.join("transaction-source");
+    devkit::files::copy_tree(
+        &project,
+        &staged,
+        &|name| devkit::state::excluded_snapshot_path(name),
+        true,
+    )
+    .unwrap();
+    for name in ["pnpm-workspace.yaml", devkit::state::MANIFEST_PATH] {
+        let path = staged.join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+    }
+    let paths = [
+        "pnpm-workspace.yaml".to_owned(),
+        devkit::state::MANIFEST_PATH.to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let stage = ".devkit/state/update-00000000-0000-4000-8000-000000000001";
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&yaml)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        devkit::transaction::PreparedTransaction::prepare(&project, stage, &staged, &paths, vec![])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::write(&yaml, original).unwrap();
+    let tx =
+        devkit::transaction::PreparedTransaction::prepare(&project, stage, &staged, &paths, vec![])
+            .unwrap();
+    let file = tx
+        .journal
+        .files
+        .iter()
+        .find(|file| file.path == "pnpm-workspace.yaml")
+        .unwrap();
+    for saved in [&file.staged, &file.backup] {
+        let path = project.join(saved.as_ref().unwrap());
+        let bytes = fs::read(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            tx.commit(&project, None, &|| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("pnpm YAML exceeds byte budget")
+        );
+        write_json(&project.join(devkit::state::PENDING_PATH), &tx.journal).unwrap();
+        assert!(
+            devkit::transaction::recover_project(&project)
+                .unwrap_err()
+                .to_string()
+                .contains("pnpm YAML exceeds byte budget")
+        );
+        fs::write(path, bytes).unwrap();
+        fs::remove_file(project.join(devkit::state::PENDING_PATH)).unwrap();
+    }
+    write_json(&project.join(devkit::state::PENDING_PATH), &tx.journal).unwrap();
+    assert!(devkit::transaction::recover_project(&project).unwrap());
+    devkit::project::AdmissionSnapshot::capture(&project).unwrap();
+}
+
+#[test]
+fn npmrc_policy_versions_the_complete_reserved_namespace_and_fetch_allowlist() {
+    use devkit::native::parse_manifest_npmrc_policy;
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    for variable in ["PNPM_PRIVATE_TOKEN", "XDG_REGISTRY_TOKEN", "REGISTRY_TOKEN"] {
+        put(
+            root,
+            ".npmrc",
+            &format!("//registry.example/:_authToken=${{{variable}}}\n"),
+        );
+        assert!(parse_manifest_npmrc_policy(root, NodeLockKind::Npm).is_ok());
+        assert_eq!(
+            parse_manifest_npmrc_policy(root, NodeLockKind::Pnpm).is_ok(),
+            variable == "REGISTRY_TOKEN"
+        );
+    }
+    for setting in ["fetch-retries=2", "fetch-timeout=100"] {
+        put(root, ".npmrc", setting);
+        assert!(
+            parse_manifest_npmrc_policy(root, NodeLockKind::Npm)
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported npm configuration key")
+        );
+        parse_manifest_npmrc_policy(root, NodeLockKind::Pnpm).unwrap();
+    }
+    for variable in [
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "PWD",
+        "TMPDIR",
+        "CI",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "GOMAXPROCS",
+        "UV_THREADPOOL_SIZE",
+        "LD_TOKEN",
+        "DYLD_TOKEN",
+        "NODE_TOKEN",
+        "NPM_CONFIG_TOKEN",
+        "DEVKIT_TOKEN",
+        "CARGO_TOKEN",
+        "RUST_TOKEN",
+        "DOCKER_TOKEN",
+        "GIT_TOKEN",
+        "SSH_TOKEN",
+        "SSL_TOKEN",
+        "RAYON_TOKEN",
+        "ROLLDOWN_TOKEN",
+        "VITEST_TOKEN",
+        "TOKIO_TOKEN",
+    ] {
+        put(
+            root,
+            ".npmrc",
+            &format!("//registry.example/:_authToken=${{{variable}}}\n"),
+        );
+        for kind in [NodeLockKind::Npm, NodeLockKind::Pnpm] {
+            assert!(
+                parse_manifest_npmrc_policy(root, kind)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Reserved environment variable"),
+                "{kind:?}: {variable}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_snapshots_project_physical_component_roles_dependencies_and_cycles() {
+    for target in ["apps/secondary", "packages/core"] {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let mut state = state(&[("apps/main", "node"), (target, "node")]);
+        state.version = "0.5.0".into();
+        if target.starts_with("packages/") {
+            state.components.get_mut("apps/main").unwrap().dependencies = vec![target.into()];
+        }
+        let relative = if target.starts_with("apps/") {
+            "../secondary"
+        } else {
+            "../../packages/core"
+        };
+        node_project(
+            root,
+            &state,
+            &[
+                (
+                    "apps/main",
+                    manifest("main", json!({"target":format!("file:{relative}")}), false),
+                ),
+                (
+                    target,
+                    manifest("target", json!({}), target.starts_with("packages/")),
+                ),
+            ],
+            json!({}),
+        );
+        let mut lock =
+            devkit::pnpm::import_legacy_npm_lock_seed(root, &package_lock(root).unwrap()).unwrap();
+        let key = format!("target@file:{target}");
+        lock.importers
+            .get_mut("apps/main")
+            .unwrap()
+            .dependencies
+            .get_mut("target")
+            .unwrap()
+            .version = format!("file:{target}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"resolution":{"type":"directory","directory":target}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, serde_json::Map::new());
+        lock.write(root).unwrap();
+        fs::remove_file(root.join("package-lock.json")).unwrap();
+        devkit::project::sync_node_workspace(root, &state, None).unwrap();
+        if target.starts_with("apps/") {
+            assert!(
+                admit_native_components(root, &state)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        } else {
+            assert_eq!(
+                admit_native_components(root, &state).unwrap().dependencies["apps/main"],
+                vec![target.to_owned()]
+            );
+            assert_eq!(
+                devkit::native::local_dependency_map(root, &state, "apps/main").unwrap()["target"],
+                target
+            );
+            let mut core: Value = read_json(&root.join("packages/core/package.json")).unwrap();
+            core["dependencies"]["main"] = json!("file:../../apps/main");
+            put_json(root, "packages/core/package.json", &core);
+            let entry = devkit::pnpm::Dependency {
+                specifier: "file:../../apps/main".into(),
+                version: "file:apps/main".into(),
+            };
+            lock.importers
+                .get_mut("packages/core")
+                .unwrap()
+                .dependencies
+                .insert("main".into(), entry);
+            lock.packages.insert(
+                "main@file:apps/main".into(),
+                json!({"resolution":{"type":"directory","directory":"apps/main"}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            lock.snapshots
+                .insert("main@file:apps/main".into(), serde_json::Map::new());
+            lock.write(root).unwrap();
+            assert!(
+                derive_component_dependencies(root, &state)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_snapshot_library_edges_cannot_hide_a_component_cycle() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let mut state = state(&[("packages/a", "node"), ("packages/b", "node")]);
+    state.version = "0.5.0".into();
+    node_project(
+        root,
+        &state,
+        &[
+            ("packages/a", manifest("a", json!({"b":"file:../b"}), true)),
+            ("packages/b", manifest("b", json!({"a":"file:../a"}), true)),
+        ],
+        json!({}),
+    );
+    let mut lock =
+        devkit::pnpm::import_legacy_npm_lock_seed(root, &package_lock(root).unwrap()).unwrap();
+    for (from, name) in [("packages/a", "b"), ("packages/b", "a")] {
+        let target = format!("packages/{name}");
+        lock.importers
+            .get_mut(from)
+            .unwrap()
+            .dependencies
+            .get_mut(name)
+            .unwrap()
+            .version = format!("file:{target}");
+        let key = format!("{name}@file:{target}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"resolution":{"type":"directory","directory":target}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, serde_json::Map::new());
+    }
+    lock.write(root).unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    devkit::project::sync_node_workspace(root, &state, None).unwrap();
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Component dependency cycle")
+    );
+}
+
+#[test]
+fn legacy_authority_ignores_shadow_pnpm_files_and_keeps_its_exact_npmrc_policy() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let state = state(&[("apps/main", "node")]);
+    node_project(
+        root,
+        &state,
+        &[("apps/main", manifest("main", json!({}), false))],
+        json!({}),
+    );
+    let before = admit_native_components(root, &state).unwrap().inputs;
+    for name in [
+        "pnpm-workspace.yaml",
+        "pnpm-lock.yaml",
+        ".pnpmfile.cjs",
+        "apps/main/.pnpmfile.mjs",
+    ] {
+        put(root, name, "unrelated legacy product file\n");
+    }
+    let after = admit_native_components(root, &state).unwrap().inputs;
+    assert_eq!(before.digest, after.digest);
+    read_native_graph(root, NodeLockKind::Npm).unwrap();
+    put(
+        root,
+        ".npmrc",
+        "package-lock=true\ninstall-strategy=hoisted\n",
+    );
+    admit_native_components(root, &state).unwrap();
+    for setting in [
+        "node-linker=isolated",
+        "package-import-method=hardlink",
+        "strict-peer-dependencies=true",
+        "auto-install-peers=true",
+    ] {
+        put(root, ".npmrc", setting);
+        assert!(
+            admit_native_components(root, &state)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Unsupported npm configuration key"),
+            "{setting}"
+        );
+    }
+}
+
+#[test]
+fn pnpm_admission_tracks_workspace_links_and_rejects_competing_locks_and_configuration() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let mut state = state(&[("apps/web", "node"), ("packages/ui", "node")]);
+    state.version = "0.5.0".into();
+    state.components.get_mut("apps/web").unwrap().dependencies = vec!["packages/ui".into()];
+    node_project(
+        root,
+        &state,
+        &[
+            (
+                "apps/web",
+                manifest("web", json!({"ui":"workspace:*"}), false),
+            ),
+            ("packages/ui", manifest("ui", json!({}), true)),
+        ],
+        json!({}),
+    );
+    let packages = package_lock(root).unwrap();
+    devkit::project::sync_node_workspace(root, &state, None).unwrap();
+    let lock = devkit::pnpm::import_legacy_npm_lock_seed(root, &packages).unwrap();
+    lock.write(root).unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert_eq!(admitted.dependencies["apps/web"], vec!["packages/ui"]);
+    assert!(admitted.node_inputs.files.contains_key("pnpm-lock.yaml"));
+    assert!(
+        admitted
+            .node_inputs
+            .files
+            .contains_key("pnpm-workspace.yaml")
+    );
+    put(root, "package-lock.json", "{}");
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Competing root lockfile")
+    );
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    put(
+        root,
+        ".npmrc",
+        "//registry.npmjs.org/:_authToken=${PNPM_FORBIDDEN}\n",
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Reserved environment variable")
+    );
+    fs::remove_file(root.join(".npmrc")).unwrap();
+    assert_eq!(admitted.node_inputs.files[".pnpmfile.cjs"], None);
+    for directory in ["", "apps/web/", "packages/ui/"] {
+        for name in [".pnpmfile.cjs", ".pnpmfile.mjs", ".pnpmfile.js"] {
+            let name = format!("{directory}{name}");
+            put(
+                root,
+                &name,
+                "throw new Error('unsupported hook must not execute');\n",
+            );
+            assert!(assert_input_identities(root, &admitted.node_inputs).is_err());
+            assert!(
+                admit_native_components(root, &state)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Unsupported pnpm hook")
+            );
+            fs::remove_file(root.join(name)).unwrap();
+        }
+    }
+    put(root, "apps/web/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("workspace context: apps/web/pnpm-lock.yaml")
+    );
 }
 fn rust(root: &Path, path: &str, contents: &str, registered: bool) {
     put(root, &format!("{path}/Cargo.toml"), contents);
@@ -412,10 +981,14 @@ fn native_closure_binds_transitive_local_manifests_optional_config_and_archive_b
     );
     put(root, "vendor packages/b/.npmrc", "legacy-peer-deps=true\n");
     assert!(
-        assert_npmrc_compatibility(root, &second.directories)
-            .unwrap_err()
-            .to_string()
-            .contains("workspace context")
+        assert_npmrc_compatibility(
+            root,
+            &second.directories,
+            NodeLockKind::for_state(&state).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("workspace context")
     );
 }
 
@@ -652,35 +1225,48 @@ fn preserved_graph_allows_hoisting_relocation_and_rejects_artifact_edge_or_shari
         .unwrap();
     relocated["packages"]["apps/main/node_modules/a"] = a;
     put_json(root, "package-lock.json", &relocated);
-    assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).unwrap();
+    assert_product_graphs_preserved(
+        &before,
+        &read_native_graph(root, NodeLockKind::Npm).unwrap(),
+    )
+    .unwrap();
     let mut changed = relocated.clone();
     changed["packages"]["node_modules/shared"]["integrity"] = json!(sri(9));
     put_json(root, "package-lock.json", &changed);
     assert!(
-        assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("artifact changed")
+        assert_product_graphs_preserved(
+            &before,
+            &read_native_graph(root, NodeLockKind::Npm).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("artifact changed")
     );
     let mut split = relocated.clone();
     split["packages"]["node_modules/b/node_modules/shared"] =
         split["packages"]["node_modules/shared"].clone();
     put_json(root, "package-lock.json", &split);
     assert!(
-        assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("shared dependency split")
+        assert_product_graphs_preserved(
+            &before,
+            &read_native_graph(root, NodeLockKind::Npm).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("shared dependency split")
     );
     let mut topology = relocated;
     topology["packages"]["node_modules/b"]["dependencies"]["extra"] = json!("1.0.0");
     topology["packages"]["node_modules/extra"] = artifact("extra", json!({}));
     put_json(root, "package-lock.json", &topology);
     assert!(
-        assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("topology changed")
+        assert_product_graphs_preserved(
+            &before,
+            &read_native_graph(root, NodeLockKind::Npm).unwrap()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("topology changed")
     );
 }
 
@@ -709,7 +1295,11 @@ fn preserved_graph_accepts_identical_artifact_deduplication() {
         .remove("node_modules/b/node_modules/shared");
     lock["packages"]["node_modules/shared"] = shared;
     put_json(root, "package-lock.json", &lock);
-    assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).unwrap();
+    assert_product_graphs_preserved(
+        &before,
+        &read_native_graph(root, NodeLockKind::Npm).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -724,10 +1314,13 @@ fn preserved_graph_distinguishes_absent_null_false_artifact_flags() {
         lock["packages"]["node_modules/shared"]["optional"] = flag;
         put_json(root, "package-lock.json", &lock);
         assert!(
-            assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap())
-                .unwrap_err()
-                .to_string()
-                .contains("artifact changed")
+            assert_product_graphs_preserved(
+                &before,
+                &read_native_graph(root, NodeLockKind::Npm).unwrap()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("artifact changed")
         );
     }
 }
@@ -777,18 +1370,38 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
     for location in ["root", "member", "transitive", "development", "peer"] {
         let f = TempDir::new().unwrap();
         let (release, root, state) = runtime_project(f.path(), "node");
-        let mut lock: Value = read_json(&root.join("package-lock.json")).unwrap();
+        let mut lock = devkit::pnpm::Lock::read(&root).unwrap();
         let mut member: Value = read_json(&root.join("apps/main/package.json")).unwrap();
         if location == "root" {
             let mut manifest: Value = read_json(&root.join("package.json")).unwrap();
             manifest["dependencies"] = json!({"missing-required":"1.0.0"});
             put_json(&root, "package.json", &manifest);
-            lock["packages"][""] = manifest;
         } else if location == "transitive" {
             member["dependencies"] = json!({"parent":"1.0.0"});
-            lock["packages"]["node_modules/parent"] = artifact(
-                "parent",
-                json!({"dependencies":{"missing-required":"1.0.0"}}),
+            lock.importers
+                .get_mut("apps/main")
+                .unwrap()
+                .dependencies
+                .insert(
+                    "parent".into(),
+                    devkit::pnpm::Dependency {
+                        specifier: "1.0.0".into(),
+                        version: "1.0.0".into(),
+                    },
+                );
+            lock.packages.insert(
+                "parent@1.0.0".into(),
+                json!({"resolution":{"integrity":sri(1)}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            lock.snapshots.insert(
+                "parent@1.0.0".into(),
+                json!({"dependencies":{"missing-required":"1.0.0"}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
             );
         } else {
             let field = match location {
@@ -802,15 +1415,19 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
             member[field]["missing-required"] = json!("1.0.0");
         }
         put_json(&root, "apps/main/package.json", &member);
-        lock["packages"]["apps/main"] = member;
-        put_json(&root, "package-lock.json", &lock);
+        lock.write(&root).unwrap();
+        let diagnostic = if location == "transitive" {
+            "Native lock target is missing"
+        } else {
+            "Native lock omits dependency"
+        };
         let before = source_signature(&root, Some(&state)).unwrap();
         assert!(
             admit_native_components(&root, &state)
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("Native lock omits dependency"),
+                .contains(diagnostic),
             "{location}"
         );
         assert!(
@@ -818,14 +1435,14 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("Native lock omits dependency"),
+                .contains(diagnostic),
             "{location}"
         );
         let error = update_project(&release, &root, &UpdateOptions::default(), &RefuseResolver)
             .err()
             .unwrap();
         assert!(
-            error.to_string().contains("Native lock omits dependency"),
+            error.to_string().contains(diagnostic),
             "{location}: {error}"
         );
         assert_eq!(source_signature(&root, Some(&state)).unwrap(), before);
@@ -845,7 +1462,7 @@ fn npm_missing_optional_and_optional_peer_rules_match_graph_admission() {
     member["peerDependenciesMeta"] = json!({"optional-peer":{"optional":true}});
     node_project(root, &state, &[("apps/main", member.clone())], json!({}));
     admit_native_components(root, &state).unwrap();
-    read_native_graph(root).unwrap();
+    read_native_graph(root, NodeLockKind::Npm).unwrap();
     for metadata in [
         json!({}),
         json!({"optional-peer":null}),
@@ -864,7 +1481,7 @@ fn npm_missing_optional_and_optional_peer_rules_match_graph_admission() {
                 .contains("optional-peer")
         );
         assert!(
-            read_native_graph(root)
+            read_native_graph(root, NodeLockKind::Npm)
                 .unwrap_err()
                 .to_string()
                 .contains("optional-peer")
@@ -2619,7 +3236,11 @@ fn npm_alias_admission_validates_target_name_and_rejects_spoofed_or_nested_specs
     );
     assert_native_components(root, &state).unwrap();
     let before = capture_product_graph(root, &state).unwrap();
-    assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).unwrap();
+    assert_product_graphs_preserved(
+        &before,
+        &read_native_graph(root, NodeLockKind::Npm).unwrap(),
+    )
+    .unwrap();
 
     // Changing the target package under the same alias key & version must fail BOTH
     // native admission and product graph preservation.
@@ -2653,7 +3274,13 @@ fn npm_alias_admission_validates_target_name_and_rejects_spoofed_or_nested_specs
     renamed_lock["packages"]["node_modules/string-width-cjs"]["resolved"] =
         json!("https://registry.npmjs.org/other-width/-/other-width-4.2.3.tgz");
     put_json(root, "package-lock.json", &renamed_lock);
-    assert!(assert_product_graphs_preserved(&before, &read_native_graph(root).unwrap()).is_err());
+    assert!(
+        assert_product_graphs_preserved(
+            &before,
+            &read_native_graph(root, NodeLockKind::Npm).unwrap()
+        )
+        .is_err()
+    );
 
     // Alias cannot target a registered local workspace component.
     renamed_manifest["dependencies"] = json!({"@test/shared": "npm:@test/shared@1.0.0"});
@@ -2717,7 +3344,12 @@ fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() 
          //gitlab.example.com/api/v4/projects/12/packages/npm/:always-auth=true\n",
     );
     let closure = collect_native_input_closure(root, &state).unwrap();
-    let policy = parse_and_admit_npmrc(root, &closure.directories).unwrap();
+    let policy = parse_and_admit_npmrc(
+        root,
+        &closure.directories,
+        NodeLockKind::for_state(&state).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         policy.scoped_registries.get("corp").map(String::as_str),
         Some("https://gitlab.example.com/api/v4/projects/12/packages/npm/")
@@ -2732,7 +3364,12 @@ fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() 
         "@corp:registry=https://[fd00::1]:8443/api/v4/projects/12/packages/npm/\n\
          //[fd00::1]:8443/api/v4/projects/12/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}\n",
     );
-    let ipv6_policy = parse_and_admit_npmrc(root, &closure.directories).unwrap();
+    let ipv6_policy = parse_and_admit_npmrc(
+        root,
+        &closure.directories,
+        NodeLockKind::for_state(&state).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         ipv6_policy
             .scoped_registries
@@ -2762,7 +3399,12 @@ fn npmrc_closed_allowlist_supports_gitlab_registries_and_rejects_secret_leaks() 
     ] {
         put(root, ".npmrc", bad_npmrc);
         assert!(
-            parse_and_admit_npmrc(root, &closure.directories).is_err(),
+            parse_and_admit_npmrc(
+                root,
+                &closure.directories,
+                NodeLockKind::for_state(&state).unwrap()
+            )
+            .is_err(),
             "expected .npmrc to be rejected: {bad_npmrc}"
         );
     }

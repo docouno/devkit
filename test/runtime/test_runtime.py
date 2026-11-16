@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import tarfile
 import time
 import unittest
 import uuid
@@ -23,21 +25,30 @@ NODE_VERSION = PINS["DEVKIT_NODE_VERSION"]
 LABEL = "io.docouno.devkit.invocation"
 RUNTIME_SOURCE = REPO / "runtime"
 ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
+PNPM_BIN = None
+CACHE_OVERRIDE = None
 FIXTURE = Path(os.environ.get("DEVKIT_TEST_FIXTURE", ENGINE.parent / "examples/runtime_fixture")).resolve()
 
 
 def env():
     result = dict(os.environ)
     for key in list(result):
-        if key.startswith(("COMPOSE_", "DEVKIT_")) or key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+        if key.startswith(("COMPOSE_", "DEVKIT_", "PNPM_", "pnpm_")) or key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
             result.pop(key)
     result["DEVKIT_ENGINE_PATH"] = str(ENGINE)
+    if PNPM_BIN is not None:
+        result["DEVKIT_PNPM_BIN_OVERRIDE"] = str(PNPM_BIN)
+    if CACHE_OVERRIDE is not None:
+        result["DEVKIT_CACHE_DIR"] = str(CACHE_OVERRIDE)
     return result
 
 
 def run(*args, check=True, timeout=35, **kwargs):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                            env=kwargs.pop("env", env()), **kwargs)
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                                env=kwargs.pop("env", env()), **kwargs)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(f"{args!r}: timed out after {timeout}s\n{error.stdout!r}\n{error.stderr!r}") from error
     if check and result.returncode:
         raise AssertionError(f"{args!r}: {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result
@@ -58,6 +69,11 @@ def selected_engine_version():
 
 
 VERSION = selected_engine_version()
+
+
+def setUpModule():
+    global PNPM_BIN
+    PNPM_BIN = Path(subprocess.check_output([str(ENGINE), "internal", "ensure-pnpm", "--pin-file", str(REPO / "toolchains.env")], env=env(), text=True).strip())
 
 
 def container(name):
@@ -83,6 +99,9 @@ def fixture_tool(root, script):
                "--label", f"{LABEL}={token}", "--network", "none",
                "--user", f"{os.getuid()}:{os.getgid()}",
                "--volume", f"{root}:/fixture:z",
+               "--volume", f"{PNPM_BIN}:/devkit/bin/pnpm:ro,z",
+               "--env", "PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "--env", "XDG_CACHE_HOME=/tmp/pnpm-cache", "--env", "PNPM_CONFIG_STORE_DIR=/tmp/pnpm-store",
                "--workdir", "/fixture", "--env", "npm_config_cache=/tmp/npm-cache",
                "--env", "npm_config_userconfig=/dev/null", IMAGE,
                "node", "--input-type=module", "-e", script, timeout=35)
@@ -96,6 +115,7 @@ def write_fixture(root, apps=("main",), packages=(), package_profiles=None):
         f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
         f"DEVKIT_RUST_RECIPE_HASH={hashlib.sha256((runtime / 'rust.Dockerfile').read_bytes()).hexdigest()}\n"
         f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+    (runtime / "pnpm.env").write_text("DEVKIT_PNPM_PACKAGE=@pnpm/exe.linux-x64-musl\n" + "".join(f"{key}={PINS[key]}\n" for key in ("DEVKIT_PNPM_SHA256", "DEVKIT_PNPM_TARBALL_SHA256", "DEVKIT_PNPM_VERSION")))
     (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
     for area, app in [("apps", name) for name in apps] + [("packages", name) for name in packages]:
         path = root / area / app
@@ -204,21 +224,24 @@ def accept_runtime(root, native=False, package_profiles=None):
                 components[name].setdefault("development", {"owner": "project", "kind": "compose", "service": path.name})
     state["components"] = components
     state_path.write_text(json.dumps(state) + "\n")
-    # Native npm owns fixture locks; Rust fixture helper renders the actual
-    # production projections. No Node metadata/admission implementation is used.
+    # Pinned pnpm selects fixture resolutions; the Rust helper renders production projections.
     nodes = sorted(name for name, c in components.items() if c["toolchain"] == "node")
     if native:
         if nodes:
             root_file = root / "package.json"
             manifest = json.loads(root_file.read_text()) if root_file.exists() else {"name":"runtime-fixture","version":"1.0.0","private":True}
-            manifest["workspaces"] = nodes
+            manifest.pop("workspaces", None)
             root_file.write_text(json.dumps(manifest)+"\n")
-            for name in nodes:
-                (root / name / "package-lock.json").unlink(missing_ok=True)
-            fixture_tool(root, "import {spawnSync} from 'node:child_process';const r=spawnSync('npm',['install','--package-lock-only','--ignore-scripts','--include=dev','--strict-peer-deps','--offline','--no-audit','--no-fund'],{stdio:'inherit'});process.exit(r.status??1)")
-        else:
-            (root / "package.json").unlink(missing_ok=True)
+            workspace = {"packages": nodes, "nodeLinker": "isolated", "packageImportMethod": "hardlink", "verifyDepsBeforeRun": False}
+            (root / "pnpm-workspace.yaml").write_text(json.dumps(workspace)+"\n")
             (root / "package-lock.json").unlink(missing_ok=True)
+            for name in nodes:
+                for filename in ("package-lock.json", "pnpm-lock.yaml"):
+                    (root / name / filename).unlink(missing_ok=True)
+            fixture_tool(root, "import {spawnSync} from 'node:child_process';const r=spawnSync('pnpm',['install','--lockfile-only','--fix-lockfile','--ignore-scripts','--offline','--trust-lockfile','--config.strict-peer-dependencies=true'],{stdio:'inherit'});process.exit(r.status??1)")
+        else:
+            for filename in ("package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
+                (root / filename).unlink(missing_ok=True)
     run(str(FIXTURE), str(root))
     seal_runtime(root)
 
@@ -232,6 +255,7 @@ def write_rust_fixture(root):
         f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
         f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
         f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+    (runtime / "pnpm.env").write_text("DEVKIT_PNPM_PACKAGE=@pnpm/exe.linux-x64-musl\n" + "".join(f"{key}={PINS[key]}\n" for key in ("DEVKIT_PNPM_SHA256", "DEVKIT_PNPM_TARBALL_SHA256", "DEVKIT_PNPM_VERSION")))
     (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
     shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
     accept_runtime(root, native=True)
@@ -419,8 +443,10 @@ class RuntimeTests(unittest.TestCase):
         cls.capture.cleanup()
 
     def setUp(self):
+        global CACHE_OVERRIDE
         self.temp = tempfile.TemporaryDirectory(prefix="devkit-runtime-test-")
         self.base = Path(self.temp.name)
+        CACHE_OVERRIDE = self.base / "cache"
         self.root = self.base / "checkout with space"
         self.token = uuid.uuid4().hex
         self.resources = []
@@ -428,6 +454,8 @@ class RuntimeTests(unittest.TestCase):
         self.projects = []
 
     def tearDown(self):
+        global CACHE_OVERRIDE
+        CACHE_OVERRIDE = None
         errors = []
         for name in self.resources:
             found = container(name)
@@ -465,17 +493,130 @@ class RuntimeTests(unittest.TestCase):
         e["DEVKIT_TEST_SECRET"] = "must-not-reach-tools"
         self.make("setup", env=e)
         hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                  for path in (source, source.with_name("package.json"), self.root / "package.json", self.root / "package-lock.json")}
+                  for path in (source, source.with_name("package.json"), self.root / "package.json", self.root / "pnpm-lock.yaml")}
         for command in ("check", "test", "build"):
             self.assertIn(f"GATE main {command}", self.make(command, env=e).stdout)
         self.assertEqual(hashes, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in hashes})
         self.make("fix")
         self.assertEqual(source.read_text(), "explicit fix\n")
-        lock = self.root / "package-lock.json"
+        lock = self.root / "pnpm-lock.yaml"
         lock.write_text(lock.read_text() + "\n")
         result = self.make("check", check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("dependencies are absent/stale", result.stderr)
+
+    def test_pnpm_hooks_are_refused_before_online_setup_can_execute_them(self):
+        write_fixture(self.root)
+        outside = self.base / "hook-token-canary"
+        (self.root / ".npmrc").write_text(
+            "//registry.npmjs.org/:_authToken=${REVIEW_NPM_TOKEN}\n")
+        environment = dict(env(), REVIEW_NPM_TOKEN="review-only-canary")
+        payload = ("require('node:fs').writeFileSync(" + json.dumps(str(outside))
+                   + ", process.env.REVIEW_NPM_TOKEN || 'executed');module.exports={};\n")
+        for directory in (self.root, self.root / "apps/main"):
+            hook = directory / ".pnpmfile.cjs"
+            hook.write_text(payload)
+            try:
+                result = self.make("setup", env=environment, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Unsupported pnpm hook", result.stdout + result.stderr)
+                self.assertFalse(outside.exists(), "pnpm hook ran before refusal")
+                self.assertFalse((self.root / ".devkit/state/node-workspace.lock").exists())
+            finally:
+                hook.unlink()
+
+    def test_setup_preserves_package_manager_metadata_and_uses_the_release_pin(self):
+        write_fixture(self.root)
+        path = self.root / "package.json"
+        manifest = json.loads(path.read_text())
+        for manager in ("pnpm@0.0.0", "npm@11.21.1"):
+            manifest["packageManager"] = manager
+            manifest["devEngines"] = {
+                "packageManager": {"name": manager.split("@")[0], "version": manager.split("@")[1], "onFail": "error"},
+                "runtime": {"name": "node", "version": "24.22.1", "onFail": "download"},
+            }
+            path.write_text(json.dumps(manifest, indent=2) + "\n")
+            before = path.read_bytes()
+            self.make("setup")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue((self.root / ".devkit/state/node-workspace.lock").is_file())
+
+    def test_shared_store_hardlinks_offline_worktree_and_masks(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as package:
+            for name, contents in {"package.json": json.dumps({"name":"hardlink-probe","version":"1.0.0","main":"index.js"}),
+                                   "index.js": "module.exports = 'shared content';\n"}.items():
+                payload = contents.encode()
+                info = tarfile.TarInfo("package/" + name)
+                info.size, info.mode = len(payload), 0o644
+                package.addfile(info, io.BytesIO(payload))
+        second = self.base / "second checkout"
+        def prepare(root):
+            write_fixture(root)
+            (root / "vendor").mkdir()
+            (root / "vendor/probe.tgz").write_bytes(archive.getvalue())
+            path = root / "apps/main/package.json"
+            manifest = json.loads(path.read_text())
+            manifest["dependencies"] = {"hardlink-probe":"file:../../vendor/probe.tgz"}
+            path.write_text(json.dumps(manifest)+"\n")
+            accept_runtime(root, native=True)
+        prepare(self.root)
+        run("git", "-C", str(self.root), "init", "--initial-branch=fixture")
+        run("git", "-C", str(self.root), "add", "--", ".")
+        run("git", "-C", str(self.root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "-c", "core.hooksPath=/dev/null", "commit", "-m", "chore(test): seed worktree fixture")
+        run("git", "-C", str(self.root), "worktree", "add", "--detach", str(second), "HEAD")
+        (self.base / "sibling-secret").mkdir()
+        (self.base / "sibling-secret/token.txt").write_text("must remain hidden")
+        (self.base / "top-secret.txt").write_text("must remain hidden")
+        (self.base / "broken-link").symlink_to("absent-target")
+        (self.base / "dir-link").symlink_to("sibling-secret", target_is_directory=True)
+        (self.root / ".env").write_text("SECRET=hidden\n")
+        (self.root / ".env.example").write_text("PUBLIC=example\n")
+        self.make("setup")
+        started = time.monotonic()
+        self.make("setup")
+        warm_seconds = time.monotonic() - started
+        wrappers = self.base / "offline-bin"
+        wrappers.mkdir()
+        docker = wrappers / "docker"
+        real_docker = shutil.which("docker")
+        docker.write_text("#!/usr/bin/python3\nimport os,sys\nargs=sys.argv[1:]\n"
+                          "if args[:1] == ['run'] and '--network' in args: args[args.index('--network')+1]='none'\n"
+                          f"os.execv({real_docker!r},[{real_docker!r},*args])\n")
+        docker.chmod(0o755)
+        started = time.monotonic()
+        run("make", "--no-print-directory", "-C", str(second), "setup",
+            env=dict(env(), PATH=str(wrappers)+os.pathsep+os.environ["PATH"]))
+        offline_seconds = time.monotonic() - started
+        files = [root / "apps/main/node_modules/hardlink-probe/index.js" for root in (self.root, second)]
+        first_stat, second_stat = [path.stat() for path in files]
+        self.assertEqual((first_stat.st_dev,first_stat.st_ino),(second_stat.st_dev,second_stat.st_ino))
+        self.assertGreaterEqual(first_stat.st_nlink,3)
+        script = """const fs=require('node:fs'),assert=require('node:assert/strict');
+assert.deepEqual(fs.readdirSync('/devkit/unified/sibling-secret'),[]);
+for(const file of ['/devkit/unified/top-secret.txt','/workspace/.env','../../.env']) assert.equal(fs.readFileSync(file,'utf8'),'');
+assert.equal(fs.readFileSync('/workspace/.env.example','utf8'),'PUBLIC=example\\n');"""
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--", "node", "-e", script)
+        self.make("setup")
+        gate = self.root / "apps/main/gate.cjs"
+        gate.write_text("require('node:assert/strict').throws(()=>require('node:fs').writeFileSync(require.resolve('hardlink-probe'),'tampered'), /EROFS/);\n" + gate.read_text())
+        self.make("check")
+        self.assertEqual(files[0].read_text(),"module.exports = 'shared content';\n")
+        with tempfile.TemporaryDirectory(prefix="devkit-cache-fallback-", dir="/dev/shm") as external_cache:
+            self.assertNotEqual(os.stat(external_cache).st_dev, os.stat(self.root).st_dev)
+            environment = dict(env(), DEVKIT_CACHE_DIR=external_cache)
+            for root in (self.root, second):
+                run("make", "--no-print-directory", "-C", str(root), "setup", env=environment)
+            self.assertTrue((self.root / ".git/devkit-store").is_dir())
+            self.assertEqual(files[0].stat().st_ino, files[1].stat().st_ino)
+            self.assertGreaterEqual(files[0].stat().st_nlink,3)
+            local = self.base / "non-git checkout"
+            prepare(local)
+            run("make", "--no-print-directory", "-C", str(local), "setup", env=environment)
+            self.assertTrue((local / ".devkit/cache/pnpm-store").is_dir())
+        print("HARDLINK-PROOF " + json.dumps({"warmSetupSeconds":warm_seconds,"offlineWorktreeSetupSeconds":offline_seconds,
+                                            "inode":first_stat.st_ino,"links":first_stat.st_nlink}))
 
     def test_make_named_edges_selector_native_failure(self):
         write_fixture(self.root, ("web", "api"))
@@ -487,14 +628,14 @@ class RuntimeTests(unittest.TestCase):
         (self.root / "apps/api/FAIL").write_text("fail")
         result = self.make("test-api", check=False)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Error 42", result.stderr)
+        self.assertIn("42", result.stdout + result.stderr)
 
     def test_one_workspace_setup_shared_library_gates_and_full_input_receipt(self):
         write_fixture(self.root, ("web", "api"), ("client",))
         for area, name in (("apps", "web"), ("apps", "api"), ("packages", "client")):
             path = self.root / area / name / "package.json"
             package = json.loads(path.read_text())
-            package["scripts"]["postinstall"] = "node -e \"require('node:fs').appendFileSync(process.env.NPM_CONFIG_CACHE+'/setup-count',process.cwd()+'\\n')\""
+            package["scripts"]["postinstall"] = "node -e \"require('node:fs').appendFileSync('/workspace/node_modules/setup-count',process.cwd()+'\\n')\""
             if name == "web":
                 package["dependencies"] = {"devkit-test-client": "file:../../packages/client",
                                            "fixture-link": "file:../../shared/link"}
@@ -507,7 +648,7 @@ class RuntimeTests(unittest.TestCase):
             (path / "index.js").write_text("module.exports = true;\n")
         accept_runtime(self.root, native=True)
         self.make("setup")
-        count = (self.root / ".devkit/cache/npm/setup-count").read_text().splitlines()
+        count = (self.root / "node_modules/setup-count").read_text().splitlines()
         self.assertEqual(sorted(count), ["/workspace/apps/api", "/workspace/apps/web", "/workspace/packages/client"])
         for name in ("apps/web", "apps/api", "packages/client"):
             self.assertFalse((self.root / name / "package-lock.json").exists())
@@ -521,11 +662,11 @@ class RuntimeTests(unittest.TestCase):
         failure.touch()
         blocked = self.make("check", "app=web", check=False)
         self.assertNotEqual(blocked.returncode, 0)
-        self.assertIn("Error 42", blocked.stderr)
+        self.assertIn("42", blocked.stdout + blocked.stderr)
         self.assertNotIn("GATE web check", blocked.stdout)
         failure.unlink()
         receipt = (self.root / ".devkit/state/node-workspace.lock").read_bytes()
-        for relative in ("package.json", "package-lock.json", "packages/client/package.json",
+        for relative in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/client/package.json",
                          "shared/link/package.json", "shared/leaf/package.json"):
             with self.subTest(input=relative):
                 path = self.root / relative
@@ -768,13 +909,15 @@ build: simulate-update
         source = self.root / "apps/main/src"
         source.mkdir()
         (source / "result").write_text("SOURCE\n")
-        directories = [".devkit", ".devkit/state", ".devkit/cache", ".devkit/cache/npm", ".devkit/cache/cargo", ".devkit/cache/electron",
+        directories = [".devkit", ".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store",
                        "node_modules", "apps/main/node_modules", "apps/main/dist"]
+        directories += [str(self.base / "cache" / name) for name in ("pnpm-store", "pnpm-cache", "cargo", "electron", "tools", "empty-mask")]
         files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock", ".devkit/state/rust-image", ".devkit/state/desktop-image"]
         dist_occurrence = 0
         for relative in directories + files + ["apps/main/dist"]:
             with self.subTest(path=relative):
                 path = self.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
                 saved = path.with_name(path.name + ".saved")
                 had_original = path.exists()
                 if had_original:
@@ -846,13 +989,13 @@ build: simulate-update
         self.make("setup")
         receipt = self.root / ".devkit/state/node-workspace.lock"
         self.assertTrue(receipt.is_file())
-        before = package_path.read_bytes(), (self.root / "package-lock.json").read_bytes()
+        before = package_path.read_bytes(), (self.root / "pnpm-lock.yaml").read_bytes()
         (self.root / "apps/main/FAIL_SETUP").touch()
         result = self.make("setup", check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.root / "apps/main/node_modules/install-mutated").is_file())
         self.assertFalse(receipt.exists())
-        self.assertEqual(before, (package_path.read_bytes(), (self.root / "package-lock.json").read_bytes()))
+        self.assertEqual(before, (package_path.read_bytes(), (self.root / "pnpm-lock.yaml").read_bytes()))
         self.assertIn("dependencies are absent/stale", self.make("check", check=False).stderr)
 
     def test_cancelled_repeat_setup_invalidates_receipt(self):
@@ -1009,10 +1152,10 @@ build: simulate-update
         write_fixture(self.root)
         self.make("setup")
         receipt = self.root / ".devkit/state/node-workspace.lock"
-        (self.root / "package-lock.json").write_text("invalid native lock\n")
+        (self.root / "pnpm-lock.yaml").write_text("invalid native lock\n")
         self.assertNotEqual(self.make("check", check=False).returncode, 0)
         run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--",
-            "npm", "install", "--package-lock-only", "--ignore-scripts", "--offline", "--strict-peer-deps")
+            "pnpm", "install", "--lockfile-only", "--ignore-scripts", "--offline", "--trust-lockfile", "--config.strict-peer-dependencies=true")
         self.assertFalse(receipt.exists())
         self.make("setup")
         args = ["space value", "$literal", ";", "$(not-a-shell)", "quote'\"value"]
@@ -1088,7 +1231,7 @@ build: simulate-update
         pins = self.root / ".devkit/runtime/toolchains.env"
         pins.write_text(pins.read_text().replace(IMAGE, "node:missing@sha256:"+"a"*64))
         seal_runtime(self.root)
-        (self.root / "package-lock.json").unlink()
+        (self.root / "pnpm-lock.yaml").unlink()
         for command in ("status", "logs", "down"):
             self.make(command)
         self.assertFalse((self.root / "node_modules").exists())
@@ -1530,7 +1673,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
         no_tok_env["DEVKIT_CA_CERT"] = str(ca_pem)
         missing_tok = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
                           "--write", "--network", "bridge", "--prepare", "--",
-                          "npm", "install", "@corp/token-lib@1.0.0", "--save-exact",
+                          "pnpm", "add", "@corp/token-lib@1.0.0", "--save-exact",
                           env=no_tok_env, check=False, timeout=90)
         self.assertNotEqual(missing_tok.returncode, 0)
         self.assertIn("Missing environment variable GITLAB_NPM_TOKEN required by .npmrc", missing_tok.stderr)
@@ -1540,7 +1683,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
         no_ca_env["GITLAB_NPM_TOKEN"] = secret_token
         missing_ca = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
                          "--write", "--network", "bridge", "--prepare", "--",
-                         "npm", "install", "@corp/token-lib@1.0.0", "--save-exact",
+                         "pnpm", "add", "@corp/token-lib@1.0.0", "--save-exact",
                          env=no_ca_env, check=False, timeout=90)
         self.assertNotEqual(missing_ca.returncode, 0)
 
@@ -1548,10 +1691,15 @@ if (priv.value !== 'from-private-gitlab-registry') {
         auth_env = env()
         auth_env["DEVKIT_CA_CERT"] = str(ca_pem)
         auth_env["GITLAB_NPM_TOKEN"] = secret_token
-        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
+        installed = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main",
             "--write", "--network", "bridge", "--prepare", "--",
-            "npm", "install", "@corp/token-lib@1.0.0", "--save-exact", "--ignore-scripts",
+            "pnpm", "add", "@corp/token-lib@1.0.0", "--save-exact", "--ignore-scripts",
             env=auth_env, timeout=120)
+        self.assertNotIn("Ignored project-level auth setting", installed.stdout + installed.stderr)
+        readonly = run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--network", "bridge", "--",
+                       "npm", "view", "@corp/token-lib", "version", env=auth_env, timeout=90)
+        self.assertEqual(readonly.stdout.strip(), "1.0.0")
+        self.assertNotIn("Ignored project-level auth setting", readonly.stdout + readonly.stderr)
         accept_runtime(self.root, native=False)
 
         self.make("setup", env=auth_env, timeout=240)
@@ -1574,8 +1722,8 @@ if (priv.value !== 'from-private-gitlab-registry') {
         finally:
             comp_npmrc.unlink(missing_ok=True)
 
-        # 5. Verify secret_token is absent from ALL files under checkout (including package-lock.json, .npmrc, .devkit, node_modules).
-        lock_text = (self.root / "package-lock.json").read_text()
+        # 5. Verify secret_token is absent from ALL files under checkout (including pnpm-lock.yaml, .npmrc, .devkit, node_modules).
+        lock_text = (self.root / "pnpm-lock.yaml").read_text()
         self.assertIn(f"{registry_url}@corp/token-lib/-/@corp/token-lib-1.0.0.tgz", lock_text)
         for file_path in self.root.rglob("*"):
             if file_path.is_file() and not file_path.is_symlink():

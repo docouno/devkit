@@ -8,8 +8,8 @@ use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
-    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
+    io::{Read, Write},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
 
@@ -278,6 +278,26 @@ pub fn exists(path: &Path) -> Result<bool> {
     }
 }
 pub fn identity(path: &Path) -> Result<Option<FileIdentity>> {
+    identity_for(path, path)
+}
+
+pub(crate) const PNPM_YAML_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) fn is_pnpm_yaml(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("pnpm-lock.yaml" | "pnpm-workspace.yaml")
+    )
+}
+
+/// Saved transaction slots retain the acquisition policy of their original input.
+pub(crate) fn identity_for(path: &Path, original: &Path) -> Result<Option<FileIdentity>> {
+    if is_pnpm_yaml(original) {
+        return Ok(
+            read_regular_file(path, PNPM_YAML_MAX_BYTES as u64, "pnpm YAML")?
+                .map(|(_, identity)| identity),
+        );
+    }
     let info = match fs::symlink_metadata(path) {
         Ok(i) => i,
         Err(e) if absent(&e) => return Ok(None),
@@ -292,6 +312,62 @@ pub fn identity(path: &Path) -> Result<Option<FileIdentity>> {
         sha256: digest(fs::read(path)?),
         mode: info.permissions().mode() & 0o777,
     }))
+}
+
+pub(crate) fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_input_bytes_for(path, path)
+}
+
+pub(crate) fn read_input_bytes_for(path: &Path, original: &Path) -> Result<Vec<u8>> {
+    if is_pnpm_yaml(original) {
+        return Ok(
+            read_regular_file(path, PNPM_YAML_MAX_BYTES as u64, "pnpm YAML")?
+                .with_context(|| format!("Missing pnpm YAML input: {}", path.display()))?
+                .0,
+        );
+    }
+    Ok(fs::read(path)?)
+}
+
+/// Acquire bounded generated/native metadata without opening pipes or links.
+pub(crate) fn read_regular_file(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Option<(Vec<u8>, FileIdentity)>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if absent(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "{label} must be a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= maximum,
+        "{label} exceeds byte budget: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take(maximum.checked_add(1).context("Invalid file byte budget")?)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= maximum,
+        "{label} exceeds byte budget: {}",
+        path.display()
+    );
+    let identity = FileIdentity {
+        sha256: digest(&bytes),
+        mode: metadata.permissions().mode() & 0o777,
+    };
+    Ok(Some((bytes, identity)))
 }
 pub fn validate_identity(value: &FileIdentity) -> Result<()> {
     ensure!(
@@ -475,7 +551,7 @@ pub fn copy_tree(
                 copy(root, &e.path(), &t.join(e.file_name()), ignore, links)?;
             }
         } else if info.is_file() {
-            write_atomic(t, &fs::read(p)?, info.permissions().mode() & 0o777)?;
+            write_atomic(t, &read_input_bytes(p)?, info.permissions().mode() & 0o777)?;
         } else if links && (info.file_type().is_socket() || info.file_type().is_fifo()) {
             return Ok(());
         } else {

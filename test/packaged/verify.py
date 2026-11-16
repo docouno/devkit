@@ -61,6 +61,28 @@ def verify_creation_hint(output):
             "Successful init did not provide a make setup hint")
 
 
+def pnpm_project(root):
+    state = json.loads((root / '.devkit/manifest.json').read_text())
+    return semver_tuple(state['version']) >= (0, 5, 0)
+
+
+def node_workspace(root):
+    if not pnpm_project(root):
+        return set(json.loads((root / 'package.json').read_text())['workspaces'])
+    # Generated membership is an explicit sequence of canonical component paths.
+    text = (root / 'pnpm-workspace.yaml').read_text()
+    return set(re.findall(r'^\s*-\s*[\'"]?((?:apps|packages)/[a-z][a-z0-9-]*)[\'"]?\s*$', text, re.M))
+
+
+def assert_node_workspace(root, paths):
+    require(node_workspace(root) == set(paths), 'Root workspace registration mismatch')
+    if pnpm_project(root):
+        require('workspaces' not in json.loads((root / 'package.json').read_text()), 'npm workspaces survived pnpm migration')
+        require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
+    else:
+        require((root / 'package-lock.json').is_file(), 'Missing legacy npm lock')
+
+
 def source_snapshot(root):
     """Include untracked inputs; ignore only native outputs and operational state."""
     records = {}
@@ -131,14 +153,14 @@ class Verification:
         self.forbidden_log = self.scratch / "host-sdk-attempts"
         blockers = self.scratch / "without-host-sdks"
         blockers.mkdir()
-        for name in ("node", "npm", "npx", "cargo", "rustc", "rustup", "tsc", "eslint"):
+        for name in ("node", "npm", "npx", "pnpm", "pnpx", "corepack", "cargo", "rustc", "rustup", "tsc", "eslint"):
             path = blockers / name
             path.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$DEVKIT_FORBIDDEN_HOST_SDK_LOG"\n'
                             'printf "Host language SDK use is forbidden in this test\\n" >&2\nexit 97\n')
             path.chmod(0o755)
         self.environment = dict(os.environ)
         for key in list(self.environment):
-            if key.startswith(("COMPOSE_", "DEVKIT_", "npm_", "NPM_")) or key in (
+            if key.startswith(("COMPOSE_", "DEVKIT_", "npm_", "NPM_", "pnpm_", "PNPM_")) or key in (
                 "MAKEFLAGS", "MFLAGS", "MAKELEVEL", "NODE_OPTIONS", "NODE_PATH", "NODE_TEST_CONTEXT"
             ):
                 self.environment.pop(key)
@@ -146,6 +168,9 @@ class Verification:
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
         self.environment["DEVKIT_CACHE_DIR"] = str(self.scratch / "native cache")
         self.environment["CI"] = "true"
+        if (self.manager / "runtime/pnpm.env").is_file():
+            selected = subprocess.check_output([str(self.manager / 'devkit'), 'internal', 'ensure-pnpm', '--pin-file', str(self.manager / 'runtime/pnpm.env')], text=True).strip()
+            self.environment['DEVKIT_PNPM_BIN_OVERRIDE'] = selected
         print(f"Receipt directory: {self.receipt}", flush=True)
         print(f"Consumer scratch: {self.scratch}", flush=True)
 
@@ -319,9 +344,7 @@ class Verification:
         require(all(path.startswith(("apps/", "packages/")) for path in components), "Invalid component paths")
         node_paths = [path for path, component in components.items() if component["toolchain"] == "node"]
         if node_paths:
-            workspace = json.loads((root / "package.json").read_text())
-            require(set(workspace["workspaces"]) == set(node_paths), "Root workspace registration mismatch")
-            require((root / "package-lock.json").is_file(), "Missing root lock")
+            assert_node_workspace(root, node_paths)
         for path in node_paths:
             package = json.loads((root / path / "package.json").read_text())
             environment_spec = package["devDependencies"]["@docouno/env"]
@@ -329,7 +352,7 @@ class Verification:
                 require(environment_spec.startswith("file:../../.devkit/npm/"), "Init did not use the release's local env archive")
             else:
                 require(environment_spec == selected_version, "Registry consumer did not pin the published environment version")
-            require(not (root / path / "package-lock.json").exists(), "Leaf npm lock survived workspace creation")
+            require(not (root / path / "package-lock.json").exists() and not (root / path / "pnpm-lock.yaml").exists(), "Leaf lock survived workspace creation")
             (root / path / "src/consumer-marker.ts").write_text("export const consumerMarker = 'untracked source input';\n")
         if kind == "react":
             require(set(components) == {"apps/web"}, "React selection implicitly created a backend")
@@ -363,6 +386,8 @@ class Verification:
                     "    assert.throws(() => { const fd = openSync(file, 'r+'); closeSync(fd); }, { code: 'EROFS' });\n"
                     "  }\n"
                     "});\n")
+            if pnpm_project(root):
+                code = code.replace("new URL('../../../package-lock.json', import.meta.url)", "new URL('../../../pnpm-lock.yaml', import.meta.url), new URL('../../../pnpm-workspace.yaml', import.meta.url)")
         else:
             probe = root / "apps/api/tests/readonly_mount.rs"
             code = ('#[test]\nfn source_and_lock_mounts_reject_writable_opens() {\n'
@@ -622,12 +647,59 @@ class Verification:
             state = json.loads((root / ".devkit/manifest.json").read_text())
             require(state["components"]["packages/shared"]["role"] == "library" and
                     state["components"]["apps/worker"]["toolchain"] == "rust", "Public component operations registered wrong profiles")
-            workspace = json.loads((root / "package.json").read_text())["workspaces"]
+            workspace = node_workspace(root)
             require("packages/shared" in workspace and "apps/worker" not in workspace,
                     "Public native workspace membership is wrong")
             for path, content in preserved.items():
                 require(path.read_bytes() == content, f"Public component operation overwrote {path}")
         self.healthy(root, "added-react-app")
+
+    def electron_cache_corruption(self, root):
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        if state["version"].startswith("0.4."):
+            return
+        component = next(path for path, value in state["components"].items()
+                         if value["toolingProfile"] == "electron")
+        package = root / component / "node_modules/electron"
+        version = json.loads((package / "package.json").read_text())["version"]
+        cached = (Path(self.environment["DEVKIT_CACHE_DIR"]) / "pnpm-store/electron-dist"
+                  / (version + "-linux-x64") / "dist/icudtl.dat")
+        local = package / "dist/icudtl.dat"
+        require(cached.is_file() and local.is_file(), "Electron ICU resource is absent before corruption proof")
+        require((cached.stat().st_dev, cached.stat().st_ino) ==
+                (local.stat().st_dev, local.stat().st_ino), "Electron resource is not shared through hardlinks")
+        expected = sha256(cached.read_bytes())
+        backup = cached.parent.parent / (".verify-icu-" + uuid.uuid4().hex)
+        os.link(cached, backup)
+        before = source_snapshot(root)
+        try:
+            cached.unlink()
+            self.make(root, "setup", expected="Cached Electron distribution is incomplete or corrupt",
+                      label="electron-cache-corruption-refused")
+            receipt = root / ".devkit/state/node-workspace.lock"
+            require(not receipt.exists(), "Failed Electron setup retained a success receipt")
+        finally:
+            if not cached.exists():
+                os.link(backup, cached)
+            backup.unlink()
+        self.make(root, "setup", label="electron-cache-restored-setup")
+        require(sha256(cached.read_bytes()) == expected and sha256(local.read_bytes()) == expected,
+                "Restored Electron distribution differs from its verified resource")
+        require(source_snapshot(root) == before, "Electron cache validation changed product inputs")
+        installed = package / "path.txt"
+        original = installed.read_bytes()
+        try:
+            installed.unlink()
+            os.mkfifo(installed)
+            self.make(root, "setup", expected="Electron metadata must be a regular file", timeout=30,
+                      label="electron-fifo-marker-refused")
+            require(not (root / ".devkit/state/node-workspace.lock").exists(),
+                    "FIFO marker failure retained a success receipt")
+        finally:
+            installed.unlink()
+            installed.write_bytes(original)
+        self.make(root, "setup", label="electron-fifo-restored-setup")
+        require(source_snapshot(root) == before, "Electron marker validation changed product inputs")
 
     def upgrade(self, root):
         if self.next_release is None:
@@ -659,6 +731,7 @@ class Verification:
         require(current["scripts"]["consumer:example"] == package["scripts"]["consumer:example"] and
                 current["dependencies"] == package["dependencies"] and current["description"] == package["description"],
                 "Update changed consumer scripts/dependencies/metadata")
+        assert_node_workspace(root, [path for path,c in state['components'].items() if c['toolchain'] == 'node'])
         self.make(root, "check", expected="dependencies are absent/stale", label="upgrade-requires-setup")
         self.healthy(root, "upgraded-node")
         before = source_snapshot(root)
@@ -711,6 +784,17 @@ class Verification:
         state["verificationExtension"] = {"kind": kind, "keep": [True, "opaque"]}
         native_packages = {}
         native_dev_dependencies = {}
+        manager_metadata = None
+        engine_metadata = None
+        root_package = root / "package.json"
+        if root_package.is_file() and any(c["toolchain"] == "node" for c in state["components"].values()):
+            package = json.loads(root_package.read_text())
+            manager_metadata = "npm@11.21.1" if semver_tuple(state["version"]) < (0, 5, 0) else "pnpm@0.0.0"
+            package["packageManager"] = manager_metadata
+            pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
+            engine_metadata = {"runtime": {"name": "node", "version": pins["DEVKIT_NODE_VERSION"], "onFail": "download"}}
+            package["devEngines"] = engine_metadata
+            root_package.write_text(json.dumps(package, indent=2) + "\n")
         preserve = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml")}
         for path, component in state["components"].items():
             component["verificationExtension"] = {"component": path}
@@ -753,6 +837,11 @@ class Verification:
         require(after["version"] == version and after["packageMode"] == self.package_source,
                 f"{kind} accepted wrong environment")
         require(after["verificationExtension"] == state["verificationExtension"], "Top-level metadata lost")
+        if manager_metadata:
+            require(json.loads(root_package.read_text())["packageManager"] == manager_metadata,
+                    "Migration changed consumer-owned packageManager metadata")
+            require(json.loads(root_package.read_text())["devEngines"] == engine_metadata,
+                    "Migration changed consumer-owned runtime metadata")
         for path, old in state["components"].items():
             current = after["components"][path]
             require(current["verificationExtension"] == old["verificationExtension"]
@@ -763,7 +852,17 @@ class Verification:
                         f"Development metadata lost: {path}")
         for path, content in preserve.items():
             require(path.read_bytes() == content, f"{kind} update overwrote {path.relative_to(root)}")
+        node_paths = [path for path,c in after['components'].items() if c['toolchain'] == 'node']
+        if node_paths: assert_node_workspace(root,node_paths)
         for path, fields in native_packages.items():
+            if semver_tuple(state['version']) < (0,5,0) <= semver_tuple(version):
+                fields = json.loads(json.dumps(fields))
+                for field in ('dependencies','optionalDependencies','peerDependencies'):
+                    for name,spec in fields.get(field,{}).items():
+                        target = next((p for p in native_packages if json.loads((root/p/'package.json').read_text())['name'] == name),None)
+                        if target is not None:
+                            public = fields.get('private') is False and json.loads((root/target/'package.json').read_text()).get('private') is False
+                            fields[field][name] = 'workspace:^' if public else 'workspace:*'
             current = json.loads((root / path / "package.json").read_text())
             require({key: value for key, value in current.items() if key != "devDependencies"} == fields,
                     f"{kind} update changed product manifest fields: {path}")
@@ -813,7 +912,7 @@ class Verification:
         self.run("tslib-sync", self.cli(self.manager, "sync", tslib))
         self.make(tslib, "setup", label="tslib-setup-after-sync")
         self.run("tslib-npm-version", self.exec_cli(
-            tslib, "packages/lib", "npm", "version", "0.2.0", "--no-git-tag-version", write=True))
+            tslib, "packages/lib", "pnpm" if pnpm_project(tslib) else "npm", "version", "0.2.0", "--no-git-tag-version", write=True))
         self.make(tslib, "setup", label="tslib-setup-after-version")
         self.make(tslib, "package", label="tslib-package")
 
@@ -949,6 +1048,7 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
+            self.electron_cache_corruption(fullstack)
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error

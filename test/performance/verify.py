@@ -52,7 +52,7 @@ def atomic_json(path, value):
 def clean_environment(cache):
     environment = dict(os.environ)
     for key in list(environment):
-        if key.startswith(("COMPOSE_", "DEVKIT_", "npm_", "NPM_")) or key in (
+        if key.startswith(("COMPOSE_", "DEVKIT_", "npm_", "NPM_", "pnpm_", "PNPM_")) or key in (
                 "MAKEFLAGS", "MFLAGS", "MAKELEVEL", "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
             environment.pop(key)
     environment.update(CI="true", LC_ALL="C", DEVKIT_CACHE_DIR=str(cache))

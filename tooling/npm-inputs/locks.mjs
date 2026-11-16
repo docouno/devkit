@@ -1,4 +1,6 @@
-const envLocation = 'node_modules/@docouno/env';
+import { parse, stringify } from 'yaml';
+import { isDeepStrictEqual } from 'node:util';
+import semver from 'semver';
 const dependencyFields = [
   'dependencies',
   'devDependencies',
@@ -43,7 +45,9 @@ export function parseRegistryDependencySpec(spec, label) {
 export function assertRegistryDependencies(value) {
   for (const field of dependencyFields) {
     for (const [name, spec] of Object.entries(object(value[field] ?? {}, field))) {
-      packageName(`node_modules/${name}`);
+      if (!npmPackagePattern.test(name) || name.includes('..')) {
+        throw new Error(`Invalid package name: ${name}`);
+      }
       parseRegistryDependencySpec(spec, name);
     }
   }
@@ -73,22 +77,11 @@ export function exactVersion(value) {
   return value;
 }
 
-function packageName(location) {
-  if (
-    !/^(?:node_modules\/(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*)(?:\/node_modules\/(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*)*$/i.test(
-      location,
-    )
-  ) {
-    throw new Error(`Unsupported canonical lock location: ${location}`);
-  }
-  return location.slice(location.lastIndexOf('node_modules/') + 'node_modules/'.length);
-}
-
 export function validIntegrity(value) {
   if (typeof value !== 'string') {
     return false;
   }
-  const match = /^(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})$/.exec(value);
+  const match = /^(sha512)-([A-Za-z0-9+/]+={0,2})$/.exec(value);
   if (!match) {
     return false;
   }
@@ -103,227 +96,409 @@ export function registryUrl(name, version) {
   return `https://registry.npmjs.org/${name}/-/${name.slice(name.lastIndexOf('/') + 1)}-${version}.tgz`;
 }
 
-function resolveLockedLocation(entries, from, depName) {
-  let directory = from;
-  for (;;) {
-    const candidate = directory
-      ? `${directory}/node_modules/${depName}`
-      : `node_modules/${depName}`;
-    if (Object.hasOwn(entries, candidate)) {
-      return candidate;
-    }
-    if (!directory) {
-      return undefined;
-    }
-    const slash = directory.lastIndexOf('/');
-    directory = slash === -1 ? '' : directory.slice(0, slash);
+export const parseLock = (text) => parse(text, { maxAliasCount: 0, uniqueKeys: true });
+export const encodeLock = (lock) => stringify(lock, { lineWidth: 0 });
+const fields = ['dependencies', 'optionalDependencies', 'devDependencies'];
+const baseKey = (key) => key.split('(')[0];
+function parts(key) {
+  const base = baseKey(key);
+  const at = base.indexOf('@', base.startsWith('@') ? 1 : 0);
+  const name = base.slice(0, at),
+    version = base.slice(at + 1);
+  if (at < 1 || !npmPackagePattern.test(name) || name.includes('..')) {
+    throw new Error(`Unsupported canonical registry identity: ${key}`);
   }
-}
-
-function collectAliasTargets(entries) {
-  const aliasTargets = new Map();
-  const nonAliasLocations = new Set();
-  for (const [from, rawEntry] of Object.entries(entries)) {
-    const entry = object(rawEntry, from || 'canonical lock root');
-    for (const field of dependencyFields) {
-      for (const [depName, spec] of Object.entries(object(entry[field] ?? {}, field))) {
-        packageName(`node_modules/${depName}`);
-        const parsed = parseRegistryDependencySpec(spec, depName);
-        const resolvedLoc = resolveLockedLocation(entries, from, depName);
-        if (!resolvedLoc) {
-          continue;
-        }
-        if (parsed.kind === 'alias') {
-          const previous = aliasTargets.get(resolvedLoc);
-          if (
-            (previous !== undefined && previous !== parsed.targetName) ||
-            (nonAliasLocations.has(resolvedLoc) && parsed.targetName !== packageName(resolvedLoc))
-          ) {
-            throw new Error(`Conflicting alias target identity at ${resolvedLoc}`);
-          }
-          aliasTargets.set(resolvedLoc, parsed.targetName);
-        } else {
-          const previous = aliasTargets.get(resolvedLoc);
-          if (previous !== undefined && previous !== packageName(resolvedLoc)) {
-            throw new Error(`Conflicting alias target identity at ${resolvedLoc}`);
-          }
-          nonAliasLocations.add(resolvedLoc);
-        }
+  exactVersion(version);
+  if (!/^(?:\([^()]+(?:\([^()]*\))*\))*$/.test(key.slice(base.length))) {
+    // Nested peer contexts are checked through their referenced snapshots below.
+    let depth = 0;
+    for (const c of key.slice(base.length)) {
+      if (c === '(') {
+        depth++;
+      }
+      if (c === ')' && --depth < 0) {
+        throw new Error(`Invalid peer context: ${key}`);
       }
     }
+    if (depth !== 0) {
+      throw new Error(`Invalid peer context: ${key}`);
+    }
   }
-  return aliasTargets;
+  return { name, version };
 }
-
-function identity(location, value, allowMissing, aliasTargets) {
-  const record = object(value, location),
-    slotName = packageName(location),
-    aliasTarget = aliasTargets?.get(location),
-    effectiveName = aliasTarget ?? slotName;
-  exactVersion(record.version);
+function entries(value) {
+  const lock = object(value, 'canonical pnpm lock');
+  if (String(lock.lockfileVersion) !== '9.0') {
+    throw new Error('Canonical pnpm lock must use lockfileVersion 9.0');
+  }
+  const importers = object(lock.importers, 'canonical importers');
+  if (Object.keys(importers).length !== 1 || !importers['.']) {
+    throw new Error('Canonical templates must have exactly one root importer');
+  }
+  object(importers['.'], 'canonical root importer');
+  object(lock.snapshots ?? {}, 'canonical snapshots');
+  return object(lock.packages ?? {}, 'canonical packages');
+}
+export function snapshotKey(name, ref) {
+  if (typeof ref !== 'string') {
+    throw new Error(`Invalid dependency reference: ${name}`);
+  }
+  const key = baseKey(ref).includes('@') ? ref : `${name}@${ref}`;
+  parts(key);
+  return key;
+}
+function identity(key, raw, allowMissing) {
+  const { name, version } = parts(key),
+    record = object(raw, key);
+  if (key !== baseKey(key)) {
+    throw new Error(`Package metadata has a peer context: ${key}`);
+  }
   if (
     record.link ||
     record.inBundle ||
-    (aliasTarget !== undefined
-      ? record.name !== aliasTarget
-      : record.name !== undefined && record.name !== slotName)
+    (record.name !== undefined && record.name !== name) ||
+    (record.version !== undefined && record.version !== version)
   ) {
-    throw new Error(`Unsupported canonical registry identity: ${location}`);
+    throw new Error(`Unsupported canonical registry identity: ${key}`);
   }
-  if (
-    record.resolved !== undefined &&
-    record.resolved !== registryUrl(effectiveName, record.version)
-  ) {
-    throw new Error(`Canonical resolved identity conflict: ${location}`);
+  const resolution = object(record.resolution ?? {}, `resolution ${key}`);
+  if (Object.keys(resolution).some((k) => !['integrity', 'tarball'].includes(k))) {
+    throw new Error(`Unsupported canonical registry identity: ${key}`);
   }
-  if (record.integrity !== undefined && !validIntegrity(record.integrity)) {
-    throw new Error(`Invalid canonical integrity: ${location}`);
+  if (resolution.tarball !== undefined && resolution.tarball !== registryUrl(name, version)) {
+    throw new Error(`Canonical resolved identity conflict: ${key}`);
   }
-  if (!allowMissing && (record.resolved === undefined || record.integrity === undefined)) {
-    throw new Error(`Incomplete canonical registry identity: ${location}`);
+  if (resolution.integrity !== undefined && !validIntegrity(resolution.integrity)) {
+    throw new Error(`Invalid canonical integrity: ${key}`);
   }
-  return { record, name: effectiveName };
+  if (!allowMissing && !validIntegrity(resolution.integrity)) {
+    throw new Error(`Incomplete canonical registry identity: ${key}`);
+  }
+  assertRegistryDependencies({ peerDependencies: record.peerDependencies });
+  return { name, version, record, resolution };
 }
-
-function packages(value) {
-  const lock = object(value, 'canonical package lock');
-  if (lock.lockfileVersion !== 3) {
-    throw new Error('Canonical package lock must use lockfileVersion 3');
-  }
-  const entries = object(lock.packages, 'canonical lock packages');
-  object(entries[''], 'canonical lock root');
-  return entries;
-}
-
-/** Never reselect versions. Fetch dist only where URL/SRI is absent. */
-export async function hydrateLockIdentities(value, fetchDist) {
-  const lock = structuredClone(value),
-    entries = packages(lock),
-    aliasTargets = collectAliasTargets(entries),
-    requests = new Map();
-  for (const [location, value] of Object.entries(entries)) {
-    if (!location) {
-      continue;
+function checkReferences(lock) {
+  const check = (name, ref) => {
+    const key = snapshotKey(name, ref);
+    if (
+      !Object.hasOwn(lock.packages ?? {}, baseKey(key)) ||
+      !Object.hasOwn(lock.snapshots ?? {}, key)
+    ) {
+      throw new Error(`Missing canonical snapshot: ${key}`);
     }
-    const { record, name } = identity(location, value, true, aliasTargets);
-    if (record.resolved !== undefined && record.integrity !== undefined) {
-      continue;
-    }
-    const key = `${name}@${record.version}`;
-    let dist = requests.get(key);
-    if (!dist) {
-      dist = object(await fetchDist(name, record.version), `registry identity ${key}`);
-      if (dist.tarball !== registryUrl(name, record.version) || !validIntegrity(dist.integrity)) {
-        throw new Error(`Unsupported registry identity: ${key}`);
+  };
+  for (const field of fields) {
+    for (const [name, value] of Object.entries(lock.importers['.'][field] ?? {})) {
+      const dep = object(value, `importer ${name}`);
+      const spec = parseRegistryDependencySpec(dep.specifier, name);
+      const target = parts(snapshotKey(name, dep.version)).name;
+      if (target !== (spec.kind === 'alias' ? spec.targetName : name)) {
+        throw new Error(`Importer resolves to mismatched package: ${name}`);
       }
-      requests.set(key, dist);
+      check(name, dep.version);
     }
-    if (record.integrity !== undefined && record.integrity !== dist.integrity) {
-      throw new Error(`Canonical integrity identity conflict: ${location}`);
+  }
+  for (const [key, snapshot] of Object.entries(lock.snapshots ?? {})) {
+    parts(key);
+    if (!Object.hasOwn(lock.packages ?? {}, baseKey(key))) {
+      throw new Error(`Missing canonical package: ${key}`);
     }
-    record.resolved = dist.tarball;
-    record.integrity = dist.integrity;
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      for (const [name, ref] of Object.entries(snapshot[field] ?? {})) {
+        check(name, ref);
+      }
+    }
+  }
+}
+export function assertManifestImporter(manifest, lock) {
+  entries(lock);
+  const root = lock.importers['.'];
+  for (const field of fields) {
+    const expected = { ...(manifest[field] ?? {}) };
+    if (field === 'dependencies') {
+      for (const key of Object.keys(manifest.optionalDependencies ?? {})) {
+        delete expected[key];
+      }
+    }
+    const actual = object(root[field] ?? {}, field);
+    if (
+      JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(Object.keys(expected).sort()) ||
+      Object.entries(expected).some(([name, spec]) => actual[name]?.specifier !== spec)
+    ) {
+      throw new Error(`Template manifest and source lock disagree: ${field}`);
+    }
+  }
+  for (const name of Object.keys(manifest.peerDependencies ?? {})) {
+    if (
+      !manifest.peerDependenciesMeta?.[name]?.optional &&
+      !fields.some((field) => root[field]?.[name])
+    ) {
+      throw new Error(`Missing template peer resolution: ${name}`);
+    }
+  }
+}
+export async function hydrateLockIdentities(value, fetchDist) {
+  const lock = structuredClone(value);
+  for (const [key, raw] of Object.entries(entries(lock))) {
+    const { name, version, record, resolution } = identity(key, raw, true);
+    if (resolution.integrity !== undefined) {
+      continue;
+    }
+    const dist = object(await fetchDist(name, version), `registry identity ${key}`);
+    if (dist.tarball !== registryUrl(name, version) || !validIntegrity(dist.integrity)) {
+      throw new Error(`Unsupported registry identity: ${key}`);
+    }
+    record.resolution = { integrity: dist.integrity };
   }
   assertCanonicalLock(lock);
   return lock;
 }
-
 export function assertCanonicalLock(value) {
-  const entries = packages(value),
-    aliasTargets = collectAliasTargets(entries);
-  for (const [location, entry] of Object.entries(entries)) {
-    if (location) {
-      identity(location, entry, false, aliasTargets);
-    }
-    assertRegistryDependencies(entry);
+  for (const [key, raw] of Object.entries(entries(value))) {
+    identity(key, raw, false);
   }
-  const encoded = JSON.stringify(value);
-  if (/127\.0\.0\.1|localhost|file:|workspace:|\/workspace\/|\.artifacts\//i.test(encoded)) {
+  checkReferences(value);
+  if (
+    /127\.0\.0\.1|localhost|file:|link:|workspace:|\/workspace\/|\.artifacts\//i.test(
+      JSON.stringify(value),
+    )
+  ) {
     throw new Error('Source/local endpoint remains in canonical lock');
   }
 }
+function rewriteEnvironmentKey(key, sourceVersion, version, depth = 0) {
+  if (depth >= 64) {
+    throw new Error('Template peer context exceeds depth budget');
+  }
+  const base = baseKey(key);
+  let result = base === `@docouno/env@${sourceVersion}` ? `@docouno/env@${version}` : base;
+  let offset = base.length;
+  while (offset < key.length) {
+    if (key[offset] !== '(') {
+      throw new Error(`Invalid template peer context: ${key}`);
+    }
+    let end = offset + 1,
+      nesting = 1;
+    while (end < key.length && nesting > 0) {
+      if (key[end] === '(') {
+        nesting++;
+      }
+      if (key[end] === ')') {
+        nesting--;
+      }
+      end++;
+    }
+    if (nesting !== 0) {
+      throw new Error(`Invalid template peer context: ${key}`);
+    }
+    const peer = key.slice(offset + 1, end - 1);
+    result += `(${rewriteEnvironmentKey(peer, sourceVersion, version, depth + 1)})`;
+    offset = end;
+  }
+  return result;
+}
 
-/** The sole version replacement is the template's accepted env dependency. */
+function rewriteEnvironmentSelections(input, sourceVersion, version) {
+  const lock = structuredClone(input);
+  const rewriteKey = (key) => rewriteEnvironmentKey(key, sourceVersion, version);
+  const rewriteRef = (name, ref) => {
+    const key = rewriteKey(snapshotKey(name, ref));
+    return baseKey(ref).includes('@') ? key : key.slice(name.length + 1);
+  };
+  const remap = (value, change) => {
+    const mapped = Object.entries(value).map(([key, record]) => [rewriteKey(key), change(record)]);
+    if (new Set(mapped.map(([key]) => key)).size !== mapped.length) {
+      throw new Error('Template environment rewrite collides with another selection');
+    }
+    return Object.fromEntries(mapped);
+  };
+  for (const importer of Object.values(lock.importers)) {
+    for (const field of fields) {
+      for (const [name, dependency] of Object.entries(importer[field] ?? {})) {
+        dependency.version = rewriteRef(name, dependency.version);
+      }
+    }
+  }
+  lock.packages = remap(lock.packages, (record) => record);
+  lock.snapshots = remap(lock.snapshots ?? {}, (snapshot) => {
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      if (snapshot[field]) {
+        snapshot[field] = Object.fromEntries(
+          Object.entries(snapshot[field]).map(([name, ref]) => [name, rewriteRef(name, ref)]),
+        );
+      }
+    }
+    return snapshot;
+  });
+  return lock;
+}
+
 export function prepareTemplate(manifestInput, lockInput, sourceVersion, version) {
   const manifest = structuredClone(object(manifestInput, 'template manifest'));
   assertRegistryDependencies(manifest);
   if (manifest.workspaces !== undefined) {
-    throw new Error('Default npm templates must be standalone packages');
+    throw new Error('Default pnpm templates must be standalone packages');
   }
-  const deps = object(manifest.devDependencies, 'template devDependencies');
-  if (deps['@docouno/env'] !== sourceVersion) {
+  if (manifest.devDependencies?.['@docouno/env'] !== sourceVersion) {
     throw new Error('Template must accept the exact source env version');
   }
-  for (const field of dependencyFields.filter((name) => name !== 'devDependencies')) {
-    if (Object.hasOwn(object(manifest[field] ?? {}, field), '@docouno/env')) {
+  for (const field of dependencyFields.filter((f) => f !== 'devDependencies')) {
+    if (Object.hasOwn(manifest[field] ?? {}, '@docouno/env')) {
       throw new Error(`Unexpected template env dependency in ${field}`);
     }
   }
-  deps['@docouno/env'] = version;
-  const lock = structuredClone(lockInput),
-    entries = packages(lock);
-  for (const field of dependencyFields) {
-    const sorted = (value) =>
-      JSON.stringify(Object.entries(value ?? {}).sort(([a], [b]) => (a < b ? -1 : 1)));
-    const expected =
-      field === 'devDependencies'
-        ? { ...manifest[field], '@docouno/env': sourceVersion }
-        : manifest[field];
-    if (sorted(entries[''][field]) !== sorted(expected)) {
-      throw new Error(`Template manifest and source lock disagree: ${field}`);
-    }
-  }
-  if (
-    object(entries[envLocation], 'template env lock').version !== sourceVersion ||
-    object(entries[''].devDependencies, 'template lock devDependencies')['@docouno/env'] !==
-      sourceVersion
-  ) {
+  assertManifestImporter(manifest, lockInput);
+  const oldKey = `@docouno/env@${sourceVersion}`,
+    newKey = `@docouno/env@${version}`;
+  if (!Object.hasOwn(entries(lockInput), oldKey)) {
     throw new Error('Template accepted env lock version differs from source');
   }
-  // Existing env SRI describes the previous bytes, even during same-version rebuilds.
-  delete entries[envLocation];
-  entries[''].devDependencies['@docouno/env'] = version;
+  // Only typed selections and the owned environment identity are rewritten.
+  const lock = rewriteEnvironmentSelections(lockInput, sourceVersion, version);
+  manifest.devDependencies['@docouno/env'] = version;
+  lock.importers['.'].devDependencies['@docouno/env'].specifier = version;
+  const envRef = lock.importers['.'].devDependencies['@docouno/env'];
+  if (snapshotKey('@docouno/env', envRef.version).split('(')[0] !== newKey) {
+    throw new Error('Template accepted env lock version differs from source');
+  }
+  if (lock.packages[newKey].version !== undefined) {
+    lock.packages[newKey].version = version;
+  }
+  lock.packages[newKey].resolution = {};
   return { manifest, lock };
 }
-
-/** Rewrite only the exact fixture origin; everything else must already be public. */
 export function canonicalizeLock(value, registry) {
   const lock = structuredClone(value);
-  for (const [location, entry] of Object.entries(packages(lock))) {
-    if (location && typeof entry.resolved === 'string' && entry.resolved.startsWith(registry)) {
-      entry.resolved = `https://registry.npmjs.org/${entry.resolved.slice(registry.length)}`;
+  for (const [key, record] of Object.entries(entries(lock))) {
+    const tarball = record.resolution?.tarball;
+    if (typeof tarball === 'string' && tarball.startsWith(registry)) {
+      const { name, version } = parts(key);
+      if (
+        `https://registry.npmjs.org/${tarball.slice(registry.length)}` !==
+        registryUrl(name, version)
+      ) {
+        throw new Error(`Canonical resolved identity conflict: ${key}`);
+      }
+      delete record.resolution.tarball;
     }
   }
   assertCanonicalLock(lock);
   return lock;
 }
-
-export function assertSelectedIdentities(previous, next, version, integrity) {
-  const before = packages(previous),
-    after = packages(next);
-  for (const [location, record] of Object.entries(before)) {
-    if (!location || location === envLocation) {
-      continue;
-    }
-    const actual = after[location];
-    if (
-      !actual ||
-      ['name', 'version', 'resolved', 'integrity'].some((field) => actual[field] !== record[field])
-    ) {
-      throw new Error(`npm changed a selected external identity: ${location}`);
+/** Validate the SDK manifest against its reviewed graph without selecting versions. */
+export function assertEnvironmentSelections(manifest, lock, version) {
+  const envKey = `@docouno/env@${version}`,
+    record = entries(lock)[envKey];
+  const stale = (detail) => {
+    throw new Error(
+      `Source environment differs from template source lock (${detail}); regenerate the template locks explicitly`,
+    );
+  };
+  if (
+    !record ||
+    !isDeepStrictEqual(record.peerDependencies ?? {}, manifest.peerDependencies ?? {}) ||
+    Boolean(record.hasBin) !== Boolean(manifest.bin && Object.keys(manifest.bin).length)
+  ) {
+    stale('package metadata');
+  }
+  for (const field of ['engines', 'os', 'cpu', 'libc']) {
+    const empty = field === 'engines' ? {} : [];
+    if (!isDeepStrictEqual(record[field] ?? empty, manifest[field] ?? empty)) {
+      stale(`package metadata: ${field}`);
     }
   }
-  const env = object(after[envLocation], 'normalized env lock');
+  for (const name of new Set([
+    ...Object.keys(record.peerDependenciesMeta ?? {}),
+    ...Object.keys(manifest.peerDependenciesMeta ?? {}),
+  ])) {
+    if (
+      Boolean(record.peerDependenciesMeta?.[name]?.optional) !==
+      Boolean(manifest.peerDependenciesMeta?.[name]?.optional)
+    ) {
+      stale(`peer metadata: ${name}`);
+    }
+  }
+  const snapshots = Object.entries(lock.snapshots ?? {}).filter(([key]) => baseKey(key) === envKey);
+  if (!snapshots.length) {
+    stale('missing environment snapshot');
+  }
+  for (const [, snapshot] of snapshots) {
+    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+      for (const [name, spec] of Object.entries(manifest[field] ?? {})) {
+        if (field === 'dependencies' && Object.hasOwn(manifest.optionalDependencies ?? {}, name)) {
+          continue;
+        }
+        const selectedField =
+          field === 'peerDependencies'
+            ? Object.hasOwn(snapshot.optionalDependencies ?? {}, name)
+              ? 'optionalDependencies'
+              : 'dependencies'
+            : field;
+        const reference = snapshot[selectedField]?.[name];
+        if (
+          reference === undefined &&
+          field === 'peerDependencies' &&
+          manifest.peerDependenciesMeta?.[name]?.optional === true
+        ) {
+          continue;
+        }
+        if (reference === undefined) {
+          stale(`missing ${field}.${name}`);
+        }
+        const parsed = parseRegistryDependencySpec(spec, `environment ${name}`),
+          selected = parts(snapshotKey(name, reference)),
+          target = parsed.kind === 'alias' ? parsed.targetName : name,
+          range = parsed.kind === 'alias' ? (parsed.innerSpec ?? '*') : parsed.spec;
+        if (selected.name !== target || !semver.satisfies(selected.version, range)) {
+          stale(`${field}.${name}`);
+        }
+      }
+    }
+    const allowed = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.optionalDependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {}),
+      ...(snapshot.transitivePeerDependencies ?? []),
+    ]);
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      for (const name of Object.keys(snapshot[field] ?? {})) {
+        if (!allowed.has(name)) {
+          stale(`removed dependency: ${name}`);
+        }
+      }
+    }
+  }
+}
+
+export function assertSelectedIdentities(previous, next, version, integrity) {
+  const before = entries(previous),
+    after = entries(next),
+    envKey = `@docouno/env@${version}`;
+  if (JSON.stringify(Object.keys(before).sort()) !== JSON.stringify(Object.keys(after).sort())) {
+    throw new Error('pnpm changed selected external identities');
+  }
+  for (const [key, record] of Object.entries(before)) {
+    if (key !== envKey && record.resolution.integrity !== after[key]?.resolution?.integrity) {
+      throw new Error(`pnpm changed a selected external identity: ${key}`);
+    }
+    const metadata = (value) =>
+      Object.fromEntries(Object.entries(value).filter(([field]) => field !== 'resolution'));
+    if (!isDeepStrictEqual(metadata(record), metadata(after[key]))) {
+      throw new Error(`pnpm changed selected template package metadata: ${key}`);
+    }
+  }
+  const graph = (value) => ({
+    ...Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'packages')),
+    snapshots: value.snapshots ?? {},
+  });
+  if (!isDeepStrictEqual(graph(previous), graph(next))) {
+    throw new Error('pnpm changed the selected template graph');
+  }
   if (
-    env.version !== version ||
-    env.integrity !== integrity ||
-    env.resolved !== registryUrl('@docouno/env', version)
+    after[envKey]?.resolution?.integrity !== integrity ||
+    next.importers['.'].devDependencies?.['@docouno/env']?.specifier !== version
   ) {
     throw new Error('Normalized env identity differs from the packed archive');
   }
-  if (
-    object(after[''].devDependencies, 'normalized root devDependencies')['@docouno/env'] !== version
-  ) {
-    throw new Error('Normalized template accepted env version differs');
-  }
+  assertCanonicalLock(next);
 }

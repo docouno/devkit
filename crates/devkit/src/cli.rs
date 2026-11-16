@@ -307,13 +307,13 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             !globals.interactive,
             "Streaming commands do not accept --interactive"
         );
+        if command == "internal" && internal(&globals.args[1..], &globals, runner)? {
+            return Ok(());
+        }
         ensure!(
             !globals.offline,
             "--offline applies to lifecycle release acquisition; daily tasks already use the accepted local engine"
         );
-        if command == "internal" && internal(&globals.args[1..], runner)? {
-            return Ok(());
-        }
         if ["exec", "task"].contains(&command) {
             dispatch_accepted(command, &globals, runner)?;
         }
@@ -594,11 +594,32 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     Err(command.exec()).context("Cannot execute the accepted native engine")
 }
 
-fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<bool> {
+fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Result<bool> {
     let Some(command) = args.first().map(|v| string(v)).transpose()? else {
         return Ok(false);
     };
+    ensure!(
+        !globals.offline || command == "ensure-pnpm",
+        "--offline is supported only for internal ensure-pnpm"
+    );
     match command {
+        "ensure-pnpm" => {
+            let options = Options::parse(&args[1..], &["--pin-file"], &[], &[])?;
+            ensure!(
+                options.target.is_none(),
+                "Ensure-pnpm takes named options only"
+            );
+            let pin_file = options
+                .value("--pin-file")?
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir()?.join(".devkit/runtime/pnpm.env"));
+            let pin = crate::runtime::PnpmPin::from_pin_file(&pin_file)?;
+            let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
+            println!(
+                "{}",
+                cache.ensure_pnpm(&pin, None, !globals.offline)?.display()
+            );
+        }
         "build-info" => {
             ensure!(args.len() == 1, "Build-info takes no arguments");
             println!("{}", serde_json::to_string(&distribution::build_info())?);
@@ -632,14 +653,19 @@ fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<bool> {
             println!("{}", flags.join(" "));
         }
         "fetch" => {
-            let options =
-                Options::parse(&args[1..], &["--url", "--output", "--max-bytes"], &[], &[])?;
+            let options = Options::parse(
+                &args[1..],
+                &["--url", "--output", "--max-bytes", "--allow-loopback-http"],
+                &[],
+                &["--allow-loopback-http"],
+            )?;
             ensure!(options.target.is_none(), "Fetch takes named options only");
-            crate::download::fetch(
+            crate::download::fetch_with_options(
                 options.required("--url")?,
                 &options.required_path("--output")?,
                 options.required("--max-bytes")?.parse()?,
                 runner,
+                options.flag("--allow-loopback-http"),
             )?;
         }
         "assemble" => {

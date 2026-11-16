@@ -62,6 +62,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         command.to_owned()
     };
     let mut request = RuntimeRequest::new(std::env::current_dir()?, task);
+    request.cache_dir = cache_dir.map(Path::to_owned);
     if command == "task" || command == "exec" {
         request.component = env_string("DEVKIT_TARGET_COMPONENT");
         request.app = env_string("DEVKIT_APP");

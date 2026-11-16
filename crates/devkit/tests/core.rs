@@ -161,6 +161,17 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             bytes.as_bytes(),
         );
     }
+    if SemVer::parse(version).unwrap() >= SemVer::parse("0.5.0").unwrap() {
+        let pin = devkit::runtime::PnpmPin::from_source_pins(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        put(&root, "runtime/pnpm.env", pin.encode().as_bytes());
+    }
     seal(&root, version);
     root
 }
@@ -175,6 +186,47 @@ impl LockResolver for NoResolver {
 struct FixtureResolver;
 impl LockResolver for FixtureResolver {
     fn regenerate(&self, root: &Path, release: &AdmittedRelease, _: Option<&str>) -> Result<()> {
+        if root.join("pnpm-lock.yaml").is_file() {
+            let mut lock: devkit::pnpm::Lock = devkit::pnpm::read_yaml(root, "pnpm-lock.yaml")?;
+            let workspace = devkit::pnpm::Workspace::read(root)?;
+            for path in workspace.packages {
+                let manifest: Value = read_json(&root.join(&path).join("package.json"))?;
+                let spec = manifest["devDependencies"]["@docouno/env"]
+                    .as_str()
+                    .unwrap();
+                let base = if let Some(file) = spec.strip_prefix("file:") {
+                    format!("file:{}", devkit::native::local_path(root, &path, file)?)
+                } else {
+                    spec.to_owned()
+                };
+                let key = format!("@docouno/env@{base}");
+                let resolution = if base.starts_with("file:") {
+                    json!({"integrity":release.manifest.environment.integrity,"tarball":base})
+                } else {
+                    json!({"integrity":release.manifest.environment.integrity})
+                };
+                let mut package = json!({"resolution":resolution});
+                if base.starts_with("file:") {
+                    package["version"] = json!(release.manifest.version);
+                }
+                lock.packages
+                    .insert(key.clone(), package.as_object().unwrap().clone());
+                lock.snapshots.insert(key, serde_json::Map::new());
+                lock.importers
+                    .get_mut(&path)
+                    .unwrap()
+                    .dev_dependencies
+                    .insert(
+                        "@docouno/env".into(),
+                        devkit::pnpm::Dependency {
+                            specifier: spec.into(),
+                            version: base,
+                        },
+                    );
+            }
+            lock.prune_unused()?;
+            return lock.write(root);
+        }
         let mut lock: Value = read_json(&root.join("package-lock.json"))?;
         let manifest: Value = read_json(&root.join("package.json"))?;
         lock["packages"][""] = manifest.clone();
@@ -377,7 +429,471 @@ fn preview_is_read_only_noop_is_byte_stable_and_local_registry_is_transactional(
 }
 
 #[test]
-fn same_release_updates_native_name_links_but_preserves_root_product_graph() {
+fn npm_migration_refuses_destination_collisions_before_creating_a_stage() {
+    let temporary = TempDir::new().unwrap();
+    let old = fixture_release(temporary.path(), "0.4.1");
+    let next = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("consumer");
+    let state = init(&old, &target, "node", PackageMode::Local);
+    for destination in ["pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        put(&target, destination, b"consumer-owned collision\n");
+        let before = source_signature(&target, None).unwrap();
+        let error = update_project(
+            &next,
+            &target,
+            &UpdateOptions {
+                preview: true,
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("migration destination already exists"),
+            "{error:#}"
+        );
+        assert_eq!(source_signature(&target, None).unwrap(), before);
+        assert!(
+            !fs::read_dir(target.join(".devkit/state"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("update-"))
+        );
+        if destination == "pnpm-lock.yaml" {
+            devkit::graph::read_legacy_npm_product_graph(&target, &state).unwrap();
+        }
+        fs::remove_file(target.join(destination)).unwrap();
+    }
+}
+
+#[test]
+fn npm_upgrade_migrates_linked_public_ranges_and_config_without_touching_preview_receipts() {
+    let temporary = TempDir::new().unwrap();
+    let old = fixture_release(temporary.path(), "0.4.1");
+    let next = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("libraries");
+    init_project(
+        &old,
+        &target,
+        &InitOptions {
+            packages: Some(vec![
+                ComponentSpec {
+                    name: "core".into(),
+                    template: "ts-library".into(),
+                    uses: vec![],
+                },
+                ComponentSpec {
+                    name: "ui".into(),
+                    template: "ts-library".into(),
+                    uses: vec!["core".into()],
+                },
+                ComponentSpec {
+                    name: "peer".into(),
+                    template: "ts-library".into(),
+                    uses: vec![],
+                },
+            ]),
+            package_mode: Some(PackageMode::Registry),
+            name: Some("suite".into()),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
+    for path in ["packages/core", "packages/ui", "packages/peer"] {
+        let mut manifest: Value = read_json(&target.join(path).join("package.json")).unwrap();
+        manifest["private"] = json!(false);
+        if path == "packages/ui" {
+            manifest["dependencies"]["@suite/package-core"] = json!("^1.0.0");
+        }
+        if path == "packages/peer" {
+            manifest["peerDependencies"] = json!({"@suite/package-core":"^1.0.0"});
+        }
+        put_json(&target, &format!("{path}/package.json"), &manifest);
+        lock["packages"][path] = manifest;
+    }
+    let mut root_manifest: Value = read_json(&target.join("package.json")).unwrap();
+    root_manifest["dependencies"] = json!({"@suite/package-ui":"file:packages/ui"});
+    root_manifest["peerDependencies"] = json!({"@suite/package-peer":"^1.0.0"});
+    root_manifest["scripts"] = json!({"custom":"unchanged"});
+    put_json(&target, "package.json", &root_manifest);
+    lock["packages"][""] = root_manifest;
+    put_json(&target, "package-lock.json", &lock);
+    put(&target,".npmrc",b"# user configuration\npackage-lock=true\ninstall-strategy=hoisted\nregistry=https://registry.npmjs.org/\n");
+    put(
+        &target,
+        ".devkit/state/node-workspace.lock",
+        b"existing-setup-receipt\n",
+    );
+    let signature = source_signature(&target, None).unwrap();
+    update_project(
+        &next,
+        &target,
+        &UpdateOptions {
+            preview: true,
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(source_signature(&target, None).unwrap(), signature);
+    assert_eq!(
+        fs::read(target.join(".devkit/state/node-workspace.lock")).unwrap(),
+        b"existing-setup-receipt\n"
+    );
+    update_project(&next, &target, &UpdateOptions::default(), &FixtureResolver).unwrap();
+    assert!(!target.join("package-lock.json").exists());
+    assert!(target.join("pnpm-lock.yaml").is_file());
+    assert!(target.join("pnpm-workspace.yaml").is_file());
+    assert!(!target.join(".devkit/state/node-workspace.lock").exists());
+    assert!(
+        read_json::<Value>(&target.join("package.json"))
+            .unwrap()
+            .get("workspaces")
+            .is_none()
+    );
+    assert_eq!(
+        read_json::<Value>(&target.join("packages/ui/package.json")).unwrap()["dependencies"]["@suite/package-core"],
+        "workspace:^"
+    );
+    let root_manifest: Value = read_json(&target.join("package.json")).unwrap();
+    assert_eq!(
+        root_manifest["dependencies"]["@suite/package-ui"],
+        "file:packages/ui"
+    );
+    assert_eq!(root_manifest["scripts"]["custom"], "unchanged");
+    assert_eq!(
+        root_manifest["peerDependencies"]["@suite/package-peer"],
+        "^1.0.0"
+    );
+    assert_eq!(
+        root_manifest["devDependencies"]["@suite/package-peer"],
+        "workspace:*"
+    );
+    let peer_manifest: Value = read_json(&target.join("packages/peer/package.json")).unwrap();
+    assert_eq!(
+        peer_manifest["peerDependencies"]["@suite/package-core"],
+        "^1.0.0"
+    );
+    assert_eq!(
+        peer_manifest["devDependencies"]["@suite/package-core"],
+        "workspace:*"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(".npmrc")).unwrap(),
+        "# user configuration\nregistry=https://registry.npmjs.org/\n"
+    );
+}
+
+#[test]
+fn sync_resolves_new_ranges_aliases_and_sections_without_changing_preview_inputs() {
+    use std::cell::Cell;
+    struct SelectedArtifact(Cell<usize>);
+    impl LockResolver for SelectedArtifact {
+        fn regenerate(&self, root: &Path, _: &AdmittedRelease, _: Option<&str>) -> Result<()> {
+            self.0.set(self.0.get() + 1);
+            let mut lock = devkit::pnpm::Lock::read(root)?;
+            let manifest: Value = read_json(&root.join("apps/main/package.json"))?;
+            for field in devkit::pnpm::PHYSICAL_FIELDS {
+                for name in ["fresh", "alias", "optional"] {
+                    if let Some(spec) = manifest[field][name].as_str() {
+                        lock.importers
+                            .get_mut("apps/main")
+                            .unwrap()
+                            .field_mut(field)
+                            .insert(
+                                name.into(),
+                                devkit::pnpm::Dependency {
+                                    specifier: spec.into(),
+                                    version: if name == "fresh" {
+                                        "1.2.3"
+                                    } else {
+                                        "fresh@1.2.3"
+                                    }
+                                    .into(),
+                                },
+                            );
+                    }
+                }
+            }
+            lock.packages.insert(
+                "fresh@1.2.3".into(),
+                json!({"resolution":{"integrity":sri(b"chosen artifact")}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            lock.snapshots
+                .insert("fresh@1.2.3".into(), Default::default());
+            lock.write(root)
+        }
+    }
+    let temporary = TempDir::new().unwrap();
+    let release = fixture_release(temporary.path(), "0.5.0");
+    for optional in [false, true] {
+        let peer_target = temporary.path().join(format!("peer-{optional}"));
+        init(&release, &peer_target, "node", PackageMode::Registry);
+        let mut manifest: Value = read_json(&peer_target.join("apps/main/package.json")).unwrap();
+        manifest["peerDependencies"] = json!({"fresh":"^1.0.0"});
+        manifest["devDependencies"]["fresh"] = json!("1.2.3");
+        if optional {
+            manifest["peerDependenciesMeta"] = json!({"fresh":{"optional":true}});
+        }
+        put_json(&peer_target, "apps/main/package.json", &manifest);
+        let before = source_signature(&peer_target, None).unwrap();
+        let resolver = SelectedArtifact(Cell::new(0));
+        for reconcile_lock in [false, true] {
+            sync_project(
+                &release,
+                &peer_target,
+                &UpdateOptions {
+                    preview: true,
+                    reconcile_lock,
+                    ..Default::default()
+                },
+                &resolver,
+            )
+            .unwrap();
+            assert_eq!(source_signature(&peer_target, None).unwrap(), before);
+        }
+        assert_eq!(resolver.0.get(), 2);
+        sync_project(&release, &peer_target, &UpdateOptions::default(), &resolver).unwrap();
+        read_runtime_project(&peer_target, "0.5.0").unwrap();
+    }
+    let target = temporary.path().join("consumer");
+    init(&release, &target, "node", PackageMode::Registry);
+    let resolver = SelectedArtifact(Cell::new(0));
+    let mut manifest: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    manifest["dependencies"] = json!({"fresh":"^1.0.0","alias":"npm:fresh@^1.0.0"});
+    put_json(&target, "apps/main/package.json", &manifest);
+    let before = source_signature(&target, None).unwrap();
+    sync_project(
+        &release,
+        &target,
+        &UpdateOptions {
+            preview: true,
+            ..Default::default()
+        },
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(resolver.0.get(), 1);
+    assert_eq!(source_signature(&target, None).unwrap(), before);
+    sync_project(&release, &target, &UpdateOptions::default(), &resolver).unwrap();
+    assert_eq!(resolver.0.get(), 2);
+    manifest["dependencies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fresh");
+    manifest["devDependencies"]["fresh"] = json!("^1.0.0");
+    manifest["optionalDependencies"] = json!({"optional":"npm:fresh@^1.0.0"});
+    put_json(&target, "apps/main/package.json", &manifest);
+    sync_project(&release, &target, &UpdateOptions::default(), &resolver).unwrap();
+    assert_eq!(resolver.0.get(), 3);
+    read_runtime_project(&target, "0.5.0").unwrap();
+}
+
+#[test]
+fn sync_preserves_unregistered_directory_snapshots_and_rejects_dangling_links() {
+    let temporary = TempDir::new().unwrap();
+    let release = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("consumer");
+    init(&release, &target, "node", PackageMode::Registry);
+    put_json(
+        &target,
+        "shared/local/package.json",
+        &json!({"name":"local","version":"1.0.0","private":true}),
+    );
+    let mut manifest: Value = read_json(&target.join("apps/main/package.json")).unwrap();
+    manifest["dependencies"] = json!({"local":"file:../../shared/local"});
+    put_json(&target, "apps/main/package.json", &manifest);
+    let mut lock = devkit::pnpm::Lock::read(&target).unwrap();
+    lock.importers
+        .get_mut("apps/main")
+        .unwrap()
+        .dependencies
+        .insert(
+            "local".into(),
+            devkit::pnpm::Dependency {
+                specifier: "file:../../shared/local".into(),
+                version: "file:shared/local".into(),
+            },
+        );
+    lock.packages.insert(
+        "local@file:shared/local".into(),
+        json!({"version":"1.0.0","resolution":{"type":"directory","directory":"shared/local"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    lock.snapshots
+        .insert("local@file:shared/local".into(), Default::default());
+    lock.write(&target).unwrap();
+    sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    read_runtime_project(&target, "0.5.0").unwrap();
+    let before = source_signature(&target, None).unwrap();
+    let result = sync_project(&release, &target, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(result.no_op);
+    assert_eq!(source_signature(&target, None).unwrap(), before);
+    lock.importers
+        .get_mut("apps/main")
+        .unwrap()
+        .dependencies
+        .get_mut("local")
+        .unwrap()
+        .version = "link:../../shared/local".into();
+    lock.write(&target).unwrap();
+    let error = read_runtime_project(&target, "0.5.0").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Local pnpm link has no importer")
+    );
+    lock.importers
+        .get_mut("apps/main")
+        .unwrap()
+        .dependencies
+        .get_mut("local")
+        .unwrap()
+        .version = "file:shared/local".into();
+    lock.packages
+        .get_mut("local@file:shared/local")
+        .unwrap()
+        .get_mut("resolution")
+        .unwrap()["directory"] = json!("shared/other");
+    put_json(
+        &target,
+        "shared/other/package.json",
+        &json!({"name":"local","version":"1.0.0","private":true}),
+    );
+    lock.write(&target).unwrap();
+    let manifest = devkit::native::native_manifest(&target, "apps/main").unwrap();
+    assert!(
+        lock.validate_importer(&target, "apps/main", &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("different path")
+    );
+}
+
+#[test]
+fn register_rebases_standalone_local_directory_chains_before_resolution() {
+    struct InspectSeed;
+    impl LockResolver for InspectSeed {
+        fn regenerate(
+            &self,
+            root: &Path,
+            release: &AdmittedRelease,
+            registry: Option<&str>,
+        ) -> Result<()> {
+            let lock = devkit::pnpm::Lock::read(root)?;
+            assert_eq!(
+                lock.importers["apps/extra"].dependencies["local"].version,
+                "file:apps/extra/vendor/local"
+            );
+            assert_eq!(
+                lock.packages["local@file:apps/extra/vendor/local"]["resolution"]["directory"],
+                "apps/extra/vendor/local"
+            );
+            assert_eq!(
+                lock.snapshots["local@file:apps/extra/vendor/local"]["dependencies"]["leaf"],
+                "file:apps/extra/vendor/leaf"
+            );
+            FixtureResolver.regenerate(root, release, registry)
+        }
+    }
+    let temporary = TempDir::new().unwrap();
+    let release = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("consumer");
+    init(&release, &target, "node", PackageMode::Registry);
+    let extra = target.join("apps/extra");
+    copy_tree(
+        &release.join("templates/node-api"),
+        &extra,
+        &|_| false,
+        false,
+    )
+    .unwrap();
+    let mut manifest: Value = read_json(&extra.join("package.json")).unwrap();
+    manifest["name"] = json!("existing-extra");
+    manifest["dependencies"] = json!({"local":"file:vendor/local"});
+    put_json(&extra, "package.json", &manifest);
+    put_json(
+        &extra,
+        "vendor/local/package.json",
+        &json!({"name":"local","version":"1.0.0","private":true,"dependencies":{"leaf":"file:../leaf"}}),
+    );
+    put_json(
+        &extra,
+        "vendor/leaf/package.json",
+        &json!({"name":"leaf","version":"1.0.0","private":true}),
+    );
+    let mut lock = devkit::pnpm::import_legacy_npm_lock_seed(
+        &extra,
+        &devkit::native::package_lock(&extra).unwrap(),
+    )
+    .unwrap();
+    lock.importers.get_mut(".").unwrap().dependencies.insert(
+        "local".into(),
+        devkit::pnpm::Dependency {
+            specifier: "file:vendor/local".into(),
+            version: "file:vendor/local".into(),
+        },
+    );
+    for name in ["local", "leaf"] {
+        let key = format!("{name}@file:vendor/{name}");
+        lock.packages.insert(key.clone(), json!({"version":"1.0.0","resolution":{"type":"directory","directory":format!("vendor/{name}")}}).as_object().unwrap().clone());
+        lock.snapshots.insert(
+            key,
+            if name == "local" {
+                json!({"dependencies":{"leaf":"file:vendor/leaf"}})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            } else {
+                Default::default()
+            },
+        );
+    }
+    lock.write(&extra).unwrap();
+    let before = source_signature(&target, None).unwrap();
+    let preview = register_project_component(
+        &release,
+        &target,
+        Role::App,
+        "extra".into(),
+        ToolingProfile::Node,
+        &UpdateOptions {
+            preview: true,
+            ..Default::default()
+        },
+        &InspectSeed,
+    )
+    .unwrap();
+    assert!(!preview.applied);
+    assert_eq!(source_signature(&target, None).unwrap(), before);
+    register_project_component(
+        &release,
+        &target,
+        Role::App,
+        "extra".into(),
+        ToolingProfile::Node,
+        &UpdateOptions::default(),
+        &InspectSeed,
+    )
+    .unwrap();
+    read_runtime_project(&target, "0.5.0").unwrap();
+    assert!(!extra.join("pnpm-lock.yaml").exists());
+}
+
+#[test]
+fn same_release_accepts_native_renames_and_preserves_root_product_graph() {
     let f = TempDir::new().unwrap();
     let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("consumer");
@@ -393,10 +909,23 @@ fn same_release_updates_native_name_links_but_preserves_root_product_graph() {
     member["version"] = json!("2.3.4");
     member["exports"] = json!({".":"./product.js"});
     put_json(&target, "apps/main/package.json", &member);
-    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
-    lock["packages"][""] = root.clone();
-    lock["packages"]["node_modules/product"] = json!({"version":"1.0.0","resolved":"https://registry.npmjs.org/product/-/product-1.0.0.tgz","integrity":sri(b"product artifact"),"optional":false});
-    put_json(&target, "package-lock.json", &lock);
+    let mut lock = devkit::pnpm::Lock::read(&target).unwrap();
+    lock.importers.get_mut(".").unwrap().dependencies.insert(
+        "product".into(),
+        devkit::pnpm::Dependency {
+            specifier: "1.0.0".into(),
+            version: "1.0.0".into(),
+        },
+    );
+    let artifact = json!({"resolution":{"integrity":sri(b"product artifact")}})
+        .as_object()
+        .unwrap()
+        .clone();
+    lock.packages
+        .insert("product@1.0.0".into(), artifact.clone());
+    lock.snapshots
+        .insert("product@1.0.0".into(), serde_json::Map::new());
+    lock.write(&target).unwrap();
     let changed = update_project(
         &release,
         &target,
@@ -404,21 +933,13 @@ fn same_release_updates_native_name_links_but_preserves_root_product_graph() {
         &FixtureResolver,
     )
     .unwrap();
-    assert_ne!(initial.generation, changed.state.generation);
-    let after: Value = read_json(&target.join("package-lock.json")).unwrap();
-    assert!(
-        after["packages"]
-            .get(format!("node_modules/{previous}"))
-            .is_none()
-    );
-    assert_eq!(
-        after["packages"]["node_modules/@custom/renamed"]["resolved"],
-        "apps/main"
-    );
-    assert_eq!(
-        after["packages"]["node_modules/product"],
-        lock["packages"]["node_modules/product"]
-    );
+    assert!(changed.no_op);
+    assert_eq!(initial.generation, changed.state.generation);
+    let after = devkit::pnpm::Lock::read(&target).unwrap();
+    assert!(after.importers.contains_key("apps/main"));
+    assert_eq!(after.packages["product@1.0.0"], artifact);
+    assert!(!target.join("package-lock.json").exists());
+    assert_ne!(previous, member["name"].as_str().unwrap());
     assert_eq!(
         read_json::<Value>(&target.join("package.json")).unwrap(),
         root
@@ -1036,10 +1557,6 @@ fn node_add_preserves_declared_scoped_namespace_after_checkout_move() {
     root["name"] = json!("@team/product");
     root["futureRoot"] = json!({"keep":true});
     put_json(&target, "package.json", &root);
-    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
-    lock["name"] = root["name"].clone();
-    lock["packages"][""] = root.clone();
-    put_json(&target, "package-lock.json", &lock);
     let existing = fs::read(target.join("apps/main/package.json")).unwrap();
     let inventory = capture_compose_inputs(&target).unwrap();
     add_project_component(
@@ -1886,16 +2403,13 @@ fn author_port_register_existing_node_workspace_preserves_owner_identity_and_sou
         "apps/existing/src/index.ts",
         b"export const owner = 'adopted source';\n",
     );
-    let mut root: Value = read_json(&target.join("package.json")).unwrap();
-    root["workspaces"] = json!(["apps/existing", "apps/main"]);
-    put_json(&target, "package.json", &root);
-    // Native npm fixture output for this already existing workspace member.
-    let mut lock: Value = read_json(&target.join("package-lock.json")).unwrap();
-    lock["packages"][""] = root;
-    lock["packages"]["apps/existing"] = member.clone();
-    lock["packages"]["node_modules/@adopt/existing"] =
-        json!({"resolved":"apps/existing","link":true});
-    put_json(&target, "package-lock.json", &lock);
+    let mut workspace = devkit::pnpm::Workspace::read(&target).unwrap();
+    workspace.packages = vec!["apps/existing".into(), "apps/main".into()];
+    devkit::pnpm::write_yaml(&target, "pnpm-workspace.yaml", &workspace).unwrap();
+    let mut lock = devkit::pnpm::Lock::read(&target).unwrap();
+    let importer = lock.importers["apps/main"].clone();
+    lock.importers.insert("apps/existing".into(), importer);
+    lock.write(&target).unwrap();
     let adopted = register_project_component(
         &release,
         &target,
@@ -2087,7 +2601,7 @@ fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_a
     put_json(&target, "apps/web/package.json", &web_pkg);
 
     // Inject mid-commit failure first and prove devkit recover rolls back cleanly!
-    let pre_sync_lock = fs::read(target.join("package-lock.json")).unwrap();
+    let pre_sync_lock = fs::read(target.join("pnpm-lock.yaml")).unwrap();
     let interrupted = sync_project(
         &release,
         &target,
@@ -2106,7 +2620,7 @@ fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_a
     // Automatic rollback inside tx.commit restores pre-sync files; verify clean state.
     assert!(!target.join(PENDING_PATH).exists());
     assert_eq!(
-        fs::read(target.join("package-lock.json")).unwrap(),
+        fs::read(target.join("pnpm-lock.yaml")).unwrap(),
         pre_sync_lock
     );
     assert!(!recover_project(&target).unwrap());
@@ -2123,18 +2637,15 @@ fn sync_project_offline_fast_path_renames_workspace_package_rotates_generation_a
         vec!["packages/client".to_string()]
     );
 
-    let updated_lock: Value = read_json(&target.join("package-lock.json")).unwrap();
-    assert!(
-        updated_lock["packages"]
-            .get(format!("node_modules/{old_name}"))
-            .is_none()
+    let updated_lock = devkit::pnpm::Lock::read(&target).unwrap();
+    let importer = &updated_lock.importers["apps/web"];
+    assert!(!importer.dependencies.contains_key(&old_name));
+    assert_eq!(
+        importer.dependencies[new_name].version,
+        "link:../../packages/client"
     );
     assert_eq!(
-        updated_lock["packages"][format!("node_modules/{new_name}")]["resolved"],
-        "packages/client"
-    );
-    assert_eq!(
-        updated_lock["packages"]["packages/client"]["version"],
+        read_json::<Value>(&target.join("packages/client/package.json")).unwrap()["version"],
         "2.1.0"
     );
     devkit::native::assert_native_components(&target, &synced.state).unwrap();
@@ -2161,64 +2672,63 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
             &self,
             root: &Path,
             release: &AdmittedRelease,
-            _registry: Option<&str>,
+            _: Option<&str>,
         ) -> Result<()> {
             let attempt = self.calls.get() + 1;
             self.calls.set(attempt);
-            let lock_path = root.join("package-lock.json");
             if self.min_stage == 2 && attempt == 1 {
-                bail!("ERESOLVE simulated stage-1 conflict on dev tree");
+                bail!("ERR_PNPM_PEER_DEP_ISSUES simulated stage-1 conflict on dev tree");
             }
             if self.min_stage == 3 && attempt < 3 {
                 if attempt == 2 {
-                    // Verify stage 2 pruned dev nodes while preserving !dev product pin.
-                    let pruned: Value = read_json(&lock_path)?;
-                    assert!(pruned["packages"].get("node_modules/stale-dev").is_none());
-                    assert!(pruned["packages"].get("node_modules/clsx").is_some());
+                    let pruned = devkit::pnpm::Lock::read(root)?;
+                    assert!(!pruned.packages.contains_key("stale-dev@1.0.0"));
+                    assert!(pruned.packages.contains_key("clsx@2.1.0"));
                 }
-                bail!("ERESOLVE simulated conflict before clean fallback");
+                bail!("ERR_PNPM_PEER_DEP_ISSUES simulated conflict before clean fallback");
             }
-            let manifest: Value = read_json(&root.join("package.json"))?;
-            let mut packages = serde_json::Map::new();
-            packages.insert(String::new(), manifest.clone());
-            for path in manifest["workspaces"].as_array().unwrap() {
-                let p = path.as_str().unwrap();
-                let member: Value = read_json(&root.join(p).join("package.json"))?;
-                let name = member["name"].as_str().unwrap().to_owned();
-                packages.insert(p.to_owned(), member);
-                packages.insert(
-                    format!("node_modules/{name}"),
-                    json!({"resolved": p, "link": true}),
+            let workspace = devkit::pnpm::Workspace::read(root)?;
+            let mut lock = devkit::pnpm::Lock::default();
+            for path in std::iter::once(String::new()).chain(workspace.packages) {
+                let manifest: Value = read_json(&root.join(&path).join("package.json"))?;
+                let mut importer = devkit::pnpm::Importer::default();
+                for field in devkit::pnpm::PHYSICAL_FIELDS {
+                    for (name, value) in
+                        devkit::native::dependency_table(manifest.as_object().unwrap(), field)?
+                    {
+                        let specifier = value.as_str().unwrap().to_owned();
+                        let version = match name.as_str() {
+                            "@docouno/env" => release.manifest.version.clone(),
+                            "clsx" => "2.1.1".into(),
+                            _ => bail!("Unexpected fixture dependency {name}"),
+                        };
+                        importer
+                            .field_mut(field)
+                            .insert(name, devkit::pnpm::Dependency { specifier, version });
+                    }
+                }
+                lock.importers
+                    .insert(devkit::pnpm::importer_id(&path).into(), importer);
+            }
+            for (name, version, integrity) in [
+                (
+                    "@docouno/env",
+                    release.manifest.version.as_str(),
+                    release.manifest.environment.integrity.clone(),
+                ),
+                ("clsx", "2.1.1", sri(b"clsx-2.1.1")),
+            ] {
+                let key = format!("{name}@{version}");
+                lock.packages.insert(
+                    key.clone(),
+                    json!({"resolution":{"integrity":integrity}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
                 );
+                lock.snapshots.insert(key, serde_json::Map::new());
             }
-            packages.insert(
-                "node_modules/@docouno/env".into(),
-                json!({
-                    "version": release.manifest.version,
-                    "resolved": format!("https://registry.npmjs.org/@docouno/env/-/env-{}.tgz", release.manifest.version),
-                    "integrity": release.manifest.environment.integrity,
-                    "dev": true,
-                }),
-            );
-            // Bump transitive/product clsx from 2.1.0 -> 2.1.1 while preserving direct spec ^2.1.0.
-            packages.insert(
-                "node_modules/clsx".into(),
-                json!({
-                    "version": "2.1.1",
-                    "resolved": "https://registry.npmjs.org/clsx/-/clsx-2.1.1.tgz",
-                    "integrity": sri(b"clsx-2.1.1"),
-                }),
-            );
-            write_json(
-                &lock_path,
-                &json!({
-                    "name": manifest["name"],
-                    "version": manifest["version"],
-                    "lockfileVersion": 3,
-                    "requires": true,
-                    "packages": packages,
-                }),
-            )
+            lock.write(root)
         }
     }
 
@@ -2350,26 +2860,6 @@ fn reconcile_lock_reports_drift_previews_and_climbs_three_stage_ladder() {
             signal,
             calls: Cell::new(0),
         };
-        let err = devkit::project::sync_project(
-            &next,
-            &target,
-            &UpdateOptions {
-                reconcile_lock: true,
-                ..Default::default()
-            },
-            &resolver,
-        );
-        // Drift must exist to invoke regenerate_reconciled: mutate lock version back to 2.1.0 first.
-        let _ = err;
-    }
-    let mut drifted_again: Value = read_json(&target.join("package-lock.json")).unwrap();
-    drifted_again["packages"]["node_modules/@docouno/env"]["version"] = json!("0.0.1");
-    write_json(&target.join("package-lock.json"), &drifted_again).unwrap();
-    for signal in [false, true] {
-        let resolver = NonConflictResolver {
-            signal,
-            calls: Cell::new(0),
-        };
         let err = update_project(
             &next,
             &target,
@@ -2467,10 +2957,7 @@ fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() 
     )
     .unwrap();
     let ui_pkg: Value = read_json(&multi.join("packages/ui/package.json")).unwrap();
-    assert_eq!(
-        ui_pkg["dependencies"]["@suite/package-core"],
-        "file:../core"
-    );
+    assert_eq!(ui_pkg["dependencies"]["@suite/package-core"], "workspace:*");
     assert!(
         ui_pkg["devDependencies"]
             .get("@suite/package-core")
@@ -2495,13 +2982,10 @@ fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() 
     )
     .unwrap();
     let play_pkg: Value = read_json(&multi.join("apps/playground/package.json")).unwrap();
-    assert_eq!(
-        play_pkg["dependencies"]["@suite/package-ui"],
-        "file:../../packages/ui"
-    );
+    assert_eq!(play_pkg["dependencies"]["@suite/package-ui"], "workspace:*");
     assert_eq!(
         play_pkg["dependencies"]["@suite/package-core"],
-        "file:../../packages/core"
+        "workspace:*"
     );
     assert!(
         play_pkg["devDependencies"]

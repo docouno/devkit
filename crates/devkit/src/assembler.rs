@@ -9,8 +9,9 @@ use crate::{
     distribution::{AssetIdentity, ENGINE_ASSET, NpmArtifact, ReleaseIndex, TARGET},
     files::*,
     model::{Environment, FileIdentity, MigrationEntry, Release},
-    native::{DEPENDENCY_FIELDS, NpmDepSpec, dependency_table, parse_npm_dependency_spec},
+    native::{NpmDepSpec, dependency_table, parse_npm_dependency_spec},
     notices::verify_notice_set,
+    pnpm::{self, Lock, PHYSICAL_FIELDS},
     processes::{OutputMode, OwnedContainer, ProcessRunner},
     release::{admit_release, import_npm_payload, validate_migrations},
 };
@@ -173,7 +174,7 @@ fn npm_sources(root: &Path) -> Result<BTreeMap<String, FileIdentity>> {
         "Package .npmrc is not an accepted npm preparation input"
     );
     for name in NODE_TEMPLATES {
-        for file in ["package.json", "package-lock.json"] {
+        for file in ["package.json", "pnpm-lock.yaml"] {
             let path = format!("templates/{name}/{file}");
             files.insert(
                 path.clone(),
@@ -188,40 +189,111 @@ fn sri(bytes: &[u8]) -> String {
     format!("sha512-{}", STANDARD.encode(Sha512::digest(bytes)))
 }
 
-fn npm_name(location: &str) -> Result<String> {
-    let name = location
-        .rsplit("node_modules/")
-        .next()
-        .context("Missing native lock location")?;
-    ensure!(
-        location.starts_with("node_modules/") && !name.is_empty() && !name.contains("node_modules"),
-        "Invalid native lock package location"
-    );
-    ensure!(
-        name.split('/').count() == if name.starts_with('@') { 2 } else { 1 },
-        "Invalid native lock package name"
-    );
-    ensure!(
-        name.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"@/._-".contains(&b)),
-        "Invalid native lock package name"
-    );
-    Ok(name.to_owned())
-}
-
 fn lock_integrity(value: &str) -> bool {
     let Some((algorithm, encoded)) = value.split_once('-') else {
         return false;
     };
-    let length = match algorithm {
-        "sha256" => 32,
-        "sha384" => 48,
-        "sha512" => 64,
-        _ => return false,
-    };
+    if algorithm != "sha512" {
+        return false;
+    }
+    let length = 64;
     STANDARD
         .decode(encoded)
         .is_ok_and(|raw| raw.len() == length && STANDARD.encode(raw) == encoded)
+}
+
+fn template_environment_key(key: &str, from: &str, to: &str, depth: usize) -> Result<String> {
+    ensure!(depth < 64, "Template peer context exceeds depth budget");
+    let base = pnpm::strip_peer_suffixes(key);
+    let mut result = if base == format!("@docouno/env@{from}") {
+        format!("@docouno/env@{to}")
+    } else {
+        base.to_owned()
+    };
+    let mut offset = base.len();
+    while offset < key.len() {
+        ensure!(
+            key.as_bytes()[offset] == b'(',
+            "Invalid template peer context"
+        );
+        let mut nesting = 1;
+        let mut end = offset + 1;
+        while end < key.len() && nesting > 0 {
+            match key.as_bytes()[end] {
+                b'(' => nesting += 1,
+                b')' => nesting -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        ensure!(nesting == 0, "Invalid template peer context");
+        result.push('(');
+        result.push_str(&template_environment_key(
+            &key[offset + 1..end - 1],
+            from,
+            to,
+            depth + 1,
+        )?);
+        result.push(')');
+        offset = end;
+    }
+    Ok(result)
+}
+
+fn template_reference(name: &str, reference: &str, from: &str, to: &str) -> Result<String> {
+    let key = template_environment_key(&pnpm::snapshot_key(name, reference)?, from, to, 0)?;
+    Ok(if pnpm::strip_peer_suffixes(reference).contains('@') {
+        key
+    } else {
+        key.strip_prefix(&format!("{name}@"))
+            .context("Template rewrite changed dependency name")?
+            .to_owned()
+    })
+}
+
+fn template_selection_graph(lock: &Lock, from: &str, to: &str) -> Result<Value> {
+    let mut expected = lock.clone();
+    for importer in expected.importers.values_mut() {
+        for field in PHYSICAL_FIELDS {
+            for (name, dependency) in importer.field_mut(field) {
+                dependency.version = template_reference(name, &dependency.version, from, to)?;
+            }
+        }
+    }
+    expected
+        .importers
+        .get_mut(".")
+        .and_then(|importer| importer.dev_dependencies.get_mut("@docouno/env"))
+        .context("Template source environment selection")?
+        .specifier = to.to_owned();
+    let mut snapshots = BTreeMap::new();
+    for (key, mut snapshot) in expected.snapshots {
+        for field in ["dependencies", "optionalDependencies"] {
+            if let Some(dependencies) = snapshot.get_mut(field).and_then(Value::as_object_mut) {
+                for (name, reference) in dependencies {
+                    *reference = json!(template_reference(
+                        name,
+                        text(reference, "Template reference")?,
+                        from,
+                        to
+                    )?);
+                }
+            }
+        }
+        ensure!(
+            snapshots
+                .insert(template_environment_key(&key, from, to, 0)?, snapshot)
+                .is_none(),
+            "Template environment rewrite collides with another selection"
+        );
+    }
+    expected.snapshots = snapshots;
+    let mut graph = serde_json::to_value(expected)?;
+    graph
+        .as_object_mut()
+        .context("Template graph")?
+        .remove("packages");
+    Ok(graph)
 }
 
 fn verify_template_lock(
@@ -247,165 +319,219 @@ fn verify_template_lock(
         manifest == expected_manifest,
         "Prepared template manifest changed fields other than the environment version: {name}"
     );
-    let original: Value = read_json(&safe_path(
-        root,
-        &format!("templates/{name}/package-lock.json"),
-    )?)?;
-    let lock: Value = read_json(&safe_path(
-        directory,
-        &format!("templates/{name}/package-lock.json"),
-    )?)?;
+    let original: Lock = pnpm::read_yaml(root, &format!("templates/{name}/pnpm-lock.yaml"))?;
+    let lock: Lock = pnpm::read_yaml(directory, &format!("templates/{name}/pnpm-lock.yaml"))?;
     ensure!(
-        lock["lockfileVersion"] == 3,
-        "Default template must use lockfileVersion3"
+        lock.lockfile_version == "9.0" && original.lockfile_version == "9.0",
+        "Default template must use pnpm lockfileVersion 9.0"
     );
-    let packages = object(&lock["packages"], "Template lock packages")?;
-    let old_packages = object(&original["packages"], "Source template lock packages")?;
-    let lock_root = packages.get("").context("Template lock root is missing")?;
-    for field in DEPENDENCY_FIELDS {
+    ensure!(
+        lock.importers.len() == 1,
+        "Template must have exactly one root importer"
+    );
+    let importer = lock
+        .importers
+        .get(".")
+        .context("Template root importer is missing")?;
+    let manifest_fields = object(&manifest, "Template manifest")?;
+    for field in PHYSICAL_FIELDS {
+        let mut expected = dependency_table(manifest_fields, field)?;
+        if field == "dependencies" {
+            for key in dependency_table(manifest_fields, "optionalDependencies")?.keys() {
+                expected.remove(key);
+            }
+        }
         ensure!(
-            lock_root[field] == manifest[field],
+            expected.len() == importer.field(field).len()
+                && expected.iter().all(|(key, value)| value.as_str()
+                    == importer.field(field).get(key).map(|v| v.specifier.as_str())),
             "Prepared template root dependency field differs: {name}/{field}"
         );
-    }
-    let mut alias_targets: BTreeMap<String, String> = BTreeMap::new();
-    for (parent_loc, parent_val) in packages {
-        let parent_obj = object(parent_val, "Template package record")?;
-        for field in DEPENDENCY_FIELDS {
-            for (dep_name, spec_val) in dependency_table(parent_obj, field)? {
-                let spec_str = text(&spec_val, &format!("{name}:{parent_loc}:{dep_name}"))?;
-                let parsed = parse_npm_dependency_spec(spec_str)?;
-                ensure!(
-                    !matches!(parsed, NpmDepSpec::LocalFile(_)),
-                    "Default template cannot declare local file dependency: {name}:{parent_loc}:{dep_name}"
-                );
-                if let NpmDepSpec::Alias { target_name, .. } = parsed {
-                    let mut bases = vec![parent_loc.clone()];
-                    let mut cursor = parent_loc.as_str();
-                    while let Some((prefix, _)) = cursor.rsplit_once("/node_modules/") {
-                        bases.push(prefix.to_owned());
-                        cursor = prefix;
-                    }
-                    if !parent_loc.is_empty() {
-                        bases.push(String::new());
-                    }
-                    let resolved_loc = bases.into_iter().find_map(|base| {
-                        let candidate = if base.is_empty() {
-                            format!("node_modules/{dep_name}")
-                        } else {
-                            format!("{base}/node_modules/{dep_name}")
-                        };
-                        packages.contains_key(&candidate).then_some(candidate)
-                    });
-                    if let Some(target_loc) = resolved_loc {
-                        if let Some(prev) = alias_targets.get(&target_loc) {
-                            ensure!(
-                                prev == &target_name,
-                                "Conflicting alias target names for {target_loc} in template {name}"
-                            );
-                        } else {
-                            alias_targets.insert(target_loc, target_name);
-                        }
-                    } else {
-                        ensure!(
-                            field == "optionalDependencies" || field == "peerDependencies",
-                            "Missing locked target for alias dependency {parent_loc}:{dep_name} in template {name}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-    for (location, value) in packages {
-        if location.is_empty() {
-            continue;
-        }
-        let package = object(value, "Template package identity")?;
-        let slot_name = npm_name(location)?;
-        let effective_name = if let Some(expected_target) = alias_targets.get(location) {
+        for (dependency, entry) in importer.field(field) {
             ensure!(
-                value.get("name").and_then(Value::as_str) == Some(expected_target.as_str()),
-                "Alias template package {location} must declare name {expected_target}"
+                !matches!(
+                    parse_npm_dependency_spec(&entry.specifier)?,
+                    NpmDepSpec::LocalFile(_) | NpmDepSpec::Workspace(_)
+                ),
+                "Default template cannot declare local dependency: {dependency}"
             );
-            expected_target.clone()
+        }
+    }
+    for dependency in dependency_table(manifest_fields, "peerDependencies")?.keys() {
+        if manifest["peerDependenciesMeta"][dependency]["optional"] != json!(true) {
+            ensure!(
+                importer.dependency(dependency).is_some(),
+                "Missing template peer resolution: {dependency}"
+            );
+        }
+    }
+    let source_version = original
+        .importers
+        .get(".")
+        .and_then(|i| i.dev_dependencies.get("@docouno/env"))
+        .context("Source template env dependency")?
+        .specifier
+        .clone();
+    let env_key = format!("@docouno/env@{version}");
+    let expected_keys: BTreeSet<_> = original
+        .packages
+        .keys()
+        .map(|k| template_environment_key(k, &source_version, version, 0))
+        .collect::<Result<_>>()?;
+    ensure!(
+        expected_keys.len() == original.packages.len()
+            && expected_keys == lock.packages.keys().cloned().collect(),
+        "Selected external template identities changed: {name}"
+    );
+    ensure!(
+        template_selection_graph(&original, &source_version, version)?
+            == template_selection_graph(&lock, version, version)?,
+        "Selected template graph changed: {name}"
+    );
+    for (key, record) in &lock.packages {
+        let source_key = if key == &env_key {
+            format!("@docouno/env@{source_version}")
         } else {
-            ensure!(
-                value
-                    .get("name")
-                    .is_none_or(|v| v.as_str() == Some(slot_name.as_str())),
-                "Non-alias template package {location} declares mismatched name"
-            );
-            slot_name.clone()
+            key.clone()
         };
-        let selected = text(&value["version"], "Template package version")?;
+        let mut expected_metadata = original
+            .packages
+            .get(&source_key)
+            .context("Added external template metadata")?
+            .clone();
+        expected_metadata.remove("resolution");
+        if key == &env_key && expected_metadata.contains_key("version") {
+            expected_metadata.insert("version".into(), json!(version));
+        }
+        let mut metadata = record.clone();
+        metadata.remove("resolution");
         ensure!(
-            !selected.is_empty()
-                && selected.len() <= 128
-                && selected
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b)),
+            metadata == expected_metadata,
+            "Selected template package metadata changed: {key}"
+        );
+        let (package_name, selected) = pnpm::package_parts(key)?;
+        static EXACT_VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$").unwrap()
+        });
+        ensure!(
+            selected.len() <= 128
+                && EXACT_VERSION.is_match(selected)
+                && !selected
+                    .split('+')
+                    .next()
+                    .unwrap_or(selected)
+                    .split_once('-')
+                    .is_some_and(|(_, pre)| pre.split('.').any(|v| v.len() > 1
+                        && v.starts_with('0')
+                        && v.bytes().all(|b| b.is_ascii_digit()))),
             "Invalid selected template version"
         );
-        let base = effective_name
-            .rsplit('/')
-            .next()
-            .context("Package basename")?;
-        let expected_url =
-            format!("https://registry.npmjs.org/{effective_name}/-/{base}-{selected}.tgz");
         ensure!(
-            value["resolved"].as_str() == Some(expected_url.as_str())
-                && value["integrity"].as_str().is_some_and(lock_integrity),
-            "Incomplete/non-registry default template identity: {location}"
+            pnpm::strip_peer_suffixes(key) == key,
+            "Package metadata has a peer context"
+        );
+        let resolution = object(
+            record
+                .get("resolution")
+                .context("Missing template resolution")?,
+            "Template resolution",
+        )?;
+        let expected_url = format!(
+            "https://registry.npmjs.org/{package_name}/-/{}-{selected}.tgz",
+            package_name
+                .rsplit('/')
+                .next()
+                .context("Package basename")?
         );
         ensure!(
-            !package.get("link").is_some_and(|v| v != &json!(false))
-                && !package.get("inBundle").is_some_and(|v| v != &json!(false)),
-            "Linked/bundled default template identity: {location}"
+            resolution
+                .keys()
+                .all(|k| ["integrity", "tarball"].contains(&k.as_str()))
+                && resolution
+                    .get("tarball")
+                    .is_none_or(|v| v.as_str() == Some(&expected_url))
+                && resolution
+                    .get("integrity")
+                    .and_then(Value::as_str)
+                    .is_some_and(lock_integrity),
+            "Incomplete/non-registry default template identity: {key}"
         );
-        if slot_name == "@docouno/env" {
+        if key == &env_key {
             ensure!(
-                effective_name == "@docouno/env"
-                    && selected == version
-                    && value["integrity"].as_str() == Some(environment_sri),
+                resolution["integrity"].as_str() == Some(environment_sri),
                 "Prepared environment identity differs"
             );
-        } else if let Some(old) = old_packages.get(location) {
-            for field in [
-                "name",
-                "version",
-                "resolved",
-                "integrity",
-                "dev",
-                "optional",
-                "devOptional",
-                "peer",
-                "inBundle",
-                "link",
-            ] {
-                if old.get(field).is_some() || (field == "name" && value.get(field).is_some()) {
-                    ensure!(
-                        old.get(field) == value.get(field),
-                        "Selected external template identity changed: {location}/{field}"
-                    );
-                }
-            }
         } else {
-            anyhow::bail!("Prepared template added an external identity: {location}");
+            let old = original
+                .packages
+                .get(key)
+                .context("Added external identity")?;
+            if let Some(previous) = old.get("resolution").and_then(|v| v.get("integrity")) {
+                ensure!(
+                    Some(previous) == resolution.get("integrity"),
+                    "Selected external template integrity changed: {key}"
+                );
+            }
         }
     }
-    for location in old_packages
-        .keys()
-        .filter(|p| !p.is_empty() && p.as_str() != "node_modules/@docouno/env")
-    {
-        ensure!(
-            packages.contains_key(location),
-            "Prepared template removed an external identity: {location}"
-        );
-    }
     ensure!(
-        packages.contains_key("node_modules/@docouno/env"),
-        "Template lock lacks environment package"
+        lock.packages.contains_key(&env_key)
+            && importer
+                .dev_dependencies
+                .get("@docouno/env")
+                .is_some_and(|d| d.specifier == version),
+        "Template environment identity differs"
     );
+    let check_reference = |dependency: &str, reference: &str| -> Result<()> {
+        let key = pnpm::snapshot_key(dependency, reference)?;
+        ensure!(
+            lock.snapshots.contains_key(&key)
+                && lock.packages.contains_key(pnpm::strip_peer_suffixes(&key)),
+            "Missing canonical template snapshot: {key}"
+        );
+        Ok(())
+    };
+    for field in PHYSICAL_FIELDS {
+        for (dependency, entry) in importer.field(field) {
+            check_reference(dependency, &entry.version)?;
+            let key = pnpm::snapshot_key(dependency, &entry.version)?;
+            let expected = match parse_npm_dependency_spec(&entry.specifier)? {
+                NpmDepSpec::Alias { target_name, .. } => target_name,
+                _ => dependency.clone(),
+            };
+            ensure!(
+                pnpm::package_parts(&key)?.0 == expected,
+                "Template importer resolves to mismatched package: {dependency}"
+            );
+        }
+    }
+    for (key, snapshot) in &lock.snapshots {
+        ensure!(
+            lock.packages.contains_key(pnpm::strip_peer_suffixes(key)),
+            "Template snapshot has no package: {key}"
+        );
+        for field in ["dependencies", "optionalDependencies"] {
+            for (dependency, reference) in dependency_table(snapshot, field)? {
+                check_reference(&dependency, text(&reference, "Snapshot reference")?)?;
+            }
+        }
+    }
+    let encoded = serde_json::to_string(&lock)?;
+    ensure!(
+        ![
+            "file:",
+            "link:",
+            "workspace:",
+            "127.0.0.1",
+            "localhost",
+            "/workspace/",
+            ".artifacts/"
+        ]
+        .iter()
+        .any(|v| encoded.contains(v)),
+        "Source/local endpoint remains in canonical template lock"
+    );
+
     Ok(())
 }
 
@@ -465,7 +591,7 @@ pub fn verify_npm_inputs(root: &Path, directory: &Path) -> Result<NpmInputs> {
             .context("Missing npm template snapshot")?;
         ensure!(
             template.manifest == format!("templates/{name}/package.json")
-                && template.lock == format!("templates/{name}/package-lock.json"),
+                && template.lock == format!("templates/{name}/pnpm-lock.yaml"),
             "Unexpected template snapshot paths"
         );
         expected.insert(template.manifest.clone());
@@ -560,6 +686,9 @@ fn pins(root: &Path) -> Result<BTreeMap<String, String>> {
             [
                 "DEVKIT_NODE_IMAGE",
                 "DEVKIT_NODE_VERSION",
+                "DEVKIT_PNPM_VERSION",
+                "DEVKIT_PNPM_TARBALL_SHA256",
+                "DEVKIT_PNPM_SHA256",
                 "DEVKIT_RUST_VERSION"
             ]
             .contains(&key)
@@ -569,7 +698,8 @@ fn pins(root: &Path) -> Result<BTreeMap<String, String>> {
             "Unexpected/duplicate source toolchain pin"
         );
     }
-    ensure!(pins.len() == 3, "Incomplete source toolchains.env");
+    ensure!(pins.len() == 6, "Incomplete source toolchains.env");
+    crate::runtime::PnpmPin::from_source_pins(root)?;
     let (_, hash) = pins["DEVKIT_NODE_IMAGE"]
         .rsplit_once("@sha256:")
         .context("Node image is not digest-pinned")?;
@@ -994,6 +1124,13 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &fs::read(safe_path(&root, "LICENSE")?)?,
         0o644,
     )?;
+    let pnpm_pin = crate::runtime::PnpmPin::from_source_pins(&root)?;
+    write_atomic(
+        &safe_path(&payload, "runtime/pnpm.env")?,
+        pnpm_pin.encode().as_bytes(),
+        0o644,
+    )?;
+    settings.retain(|key, _| !key.starts_with("DEVKIT_PNPM_"));
     settings.insert("DEVKIT_VERSION".to_owned(), version.clone());
     settings.insert(
         "DEVKIT_RUST_RECIPE_HASH".to_owned(),
@@ -1029,7 +1166,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     for name in inputs.files.keys() {
         write_atomic(
             &safe_path(&payload, name)?,
-            &fs::read(safe_path(&npm_inputs, name)?)?,
+            &read_input_bytes(&safe_path(&npm_inputs, name)?)?,
             0o644,
         )?;
     }

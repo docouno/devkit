@@ -13,12 +13,12 @@ This repository uses a pinned Devkit development environment. Daily commands run
 - **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/compose.workspace.json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and `{rust-component}/rust-toolchain.toml`.
 - **Shared native manifests**:
   - In `apps/*/package.json` and `packages/*/package.json`, Devkit manages only the `toolDependencies` entries inside `devDependencies` (recorded in `.devkit/manifest.json`). Product `name`, `version`, `private`, `exports`, `files`, `publishConfig`, `scripts`, `dependencies`, `peerDependencies`, and extra `devDependencies` belong to the project.
-  - Root `package.json` `workspaces` and `package-lock.json` represent the unified Node workspace graph.
+  - Root `pnpm-workspace.yaml` and `pnpm-lock.yaml` represent the unified Node workspace graph; `package.json` has no `workspaces` field.
 - **Owned by the project**: Component `src/**` and `test/**`, Rust `Cargo.toml` and `Cargo.lock`, root `Makefile`, `compose.yaml`, `.npmrc`, and `.env` files.
 
 ## Toolchain Rules
 
-1. **Never run bare host `npm install`, `npx`, `cargo`, or `rustup`** to mutate lockfiles or build outputs. Always execute native tools through `make` or `devkit exec`.
+1. **Never run bare host `pnpm`, `npm install`, `cargo`, or `rustup`** to mutate lockfiles or build outputs. Always execute native tools through `make` or `devkit exec`.
 2. **Read-only gates**: `make check`, `make test`, `make build`, and `make package` mount source and lockfiles read-only with `--network none`. Only `make fix` writes formatting changes back to source files.
 3. **Syncing manual manifest edits**: After editing `package.json` metadata (`name`, `"private": false`, `exports`, `files`, `publishConfig`) or `.npmrc`, run:
    ```sh
@@ -32,7 +32,7 @@ This repository uses a pinned Devkit development environment. Daily commands run
 | Command | Purpose |
 | --- | --- |
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
-| `make sync [reconcile=1] [preview=1]` | Synchronize workspace projections and `package-lock.json` after manual `package.json` or `.npmrc` edits |
+| `make sync [reconcile=1] [preview=1]` | Synchronize workspace projections and `pnpm-lock.yaml` after manual `package.json` or `.npmrc` edits |
 | `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |
@@ -50,14 +50,14 @@ Scope `setup`, `check`, `fix`, `test`, `build`, and `package` with `app=<name>` 
 ### Container budgets and Git worktrees
 
 - Devkit automatically sizes container CPU, memory, and worker concurrency from the active cgroup quota (falling back cleanly to in-process toolchain bounds when nested Docker-in-Docker lacks cgroup v2 controller delegation). Override detected ceilings when needed via `DEVKIT_CPUS=<cores>` and `DEVKIT_MEMORY_LIMIT=<bytes>` (for example `DEVKIT_CPUS=2 DEVKIT_MEMORY_LIMIT=4g`).
-- Containers bind-mount only the checkout root at `/workspace`. In a linked `git worktree` (where `.git` points to a parent repository outside the checkout directory), run `git` commands on the host rather than inside `devkit exec`.
+- Daily gates bind-mount the checkout at `/workspace`; setup and Node write sessions use a common ancestor mount for hardlinks and mask unrelated siblings and credential files. In a linked `git worktree` (where `.git` points to a parent repository outside the checkout directory), run `git` commands on the host rather than inside `devkit exec`.
 
 ## Common Workflows
 
 ### Add or remove npm dependencies
 
 ```sh
-devkit exec --component apps/web --write --network bridge -- npm install zod
+devkit exec --component apps/web --write --network bridge -- pnpm add zod
 make setup
 make check
 ```
@@ -75,10 +75,10 @@ make setup
 ### Publishable npm libraries (`ts-library`, `react-ui`)
 
 1. Edit `packages/<slug>/package.json`: set the final `name`, `"private": false`, `exports` (`types` before `import` or `default`), `files` (`["dist"]`), and optional `publishConfig`.
-2. Run `devkit sync` to synchronize projections and `package-lock.json`.
+2. Run `devkit sync` to synchronize projections and `pnpm-lock.yaml`.
 3. Bump versions through the pinned Node container:
    ```sh
-   devkit exec --component packages/<slug> --write -- npm version 0.2.0 --no-git-tag-version
+   devkit exec --component packages/<slug> --write -- pnpm version 0.2.0 --no-git-tag-version
    make setup
    ```
 4. Build and validate the publishable tarball (`publint` + `@arethetypeswrong/core`) offline:
@@ -108,3 +108,7 @@ make setup && make check
 ```
 
 Pass `--reconcile-lock` when transitive lockfile dependencies require re-resolution across toolchain bumps. If an update is interrupted, run `devkit recover .`.
+
+### Shared caches
+
+`DEVKIT_CACHE_DIR` defaults to `~/.cache/docouno/devkit`. Its `tools`, `pnpm-store`, `pnpm-cache`, `cargo`, and `electron` directories are reusable across repositories and Git worktrees. Node setup lazily verifies the pinned pnpm executable; Rust-only setup does not acquire it. Keep the cache on the checkout filesystem for hardlinks. If the mount differs, the package store falls back to the repository's common Git directory (`devkit-store`) or `.devkit/cache/pnpm-store`. Daily tasks mount the pnpm virtual store read-only.

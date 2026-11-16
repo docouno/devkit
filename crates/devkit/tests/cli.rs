@@ -1314,6 +1314,24 @@ fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadat
             )
             .unwrap();
         }
+        if devkit::files::SemVer::parse(version).unwrap()
+            >= devkit::files::SemVer::parse("0.5.0").unwrap()
+        {
+            let pin = devkit::runtime::PnpmPin::from_source_pins(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            write_atomic(
+                &rel.join("runtime/pnpm.env"),
+                pin.encode().as_bytes(),
+                0o644,
+            )
+            .unwrap();
+        }
         let env_bytes = format!("env-{version}");
         let env_sri = format!("sha512-{}", STANDARD.encode(Sha512::digest(&env_bytes)));
         let archive = format!("npm/env-{version}.tgz");

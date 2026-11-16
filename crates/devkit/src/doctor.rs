@@ -754,6 +754,36 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
         }
     }
 
+    if let Ok(cache_root) = crate::cache::cache_root(None) {
+        let cache_probe = nearest_existing_dir(&cache_root);
+        let target_probe = nearest_existing_dir(&resolved_target);
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(&cache_probe)
+            .ok()
+            .zip(fs::metadata(&target_probe).ok())
+            .is_some_and(|(a, b)| a.dev() != b.dev())
+        {
+            let result = ensure_disk_space(&cache_root);
+            checks.push(DoctorCheck {
+                id: "cache_disk_space",
+                status: if result.is_ok() { "ok" } else { "fail" },
+                summary: match &result {
+                    Ok(stats) => format!(
+                        "{} GiB free at shared cache {}",
+                        stats.available_bytes / GIB,
+                        stats.path.display()
+                    ),
+                    Err(error) => format!("Shared cache capacity: {error:#}"),
+                },
+                details: match result {
+                    Ok(stats) => serde_json::to_value(stats)?,
+                    Err(_) => json!({"target":cache_root}),
+                },
+                remediation: None,
+            });
+        }
+    }
+
     // 5. DinD network MTU & storage driver
     let docker0_mtu = read_net_mtu("docker0");
     let uplink = detect_uplink_mtu();
@@ -893,6 +923,9 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
             pins.version == s.version,
             "Manifest version differs from accepted toolchains.env"
         );
+        if SemVer::parse(&s.version)? >= SemVer::parse("0.5.0")? {
+            crate::runtime::PnpmPin::from_checkout(&root)?;
+        }
         let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
         let receipts = local_receipts(&root, &full.state, Some(&full.native.node_inputs.digest))?;
         Ok((full.state, pins.version, receipts))

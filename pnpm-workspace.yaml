@@ -1,0 +1,5 @@
+packages:
+  - packages/*
+nodeLinker: isolated
+packageImportMethod: hardlink
+verifyDepsBeforeRun: false

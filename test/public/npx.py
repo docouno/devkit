@@ -166,7 +166,7 @@ def main():
             blockers = native / "no-host-sdks"
             blockers.mkdir()
             forbidden = native / "host-sdk-attempts"
-            for name in ("node", "npm", "npx", "cargo", "rustc", "rustup", "tsc", "eslint"):
+            for name in ("node", "npm", "npx", "pnpm", "pnpx", "corepack", "cargo", "rustc", "rustup", "tsc", "eslint"):
                 path = blockers / name
                 path.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$DEVKIT_FORBIDDEN_HOST_SDK_LOG"\nexit 97\n')
                 path.chmod(0o755)

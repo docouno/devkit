@@ -5,6 +5,19 @@ use devkit::{
 };
 use serde_json::json;
 use std::path::Path;
+
+fn modernize_node_fixture(root: &Path, state: &ProjectState) {
+    if !root.join("package-lock.json").is_file() {
+        return;
+    }
+    let packages = devkit::native::package_lock(root).unwrap();
+    devkit::project::sync_node_workspace(root, state, None).unwrap();
+    devkit::pnpm::import_legacy_npm_lock_seed(root, &packages)
+        .unwrap()
+        .write(root)
+        .unwrap();
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+}
 #[test]
 fn compose_requires_fixed_stable_env_resolution_and_accepts_desktop_packaging() {
     for version in [
@@ -89,6 +102,12 @@ fn tool_pin_parser_never_evaluates_shell_and_requires_pinned_engine_and_images()
     );
     let parsed = ToolPins::parse(source.as_bytes()).unwrap();
     assert_eq!(parsed.engine.version, "0.5.0");
+    assert!(ToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\n").as_bytes()).is_ok());
+    assert!(ToolPins::parse(format!("{source}UNTRUSTED_PIN=1\n").as_bytes()).is_err());
+    assert!(
+        ToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\nDEVKIT_FUTURE_PIN=2\n").as_bytes())
+            .is_err()
+    );
     let without_engine = source
         .lines()
         .filter(|line| !line.starts_with("DEVKIT_ENGINE_"))
@@ -187,6 +206,7 @@ fn node_snapshot_is_projected_before_cargo_but_full_recheck_retains_namespace_ba
         std::fs::write(root.join("apps/api").join(name), contents).unwrap();
     }
     write_json(&root.join(".devkit/tooling-profiles.json"),&json!({"schemaVersion":1,"version":"0.5.0","packageMode":"registry","profiles":{"web":{},"electron":{},"rust":{}}})).unwrap();
+    modernize_node_fixture(root, &state);
     let first = admit_native_components(root, &state).unwrap();
     std::fs::write(
         root.join("apps/api/rustfmt.toml"),
@@ -243,6 +263,18 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         0o644,
     )
     .unwrap();
+    let pnpm_pin = devkit::runtime::PnpmPin {
+        package: "@pnpm/exe.linux-x64-musl".into(),
+        version: "12.21.0".into(),
+        tarball_sha256: "a".repeat(64),
+        binary_sha256: engine_sha.clone(),
+    };
+    write_atomic(
+        &root.join(".devkit/runtime/pnpm.env"),
+        pnpm_pin.encode().as_bytes(),
+        0o644,
+    )
+    .unwrap();
     for stub in [
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
@@ -270,6 +302,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/toolchains.env",
+        ".devkit/runtime/pnpm.env",
     ] {
         managed.insert(
             path.to_string(),
@@ -362,6 +395,7 @@ exit 90
             "true",
         ])
         .env("PATH", path_env)
+        .env("DEVKIT_PNPM_BIN_OVERRIDE", exe)
         .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
         .output()
         .unwrap();
@@ -435,6 +469,18 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         0o644,
     )
     .unwrap();
+    let pnpm_pin = devkit::runtime::PnpmPin {
+        package: "@pnpm/exe.linux-x64-musl".into(),
+        version: "12.21.0".into(),
+        tarball_sha256: "a".repeat(64),
+        binary_sha256: engine_sha.clone(),
+    };
+    write_atomic(
+        &root.join(".devkit/runtime/pnpm.env"),
+        pnpm_pin.encode().as_bytes(),
+        0o644,
+    )
+    .unwrap();
     for stub in [
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
@@ -490,6 +536,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         }
     }))
     .unwrap();
+    modernize_node_fixture(&root, &seed_state);
     let native = admit_native_components(&root, &seed_state).unwrap();
     write_atomic(
         &root.join(".devkit/project.mk"),
@@ -519,6 +566,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/toolchains.env",
+        ".devkit/runtime/pnpm.env",
     ] {
         managed.insert(
             path.to_string(),
@@ -624,6 +672,7 @@ exit 90
             "apps/web",
         ])
         .env("PATH", path_env)
+        .env("DEVKIT_PNPM_BIN_OVERRIDE", exe)
         .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
         .output()
         .unwrap();
@@ -776,6 +825,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         }
     }))
     .unwrap();
+    modernize_node_fixture(&root, &seed_state);
     let native = admit_native_components(&root, &seed_state).unwrap();
     write_atomic(
         &root.join(".devkit/project.mk"),

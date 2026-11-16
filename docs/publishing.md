@@ -48,7 +48,7 @@ Devkit enforces the following rules when `"private": false` is set on a library 
 - `files` must be a non-empty array containing `"dist"` (and must not include source/test paths such as `src`, `test`, or `tests`).
 - `exports` must define `"."` with `"types"` listed **before** `"import"` or `"default"` (TypeScript and `publint` require `"types"` first in conditional export maps), and every target must point inside `./dist/` (except `"./package.json": "./package.json"`).
 - Unscoped package names cannot set `publishConfig.access` to `"restricted"`. When publishing a scoped `@scope/pkg` publicly to `https://registry.npmjs.org/`, set `"publishConfig": { "access": "public" }` (or pass `--access public` to `npm publish`).
-- Runtime dependency fields (`dependencies`, `peerDependencies`, `optionalDependencies`) cannot use `file:` links or reference any `"private": true` workspace package. If one publishable workspace library depends on another `"private": false` workspace library, declare a standard SemVer range in `dependencies` or `peerDependencies`.
+- Runtime dependency fields (`dependencies`, `peerDependencies`, `optionalDependencies`) cannot use `file:` links or reference any `"private": true` workspace package. Use `workspace:^` for a local runtime dependency between explicitly public workspace libraries; `pnpm pack` rewrites it to a registry SemVer range. Keep a normal SemVer range in `peerDependencies` and add a `workspace:*` development dependency when the peer should resolve to local source. A normal SemVer runtime dependency intentionally selects the published registry artifact.
 
 After editing `packages/<slug>/package.json`, synchronize the workspace lockfile and projections:
 
@@ -59,11 +59,12 @@ make setup
 
 ## 2. Bump Package Versions
 
-Always bump versions inside the pinned Node container so both `packages/<slug>/package.json` and root `package-lock.json` stay consistent:
+Always bump versions inside the pinned Node container then refresh root `pnpm-lock.yaml` with `make sync` before setup:
 
 ```sh
 npx @docouno/devkit@0.5.0 exec --component packages/ui --write -- \
-  npm version 0.2.0 --no-git-tag-version
+  pnpm version 0.2.0 --no-git-tag-version
+make sync
 make setup
 ```
 
@@ -80,8 +81,8 @@ make package package=ui
 `make package` runs `build/packages/ui` (`tsdown`) and then executes `devkit-pack` inside an isolated `--network none` container (`dist/` mounted read-only, `release/` writable):
 
 1. Verifies `private === false` and all `exports` targets exist inside the packed archive without leaking `src/`, tests, configs, or test ambient types.
-2. Runs `npm pack --ignore-scripts` into a temporary staging directory.
-3. Validates package structure and export conditions with `publint` (`strict: true`).
+2. Runs `pnpm pack --config.ignore-scripts=true` into a temporary staging directory.
+3. Rejects source `file:` runtime dependencies and requires every `workspace:` target to be a registered library with explicit `"private": false`, then validates package structure and export conditions with `publint` (`strict: true`).
 4. Validates TypeScript declaration resolution (`node16-esm` and `bundler`) with `@arethetypeswrong/core`.
 5. Publishes two deterministic outputs in `packages/<slug>/release/`:
    - `<safe-name>-<version>.tgz` (for example `acme-ui-0.2.0.tgz`)
@@ -132,7 +133,7 @@ jobs:
    //gitlab.example.com/api/v4/projects/42/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}
    //gitlab.example.com/api/v4/projects/42/packages/npm/:always-auth=true
    ```
-3. Run `make sync` (or `npx @docouno/devkit@0.5.0 sync .`) and commit `package.json`, `.npmrc`, and `package-lock.json`.
+3. Run `make sync` (or `npx @docouno/devkit@0.5.0 sync .`) and commit `package.json`, `.npmrc`, and `pnpm-lock.yaml`.
 4. In GitLab CI, map `CI_JOB_TOKEN` (or a Deploy Token) to `GITLAB_NPM_TOKEN`, pass `DEVKIT_CA_CERT` if your GitLab instance uses a private enterprise CA, build with `make package`, and publish the verified tarball through the pinned Node container (no host Node.js required):
    ```sh
    export GITLAB_NPM_TOKEN="${CI_JOB_TOKEN}"

@@ -14,11 +14,19 @@ export function npmEnvironment(directory, registry = publicRegistry, inherited =
   writeFileSync(userconfig, '', { mode: 0o600 });
   writeFileSync(globalconfig, '', { mode: 0o600 });
   const clean = Object.fromEntries(
-    Object.entries(inherited).filter(([key]) => !/^(?:npm_|node_)/i.test(key)),
+    Object.entries(inherited).filter(([key]) => !/^(?:pnpm_|npm_|node_)/i.test(key)),
   );
   return {
     ...clean,
     HOME: directory,
+    CI: 'true',
+    XDG_CACHE_HOME: join(directory, 'pnpm-cache'),
+    PNPM_CONFIG_REGISTRY: registry,
+    PNPM_CONFIG_NPMRC_AUTH_FILE: userconfig,
+    PNPM_CONFIG_IGNORE_PNPMFILE: 'true',
+    PNPM_CONFIG_PM_ON_FAIL: 'ignore',
+    PNPM_CONFIG_RUNTIME: 'false',
+    PNPM_CONFIG_RUNTIME_ON_FAIL: 'ignore',
     npm_config_userconfig: userconfig,
     npm_config_globalconfig: globalconfig,
     npm_config_cache: join(directory, 'cache'),
@@ -36,9 +44,17 @@ export function npmEnvironment(directory, registry = publicRegistry, inherited =
 
 /** Author-only native npm subprocess; bounded output/time and no shell. */
 export async function runNpm(args, { cwd, env, signal, timeout = 180_000 }) {
+  return runPackageManager('npm', args, { cwd, env, signal, timeout });
+}
+
+export async function runPnpm(args, { cwd, env, signal, timeout = 180_000 }) {
+  return runPackageManager('pnpm', args, { cwd, env, signal, timeout });
+}
+
+async function runPackageManager(binary, args, { cwd, env, signal, timeout }) {
   signal?.throwIfAborted();
   return await new Promise((resolve, reject) => {
-    const child = spawn('npm', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(binary, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '',
       stderr = '',
       failure;
@@ -78,7 +94,11 @@ export async function runNpm(args, { cwd, env, signal, timeout = 180_000 }) {
       if (failure) {
         reject(failure);
       } else if (code !== 0 || terminated !== null) {
-        reject(new Error(`npm ${args[0]} failed (${terminated ?? code}): ${stderr.trim()}`));
+        reject(
+          new Error(
+            `${binary} ${args[0]} failed (${terminated ?? code}): ${stdout.trim()}\n${stderr.trim()}`,
+          ),
+        );
       } else {
         resolve({ stdout, stderr });
       }

@@ -1,4 +1,15 @@
 {
   "schemaVersion": 1,
-  "migrations": []
+  "migrations": [
+    {
+      "id": "pnpm-workspaces",
+      "version": "0.5.0",
+      "severity": "recommended",
+      "title": "Migrate Node workspaces to pnpm",
+      "summary": "Review product scripts and CI caches after the automatic pnpm workspace migration.",
+      "profiles": ["node", "web", "electron", "react-library", "ts-library", "react-ui"],
+      "docPath": "docs/migrations/0.5.0.md",
+      "anchor": "migrate-node-workspaces-to-pnpm"
+    }
+  ]
 }

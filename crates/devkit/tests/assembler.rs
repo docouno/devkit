@@ -4,7 +4,7 @@ use devkit::{
         AssemblyOptions, assemble, verify_migration_index, verify_npm_inputs, verify_npm_pack,
         verify_runtime_notices, verify_rust_template, verify_source_checkout,
     },
-    files::{digest, file_map, write_atomic, write_json},
+    files::{digest, file_map, read_json, write_atomic, write_json},
     processes::ProcessRunner,
 };
 use serde_json::{Value, json};
@@ -47,7 +47,7 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
         0o644,
     )
     .unwrap();
-    let external = json!({"version":"1.2.3","resolved":"https://registry.npmjs.org/external/-/external-1.2.3.tgz","integrity":sri(b"selected external artifact"),"dev":true});
+    let external = json!({"resolution":{"integrity":sri(b"selected external artifact")}});
     let mut templates = BTreeMap::new();
     for name in [
         "node-api",
@@ -58,16 +58,27 @@ fn prepared_fixture(base: &Path) -> (PathBuf, PathBuf) {
         "react-ui",
     ] {
         let manifest = json!({"name":format!("fixture-{name}"),"version":"1.0.0","devDependencies":{"@docouno/env":"0.4.1","external":"1.2.3"}});
-        let lock = json!({"lockfileVersion":3,"packages":{"":manifest,"node_modules/@docouno/env":{"version":"0.4.1","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.4.1.tgz","integrity":sri(b"old environment")},"node_modules/external":external}});
+        let lock = json!({"lockfileVersion":"9.0","importers":{".":{"devDependencies":{"@docouno/env":{"specifier":"0.4.1","version":"0.4.1"},"external":{"specifier":"1.2.3","version":"1.2.3"}}}},"packages":{"@docouno/env@0.4.1":{"resolution":{"integrity":sri(b"old environment")}},"external@1.2.3":external},"snapshots":{"@docouno/env@0.4.1":{},"external@1.2.3":{}}});
         let manifest_name = format!("templates/{name}/package.json");
-        let lock_name = format!("templates/{name}/package-lock.json");
+        let lock_name = format!("templates/{name}/pnpm-lock.yaml");
         write_json(&root.join(&manifest_name), &manifest).unwrap();
         write_json(&root.join(&lock_name), &lock).unwrap();
         let mut new_manifest = manifest;
         new_manifest["devDependencies"]["@docouno/env"] = json!("0.5.0");
         let mut new_lock = lock;
-        new_lock["packages"][""] = new_manifest.clone();
-        new_lock["packages"]["node_modules/@docouno/env"] = json!({"version":"0.5.0","resolved":"https://registry.npmjs.org/@docouno/env/-/env-0.5.0.tgz","integrity":env_integrity});
+        new_lock["importers"]["."]["devDependencies"]["@docouno/env"] =
+            json!({"specifier":"0.5.0","version":"0.5.0"});
+        new_lock["packages"]
+            .as_object_mut()
+            .unwrap()
+            .remove("@docouno/env@0.4.1");
+        new_lock["packages"]["@docouno/env@0.5.0"] =
+            json!({"resolution":{"integrity":env_integrity}});
+        new_lock["snapshots"]
+            .as_object_mut()
+            .unwrap()
+            .remove("@docouno/env@0.4.1");
+        new_lock["snapshots"]["@docouno/env@0.5.0"] = json!({});
         write_json(&prepared.join(&manifest_name), &new_manifest).unwrap();
         write_json(&prepared.join(&lock_name), &new_lock).unwrap();
         templates.insert(name, json!({"manifest":manifest_name,"lock":lock_name}));
@@ -111,11 +122,14 @@ fn npm_preparation_is_bound_to_the_complete_actual_source_and_output_file_sets()
 fn a_self_consistent_receipt_cannot_reselect_external_template_artifacts() {
     let temp = TempDir::new().unwrap();
     let (root, prepared) = prepared_fixture(temp.path());
-    let name = "templates/node-api/package-lock.json";
+    let name = "templates/node-api/pnpm-lock.yaml";
     let mut lock: Value = serde_json::from_slice(&fs::read(prepared.join(name)).unwrap()).unwrap();
-    lock["packages"]["node_modules/external"]["version"] = json!("1.2.4");
-    lock["packages"]["node_modules/external"]["resolved"] =
-        json!("https://registry.npmjs.org/external/-/external-1.2.4.tgz");
+    let external = lock["packages"]
+        .as_object_mut()
+        .unwrap()
+        .remove("external@1.2.3")
+        .unwrap();
+    lock["packages"]["external@1.2.4"] = external;
     write_json(&prepared.join(name), &lock).unwrap();
     let mut receipt: Value =
         serde_json::from_slice(&fs::read(prepared.join("inputs.json")).unwrap()).unwrap();
@@ -124,8 +138,77 @@ fn a_self_consistent_receipt_cannot_reselect_external_template_artifacts() {
         verify_npm_inputs(&root, &prepared)
             .unwrap_err()
             .to_string()
-            .contains("Selected external template identity changed")
+            .contains("Selected external template identities changed")
     );
+}
+
+#[test]
+fn a_self_consistent_receipt_cannot_reselect_edges_or_peer_contexts() {
+    for corruption in [
+        "edge",
+        "context",
+        "optional-field",
+        "optional-flag",
+        "package-metadata",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let (root, prepared) = prepared_fixture(temp.path());
+        let name = "templates/node-api/pnpm-lock.yaml";
+        for directory in [&root, &prepared] {
+            let mut lock: Value = read_json(&directory.join(name)).unwrap();
+            for version in ["1.0.0", "2.0.0"] {
+                let key = format!("leaf@{version}");
+                lock["packages"][&key] =
+                    json!({"resolution":{"integrity":sri(version.as_bytes())}});
+                lock["snapshots"][&key] = json!({});
+                lock["snapshots"][format!("external@1.2.3(leaf@{version})")] =
+                    json!({"dependencies":{"leaf":version}});
+            }
+            lock["snapshots"]
+                .as_object_mut()
+                .unwrap()
+                .remove("external@1.2.3");
+            lock["importers"]["."]["devDependencies"]["external"]["version"] =
+                json!("1.2.3(leaf@1.0.0)");
+            write_json(&directory.join(name), &lock).unwrap();
+        }
+        let mut receipt: Value = read_json(&prepared.join("inputs.json")).unwrap();
+        receipt["sources"] = json!(file_map(&root).unwrap());
+        refresh_file(&mut receipt, &prepared, name);
+        verify_npm_inputs(&root, &prepared).unwrap();
+        let mut changed: Value = read_json(&prepared.join(name)).unwrap();
+        let first = "external@1.2.3(leaf@1.0.0)";
+        match corruption {
+            "edge" => changed["snapshots"][first]["dependencies"]["leaf"] = json!("2.0.0"),
+            "context" => {
+                changed["importers"]["."]["devDependencies"]["external"]["version"] =
+                    json!("1.2.3(leaf@2.0.0)")
+            }
+            "optional-field" => {
+                changed["snapshots"][first]["optionalDependencies"] =
+                    changed["snapshots"][first]["dependencies"].clone();
+                changed["snapshots"][first]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependencies");
+            }
+            "package-metadata" => changed["packages"]["leaf@1.0.0"]["os"] = json!(["darwin"]),
+            _ => changed["snapshots"][first]["optional"] = json!(true),
+        }
+        write_json(&prepared.join(name), &changed).unwrap();
+        refresh_file(&mut receipt, &prepared, name);
+        assert!(
+            verify_npm_inputs(&root, &prepared)
+                .unwrap_err()
+                .to_string()
+                .contains(if corruption == "package-metadata" {
+                    "Selected template package metadata changed"
+                } else {
+                    "Selected template graph changed"
+                }),
+            "{corruption}"
+        );
+    }
 }
 
 #[test]
@@ -133,21 +216,21 @@ fn missing_sri_or_root_and_fixture_urls_are_rejected_without_panicking() {
     for corruption in ["integrity", "root", "fixture-url"] {
         let temp = TempDir::new().unwrap();
         let (root, prepared) = prepared_fixture(temp.path());
-        let name = "templates/react-web/package-lock.json";
+        let name = "templates/react-web/pnpm-lock.yaml";
         let mut lock: Value =
             serde_json::from_slice(&fs::read(prepared.join(name)).unwrap()).unwrap();
         match corruption {
             "integrity" => {
-                lock["packages"]["node_modules/external"]
+                lock["packages"]["external@1.2.3"]["resolution"]
                     .as_object_mut()
                     .unwrap()
                     .remove("integrity");
             }
             "root" => {
-                lock["packages"].as_object_mut().unwrap().remove("");
+                lock["importers"].as_object_mut().unwrap().remove(".");
             }
             _ => {
-                lock["packages"]["node_modules/external"]["resolved"] =
+                lock["packages"]["external@1.2.3"]["resolution"]["tarball"] =
                     json!("http://127.0.0.1:1234/external.tgz");
             }
         }
@@ -509,7 +592,11 @@ fn assembler_requires_the_external_notice_digest_before_downstream_inputs_or_sta
         )
         .unwrap();
     }
-    fs::write(root.join("toolchains.env"), format!("DEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\n", "a".repeat(64))).unwrap();
+    fs::write(
+        root.join("toolchains.env"),
+        include_str!("../../../toolchains.env"),
+    )
+    .unwrap();
     let notices = temp.path().join("notices");
     fs::create_dir(&notices).unwrap();
     let receipt_path = notices.join("notice-set.json");

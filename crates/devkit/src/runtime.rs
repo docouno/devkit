@@ -3,6 +3,7 @@ use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
 use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,6 +47,7 @@ pub struct RuntimeRequest {
     pub package_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
+    pub cache_dir: Option<PathBuf>,
 }
 impl RuntimeRequest {
     pub fn new(root: PathBuf, command: String) -> Self {
@@ -60,6 +62,7 @@ impl RuntimeRequest {
             package_aggregate: false,
             follow: false,
             tail: 100,
+            cache_dir: None,
         }
     }
 }
@@ -92,17 +95,9 @@ impl ToolPins {
                 .split_once('=')
                 .context("Invalid toolchains.env record")?;
             ensure!(
-                [
-                    "DEVKIT_VERSION",
-                    "DEVKIT_NODE_IMAGE",
-                    "DEVKIT_NODE_VERSION",
-                    "DEVKIT_RUST_VERSION",
-                    "DEVKIT_RUST_RECIPE_HASH",
-                    "DEVKIT_DESKTOP_RECIPE_HASH",
-                    "DEVKIT_ENGINE_SHA256",
-                    "DEVKIT_ENGINE_TARGET"
-                ]
-                .contains(&k)
+                k.starts_with("DEVKIT_")
+                    && k.bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
                     && !v.is_empty()
                     && !v
                         .chars()
@@ -148,6 +143,101 @@ impl ToolPins {
             "Invalid immutable tool pins"
         );
         Ok(s)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PnpmPin {
+    pub package: String,
+    pub version: String,
+    pub tarball_sha256: String,
+    pub binary_sha256: String,
+}
+impl PnpmPin {
+    fn parse_pins(bytes: &[u8], source: bool) -> Result<Self> {
+        ensure!(
+            bytes.len() <= 64 * 1024,
+            "pnpm pin file exceeds byte budget"
+        );
+        let mut values = BTreeMap::new();
+        for line in std::str::from_utf8(bytes)?.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, value) = line.split_once('=').context("Invalid pnpm pin record")?;
+            ensure!(
+                key.starts_with(if source { "DEVKIT_" } else { "DEVKIT_PNPM_" })
+                    && key
+                        .bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+                    && !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|c| c.is_whitespace() || ['\'', '"', '\0'].contains(&c))
+                    && values.insert(key, value).is_none(),
+                "Invalid/duplicate pnpm pin: {key}"
+            );
+        }
+        let get = |key| -> Result<String> {
+            Ok(values.get(key).context("Missing pnpm pin")?.to_string())
+        };
+        let pin = Self {
+            package: if source {
+                "@pnpm/exe.linux-x64-musl".into()
+            } else {
+                get("DEVKIT_PNPM_PACKAGE")?
+            },
+            version: get("DEVKIT_PNPM_VERSION")?,
+            tarball_sha256: get("DEVKIT_PNPM_TARBALL_SHA256")?,
+            binary_sha256: get("DEVKIT_PNPM_SHA256")?,
+        };
+        version(&pin.version)?;
+        ensure!(
+            pin.package == "@pnpm/exe.linux-x64-musl"
+                && SHA256_RE.is_match(&pin.tarball_sha256)
+                && SHA256_RE.is_match(&pin.binary_sha256),
+            "Invalid immutable pnpm pins"
+        );
+        Ok(pin)
+    }
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_pins(bytes, false)
+    }
+    pub fn from_source_pins(root: &Path) -> Result<Self> {
+        Self::parse_pins(
+            &Self::read_pin_file(&input_path(root, "toolchains.env")?)?,
+            true,
+        )
+    }
+    pub fn from_release(release: &crate::release::AdmittedRelease) -> Result<Self> {
+        Self::parse(&release.bytes("runtime/pnpm.env")?)
+    }
+    pub fn from_checkout(root: &Path) -> Result<Self> {
+        Self::parse(&Self::read_pin_file(&input_path(
+            root,
+            ".devkit/runtime/pnpm.env",
+        )?)?)
+    }
+    pub fn from_pin_file(path: &Path) -> Result<Self> {
+        let bytes = Self::read_pin_file(path)?;
+        let source = !std::str::from_utf8(&bytes)?
+            .lines()
+            .any(|l| l.starts_with("DEVKIT_PNPM_PACKAGE="));
+        Self::parse_pins(&bytes, source)
+    }
+    fn read_pin_file(path: &Path) -> Result<Vec<u8>> {
+        let path = project_root(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= 64 * 1024,
+            "Invalid or oversized pnpm pin file"
+        );
+        Ok(fs::read(path)?)
+    }
+    pub fn encode(&self) -> String {
+        format!(
+            "DEVKIT_PNPM_PACKAGE={}\nDEVKIT_PNPM_SHA256={}\nDEVKIT_PNPM_TARBALL_SHA256={}\nDEVKIT_PNPM_VERSION={}\n",
+            self.package, self.binary_sha256, self.tarball_sha256, self.version
+        )
     }
 }
 /// This admission deliberately does not read native dependency graphs/locks.
@@ -303,6 +393,7 @@ impl ToolAdmission {
 }
 #[derive(Clone, Copy)]
 enum TaskAccess {
+    SetupNode,
     Finite,
     PackageLibrary,
     Fix,
@@ -329,18 +420,26 @@ struct PreparedContext<'a> {
     node_image_verified: std::cell::Cell<bool>,
     node_ready_verified: std::cell::Cell<bool>,
     budget: std::cell::RefCell<Option<crate::resources::HostResourceBudget>>,
+    cache_dir: Option<PathBuf>,
+    pnpm_path: std::cell::RefCell<Option<PathBuf>>,
+    cargo_cache: std::cell::RefCell<Option<PathBuf>>,
 }
 impl<'a> PreparedContext<'a> {
-    fn new(admission: ToolAdmission, runner: &'a ProcessRunner) -> Result<Self> {
-        Self::new_inner(admission, runner, true)
+    fn new(
+        admission: ToolAdmission,
+        runner: &'a ProcessRunner,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self> {
+        Self::new_inner(admission, runner, true, cache_dir)
     }
     fn new_for_status(admission: ToolAdmission, runner: &'a ProcessRunner) -> Result<Self> {
-        Self::new_inner(admission, runner, false)
+        Self::new_inner(admission, runner, false, None)
     }
     fn new_inner(
         admission: ToolAdmission,
         runner: &'a ProcessRunner,
         verify_pin: bool,
+        cache_dir: Option<&Path>,
     ) -> Result<Self> {
         let engine = fs::canonicalize(std::env::current_exe()?)?;
         ensure!(
@@ -361,7 +460,180 @@ impl<'a> PreparedContext<'a> {
             node_image_verified: std::cell::Cell::new(false),
             node_ready_verified: std::cell::Cell::new(false),
             budget: std::cell::RefCell::new(None),
+            cache_dir: cache_dir.map(Path::to_owned),
+            pnpm_path: std::cell::RefCell::new(None),
+            cargo_cache: std::cell::RefCell::new(None),
         })
+    }
+    fn cache_root(&self) -> Result<PathBuf> {
+        crate::cache::cache_root(self.cache_dir.as_deref())
+    }
+    fn cache_directory(&self, name: &str) -> Result<PathBuf> {
+        let root = self.cache_root()?;
+        for entry in [
+            "pnpm-store",
+            "pnpm-cache",
+            "cargo",
+            "electron",
+            "tools",
+            "empty-mask",
+        ] {
+            ensure_directory(&safe_path(&root, entry)?)?;
+        }
+        crate::shared_cache::directory(&root)?;
+        let path = safe_path(&root, name)?;
+        crate::shared_cache::directory(&path)?;
+        if name == "cargo" {
+            *self.cargo_cache.borrow_mut() = Some(path.clone());
+        }
+        Ok(path)
+    }
+    fn pnpm(&self, allow_network: bool) -> Result<PathBuf> {
+        if let Some(path) = self.pnpm_path.borrow().as_ref() {
+            return Ok(path.clone());
+        }
+        let pin = PnpmPin::from_checkout(&self.admission.root)?;
+        let policy = crate::native::parse_manifest_npmrc_policy(
+            &self.admission.root,
+            crate::native::NodeLockKind::for_state(&self.admission.state)?,
+        )?;
+        let cache = crate::cache::ReleaseCache::new(self.cache_dir.as_deref(), self.runner)?;
+        let path = cache.ensure_pnpm(&pin, Some(&policy), allow_network)?;
+        *self.pnpm_path.borrow_mut() = Some(path.clone());
+        Ok(path)
+    }
+    fn setup_electron(&self, path: &str, inputs: &InputIdentitySet) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let root = &self.admission.root;
+        let package = fs::canonicalize(root.join(path).join("node_modules/electron"))?;
+        ensure!(
+            package.starts_with(root.join("node_modules/.pnpm")),
+            "Electron package resolves outside the isolated workspace store"
+        );
+        let manifest: Value = serde_json::from_slice(
+            &read_electron_metadata(&package.join("package.json"), 1024 * 1024)?
+                .context("Electron package manifest is missing")?,
+        )?;
+        let version = text(&manifest["version"], "Electron version")?;
+        crate::files::version(version)?;
+        let plan = crate::shared_cache::UnifiedStorePlan::resolve(root, &self.cache_root()?)?;
+        let locks = plan.store.join(".locks");
+        crate::shared_cache::directory(&locks)?;
+        let _lock = crate::cache::lock_file(
+            &locks.join(format!("electron-dist-{version}-linux-x64.lock")),
+            self.runner,
+        )?;
+        let distributions = plan.store.join("electron-dist");
+        crate::shared_cache::directory(&distributions)?;
+        let cached = safe_path(&distributions, &format!("{version}-linux-x64"))?;
+        ensure_directory(&cached)?;
+        let marker = safe_path(&cached, ".complete")?;
+        if !exists(&marker)? {
+            ensure!(
+                !exists(&cached)? || fs::read_dir(&cached)?.next().is_none(),
+                "Incomplete Electron cache: {}; remove it and rerun make setup",
+                cached.display()
+            );
+            // A previous local install may be partial even when its executable
+            // exists. Force a complete verified extraction before first publish.
+            let dist = safe_path(&package, "dist")?;
+            if exists(&dist)? {
+                ensure_directory(&dist)?;
+                fs::remove_dir_all(&dist)?;
+            }
+            let installed = safe_path(&package, "path.txt")?;
+            if exists(&installed)? {
+                ensure!(
+                    fs::symlink_metadata(&installed)?.is_file(),
+                    "Electron metadata must be a regular file: {}",
+                    installed.display()
+                );
+            }
+            remove_file(&installed)?;
+            self.task(ContainerTask {
+                component: Some(path),
+                profile: ToolingProfile::Node,
+                image: &self.admission.pins.node_image,
+                argv: &node_argv(
+                    self,
+                    vec!["pnpm".into(), "exec".into(), "install-electron".into()],
+                ),
+                network: "bridge",
+                forward_npm_secrets: true,
+                access: TaskAccess::ExecWrite,
+                inputs: Some(inputs),
+            })?;
+            ensure!(
+                package.join("dist/electron").is_file(),
+                "Electron installation omitted its executable"
+            );
+            let stage = tempfile::Builder::new()
+                .prefix(".stage-")
+                .tempdir_in(&distributions)?;
+            let inventory = distribution_inventory(&package.join("dist"), self.runner)?;
+            ensure_electron_executable(&inventory)?;
+            hardlink_distribution(
+                &package.join("dist"),
+                &stage.path().join("dist"),
+                self.runner,
+            )?;
+            ensure!(
+                distribution_inventory(&stage.path().join("dist"), self.runner)? == inventory,
+                "Electron distribution changed while linking"
+            );
+            write_json(
+                &stage.path().join(".complete"),
+                &ElectronDistributionReceipt {
+                    schema_version: 1,
+                    version: version.into(),
+                    entries: inventory,
+                },
+            )?;
+            crate::archive::publish_new_directory(stage.path(), &cached)?;
+        }
+        let receipt = read_distribution_receipt(&marker)?;
+        ensure!(
+            receipt.schema_version == 1 && receipt.version == version,
+            "Invalid cached Electron distribution marker"
+        );
+        ensure_electron_executable(&receipt.entries)?;
+        ensure!(
+            distribution_inventory(&safe_path(&cached, "dist")?, self.runner)? == receipt.entries,
+            "Cached Electron distribution is incomplete or corrupt: {}; remove it and rerun make setup",
+            cached.display()
+        );
+        let source = safe_path(&cached, "dist/electron")?;
+        let cached_metadata = fs::metadata(&source)?;
+        let local = package.join("dist/electron");
+        let linked = fs::metadata(&local)
+            .is_ok_and(|m| m.dev() == cached_metadata.dev() && m.ino() == cached_metadata.ino());
+        let copied_across_mounts = local.is_file()
+            && crate::shared_cache::mount_identity(&local)?
+                != crate::shared_cache::mount_identity(&source)?;
+        let installed = read_electron_metadata(&package.join("path.txt"), 256)?;
+        let ready = (linked || copied_across_mounts)
+            && installed.as_deref().is_some_and(|bytes| {
+                std::str::from_utf8(bytes).is_ok_and(|p| p.trim() == "electron")
+            })
+            && distribution_inventory(&package.join("dist"), self.runner)
+                .is_ok_and(|inventory| inventory == receipt.entries);
+        if ready {
+            return Ok(());
+        }
+        let dist = package.join("dist");
+        if let Ok(metadata) = fs::symlink_metadata(&dist) {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "Invalid Electron dist directory"
+            );
+            fs::remove_dir_all(&dist)?;
+        }
+        hardlink_distribution(&cached.join("dist"), &dist, self.runner)?;
+        ensure!(
+            distribution_inventory(&dist, self.runner)? == receipt.entries,
+            "Electron distribution changed while linking"
+        );
+        write_atomic(&package.join("path.txt"), b"electron", 0o644)
     }
     fn docker(&self) -> Command {
         let mut c = Command::new("docker");
@@ -397,6 +669,26 @@ impl<'a> PreparedContext<'a> {
                     .into(),
             ),
             ("DEVKIT_ENGINE_PATH", self.engine.as_os_str().to_owned()),
+            (
+                "DEVKIT_PNPM_PATH",
+                self.pnpm_path
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.as_os_str().to_owned())
+                    .unwrap_or_else(|| "/devkit/unused-pnpm".into()),
+            ),
+            (
+                "DEVKIT_CARGO_CACHE_DIR",
+                self.cargo_cache
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.as_os_str().to_owned())
+                    .unwrap_or_else(|| "/devkit/unused-cargo".into()),
+            ),
+            (
+                "DEVKIT_ELECTRON_CACHE_DIR",
+                "/devkit/unused-electron".into(),
+            ),
         ] {
             c.env(k, v);
         }
@@ -641,6 +933,8 @@ impl<'a> PreparedContext<'a> {
             inputs,
         } = task;
         let write_root = matches!(access, TaskAccess::ExecWrite);
+        let setup = matches!(access, TaskAccess::SetupNode);
+        let node = profile != ToolingProfile::Rust;
         let fix = matches!(access, TaskAccess::Fix);
         let package_release_dir = if matches!(access, TaskAccess::PackageLibrary) {
             Some(format!(
@@ -675,11 +969,83 @@ impl<'a> PreparedContext<'a> {
             writes.insert("node_modules".into());
         }
         self.dirs(writes.iter().cloned())?;
-        self.dirs([
-            ".devkit/cache/npm".into(),
-            ".devkit/cache/cargo".into(),
-            ".devkit/cache/electron".into(),
-        ])?;
+        let pnpm = if node { Some(self.pnpm(setup)?) } else { None };
+        let cargo_cache = if node {
+            None
+        } else {
+            Some(self.cache_directory("cargo")?)
+        };
+        let pnpm_cache = if node {
+            Some(self.cache_directory("pnpm-cache")?)
+        } else {
+            None
+        };
+        let electron_cache = if node {
+            Some(self.cache_directory("electron")?)
+        } else {
+            None
+        };
+        let unified = if node && (setup || write_root) {
+            let root_cache = self.cache_root()?;
+            let store = safe_path(&root_cache, "pnpm-store")?;
+            ensure_directory(&store)?;
+            Some(crate::shared_cache::UnifiedStorePlan::resolve(
+                root,
+                &root_cache,
+            )?)
+        } else {
+            None
+        };
+        let empty_mask = if unified.is_some() {
+            let empty = self.cache_directory("empty-mask")?;
+            ensure!(
+                fs::read_dir(&empty)?.next().is_none(),
+                "Shared empty-mask directory must be empty"
+            );
+            Some(empty)
+        } else {
+            None
+        };
+        let policy = if node {
+            let directories = self
+                .admission
+                .state
+                .components
+                .iter()
+                .filter(|(_, c)| c.toolchain == Toolchain::Node)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            Some(crate::native::parse_and_admit_npmrc(
+                root,
+                &directories,
+                crate::native::NodeLockKind::for_state(&self.admission.state)?,
+            )?)
+        } else {
+            None
+        };
+        let userconfig = if let Some(policy) = &policy {
+            let online = network != "none" && forward_npm_secrets;
+            let mut file = tempfile::Builder::new()
+                .prefix("devkit-npmrc-")
+                .tempfile()?;
+            use std::io::Write;
+            for line in &policy.sanitized_lines {
+                if online || !line.contains("${") {
+                    writeln!(file, "{line}")?;
+                }
+            }
+            file.flush()?;
+            Some(file)
+        } else {
+            None
+        };
+        let ca_cert = if node && network != "none" && forward_npm_secrets {
+            crate::native::resolve_ca_cert_path()?
+                .map(|p| crate::download::additional_ca_file(&p))
+                .transpose()?
+        } else {
+            None
+        };
         let mut budget = self
             .budget
             .borrow()
@@ -718,10 +1084,30 @@ impl<'a> PreparedContext<'a> {
                 "no-new-privileges:true",
             ]);
             spec.write_docker_args(&mut c);
-            c.args([
-                "--mount",
-                &bind_mount(root, Path::new("/workspace"), !write_root)?,
-            ]);
+            if !setup {
+                crate::shared_cache::mount(&mut c, root, Path::new("/workspace"), !write_root)?;
+            }
+            if let Some(plan) = &unified {
+                let mut writable = Vec::new();
+                for path in &writes {
+                    if path.ends_with("node_modules") {
+                        writable.push(input_path(root, path)?);
+                    }
+                }
+                plan.mount(
+                    &mut c,
+                    empty_mask.as_deref().context("Missing empty mask")?,
+                    setup,
+                    &writable,
+                )?;
+                if write_root {
+                    plan.mask_checkout_files(&mut c, Path::new("/workspace"))?;
+                }
+                c.args([
+                    "--env",
+                    &format!("PNPM_CONFIG_STORE_DIR={}", plan.store_container.display()),
+                ]);
+            }
             if fix {
                 let target = component.context("Fix requires a component")?;
                 c.args([
@@ -733,7 +1119,7 @@ impl<'a> PreparedContext<'a> {
                     )?,
                 ]);
             }
-            for path in &writes {
+            for path in writes.iter().filter(|_| !setup && !write_root) {
                 let readonly = match access {
                     TaskAccess::PackageLibrary => {
                         package_release_dir.as_deref() != Some(path.as_str())
@@ -750,33 +1136,74 @@ impl<'a> PreparedContext<'a> {
                     )?,
                 ]);
             }
-            for (source, target) in [
-                ("npm", "/cache/npm"),
-                ("cargo", "/cache/cargo"),
-                ("electron", "/cache/electron"),
-            ] {
-                c.args([
-                    "--mount",
-                    &bind_mount(
-                        &safe_path(root, &format!(".devkit/cache/{source}"))?,
-                        Path::new(target),
-                        false,
-                    )?,
-                ]);
+            if node && matches!(access, TaskAccess::Finite | TaskAccess::Fix) {
+                let virtual_store = input_path(root, "node_modules/.pnpm")?;
+                if virtual_store.is_dir() {
+                    crate::shared_cache::mount(
+                        &mut c,
+                        &virtual_store,
+                        Path::new("/workspace/node_modules/.pnpm"),
+                        true,
+                    )?;
+                }
             }
+            for (source, target) in [
+                (cargo_cache.as_deref(), "/cache/cargo"),
+                (pnpm_cache.as_deref(), "/cache/pnpm"),
+                (electron_cache.as_deref(), "/cache/electron"),
+            ] {
+                if let Some(source) = source {
+                    crate::shared_cache::mount(&mut c, source, Path::new(target), false)?;
+                }
+            }
+            if let Some(pnpm) = &pnpm {
+                crate::shared_cache::mount(&mut c, pnpm, Path::new("/devkit/bin/pnpm"), true)?;
+            }
+            if let Some(file) = &userconfig {
+                crate::shared_cache::mount(
+                    &mut c,
+                    file.path(),
+                    Path::new("/devkit/user.npmrc"),
+                    true,
+                )?;
+            }
+            if node
+                && !setup
+                && !write_root
+                && fs::symlink_metadata(root.join(".npmrc")).is_ok_and(|m| m.is_file())
+            {
+                crate::shared_cache::mount(
+                    &mut c,
+                    Path::new("/dev/null"),
+                    Path::new("/workspace/.npmrc"),
+                    true,
+                )?;
+            }
+            let work_root = unified
+                .as_ref()
+                .map(|p| p.checkout_container.clone())
+                .unwrap_or_else(|| PathBuf::from("/workspace"));
             c.args([
                 "--mount",
                 &bind_mount(&self.engine, Path::new("/devkit/devkit"), true)?,
                 "--workdir",
-                &component
-                    .map(|p| format!("/workspace/{p}"))
-                    .unwrap_or_else(|| "/workspace".into()),
+                work_root
+                    .join(component.unwrap_or(""))
+                    .to_str()
+                    .context("Non-UTF8 container workdir")?,
             ]);
             for value in [
                 "HOME=/tmp/devkit-home",
                 "CI=true",
-                "NPM_CONFIG_CACHE=/cache/npm",
-                "NPM_CONFIG_USERCONFIG=/tmp/devkit-user.npmrc",
+                "PATH=/devkit/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
+                "PNPM_CONFIG_IGNORE_PNPMFILE=true",
+                "PNPM_CONFIG_PM_ON_FAIL=ignore",
+                "PNPM_CONFIG_RUNTIME=false",
+                "PNPM_CONFIG_RUNTIME_ON_FAIL=ignore",
+                "XDG_CACHE_HOME=/cache/pnpm",
+                "NPM_CONFIG_CACHE=/tmp/devkit-npm-cache",
+                "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
                 "NPM_CONFIG_GLOBALCONFIG=/tmp/devkit-global.npmrc",
                 "NPM_CONFIG_UPDATE_NOTIFIER=false",
                 "NPM_CONFIG_FUND=false",
@@ -798,26 +1225,20 @@ impl<'a> PreparedContext<'a> {
                 ),
             ]);
             if profile != ToolingProfile::Rust {
-                let node_dirs: Vec<String> = self
-                    .admission
-                    .state
-                    .components
-                    .iter()
-                    .filter(|(_, c)| c.toolchain == Toolchain::Node)
-                    .map(|(p, _)| p.clone())
-                    .collect();
-                let npmrc_policy = crate::native::parse_and_admit_npmrc(root, &node_dirs)?;
+                let npmrc_policy = policy.as_ref().context("Missing Node npmrc policy")?;
                 if network != "none" && forward_npm_secrets {
-                    crate::native::verify_required_npm_env_vars(&npmrc_policy)?;
+                    crate::native::verify_required_npm_env_vars(npmrc_policy)?;
                     for var in &npmrc_policy.required_env_vars {
                         c.args(["--env", var]);
                     }
-                    if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
+                    if let Some(ca_cert) = &ca_cert {
                         c.args([
                             "--mount",
-                            &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
+                            &bind_mount(ca_cert.path(), Path::new("/devkit/ca.pem"), true)?,
                             "--env",
                             "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
+                            "--env",
+                            "SSL_CERT_FILE=/devkit/ca.pem",
                         ]);
                     }
                 } else {
@@ -845,6 +1266,13 @@ impl<'a> PreparedContext<'a> {
                 ]);
             }
             c.arg(image).args(argv);
+            if setup {
+                let plan = unified.as_ref().context("Missing unified setup store")?;
+                c.arg("--store-dir").arg(&plan.store_container).args([
+                    "--config.package-import-method=hardlink",
+                    "--npmrc-auth-file=/devkit/user.npmrc",
+                ]);
+            }
             Ok(c)
         };
         for attempt in 0..2 {
@@ -877,6 +1305,229 @@ impl<'a> PreparedContext<'a> {
         Ok(())
     }
 }
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum DistributionEntry {
+    Directory {
+        mode: u32,
+    },
+    File {
+        sha256: String,
+        size: u64,
+        mode: u32,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ElectronDistributionReceipt {
+    schema_version: u32,
+    version: String,
+    entries: BTreeMap<String, DistributionEntry>,
+}
+
+fn ensure_electron_executable(entries: &BTreeMap<String, DistributionEntry>) -> Result<()> {
+    ensure!(
+        matches!(entries.get("electron"), Some(DistributionEntry::File {size, mode, ..}) if *size > 0 && mode & 0o111 != 0),
+        "Electron distribution omitted its executable"
+    );
+    Ok(())
+}
+
+fn read_electron_metadata(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>> {
+    Ok(read_regular_file(path, maximum, "Electron metadata")?.map(|(bytes, _)| bytes))
+}
+
+fn read_distribution_receipt(path: &Path) -> Result<ElectronDistributionReceipt> {
+    let bytes = read_electron_metadata(path, 4 * 1024 * 1024)?
+        .context("Electron distribution marker is missing")?;
+    let receipt: ElectronDistributionReceipt = serde_json::from_slice(&bytes)
+        .context("Invalid Electron distribution marker; remove the cache and rerun make setup")?;
+    ensure!(
+        receipt.entries.len() <= 16_384,
+        "Electron distribution exceeds entry budget"
+    );
+    Ok(receipt)
+}
+
+fn distribution_inventory(
+    root: &Path,
+    runner: &ProcessRunner,
+) -> Result<BTreeMap<String, DistributionEntry>> {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let root = project_root(root)?;
+    ensure!(
+        fs::symlink_metadata(&root)?.is_dir(),
+        "Expected Electron distribution directory"
+    );
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![(root.clone(), 0_u32)];
+    let mut total = 0_u64;
+    while let Some((path, depth)) = pending.pop() {
+        runner.check_cancelled()?;
+        ensure!(
+            depth <= 32 && entries.len() < 16_384,
+            "Electron distribution exceeds tree budget"
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        let mode = metadata.permissions().mode() & 0o7777;
+        let entry = if metadata.is_dir() {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                pending.push((child.path(), depth + 1));
+                ensure!(
+                    pending.len() + entries.len() <= 16_384,
+                    "Electron distribution exceeds entry budget"
+                );
+            }
+            DistributionEntry::Directory { mode }
+        } else if metadata.is_file() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)?;
+            let before = file.metadata()?;
+            ensure!(
+                before.is_file()
+                    && before.dev() == metadata.dev()
+                    && before.ino() == metadata.ino(),
+                "Electron distribution changed while reading"
+            );
+            let mut hash = Sha256::new();
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                runner.check_cancelled()?;
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                total = total
+                    .checked_add(count as u64)
+                    .context("Electron distribution size overflow")?;
+                ensure!(
+                    total <= MAX_BYTES,
+                    "Electron distribution exceeds byte budget"
+                );
+                bytes += count as u64;
+                hash.update(&buffer[..count]);
+            }
+            let after = file.metadata()?;
+            let current = fs::symlink_metadata(&path)?;
+            ensure!(
+                before.len() == bytes
+                    && after.len() == bytes
+                    && before.mtime() == after.mtime()
+                    && before.mtime_nsec() == after.mtime_nsec()
+                    && before.permissions().mode() == after.permissions().mode()
+                    && metadata.permissions().mode() == before.permissions().mode()
+                    && current.permissions().mode() == before.permissions().mode()
+                    && current.dev() == before.dev()
+                    && current.ino() == before.ino(),
+                "Electron distribution changed while reading"
+            );
+            DistributionEntry::File {
+                sha256: format!("{:x}", hash.finalize()),
+                size: bytes,
+                mode,
+            }
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)?;
+            ensure!(
+                !target.is_absolute()
+                    && lexical(
+                        &path
+                            .parent()
+                            .context("Electron symlink parent")?
+                            .join(&target)
+                    )?
+                    .starts_with(&root),
+                "Electron distribution symlink escapes its root"
+            );
+            DistributionEntry::Symlink { target }
+        } else {
+            anyhow::bail!("Unsupported Electron distribution entry");
+        };
+        let name = if path == root {
+            ".".into()
+        } else {
+            relative_name(&root, &path)?
+        };
+        entries.insert(name, entry);
+    }
+    Ok(entries)
+}
+
+fn hardlink_distribution(source: &Path, target: &Path, runner: &ProcessRunner) -> Result<()> {
+    let source = project_root(source)?;
+    let target = project_root(target)?;
+    fn copy(
+        root: &Path,
+        source: &Path,
+        target: &Path,
+        runner: &ProcessRunner,
+        depth: u32,
+        count: &mut usize,
+    ) -> Result<()> {
+        runner.check_cancelled()?;
+        *count += 1;
+        ensure!(
+            depth <= 32 && *count <= 16_384,
+            "Electron distribution exceeds tree budget"
+        );
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.is_dir() {
+            fs::create_dir(target)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                copy(
+                    root,
+                    &entry.path(),
+                    &target.join(entry.file_name()),
+                    runner,
+                    depth + 1,
+                    count,
+                )?;
+            }
+            fs::set_permissions(target, metadata.permissions())?;
+        } else if metadata.is_file() {
+            match fs::hard_link(source, target) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                    fs::copy(source, target)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else if metadata.file_type().is_symlink() {
+            let link = fs::read_link(source)?;
+            ensure!(
+                !link.is_absolute()
+                    && lexical(
+                        &source
+                            .parent()
+                            .context("Electron symlink parent")?
+                            .join(&link)
+                    )?
+                    .starts_with(root),
+                "Electron distribution symlink escapes its root"
+            );
+            std::os::unix::fs::symlink(link, target)?;
+        } else {
+            anyhow::bail!("Unsupported Electron distribution entry");
+        }
+        Ok(())
+    }
+    copy(&source, &source, &target, runner, 0, &mut 0)
+}
+
 fn ensure_directory(path: &Path) -> Result<()> {
     if let Ok(m) = fs::symlink_metadata(path) {
         ensure!(
@@ -901,13 +1552,7 @@ pub fn bind_mount(source: &Path, target: &Path, readonly: bool) -> Result<String
     ))
 }
 fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
-    for d in [
-        ".devkit/state",
-        ".devkit/cache",
-        ".devkit/cache/npm",
-        ".devkit/cache/cargo",
-        ".devkit/cache/electron",
-    ] {
+    for d in [".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store"] {
         ensure_directory(&safe_path(&admission.root, d)?)?;
     }
     for p in [
@@ -1064,7 +1709,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         )?)
     };
     let target = tool.target(&request)?;
-    let mut ctx = PreparedContext::new(tool, runner)?;
+    let mut ctx = PreparedContext::new(tool, runner, request.cache_dir.as_deref())?;
     if ["snapshot", "dev-snapshot", "package-snapshot"].contains(&request.command.as_str()) {
         if request.command == "dev-snapshot" {
             ensure!(
@@ -1173,16 +1818,19 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             argv: &node_argv(
                 &ctx,
                 vec![
-                    "npm".into(),
-                    "ci".into(),
+                    "pnpm".into(),
+                    "install".into(),
+                    "--frozen-lockfile".into(),
+                    "--prefer-offline".into(),
+                    "--trust-lockfile".into(),
                     "--ignore-scripts".into(),
-                    "--include=dev".into(),
-                    "--strict-peer-deps".into(),
+                    "--ignore-pnpmfile".into(),
+                    "--config.strict-peer-dependencies=true".into(),
                 ],
             ),
             network: "bridge",
             forward_npm_secrets: true,
-            access: TaskAccess::Finite,
+            access: TaskAccess::SetupNode,
             inputs: Some(&full.native.inputs),
         })?;
         if !npmrc_ignores_scripts(&ctx.admission.root)? {
@@ -1197,7 +1845,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                         component: Some(path),
                         profile: c.tooling_profile,
                         image: &ctx.admission.pins.node_image,
-                        argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                        argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                         network: "none",
                         forward_npm_secrets: false,
                         access: TaskAccess::Finite,
@@ -1210,7 +1858,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                     component: None,
                     profile: ToolingProfile::Node,
                     image: &ctx.admission.pins.node_image,
-                    argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), hook.into()]),
+                    argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                     network: "none",
                     forward_npm_secrets: false,
                     access: TaskAccess::Finite,
@@ -1220,26 +1868,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         }
         for (path, c) in &full.state.components {
             if c.tooling_profile == ToolingProfile::Electron {
-                ctx.task(ContainerTask {
-                    component: None,
-                    profile: ToolingProfile::Node,
-                    image: &ctx.admission.pins.node_image,
-                    argv: &node_argv(
-                        &ctx,
-                        vec![
-                            "npm".into(),
-                            "exec".into(),
-                            "--offline".into(),
-                            format!("--workspace={path}").into(),
-                            "--".into(),
-                            "install-electron".into(),
-                        ],
-                    ),
-                    network: "bridge",
-                    forward_npm_secrets: false,
-                    access: TaskAccess::Finite,
-                    inputs: Some(&full.native.inputs),
-                })?;
+                ctx.setup_electron(path, &full.native.inputs)?;
             }
         }
         full.recheck()?;
@@ -1351,7 +1980,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 component: Some(&target),
                 profile: component.tooling_profile,
                 image: &image,
-                argv: &node_argv(&ctx, vec!["npm".into(), "run".into(), command.into()]),
+                argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), command.into()]),
                 network: "none",
                 forward_npm_secrets: false,
                 access,
@@ -1416,7 +2045,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         identity(&input_path(&tool.root, format!("{target}/{competing}"))?)?.is_none(),
         "Ambiguous native component: {target}"
     );
-    let mut ctx = PreparedContext::new(tool, runner)?;
+    let mut ctx = PreparedContext::new(tool, runner, request.runtime.cache_dir.as_deref())?;
     ctx.prerequisite()?;
     if request.write && component.toolchain == Toolchain::Node {
         let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
@@ -1431,6 +2060,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.derived_image("rust", request.prepare)?
     } else {
         ctx.node_image(request.prepare)?;
+        ctx.pnpm(request.prepare)?;
         ctx.admission.pins.node_image.clone()
     };
     let task_result = ctx.task(ContainerTask {
@@ -1659,8 +2289,10 @@ fn run_development(
         let c = &full.state.components[&path];
         if c.toolchain == Toolchain::Rust {
             ctx.derived_image("rust", false)?;
+            ctx.cache_directory("cargo")?;
         } else {
             ctx.node_image(false)?;
+            ctx.pnpm(false)?;
             node_ready(ctx, fingerprint)?;
         }
         if c.tooling_profile == ToolingProfile::Electron {
@@ -1679,12 +2311,46 @@ fn run_development(
             .iter()
             .map(move |o| format!("{p}/{o}"))
     }))?;
-    ctx.dirs([".devkit/cache/cargo".into()])?;
+    let mut protected_services = serde_json::Map::new();
+    let virtual_store = input_path(&ctx.admission.root, "node_modules/.pnpm")?;
+    for (path, component) in &full.state.components {
+        let Some(development) = &component.development else {
+            continue;
+        };
+        let name = service_name(path, component);
+        if component.toolchain != Toolchain::Node
+            || development.owner != DevelopmentOwner::Managed
+            || !active_services.contains(name)
+        {
+            continue;
+        }
+        let mut volumes = Vec::new();
+        if virtual_store.is_dir() {
+            volumes.push(json!({"type":"bind","source":virtual_store,"target":"/workspace/node_modules/.pnpm","read_only":true,"bind":{"create_host_path":false,"selinux":"z"}}));
+        }
+        if fs::symlink_metadata(ctx.admission.root.join(".npmrc")).is_ok_and(|m| m.is_file()) {
+            volumes.push(json!({"type":"bind","source":"/dev/null","target":"/workspace/.npmrc","read_only":true,"bind":{"create_host_path":false,"selinux":"z"}}));
+        }
+        if !volumes.is_empty() {
+            protected_services.insert(name.to_owned(), json!({"volumes":volumes}));
+        }
+    }
+    if !protected_services.is_empty() {
+        let mut file = tempfile::Builder::new()
+            .prefix("node-store-")
+            .suffix(".json")
+            .tempfile_in(&state_dir)?;
+        file.write_all(&json_bytes(&json!({"services":protected_services}))?)?;
+        overlays.push(file);
+    }
     let legacy_npm_overlay = safe_path(&ctx.admission.root, ".devkit/state/compose.npm-env.json")?;
     if identity(&legacy_npm_overlay)?.is_some() {
         let _ = remove_file(&legacy_npm_overlay);
     }
-    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(&ctx.admission.root)?;
+    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(
+        &ctx.admission.root,
+        crate::native::NodeLockKind::for_state(&ctx.admission.state)?,
+    )?;
     if !npmrc_policy.required_env_vars.is_empty() {
         let mut services_map = serde_json::Map::new();
         for (path, c) in &full.state.components {
@@ -1945,6 +2611,10 @@ impl ComposeNormalizer for DockerComposeNormalizer {
         require_compose(&self.runner, &mut Command::new("docker"))?;
         let mut command = Command::new("docker");
         command
+            .env("DEVKIT_PNPM_PATH", "/devkit/unused-pnpm")
+            .env("DEVKIT_CARGO_CACHE_DIR", "/devkit/unused-cargo")
+            .env("DEVKIT_ELECTRON_CACHE_DIR", "/devkit/unused-electron");
+        command
             .args(["compose", "--project-directory"])
             .arg(snapshot)
             .args([
@@ -2080,5 +2750,118 @@ mod tests {
                 resolve_cargo_build_jobs_from(None, Some(OsStr::new(bad)), None, Some(4)).is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod electron_cache_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn generated_metadata_refuses_fifos_symlinks_and_oversized_files_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let path = temporary.path().join("path.txt");
+        assert!(read_electron_metadata(&path, 256).unwrap().is_none());
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a live, NUL-terminated temporary checkout path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::remove_file(&path).unwrap();
+        let target = temporary.path().join("target");
+        fs::write(&target, b"electron").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, vec![b'x'; 257]).unwrap();
+        assert!(read_electron_metadata(&path, 256).is_err());
+        fs::write(&path, b"electron").unwrap();
+        assert_eq!(
+            read_electron_metadata(&path, 256).unwrap().unwrap(),
+            b"electron"
+        );
+    }
+
+    #[test]
+    fn inventory_detects_missing_changed_and_unexpected_distribution_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("locales")).unwrap();
+        fs::write(source.join("electron"), b"executable").unwrap();
+        fs::set_permissions(source.join("electron"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(source.join("icudtl.dat"), b"trusted data").unwrap();
+        fs::write(source.join("locales/en.pak"), b"locale").unwrap();
+        let runner = ProcessRunner::new().unwrap();
+        let expected = distribution_inventory(&source, &runner).unwrap();
+        ensure_electron_executable(&expected).unwrap();
+        let marker = temporary.path().join(".complete");
+        write_json(
+            &marker,
+            &ElectronDistributionReceipt {
+                schema_version: 1,
+                version: "1.0.0".into(),
+                entries: expected,
+            },
+        )
+        .unwrap();
+        let receipt = read_distribution_receipt(&marker).unwrap();
+        let target = temporary.path().join("target");
+        hardlink_distribution(&source, &target, &runner).unwrap();
+        assert_eq!(
+            distribution_inventory(&target, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::remove_file(target.join("icudtl.dat")).unwrap();
+        assert_ne!(
+            distribution_inventory(&target, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("icudtl.dat"), b"changed data").unwrap();
+        assert_ne!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("icudtl.dat"), b"trusted data").unwrap();
+        assert_eq!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("unexpected"), b"extra").unwrap();
+        assert_ne!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::remove_file(source.join("unexpected")).unwrap();
+        symlink("../outside", source.join("redirected")).unwrap();
+        assert!(distribution_inventory(&source, &runner).is_err());
+    }
+
+    #[test]
+    fn distribution_links_share_inodes_and_refuse_redirected_cache_ancestors() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("electron"), b"distribution").unwrap();
+        symlink("electron", source.join("relative-link")).unwrap();
+        let runner = ProcessRunner::new().unwrap();
+        let target = temporary.path().join("target");
+        hardlink_distribution(&source, &target, &runner).unwrap();
+        assert_eq!(
+            fs::metadata(source.join("electron")).unwrap().ino(),
+            fs::metadata(target.join("electron")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::read_link(target.join("relative-link")).unwrap(),
+            Path::new("electron")
+        );
+        symlink(&source, temporary.path().join("redirected")).unwrap();
+        let refused = temporary.path().join("refused");
+        assert!(
+            hardlink_distribution(&temporary.path().join("redirected"), &refused, &runner).is_err()
+        );
+        assert!(!refused.exists());
+        assert_eq!(fs::read(source.join("electron")).unwrap(), b"distribution");
     }
 }

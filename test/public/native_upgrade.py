@@ -75,9 +75,9 @@ def verify(helper, module, index, from_version, environment, products):
     root = products / "native-upgrade"
     transport_blockers = helper.scratch / "native-transport-blockers"
     transport_blockers.mkdir()
-    for name in ("cargo", "rustc", "rustup", "tsc", "eslint"):
+    for name in ("pnpm", "pnpx", "corepack", "cargo", "rustc", "rustup", "tsc", "eslint"):
         shutil.copy2(helper.scratch / "without-host-sdks" / name, transport_blockers / name)
-    transport_environment = dict(environment)
+    transport_environment = {k:v for k,v in environment.items() if not k.lower().startswith(('pnpm_','npm_'))}
     transport_environment["PATH"] = str(transport_blockers) + ":" + environment["PATH"]
     transport_environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(helper.forbidden_log)
     old_cli = ["npx", "--yes", "@docouno/devkit@" + from_version, "--non-interactive"]
@@ -150,6 +150,8 @@ def verify(helper, module, index, from_version, environment, products):
     require(module.source_snapshot(root) == before, "Native upgrade preview changed project inputs")
     cli("native-upgrade-apply", "update", ".", "--to", to_version)
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
+    if stable_version(from_version) < (0,5,0) <= stable_version(to_version):
+        module.assert_node_workspace(root,[path for path,c in after['components'].items() if c['toolchain']=='node'])
     require(new_pins["DEVKIT_ENGINE_SHA256"] == index["files"][index["engine"]]["sha256"],
             "Updated project accepted another target engine")
     require(after["nativeUpgradeOwner"] == state["nativeUpgradeOwner"], "Native upgrade lost top-level owner metadata")

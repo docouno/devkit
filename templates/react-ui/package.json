@@ -26,12 +26,12 @@
     "react-dom": "^19.0.0"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
-    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
-    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "check": "devkit-verify && pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "format": "prettier --write . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
-    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "fix": "pnpm run format && eslint --max-warnings 0 --fix . && pnpm run format",
     "test": "vitest run --config vitest.config.mjs",
     "build": "tsdown && devkit-verify --pack",
     "package": "devkit-pack"

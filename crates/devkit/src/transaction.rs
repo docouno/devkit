@@ -13,12 +13,19 @@ pub trait MutationHooks {
 pub fn transaction_path<'a>(name: &'a str, created: &[String]) -> Result<&'a str> {
     relative_path(name)?;
     if name == MANIFEST_PATH
-        || ["package.json", "package-lock.json"].contains(&name)
+        || [
+            "package.json",
+            "package-lock.json",
+            "pnpm-workspace.yaml",
+            "pnpm-lock.yaml",
+            ".npmrc",
+        ]
+        .contains(&name)
         || {
             let parts = name.split('/').collect::<Vec<_>>();
             parts.len() == 3
                 && valid_component_path(&format!("{}/{}", parts[0], parts[1])).is_ok()
-                && ["package.json", "package-lock.json"].contains(&parts[2])
+                && ["package.json", "package-lock.json", "pnpm-lock.yaml"].contains(&parts[2])
         }
         || created.iter().any(|d| name.starts_with(&format!("{d}/")))
     {
@@ -104,14 +111,14 @@ pub fn read_journal(root: &Path) -> Result<UpdateJournal> {
 fn verify_saved(root: &Path, file: &PlannedFile) -> Result<()> {
     if let Some(p) = &file.backup {
         ensure!(
-            identity(&safe_path(root, p)?)? == file.before,
+            identity_for(&safe_path(root, p)?, Path::new(&file.path))? == file.before,
             "Update backup integrity mismatch: {}",
             file.path
         );
     }
     if let Some(p) = &file.staged {
         ensure!(
-            identity(&safe_path(root, p)?)? == file.after,
+            identity_for(&safe_path(root, p)?, Path::new(&file.path))? == file.after,
             "Update staged integrity mismatch: {}",
             file.path
         );
@@ -223,7 +230,7 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
         if let Some(backup) = &file.backup {
             write_atomic(
                 &p,
-                &fs::read(safe_path(root, backup)?)?,
+                &read_input_bytes_for(&safe_path(root, backup)?, Path::new(&file.path))?,
                 file.before.as_ref().unwrap().mode,
             )?;
         } else {
@@ -310,14 +317,14 @@ impl PreparedTransaction {
             if let Some(p) = &backup {
                 write_atomic(
                     &safe_path(root, p)?,
-                    &fs::read(safe_path(root, &name)?)?,
+                    &read_input_bytes(&safe_path(root, &name)?)?,
                     before.as_ref().unwrap().mode,
                 )?;
             }
             if let Some(p) = &staged {
                 write_atomic(
                     &safe_path(root, p)?,
-                    &fs::read(safe_path(staged_root, &name)?)?,
+                    &read_input_bytes(&safe_path(staged_root, &name)?)?,
                     after.as_ref().unwrap().mode,
                 )?;
                 let mut parent = Path::new(&name).parent();
@@ -394,7 +401,7 @@ impl PreparedTransaction {
                 if let Some(staged) = &file.staged {
                     write_atomic(
                         &p,
-                        &fs::read(safe_path(root, staged)?)?,
+                        &read_input_bytes_for(&safe_path(root, staged)?, Path::new(&file.path))?,
                         file.after.as_ref().unwrap().mode,
                     )?;
                 } else {

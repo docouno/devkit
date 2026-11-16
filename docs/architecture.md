@@ -27,10 +27,15 @@ A Devkit repository contains at least one registered component across two direct
 
 Devkit deliberately avoids duplicating native package metadata in `.devkit/manifest.json`:
 
-- **npm components** share a single root npm workspace (`package.json` + `package-lock.json`). Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
+- **Node components** share one root pnpm workspace (`pnpm-workspace.yaml` + `pnpm-lock.yaml`) with `nodeLinker: isolated` and `packageImportMethod: hardlink`. Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
+  Devkit commands use the release's verified pnpm executable and container Node runtime with automatic manager and SDK installation disabled; user-owned `packageManager` and `devEngines` metadata is preserved.
 - **Rust components** own `{component}/Cargo.toml` and `{component}/Cargo.lock`. A single registered Rust component (for example `apps/api`) can organize multiple internal crates using a native Cargo `[workspace]` inside `apps/api/Cargo.toml` (`members = [".", "crates/*"]`) while preserving a single `{component}/rust-toolchain.toml` and `{component}/Cargo.lock`.
 
-When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `package-lock.json` transactionally without changing the accepted Devkit release.
+When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `pnpm-lock.yaml` transactionally without changing the accepted Devkit release.
+
+Local directory snapshots retain their exact artifact and peer-context identities in the lock graph. Component dependency checks use their physical directories, so application dependencies, library build ordering, and cycle detection apply equally to directory snapshots and workspace links.
+
+pnpm YAML acquisition is limited to 32 MiB before allocation throughout admission, source snapshots, staging, and transaction recovery. Saved transaction files retain the policy of their original target path. Git worktree pointers used to select a shared store are regular files limited to 16 KiB before reading or hashing.
 
 ## Container Isolation and Security Model
 
@@ -42,7 +47,7 @@ Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, 
    - Network access is disabled (`--network none`).
 2. **Isolated library packaging (`package` for `ts-library` and `react-ui`)**:
    - Runs under `--network none` with `/workspace`, `node_modules`, and `{component}/dist` mounted read-only.
-   - Only `{component}/release` (and `/tmp`) is writable, ensuring `npm pack`, `publint`, and `@arethetypeswrong/core` validate the exact `dist/` produced by `build` without mutating build outputs or workspace state.
+   - Only `{component}/release` (and `/tmp`) is writable, ensuring `pnpm pack`, `publint`, and `@arethetypeswrong/core` validate the exact `dist/` produced by `build` without mutating build outputs or workspace state.
 3. **Explicit write sessions (`make fix`, `devkit exec --write`)**:
    - Formatting (`make fix`) mounts source writable under `--network none`.
    - Dependency mutations (`devkit exec --component ... --write --network bridge`) allow explicit registry access and invalidate `.devkit/state/node-workspace.lock` so the next `make setup` verifies the updated lockfile cleanly.
@@ -50,6 +55,8 @@ Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, 
    - Root `.npmrc` permits only HTTPS registries (`http://` is permitted solely on loopback `127.0.0.1` / `localhost` for local testing) and `${ENV_VAR}` placeholders — literal `_authToken`, `_auth`, `_password`, `token`, `certfile`, `keyfile`, and `strict-ssl=false` are rejected before container startup.
    - Referenced `${ENV_VAR}` tokens and `DEVKIT_CA_CERT` (`NODE_EXTRA_CA_CERTS=/devkit/ca.pem`) are injected **only** into networked Node containers (`make setup`, `devkit sync`, `devkit update`, and `devkit exec --network bridge`).
    - Offline Node containers receive dummy placeholder values (`devkit-offline-unused`) and no CA mount; Rust containers never receive npm registry tokens or `NODE_EXTRA_CA_CERTS`.
+   - `DEVKIT_CA_CERT` extends the pinned Mozilla roots for native HTTPS and standalone pnpm. The native downloader preserves the replacement semantics of an explicit `SSL_CERT_FILE`.
+   - Implicit `.pnpmfile.cjs`, `.pnpmfile.mjs`, and `.pnpmfile.js` hooks are unsupported and rejected before container startup. Automatic pnpm operations also disable these hooks; project installation scripts run in the separate offline phase.
 
 ## Adaptive Resource Budgeting and Concurrency
 

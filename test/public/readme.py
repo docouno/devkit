@@ -77,7 +77,7 @@ def main():
     readme = (REPO / "README.md").read_text()
     package = "@docouno/devkit@" + index["version"]
     for example in (f"npx {package} init my-product --app web=react-web",
-                    f"npx {package} exec --component apps/web --write --network bridge -- npm install zod"):
+                    f"npx {package} exec --component apps/web --write --network bridge -- pnpm add zod"):
         require(example in readme, "Principal README commands differ; update the named executable examples")
     spec = importlib.util.spec_from_file_location("readme_packaged_helper", REPO / "test/packaged/verify.py")
     module = importlib.util.module_from_spec(spec)
@@ -129,7 +129,7 @@ def main():
         cli("readme-add-desktop", "add-app", ".", "--name", "desktop", "--template", "electron-react", "--use", "client")
         helper.make(root, "setup", label="readme-added-components-setup")
         cli("readme-register-help", "register", "--help")
-        cli("readme-native-dependency-edit", "exec", "--component", "apps/web", "--write", "--network", "bridge", "--", "npm", "install", "zod")
+        cli("readme-native-dependency-edit", "exec", "--component", "apps/web", "--write", "--network", "bridge", "--", "pnpm", "add", "zod")
         web_package = json.loads((root / "apps/web/package.json").read_text())
         require("zod" in web_package["dependencies"], "README native dependency edit did not update the web package")
         before = module.source_snapshot(root)

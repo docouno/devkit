@@ -34,6 +34,93 @@ fn minimal_static_elf() -> Vec<u8> {
     elf
 }
 
+#[test]
+fn pnpm_cache_is_verified_and_offline_misses_never_acquire() {
+    let temporary = TempDir::new().unwrap();
+    let runner = ProcessRunner::new().unwrap();
+    let cache = ReleaseCache::new(Some(temporary.path()), &runner).unwrap();
+    let elf = minimal_static_elf();
+    let pin = devkit::runtime::PnpmPin {
+        package: "@pnpm/exe.linux-x64-musl".into(),
+        version: "12.21.0".into(),
+        tarball_sha256: "a".repeat(64),
+        binary_sha256: digest(&elf),
+    };
+    let error = cache
+        .ensure_pnpm(&pin, None, false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("absent from local cache"), "{error}");
+    let target = temporary.path().join(format!(
+        "tools/pnpm-{}-x86_64-unknown-linux-musl-{}/pnpm",
+        pin.version, pin.binary_sha256
+    ));
+    write_atomic(&target, &elf, 0o755).unwrap();
+    assert_eq!(cache.ensure_pnpm(&pin, None, false).unwrap(), target);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(cache.ensure_pnpm(&pin, None, false).is_err());
+    write_atomic(&target, b"tampered", 0o755).unwrap();
+    assert!(cache.ensure_pnpm(&pin, None, false).is_err());
+}
+
+#[test]
+fn static_elf_verifier_rejects_interpreters_needed_libraries_and_truncation() {
+    let temporary = TempDir::new().unwrap();
+    let target = temporary.path().join("pnpm");
+    let elf = minimal_static_elf();
+    for case in [
+        "valid",
+        "interpreter",
+        "needed",
+        "truncated",
+        "architecture",
+    ] {
+        let mut bytes = elf.clone();
+        match case {
+            "interpreter" => bytes[64..68].copy_from_slice(&3u32.to_le_bytes()),
+            "needed" => {
+                bytes[64..68].copy_from_slice(&2u32.to_le_bytes());
+                bytes[72..80].copy_from_slice(&120u64.to_le_bytes());
+                bytes[96..104].copy_from_slice(&16u64.to_le_bytes());
+                bytes.extend_from_slice(&1u64.to_le_bytes());
+                bytes.extend_from_slice(&0u64.to_le_bytes());
+            }
+            "truncated" => bytes.truncate(70),
+            "architecture" => bytes[18..20].copy_from_slice(&183u16.to_le_bytes()),
+            _ => {}
+        }
+        write_atomic(&target, &bytes, 0o755).unwrap();
+        assert_eq!(
+            devkit::delivery::verify_static_elf_file(&target, &digest(&bytes), true).is_ok(),
+            case == "valid",
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn pnpm_pins_validate_source_release_and_future_extensions() {
+    use devkit::runtime::PnpmPin;
+    let pin = PnpmPin::from_source_pins(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(PnpmPin::parse(pin.encode().as_bytes()).unwrap(), pin);
+    assert!(PnpmPin::parse(format!("{}DEVKIT_PNPM_FUTURE=1\n", pin.encode()).as_bytes()).is_ok());
+    for source in [
+        pin.encode().replace("12.21.0", "latest"),
+        pin.encode().replace("linux-x64-musl", "linux-arm64"),
+        format!("{}DEVKIT_PNPM_VERSION=1.0.0\n", pin.encode()),
+        pin.encode().replace(&pin.binary_sha256, "bad"),
+    ] {
+        assert!(PnpmPin::parse(source.as_bytes()).is_err());
+    }
+}
+
 fn fixture(root: &Path, marker: &[u8]) -> String {
     fs::create_dir_all(root).unwrap();
     let archive = b"opaque known environment archive";

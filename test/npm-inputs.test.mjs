@@ -18,6 +18,10 @@ import { gunzipSync } from 'node:zlib';
 import { prepareNpmInputs, validatePack, verifyNpmInputs } from '../tooling/prepare-npm-inputs.mjs';
 import {
   assertCanonicalLock,
+  assertEnvironmentSelections,
+  assertManifestImporter,
+  encodeLock,
+  parseLock,
   assertSelectedIdentities,
   canonicalizeLock,
   exactVersion,
@@ -25,16 +29,21 @@ import {
   prepareTemplate,
   registryUrl,
 } from '../tooling/npm-inputs/locks.mjs';
-import { npmEnvironment, runNpm, withEnvRegistry } from '../tooling/npm-inputs/npm.mjs';
+import { npmEnvironment, runPnpm, withEnvRegistry } from '../tooling/npm-inputs/npm.mjs';
 
 const names = ['node-api', 'react-web', 'electron-react', 'react-client', 'ts-library', 'react-ui'];
 const integrity = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
 const identity = (name, version = '1.2.3') => ({
-  version,
-  resolved: registryUrl(name, version),
-  integrity,
+  resolution: { tarball: registryUrl(name, version), integrity },
 });
-const lock = (packages = {}) => ({ lockfileVersion: 3, packages: { '': {}, ...packages } });
+const lock = (packages = {}, importer = {}) => ({
+  lockfileVersion: '9.0',
+  settings: { autoInstallPeers: true, excludeLinksFromLockfile: false },
+  importers: { '.': importer },
+  packages,
+  snapshots: Object.fromEntries(Object.keys(packages).map((key) => [key, {}])),
+});
+const dep = (specifier, version = specifier) => ({ specifier, version });
 
 function temporary(t) {
   const root = mkdtempSync(join(tmpdir(), 'devkit-npm-inputs-'));
@@ -71,15 +80,15 @@ function fixture(t) {
       devDependencies: { '@docouno/env': '0.4.1' },
     };
     put(join(root, `templates/${name}/package.json`), manifest);
-    put(join(root, `templates/${name}/package-lock.json`), {
-      name: manifest.name,
-      version: manifest.version,
-      lockfileVersion: 3,
-      packages: {
-        '': { ...manifest },
-        'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
-      },
-    });
+    put(
+      join(root, `templates/${name}/pnpm-lock.yaml`),
+      encodeLock(
+        lock(
+          { '@docouno/env@0.4.1': identity('@docouno/env', '0.4.1') },
+          { devDependencies: { '@docouno/env': dep('0.4.1') } },
+        ),
+      ),
+    );
   }
   return { root, parent, output: join(parent, 'prepared with spaces') };
 }
@@ -162,7 +171,6 @@ test('pack result is checked against actual bytes, filename, package/version, si
     { filename: 'env.tgz' },
     { integrity },
     { size: 0 },
-    { shasum: '0'.repeat(40) },
   ]) {
     assert.throws(
       () => validatePack([{ ...record, ...replacement }], root, version),
@@ -177,241 +185,266 @@ test('pack result is checked against actual bytes, filename, package/version, si
   assert.throws(() => validatePack([record], root, version), /regular input file/);
 });
 
-test('hydration only asks for missing identities at exact selected versions and deduplicates', async () => {
-  const complete = identity('stable', '7.8.9');
-  const input = lock({
-    'node_modules/stable': complete,
-    'node_modules/zod': { version: '1.2.3' },
-    'node_modules/other': identity('other'),
-    'node_modules/other/node_modules/zod': { version: '1.2.3', integrity },
-  });
+test('hydration fills only missing SRI at already selected versions', async () => {
+  const stable = identity('stable', '7.8.9');
+  const input = lock({ 'stable@7.8.9': stable, 'zod@1.2.3': { resolution: {} } });
   const calls = [];
   const hydrated = await hydrateLockIdentities(input, async (name, version) => {
     calls.push(`${name}@${version}`);
     return { tarball: registryUrl(name, version), integrity };
   });
   assert.deepEqual(calls, ['zod@1.2.3']);
-  assert.deepEqual(hydrated.packages['node_modules/stable'], complete);
-  assert.deepEqual(input.packages['node_modules/zod'], { version: '1.2.3' });
+  assert.deepEqual(hydrated.packages['stable@7.8.9'], stable);
+  assert.deepEqual(input.packages['zod@1.2.3'], { resolution: {} });
   assertCanonicalLock(hydrated);
 });
 
-test('nonexact, local, mismatched and malformed identities are refused rather than repaired', async () => {
-  const invalid = [
-    { version: '^1.2.3' },
-    { version: '1.2.3', resolved: 'file:source.tgz' },
-    { version: '1.2.3', resolved: registryUrl('zod', '1.2.4') },
-    { version: '1.2.3', integrity: 'sha512-broken' },
-    { version: '1.2.3', link: true },
-    { version: '1.2.3', inBundle: true },
-    { version: '1.2.3', name: 'other' },
-  ];
-  for (const entry of invalid) {
+test('nonexact, local, mismatched, alias YAML and malformed identities fail closed', async () => {
+  for (const [key, entry] of [
+    ['zod@^1.2.3', { resolution: {} }],
+    ['zod@1.2.3', { resolution: { tarball: 'file:source.tgz' } }],
+    ['zod@1.2.3', { resolution: { tarball: registryUrl('zod', '1.2.4') } }],
+    ['zod@1.2.3', { resolution: { integrity: 'sha512-broken' } }],
+    ['zod@1.2.3', { resolution: { directory: '../source' } }],
+    ['../zod@1.2.3', { resolution: {} }],
+  ]) {
     let fetched = false;
     await assert.rejects(
-      hydrateLockIdentities(lock({ 'node_modules/zod': entry }), async () => {
+      hydrateLockIdentities(lock({ [key]: entry }), async () => {
         fetched = true;
         return {};
       }),
     );
     assert.equal(fetched, false);
   }
-  await assert.rejects(
-    hydrateLockIdentities(
-      lock({ 'node_modules/zod': { version: '1.2.3', integrity } }),
-      async () => ({
-        tarball: registryUrl('zod', '1.2.3'),
-        integrity: `sha512-${Buffer.alloc(64, 8).toString('base64')}`,
-      }),
-    ),
-    /identity conflict/,
-  );
   for (const dist of [
     {},
     { tarball: registryUrl('zod', '1.2.4'), integrity },
-    { tarball: registryUrl('zod', '1.2.3'), integrity: 'sha512-invalid' },
+    { tarball: registryUrl('zod', '1.2.3'), integrity: 'broken' },
   ]) {
     await assert.rejects(
-      hydrateLockIdentities(lock({ 'node_modules/zod': { version: '1.2.3' } }), async () => dist),
+      hydrateLockIdentities(lock({ 'zod@1.2.3': { resolution: {} } }), async () => dist),
       /Unsupported registry/,
     );
   }
-  for (const location of [
-    '../node_modules/zod',
-    'node_modules/zod/../oops',
-    '/node_modules/zod',
-    'packages/local',
-  ]) {
-    await assert.rejects(
-      hydrateLockIdentities(lock({ [location]: identity('zod') }), async () => ({})),
-      /location/,
-    );
-  }
+  assert.throws(() => parseLock('a: &anchor [1]\nb: *anchor\n'), /alias|Alias/);
+  assert.throws(() => parseLock('a: 1\na: 2\n'), /unique|unique keys/);
 });
 
-test('templates replace only accepted env version and reject manifest/lock disagreement or source dependencies', () => {
+function templateFixture() {
   const manifest = {
     name: 'app',
     version: '9.8.7',
     devDependencies: { '@docouno/env': '0.4.1' },
     dependencies: { zod: '^1.2.3' },
+    peerDependencies: { zod: '>=1.0.0' },
     custom: { untouched: true },
   };
-  const input = lock({
-    'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
-    'node_modules/zod': identity('zod'),
-  });
-  input.packages[''] = {
-    dependencies: manifest.dependencies,
-    devDependencies: manifest.devDependencies,
-  };
+  const input = lock(
+    { '@docouno/env@0.4.1': identity('@docouno/env', '0.4.1'), 'zod@1.2.3': identity('zod') },
+    {
+      dependencies: { zod: dep('^1.2.3', '1.2.3') },
+      devDependencies: { '@docouno/env': dep('0.4.1') },
+    },
+  );
+  return { manifest, input };
+}
+test('templates replace only env, preserve peer contexts and resolve peers through physical importer fields', () => {
+  const { manifest, input } = templateFixture();
   const next = prepareTemplate(manifest, input, '0.4.1', '0.5.0');
   assert.deepEqual(next.manifest, { ...manifest, devDependencies: { '@docouno/env': '0.5.0' } });
-  assert.equal(next.lock.packages['node_modules/@docouno/env'], undefined);
-  assert.deepEqual(next.lock.packages['node_modules/zod'], input.packages['node_modules/zod']);
+  assert.deepEqual(next.lock.packages['@docouno/env@0.5.0'].resolution, {});
+  assert.deepEqual(next.lock.packages['zod@1.2.3'], input.packages['zod@1.2.3']);
   assert.equal(manifest.devDependencies['@docouno/env'], '0.4.1');
-  assert.throws(
-    () =>
-      prepareTemplate(
-        { ...manifest, dependencies: { zod: 'file:../zod' } },
-        input,
-        '0.4.1',
-        '0.5.0',
-      ),
-    /Source\/local/,
-  );
+  assertManifestImporter(next.manifest, next.lock);
+  for (const spec of [
+    'file:../zod',
+    'workspace:*',
+    'https://example.test/x.tgz',
+    'npm:pkg@file:../x',
+    'npm:a@npm:b@1.0.0',
+    'npm:',
+    'npm:pkg@',
+  ]) {
+    assert.throws(
+      () => prepareTemplate({ ...manifest, dependencies: { zod: spec } }, input, '0.4.1', '0.5.0'),
+      /Source\/local|alias/,
+    );
+  }
   assert.throws(
     () =>
       prepareTemplate({ ...manifest, dependencies: { zod: '^2.0.0' } }, input, '0.4.1', '0.5.0'),
     /disagree/,
   );
   assert.throws(() => prepareTemplate(manifest, input, '0.4.0', '0.5.0'), /exact source/);
+  assert.throws(
+    () => assertManifestImporter({ ...manifest, peerDependencies: { missing: '*' } }, input),
+    /peer resolution/,
+  );
 });
 
-test('normalization removes only exact fixture origin and preserves every external identity', () => {
-  const registry = 'http://127.0.0.1:4321/';
-  const input = lock({ 'node_modules/zod': identity('zod') });
-  const next = structuredClone(input);
-  next.packages[''].devDependencies = { '@docouno/env': '0.5.0' };
-  next.packages['node_modules/@docouno/env'] = {
-    ...identity('@docouno/env', '0.5.0'),
-    resolved: `${registry}@docouno/env/-/env-0.5.0.tgz`,
-  };
+test('canonicalization removes only the fixture origin and rejects external selection drift', () => {
+  const { manifest, input } = templateFixture();
+  const { lock: seeded } = prepareTemplate(manifest, input, '0.4.1', '0.5.0');
+  seeded.packages['@docouno/env@0.5.0'].resolution = { integrity };
+  const next = structuredClone(seeded),
+    registry = 'http://127.0.0.1:4321/';
+  next.packages['@docouno/env@0.5.0'].resolution.tarball =
+    `${registry}@docouno/env/-/env-0.5.0.tgz`;
   const canonical = canonicalizeLock(next, registry);
-  assert.equal(
-    canonical.packages['node_modules/@docouno/env'].resolved,
-    registryUrl('@docouno/env', '0.5.0'),
+  assert.equal(canonical.packages['@docouno/env@0.5.0'].resolution.tarball, undefined);
+  assertSelectedIdentities(seeded, canonical, '0.5.0', integrity);
+  const changed = structuredClone(canonical);
+  changed.packages['zod@1.2.3'].resolution.integrity =
+    `sha512-${Buffer.alloc(64, 8).toString('base64')}`;
+  assert.throws(
+    () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+    /selected external/,
   );
-  assertSelectedIdentities(input, canonical, '0.5.0', integrity);
-  for (const field of ['version', 'resolved', 'integrity']) {
-    const changed = structuredClone(canonical);
-    changed.packages['node_modules/zod'][field] = 'changed';
-    assert.throws(
-      () => assertSelectedIdentities(input, changed, '0.5.0', integrity),
-      /selected external/,
-    );
-  }
-  next.packages['node_modules/zod'].resolved = 'http://localhost:123/zod.tgz';
+  delete changed.packages['zod@1.2.3'];
+  assert.throws(
+    () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+    /external identities/,
+  );
+  next.packages['zod@1.2.3'].resolution.tarball = 'http://localhost:123/zod.tgz';
   assert.throws(() => canonicalizeLock(next, registry), /identity conflict/);
 });
 
-test('npm: alias dependencies hydrate, preserve target name, and reject spoofed or nested specs', async () => {
+test('frozen SDK graphs validate runtime ranges, aliases, peers and removals against the source manifest', () => {
   const manifest = {
-    name: 'app',
-    version: '1.0.0',
-    devDependencies: { '@docouno/env': '0.4.1' },
-    dependencies: {
-      'string-width-cjs': 'npm:string-width@^4.2.0',
-      'scoped-alias': 'npm:@acme/core@^1.0.0',
-    },
+    dependencies: { alias: 'npm:leaf@^1.0.0' },
+    peerDependencies: { peer: '^2.0.0' },
+    peerDependenciesMeta: { peer: { optional: true } },
   };
-  const input = {
-    lockfileVersion: 3,
-    packages: {
-      '': {
-        dependencies: manifest.dependencies,
-        devDependencies: manifest.devDependencies,
-      },
-      'node_modules/@docouno/env': identity('@docouno/env', '0.4.1'),
-      'node_modules/string-width-cjs': {
-        name: 'string-width',
-        version: '4.2.3',
-      },
-      'node_modules/scoped-alias': {
-        name: '@acme/core',
-        version: '1.0.2',
-      },
+  const input = lock({
+    '@docouno/env@0.5.0': {
+      ...identity('@docouno/env', '0.5.0'),
+      peerDependencies: manifest.peerDependencies,
+      peerDependenciesMeta: manifest.peerDependenciesMeta,
     },
+    'leaf@1.2.3': identity('leaf'),
+    'peer@2.1.0': identity('peer', '2.1.0'),
+  });
+  input.snapshots['@docouno/env@0.5.0'] = {
+    dependencies: { alias: 'leaf@1.2.3' },
+    optionalDependencies: { peer: '2.1.0' },
   };
-  const hydrated = await hydrateLockIdentities(input, async (name, version) => ({
-    tarball: registryUrl(name, version),
-    integrity,
-  }));
-  assert.equal(hydrated.packages['node_modules/string-width-cjs'].name, 'string-width');
-  assert.equal(
-    hydrated.packages['node_modules/string-width-cjs'].resolved,
-    registryUrl('string-width', '4.2.3'),
-  );
-  assert.equal(hydrated.packages['node_modules/scoped-alias'].name, '@acme/core');
-  assert.equal(
-    hydrated.packages['node_modules/scoped-alias'].resolved,
-    registryUrl('@acme/core', '1.0.2'),
-  );
-  assertCanonicalLock(hydrated);
-  const prepared = prepareTemplate(manifest, hydrated, '0.4.1', '0.5.0');
-  assert.equal(prepared.lock.packages['node_modules/string-width-cjs'].name, 'string-width');
-
-  const withEnv = structuredClone(hydrated);
-  withEnv.packages[''].devDependencies = { '@docouno/env': '0.5.0' };
-  withEnv.packages['node_modules/@docouno/env'] = identity('@docouno/env', '0.5.0');
-  assertSelectedIdentities(hydrated, withEnv, '0.5.0', integrity);
-  const renamedAlias = structuredClone(withEnv);
-  renamedAlias.packages['node_modules/string-width-cjs'].name = 'evil-pkg';
-  assert.throws(
-    () => assertSelectedIdentities(hydrated, renamedAlias, '0.5.0', integrity),
-    /selected external/,
-  );
-
-  const spoofedTarget = structuredClone(input);
-  spoofedTarget.packages['node_modules/string-width-cjs'].name = 'evil-pkg';
-  await assert.rejects(
-    hydrateLockIdentities(spoofedTarget, async (name, version) => ({
-      tarball: registryUrl(name, version),
-      integrity,
-    })),
-    /Unsupported canonical registry identity/,
-  );
-
-  const spoofedNonAlias = structuredClone(input);
-  spoofedNonAlias.packages['node_modules/chalk'] = { name: 'evil-pkg', version: '5.3.0' };
-  await assert.rejects(
-    hydrateLockIdentities(spoofedNonAlias, async (name, version) => ({
-      tarball: registryUrl(name, version),
-      integrity,
-    })),
-    /Unsupported canonical registry identity/,
-  );
-
-  for (const badSpec of [
-    'npm:',
-    'npm:a@npm:b@1.0.0',
-    'npm:file:../x',
-    'npm:pkg@file:../x',
-    'npm:pkg@https://example.com/pkg.tgz',
-    'npm:pkg@workspace:*',
-    'npm:pkg@',
+  assertEnvironmentSelections(manifest, input, '0.5.0');
+  for (const changed of [
+    { ...manifest, dependencies: { alias: 'npm:leaf@^2.0.0' } },
+    { ...manifest, dependencies: { alias: 'npm:other@^1.0.0' } },
+    { ...manifest, dependencies: { missing: '1.0.0' } },
+    { ...manifest, dependencies: {} },
+    { ...manifest, engines: { node: '<1.0.0' } },
+    { ...manifest, os: ['darwin'] },
+    { ...manifest, cpu: ['arm64'] },
+    { ...manifest, libc: ['musl'] },
+    { ...manifest, peerDependencies: { peer: '^3.0.0' } },
+    { ...manifest, peerDependenciesMeta: { peer: { optional: false } } },
   ]) {
     assert.throws(
-      () =>
-        prepareTemplate(
-          { ...manifest, dependencies: { bad: badSpec } },
-          hydrated,
-          '0.4.1',
-          '0.5.0',
-        ),
-      /alias|Source\/local/,
+      () => assertEnvironmentSelections(changed, input, '0.5.0'),
+      /Source environment differs/,
     );
   }
+  delete input.snapshots['@docouno/env@0.5.0'].optionalDependencies.peer;
+  assertEnvironmentSelections(manifest, input, '0.5.0');
+  const required = { ...manifest, peerDependenciesMeta: {} };
+  input.packages['@docouno/env@0.5.0'].peerDependenciesMeta = {};
+  assert.throws(
+    () => assertEnvironmentSelections(required, input, '0.5.0'),
+    /missing peerDependencies.peer/,
+  );
+});
+
+test('prepared graphs retain every selected edge and peer context, with an unchanged artifact set', () => {
+  const { manifest, input } = templateFixture();
+  input.packages['leaf@1.0.0'] = identity('leaf', '1.0.0');
+  input.packages['leaf@2.0.0'] = identity('leaf', '2.0.0');
+  input.snapshots['leaf@1.0.0'] = {};
+  input.snapshots['leaf@2.0.0'] = {};
+  delete input.snapshots['zod@1.2.3'];
+  const first = 'zod@1.2.3(leaf@1.0.0)',
+    second = 'zod@1.2.3(leaf@2.0.0)';
+  input.snapshots[first] = { dependencies: { leaf: '1.0.0' } };
+  input.snapshots[second] = { dependencies: { leaf: '2.0.0' } };
+  input.importers['.'].dependencies.zod.version = '1.2.3(leaf@1.0.0)';
+  const seeded = prepareTemplate(manifest, input, '0.4.1', '0.5.0').lock;
+  seeded.packages['@docouno/env@0.5.0'].resolution = { integrity };
+  assertSelectedIdentities(seeded, structuredClone(seeded), '0.5.0', integrity);
+  for (const mutate of [
+    (value) => {
+      value.snapshots[first].dependencies.leaf = '2.0.0';
+    },
+    (value) => {
+      value.importers['.'].dependencies.zod.version = '1.2.3(leaf@2.0.0)';
+    },
+    (value) => {
+      value.snapshots[first].optionalDependencies = value.snapshots[first].dependencies;
+      delete value.snapshots[first].dependencies;
+    },
+    (value) => {
+      value.snapshots[first].optional = true;
+    },
+  ]) {
+    const changed = structuredClone(seeded);
+    mutate(changed);
+    assert.deepEqual(changed.packages, seeded.packages);
+    assert.throws(
+      () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+      /selected template graph/,
+    );
+  }
+  const changed = structuredClone(seeded);
+  changed.packages['leaf@1.0.0'].os = ['darwin'];
+  assert.deepEqual(
+    changed.packages['leaf@1.0.0'].resolution,
+    seeded.packages['leaf@1.0.0'].resolution,
+  );
+  assert.throws(
+    () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+    /selected template package metadata/,
+  );
+});
+
+test('environment rewrites preserve other versions and nested contexts, and reject collisions', () => {
+  const { manifest, input } = templateFixture();
+  input.packages['@docouno/env@0.4.10'] = identity('@docouno/env', '0.4.10');
+  input.snapshots['@docouno/env@0.4.10'] = {};
+  const key = 'zod@1.2.3(@docouno/env@0.4.1)(@docouno/env@0.4.10)';
+  input.snapshots[key] = { dependencies: { '@docouno/env': '0.4.1', zod: '1.2.3' } };
+  input.importers['.'].dependencies.zod.version = key.slice('zod@'.length);
+  const next = prepareTemplate(manifest, input, '0.4.1', '0.5.0').lock;
+  const target = 'zod@1.2.3(@docouno/env@0.5.0)(@docouno/env@0.4.10)';
+  assert.equal(next.snapshots[target].dependencies['@docouno/env'], '0.5.0');
+  assert.deepEqual(next.packages['@docouno/env@0.4.10'], input.packages['@docouno/env@0.4.10']);
+  input.packages['@docouno/env@0.5.0'] = identity('@docouno/env', '0.5.0');
+  input.snapshots['@docouno/env@0.5.0'] = {};
+  assert.throws(() => prepareTemplate(manifest, input, '0.4.1', '0.5.0'), /collides/);
+});
+
+test('npm aliases resolve by target identity and cannot redirect the selected snapshot', async () => {
+  const input = lock(
+    { 'string-width@4.2.3': { resolution: {} }, '@acme/core@1.0.2': { resolution: {} } },
+    {
+      dependencies: {
+        'string-width-cjs': dep('npm:string-width@^4.2.0', 'string-width@4.2.3'),
+        'scoped-alias': dep('npm:@acme/core@^1.0.0', '@acme/core@1.0.2'),
+      },
+    },
+  );
+  const calls = [];
+  const hydrated = await hydrateLockIdentities(input, async (name, version) => {
+    calls.push(`${name}@${version}`);
+    return { tarball: registryUrl(name, version), integrity };
+  });
+  assert.deepEqual(calls, ['string-width@4.2.3', '@acme/core@1.0.2']);
+  assertCanonicalLock(hydrated);
+  hydrated.importers['.'].dependencies['string-width-cjs'].version = 'evil@4.2.3';
+  assert.throws(
+    () => assertCanonicalLock(hydrated),
+    /Missing canonical snapshot|mismatched package/,
+  );
 });
 
 test('npm environment strips inherited npm and Node injection and isolates both configs', (t) => {
@@ -420,6 +453,8 @@ test('npm environment strips inherited npm and Node injection and isolates both 
     PATH: '/bin',
     NPM_TOKEN: 'secret',
     npm_config_registry: 'http://evil',
+    PNPM_CONFIG_REGISTRY: 'http://evil',
+    pnpm_injection: 'evil',
     NODE_OPTIONS: '--import evil',
     NODE_PATH: '/evil',
     NODE_EXTRA_CA_CERTS: '/evil',
@@ -427,6 +462,8 @@ test('npm environment strips inherited npm and Node injection and isolates both 
     ordinary: 'retained',
   });
   assert.equal(env.NPM_TOKEN, undefined);
+  assert.equal(env.PNPM_CONFIG_REGISTRY, 'https://registry.npmjs.org/');
+  assert.equal(env.pnpm_injection, undefined);
   assert.equal(env.NODE_OPTIONS, undefined);
   assert.equal(env.NODE_PATH, undefined);
   assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
@@ -494,10 +531,43 @@ npmTest(
   async (t) => {
     const f = fixture(t);
     const original = readFileSync(join(f.root, 'packages/env/package.json'), 'utf8');
+    // Lock-only external identities are not fetched or installed. Keeping two
+    // compatible choices catches release preparation that re-resolves the graph.
+    for (const name of names) {
+      const manifestPath = join(f.root, `templates/${name}/package.json`),
+        lockPath = join(f.root, `templates/${name}/pnpm-lock.yaml`),
+        manifest = JSON.parse(readFileSync(manifestPath)),
+        selected = parseLock(readFileSync(lockPath, 'utf8'));
+      manifest.devDependencies['devkit-lock-only-parent'] = '1.0.0';
+      selected.importers['.'].devDependencies['devkit-lock-only-parent'] = dep('1.0.0');
+      for (const [key, packageName, version] of [
+        ['devkit-lock-only-parent@1.0.0', 'devkit-lock-only-parent', '1.0.0'],
+        ['devkit-lock-only-leaf@1.0.0', 'devkit-lock-only-leaf', '1.0.0'],
+        ['devkit-lock-only-leaf@1.1.0', 'devkit-lock-only-leaf', '1.1.0'],
+      ]) {
+        selected.packages[key] = identity(packageName, version);
+        selected.snapshots[key] = {};
+      }
+      selected.snapshots['devkit-lock-only-parent@1.0.0'] = {
+        dependencies: { 'devkit-lock-only-leaf': '1.0.0' },
+      };
+      put(manifestPath, manifest);
+      put(lockPath, encodeLock(selected));
+    }
     const receipt = await prepareNpmInputs({ ...f, version: '0.5.0' });
     assert.equal(receipt.sourceVersion, '0.4.1');
     assert.equal(receipt.version, '0.5.0');
     assert.deepEqual(verifyNpmInputs(f.output), receipt);
+    for (const name of names) {
+      const prepared = parseLock(
+        readFileSync(join(f.output, `templates/${name}/pnpm-lock.yaml`), 'utf8'),
+      );
+      assert.equal(
+        prepared.snapshots['devkit-lock-only-parent@1.0.0'].dependencies['devkit-lock-only-leaf'],
+        '1.0.0',
+      );
+      assert.ok(prepared.packages['devkit-lock-only-leaf@1.1.0']);
+    }
     const archive = join(f.output, receipt.environment.archive),
       bytes = readFileSync(archive);
     assert.equal(JSON.parse(tarFile(bytes, 'package/package.json')).version, '0.5.0');
@@ -525,38 +595,49 @@ npmTest(
   },
 );
 
-npmTest('native npm failure and input changes publish no output and clean staging', async (t) => {
-  const f = fixture(t);
-  const manifestPath = join(f.root, 'packages/env/package.json');
-  const manifest = JSON.parse(readFileSync(manifestPath));
-  manifest.peerDependencies = { '@docouno/missing': '1.0.0' };
-  put(manifestPath, manifest);
-  await assert.rejects(prepareNpmInputs({ ...f, version: '0.5.0' }), /npm install failed/);
-  assert.equal(existsSync(f.output), false);
-  assert.equal(
-    readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
-    false,
-  );
-  delete manifest.peerDependencies;
-  put(manifestPath, manifest);
-  const pending = prepareNpmInputs({ ...f, version: '0.5.0' });
-  put(join(f.root, 'packages/env/index.js'), 'changed while npm runs\n');
-  await assert.rejects(pending, /Source inputs changed/);
-  assert.equal(existsSync(f.output), false);
-  assert.equal(
-    readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
-    false,
-  );
-  assert.equal(
-    readFileSync(join(f.root, 'packages/env/index.js'), 'utf8'),
-    'changed while npm runs\n',
-  );
-});
+npmTest(
+  'native pack failure, stale SDK graphs and concurrent inputs publish no output',
+  async (t) => {
+    const f = fixture(t);
+    const manifestPath = join(f.root, 'packages/env/package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath));
+    manifest.publishConfig = { directory: 'missing-output' };
+    put(manifestPath, manifest);
+    await assert.rejects(prepareNpmInputs({ ...f, version: '0.5.0' }), /pnpm pack failed/);
+    assert.equal(existsSync(f.output), false);
+    delete manifest.publishConfig;
+    manifest.peerDependencies = { '@docouno/missing': '1.0.0' };
+    put(manifestPath, manifest);
+    await assert.rejects(
+      prepareNpmInputs({ ...f, version: '0.5.0' }),
+      /Source environment differs from template source lock/,
+    );
+    assert.equal(existsSync(f.output), false);
+    assert.equal(
+      readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
+      false,
+    );
+    delete manifest.peerDependencies;
+    put(manifestPath, manifest);
+    const pending = prepareNpmInputs({ ...f, version: '0.5.0' });
+    put(join(f.root, 'packages/env/index.js'), 'changed while npm runs\n');
+    await assert.rejects(pending, /Source inputs changed/);
+    assert.equal(existsSync(f.output), false);
+    assert.equal(
+      readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
+      false,
+    );
+    assert.equal(
+      readFileSync(join(f.root, 'packages/env/index.js'), 'utf8'),
+      'changed while npm runs\n',
+    );
+  },
+);
 
 npmTest('cancellation reaps native npm before staging cleanup', async (t) => {
   const directory = temporary(t),
     controller = new AbortController();
-  const pending = runNpm(['--version'], {
+  const pending = runPnpm(['--version'], {
     cwd: directory,
     env: npmEnvironment(directory),
     signal: controller.signal,

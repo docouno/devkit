@@ -22,7 +22,7 @@ make test
 make build
 ```
 
-Review `git diff` and commit the updated `.devkit/*`, component `devDependencies` (`toolDependencies`), and `package-lock.json`.
+Review `git diff` and commit the updated `.devkit/*`, component `devDependencies` (`toolDependencies`), and `pnpm-lock.yaml`.
 
 ## Supported Upgrade Window and `0.4.1` Bridge
 
@@ -50,18 +50,19 @@ make check
   - `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.*.yaml|json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`
   - `{rust-component}/rust-toolchain.toml`
   - Managed `toolDependencies` entries inside `{node-component}/package.json` `devDependencies`
-  - Root `package-lock.json`
+  - Root `pnpm-workspace.yaml` membership and `pnpm-lock.yaml`
+  - Registered internal Node dependencies become `workspace:*` (or `workspace:^` between public libraries); legacy npm linking settings are removed from root `.npmrc` during the 0.5 migration
 - **Preserved untouched**:
   - Component source (`src/**`, `test/**`, `tests/**`)
-  - Product fields, `scripts`, `dependencies`, `peerDependencies`, and product-added `devDependencies` in `{component}/package.json`
+  - Product fields and scripts, external dependencies and peer dependencies, and product-added `devDependencies` in `{component}/package.json`
   - `{rust-component}/Cargo.toml` and `{rust-component}/Cargo.lock`
-  - Root `Makefile`, `compose.yaml`, `.npmrc`, and `.env`
+  - Root `Makefile`, `compose.yaml`, and `.env`; registry routing and environment placeholders in `.npmrc`
 
 If a managed file under `.devkit/` was edited manually, `devkit update` aborts before modifying the repository so local changes are never overwritten silently.
 
 ## Transitive Lockfile Reconciliation (`--reconcile-lock`)
 
-By default, `devkit update` preserves previously resolved transitive versions in `package-lock.json` where compatible. When a jump across `@docouno/env`, TypeScript, Vite, or ESLint majors causes strict peer-dependency conflicts with stale transitive entries in `package-lock.json`, re-run with `--reconcile-lock`:
+By default, `devkit update` preserves previously resolved transitive versions in `pnpm-lock.yaml` where compatible. When a jump across `@docouno/env`, TypeScript, Vite, or ESLint majors causes strict peer-dependency conflicts with stale transitive entries in `pnpm-lock.yaml`, re-run with `--reconcile-lock`:
 
 ```sh
 npx @docouno/devkit@0.5.0 update . --to 0.5.0 --reconcile-lock
@@ -70,10 +71,12 @@ npx @docouno/devkit@0.5.0 update . --to 0.5.0 --reconcile-lock
 `--reconcile-lock` executes a three-stage fallback strategy:
 
 1. **`seeded`**: Standard lockfile refresh keeping existing transitive resolutions.
-2. **`prune-dev`**: Prunes dev-only lockfile nodes (`"dev": true`) while keeping production `dependencies` pinned, then re-resolves dev tooling.
-3. **`clean-fallback`**: Regenerates `package-lock.json` cleanly from workspace `package.json` manifests while asserting that every product dependency spec is preserved.
+2. **`prune-dev`**: Prunes graph nodes reachable only from development dependencies while keeping production `dependencies` pinned, then re-resolves dev tooling.
+3. **`clean-fallback`**: Regenerates `pnpm-lock.yaml` cleanly from workspace `package.json` manifests while asserting that every product dependency spec is preserved.
 
 When `--reconcile-lock` is used, Devkit prints a concise summary of changed, added, and removed lockfile packages (and includes `lockReconciliation` in `--json` output).
+
+Reconciliation may select different external package versions while retaining direct dependency declarations and local workspace target paths. Preview the report before applying it.
 
 ## Cumulative Migration Notes
 

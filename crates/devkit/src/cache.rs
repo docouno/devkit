@@ -14,6 +14,7 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
+    io::{Read, Write},
     os::{
         fd::AsRawFd,
         unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -38,7 +39,7 @@ pub struct ReleaseCache<'a> {
     executable: PathBuf,
 }
 
-struct CacheLock(File);
+pub(crate) struct CacheLock(File);
 impl Drop for CacheLock {
     fn drop(&mut self) {
         // SAFETY: this descriptor belongs to this lock instance.
@@ -85,6 +86,117 @@ pub fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 impl<'a> ReleaseCache<'a> {
+    pub fn ensure_pnpm(
+        &self,
+        pin: &crate::runtime::PnpmPin,
+        npmrc_policy: Option<&crate::native::NpmrcPolicy>,
+        allow_network: bool,
+    ) -> Result<PathBuf> {
+        // Validate programmatically constructed pins as strictly as file pins.
+        crate::runtime::PnpmPin::parse(pin.encode().as_bytes())?;
+        self.runner.check_cancelled()?;
+        if let Some(path) = std::env::var_os("DEVKIT_PNPM_BIN_OVERRIDE").filter(|p| !p.is_empty()) {
+            let path = PathBuf::from(path);
+            ensure!(
+                path.is_absolute(),
+                "DEVKIT_PNPM_BIN_OVERRIDE must be absolute"
+            );
+            verify_static_elf_file(&path, &pin.binary_sha256, false)?;
+            return Ok(path);
+        }
+        let directory = safe_path(
+            &self.root,
+            &format!(
+                "tools/pnpm-{}-{}-{}",
+                pin.version, TARGET, pin.binary_sha256
+            ),
+        )?;
+        let target = directory.join("pnpm");
+        if exists(&target)? {
+            verify_static_elf_file(&target, &pin.binary_sha256, true)?;
+            return Ok(target);
+        }
+        ensure!(
+            allow_network,
+            "pinned pnpm {} binary is absent from local cache; run make setup (or exec --prepare)",
+            pin.version
+        );
+        let _lock = self.lock(&format!(
+            "tool:pnpm:{TARGET}:{}:{}",
+            pin.version, pin.binary_sha256
+        ))?;
+        if exists(&target)? {
+            verify_static_elf_file(&target, &pin.binary_sha256, true)?;
+            return Ok(target);
+        }
+        let tools = safe_path(&self.root, "tools")?;
+        create_dir_all_durable(&tools)?;
+        let stage = tempfile::Builder::new()
+            .prefix(".pnpm-")
+            .tempdir_in(&tools)?;
+        let registry = npmrc_policy
+            .and_then(|p| {
+                p.scoped_registries
+                    .get("pnpm")
+                    .or(p.default_registry.as_ref())
+            })
+            .map(String::as_str)
+            .unwrap_or("https://registry.npmjs.org");
+        ensure!(
+            crate::native::valid_registry_or_tarball_url(registry),
+            "Invalid pnpm registry URL"
+        );
+        let url = format!(
+            "{}/@pnpm/exe.linux-x64-musl/-/exe.linux-x64-musl-{}.tgz",
+            registry.trim_end_matches('/'),
+            pin.version
+        );
+        let archive = stage.path().join("pnpm.tgz");
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["internal", "fetch", "--allow-loopback-http", "--url"])
+            .arg(&url)
+            .arg("--output")
+            .arg(&archive)
+            .args(["--max-bytes", "67108864"])
+            .env_remove("DEVKIT_INTERNAL_FETCH_BEARER")
+            .env_remove("DEVKIT_INTERNAL_FETCH_BASIC");
+        if let Some(auth) = npmrc_policy
+            .map(|p| npm_authentication(p, &url))
+            .transpose()?
+            .flatten()
+        {
+            let value = std::env::var(&auth.variable).with_context(|| {
+                format!(
+                    "Required registry auth variable is absent: {}",
+                    auth.variable
+                )
+            })?;
+            command.env(
+                match auth.kind {
+                    crate::native::NpmAuthKind::Bearer => "DEVKIT_INTERNAL_FETCH_BEARER",
+                    crate::native::NpmAuthKind::Basic => "DEVKIT_INTERNAL_FETCH_BASIC",
+                },
+                value,
+            );
+        }
+        self.runner.checked_with_timeout(
+            &mut command,
+            OutputMode::Capture(32 * 1024),
+            Duration::from_secs(100),
+        )?;
+        ensure!(
+            file_digest(&archive)? == pin.tarball_sha256,
+            "pnpm archive checksum differs from accepted pin"
+        );
+        let payload = stage.path().join("payload");
+        fs::create_dir(&payload)?;
+        extract_pnpm_binary(&archive, &payload.join("pnpm"), self.runner)?;
+        verify_static_elf_file(&payload.join("pnpm"), &pin.binary_sha256, true)?;
+        self.runner.check_cancelled()?;
+        publish_new_directory(&payload, &directory)?;
+        Ok(target)
+    }
     pub fn new(explicit: Option<&Path>, runner: &'a ProcessRunner) -> Result<Self> {
         Ok(Self {
             root: cache_root(explicit)?,
@@ -105,36 +217,7 @@ impl<'a> ReleaseCache<'a> {
         let directory = safe_path(&self.root, ".locks")?;
         create_dir_all_durable(&directory)?;
         let path = safe_path(&directory, &format!("{}.lock", digest(key)))?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .mode(0o600)
-            .open(path)?;
-        ensure!(
-            file.metadata()?.is_file(),
-            "Cache lock must be a regular file"
-        );
-        let until = Instant::now() + Duration::from_secs(150);
-        loop {
-            self.runner.check_cancelled()?;
-            // SAFETY: a live descriptor and nonblocking advisory exclusive lock.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(CacheLock(file));
-            }
-            let error = std::io::Error::last_os_error();
-            ensure!(
-                error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::Interrupted,
-                "Cannot lock cache: {error}"
-            );
-            ensure!(
-                Instant::now() < until,
-                "Timed out waiting for another release acquisition"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        lock_file(&path, self.runner)
     }
     pub fn release_path(&self, version: &str, identity: &str) -> Result<PathBuf> {
         crate::files::version(version)?;
@@ -462,6 +545,125 @@ impl<'a> ReleaseCache<'a> {
     }
 }
 
+pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600)
+        .open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Cache lock must be a regular file"
+    );
+    let until = Instant::now() + Duration::from_secs(150);
+    loop {
+        runner.check_cancelled()?;
+        // SAFETY: a live descriptor and nonblocking advisory exclusive lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(CacheLock(file));
+        }
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::Interrupted,
+            "Cannot lock cache: {error}"
+        );
+        ensure!(
+            Instant::now() < until,
+            "Timed out waiting for another release acquisition"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn npm_authentication<'a>(
+    policy: &'a crate::native::NpmrcPolicy,
+    url: &str,
+) -> Result<Option<&'a crate::native::NpmAuthentication>> {
+    let uri: ureq::http::Uri = url.parse()?;
+    let address = format!(
+        "{}{}",
+        uri.authority().context("Registry authority")?,
+        uri.path()
+    );
+    // npm chooses the longest matching scope, preferring a token when both
+    // authentication forms are configured at that same scope.
+    Ok(policy
+        .authentication
+        .iter()
+        .filter(|auth| address.starts_with(&auth.prefix))
+        .max_by_key(|auth| {
+            (
+                auth.prefix.len(),
+                auth.kind == crate::native::NpmAuthKind::Bearer,
+            )
+        }))
+}
+
+fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunner) -> Result<()> {
+    let compressed = File::open(archive)?;
+    ensure!(
+        compressed.metadata()?.len() <= 64 * 1024 * 1024,
+        "pnpm archive exceeds byte budget"
+    );
+    let decoded = flate2::read::MultiGzDecoder::new(compressed).take(128 * 1024 * 1024);
+    let mut archive = tar::Archive::new(decoded);
+    let mut found = false;
+    for (index, entry) in archive.entries()?.enumerate() {
+        runner.check_cancelled()?;
+        ensure!(index < 1024, "pnpm archive exceeds entry budget");
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        ensure!(
+            !path.is_absolute()
+                && path
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "Unsafe pnpm archive path"
+        );
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() {
+            continue;
+        }
+        ensure!(
+            kind.is_file() || kind.is_dir(),
+            "Unsupported pnpm archive entry"
+        );
+        ensure!(
+            entry.size() <= 64 * 1024 * 1024,
+            "pnpm archive entry exceeds byte budget"
+        );
+        if path == Path::new("package/pnpm") {
+            ensure!(
+                !found && kind.is_file(),
+                "Duplicate/invalid pnpm executable"
+            );
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(destination)?;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                runner.check_cancelled()?;
+                let count = entry.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..count])?;
+            }
+            output.set_permissions(fs::Permissions::from_mode(0o755))?;
+            output.sync_all()?;
+            found = true;
+        }
+    }
+    ensure!(found, "pnpm archive contains no executable");
+    sync_directory(destination.parent().context("pnpm staging parent")?)
+}
+
 fn payload_budget(root: &Path) -> Result<()> {
     let mut count = 0_usize;
     let mut bytes = 0_u64;
@@ -494,4 +696,43 @@ fn payload_budget(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod npm_auth_tests {
+    use super::*;
+    use crate::native::{NpmAuthKind, parse_manifest_npmrc_policy};
+
+    #[test]
+    fn registry_auth_uses_typed_longest_scope_and_prefers_bearer_at_equal_scope() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        fs::write(temporary.path().join(".npmrc"),
+            "//registry.example/:_authToken=${ROOT_TOKEN}\n//registry.example/private/:_auth=${PRIVATE_BASIC}\n//registry.example/both/:_authToken=${SCOPED_TOKEN}\n//registry.example/both/:_auth=${SCOPED_BASIC}\n").unwrap();
+        let policy =
+            parse_manifest_npmrc_policy(temporary.path(), crate::native::NodeLockKind::Npm)
+                .unwrap();
+        for (path, kind, variable) in [
+            ("/pkg", NpmAuthKind::Bearer, "ROOT_TOKEN"),
+            ("/private/pkg", NpmAuthKind::Basic, "PRIVATE_BASIC"),
+            ("/both/pkg", NpmAuthKind::Bearer, "SCOPED_TOKEN"),
+        ] {
+            let selected = npm_authentication(&policy, &format!("https://registry.example{path}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.kind, kind);
+            assert_eq!(selected.variable, variable);
+        }
+        assert!(
+            npm_authentication(&policy, "https://registry.example.evil/private/pkg")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            npm_authentication(&policy, "https://registry.example/private-other/pkg")
+                .unwrap()
+                .unwrap()
+                .variable,
+            "ROOT_TOKEN"
+        );
+    }
 }

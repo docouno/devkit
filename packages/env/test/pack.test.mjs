@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { gunzipSync } from 'node:zlib';
 import { packComponent, verifyPackableComponent } from '../src/pack.js';
 
 async function withPackFixture(callback) {
@@ -47,7 +48,7 @@ async function withPackFixture(callback) {
   await write('dist/styles.css', '.acme-btn { display: inline-flex; }\n');
 
   try {
-    await callback({ pkgDir, baseManifest, write });
+    await callback({ temp, pkgDir, baseManifest, write });
   } finally {
     await fs.rm(temp, { recursive: true, force: true });
   }
@@ -145,5 +146,84 @@ test('verifyPackableComponent rejects vite/client references, ../src/ d.ts leaks
     const tarballSrcLeak = await verifyPackableComponent(pkgDir);
     assert.equal(tarballSrcLeak.ok, false);
     assert(tarballSrcLeak.errors.some((err) => err.includes('src/index.ts')));
+  });
+});
+
+function packedManifest(bytes) {
+  const tar = gunzipSync(bytes);
+  for (let offset = 0; offset + 512 <= tar.length;) {
+    const name = tar
+      .subarray(offset, offset + 100)
+      .toString()
+      .replace(/\0.*$/u, '');
+    const size = parseInt(
+      tar
+        .subarray(offset + 124, offset + 136)
+        .toString()
+        .replace(/\0.*$/u, '')
+        .trim() || '0',
+      8,
+    );
+    if (name === 'package/package.json') {
+      return JSON.parse(tar.subarray(offset + 512, offset + 512 + size));
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  throw new Error('Packed manifest missing');
+}
+
+test('public workspace dependencies require registered explicitly public libraries before packing rewrites specs', async () => {
+  await withPackFixture(async ({ temp, pkgDir, baseManifest, write }) => {
+    const target = path.join(temp, 'packages/tokens');
+    await fs.mkdir(target, { recursive: true });
+    await fs.mkdir(path.join(temp, '.devkit'), { recursive: true });
+    await fs.writeFile(path.join(temp, 'package.json'), JSON.stringify({ private: true }));
+    await fs.writeFile(path.join(temp, 'pnpm-workspace.yaml'), 'packages: ["packages/*"]\n');
+    const state = {
+      schemaVersion: 2,
+      components: { 'packages/ui': { role: 'library' }, 'packages/tokens': { role: 'library' } },
+    };
+    const metadata = path.join(temp, '.devkit/manifest.json');
+    const targetManifest = path.join(target, 'package.json');
+    const dependencyManifest = { ...baseManifest, dependencies: { '@acme/tokens': 'workspace:^' } };
+    await write('package.json', dependencyManifest);
+    const check = async () => {
+      try {
+        return await verifyPackableComponent(pkgDir, { allowPrivateLocalDeps: true });
+      } catch (error) {
+        return { ok: false, errors: [error.message] };
+      }
+    };
+    for (const targetPrivate of [true, undefined]) {
+      await fs.writeFile(metadata, JSON.stringify(state));
+      await fs.writeFile(
+        targetManifest,
+        JSON.stringify({ name: '@acme/tokens', version: '0.1.0', private: targetPrivate }),
+      );
+      const result = await check();
+      assert.equal(result.ok, false);
+      assert.match(result.errors.join('\n'), /PRIVATE_WORKSPACE_DEPENDENCY/u);
+    }
+    await fs.writeFile(
+      targetManifest,
+      JSON.stringify({ name: '@acme/tokens', version: '0.1.0', private: false }),
+    );
+    state.components['packages/tokens'].role = 'app';
+    await fs.writeFile(metadata, JSON.stringify(state));
+    assert.match((await check()).errors.join('\n'), /PRIVATE_WORKSPACE_DEPENDENCY/u);
+    await fs.rm(metadata);
+    assert.match((await check()).errors.join('\n'), /PRIVATE_WORKSPACE_DEPENDENCY/u);
+    state.components['packages/tokens'].role = 'library';
+    await fs.writeFile(metadata, JSON.stringify(state));
+    const result = await packComponent(pkgDir);
+    const manifest = packedManifest(
+      await fs.readFile(path.join(pkgDir, 'release', result.receipt.filename)),
+    );
+    assert.equal(manifest.dependencies['@acme/tokens'], '^0.1.0');
+    await write('package.json', {
+      ...baseManifest,
+      dependencies: { '@acme/tokens': 'file:../tokens' },
+    });
+    assert.match((await check()).errors.join('\n'), /LOCAL_DEPENDENCY/u);
   });
 });
