@@ -258,7 +258,7 @@ pub fn read_legacy_npm_product_graph(root: &Path, state: &ProjectState) -> Resul
         node.edges = edges.into_values().collect();
     }
     for (path, edges) in &mut product.graph.roots {
-        if !path.is_empty() && !state.components.contains_key(path) {
+        if path.is_empty() || !state.components.contains_key(path) {
             continue;
         }
         let manifest = native_manifest(root, path)?;

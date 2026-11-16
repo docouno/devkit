@@ -131,7 +131,7 @@ Use `--help` for command options. Complete arguments run without prompts; `--non
 
 ## Shared package cache
 
-`make setup` lazily obtains the SHA-256-pinned static pnpm executable and installs from `pnpm-lock.yaml`. `DEVKIT_CACHE_DIR` (default `~/.cache/docouno/devkit`) holds the pnpm store/cache, Cargo downloads, and Electron distributions across repositories and Git worktrees. Daily gates run offline and mount `node_modules/.pnpm` read-only. Rust-only projects never download pnpm.
+`make setup` lazily obtains the SHA-256-pinned static pnpm executable and installs from `pnpm-lock.yaml`. `DEVKIT_CACHE_DIR` (default `~/.cache/docouno/devkit`) holds the pnpm store/cache, Cargo downloads, and Electron distributions across repositories and Git worktrees. Setup verifies complete Electron distributions before sharing them. Daily gates run offline and mount `node_modules/.pnpm` read-only. Rust-only projects never download pnpm.
 
 Hardlinks require a shared filesystem and mount. If the configured cache cannot share one with the checkout, Devkit uses the repository's common Git directory (`devkit-store`) or `.devkit/cache/pnpm-store` for a non-Git checkout. See the [0.5 migration guide](docs/migrations/0.5.0.md#migrate-node-workspaces-to-pnpm) for existing projects and CI cache placement.
 

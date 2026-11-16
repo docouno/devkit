@@ -284,8 +284,16 @@ impl LockResolver for DockerPnpmResolver {
         let image = image.context("Missing digest-pinned Node image")?;
         let root = project_root(root)?;
         let npmrc_policy = parse_manifest_npmrc_policy(&root)?;
-        verify_required_npm_env_vars(&npmrc_policy)?;
-        let ca_cert = resolve_ca_cert_path()?;
+        if !self.offline {
+            verify_required_npm_env_vars(&npmrc_policy)?;
+        }
+        let ca_cert = if self.offline {
+            None
+        } else {
+            resolve_ca_cert_path()?
+                .map(|p| crate::download::additional_ca_file(&p))
+                .transpose()?
+        };
         let meta = fs::metadata(&root)?;
         let runner = ProcessRunner::new()?;
         let pin = crate::runtime::PnpmPin::from_release(release)?;
@@ -357,6 +365,7 @@ impl LockResolver for DockerPnpmResolver {
                     let ca_mount = format!(
                         "type=bind,\"source={}\",target=/devkit/ca.pem,readonly",
                         ca_path
+                            .path()
                             .to_str()
                             .context("Non-UTF8 DEVKIT_CA_CERT path")?
                             .replace('"', "\"\"")
@@ -375,6 +384,7 @@ impl LockResolver for DockerPnpmResolver {
                     "npm_config_cache=/tmp/npm-cache",
                     "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
                     "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
+                    "PNPM_CONFIG_IGNORE_PNPMFILE=true",
                     "PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                     "npm_config_globalconfig=/tmp/devkit-global.npmrc",
                     "npm_config_update_notifier=false",
@@ -386,7 +396,11 @@ impl LockResolver for DockerPnpmResolver {
                 }
                 env_plan.write_docker_args(&mut command);
                 for var in &npmrc_policy.required_env_vars {
-                    command.args(["--env", var]);
+                    if self.offline {
+                        command.args(["--env", &format!("{var}=devkit-offline-unused")]);
+                    } else {
+                        command.args(["--env", var]);
+                    }
                 }
                 if let Some(registry) = registry {
                     command.args(["--env", &format!("PNPM_CONFIG_REGISTRY={registry}")]);
@@ -396,6 +410,7 @@ impl LockResolver for DockerPnpmResolver {
                     "install",
                     "--lockfile-only",
                     "--ignore-scripts",
+                    "--ignore-pnpmfile",
                     "--prefer-offline",
                     "--trust-lockfile",
                     "--config.strict-peer-dependencies=true",
@@ -1740,8 +1755,13 @@ fn migrate_npm_manifests(root: &Path, state: &ProjectState) -> Result<()> {
                 }
             }
         }
+        preserve_local_peers(state, &packages, path, &mut manifest)?;
         write_native(root, path, &manifest)?;
     }
+    let root_path = input_path(root, "package.json")?;
+    let mut root_manifest = read_json(&root_path)?;
+    preserve_local_peers(state, &packages, "", &mut root_manifest)?;
+    write_json(&root_path, &root_manifest)?;
     let npmrc = safe_path(root, ".npmrc")?;
     if exists(&npmrc)? {
         let original = fs::read_to_string(&npmrc)?;
@@ -1760,6 +1780,45 @@ fn migrate_npm_manifests(root: &Path, state: &ProjectState) -> Result<()> {
         }
         if content != original {
             write_atomic(&npmrc, content.as_bytes(), 0o644)?;
+        }
+    }
+    Ok(())
+}
+
+fn preserve_local_peers(
+    state: &ProjectState,
+    packages: &Packages,
+    path: &str,
+    manifest: &mut Value,
+) -> Result<()> {
+    // npm can select a local peer without a physical declaration. Preserve the
+    // source selection for pnpm while retaining its publishable peer range.
+    for name in dependency_table(object(manifest, "manifest")?, "peerDependencies")?.keys() {
+        let Some(target) = locked_dependency(packages, path, name)? else {
+            continue;
+        };
+        if !state.components.contains_key(&target) {
+            continue;
+        }
+        let own = crate::pnpm::PHYSICAL_FIELDS
+            .iter()
+            .any(|field| manifest.get(field).and_then(|v| v.get(name)).is_some());
+        let shared = crate::pnpm::PHYSICAL_FIELDS.iter().any(|field| {
+            packages
+                .get("")
+                .and_then(|root| root.get(*field))
+                .and_then(|v| v.get(name))
+                .is_some()
+        }) && locked_dependency(packages, "", name)?.as_ref() == Some(&target);
+        if !own && !shared {
+            manifest
+                .as_object_mut()
+                .context("Manifest object")?
+                .entry("devDependencies")
+                .or_insert(json!({}))
+                .as_object_mut()
+                .context("Development dependencies")?
+                .insert(name.clone(), json!("workspace:*"));
         }
     }
     Ok(())

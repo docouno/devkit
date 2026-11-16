@@ -48,7 +48,7 @@ Devkit enforces the following rules when `"private": false` is set on a library 
 - `files` must be a non-empty array containing `"dist"` (and must not include source/test paths such as `src`, `test`, or `tests`).
 - `exports` must define `"."` with `"types"` listed **before** `"import"` or `"default"` (TypeScript and `publint` require `"types"` first in conditional export maps), and every target must point inside `./dist/` (except `"./package.json": "./package.json"`).
 - Unscoped package names cannot set `publishConfig.access` to `"restricted"`. When publishing a scoped `@scope/pkg` publicly to `https://registry.npmjs.org/`, set `"publishConfig": { "access": "public" }` (or pass `--access public` to `npm publish`).
-- Runtime dependency fields (`dependencies`, `peerDependencies`, `optionalDependencies`) cannot use `file:` links or reference any `"private": true` workspace package. If one publishable workspace library depends on another `"private": false` workspace library, declare a standard SemVer range in `dependencies` or `peerDependencies`.
+- Runtime dependency fields (`dependencies`, `peerDependencies`, `optionalDependencies`) cannot use `file:` links or reference any `"private": true` workspace package. Use `workspace:^` for a local runtime dependency between explicitly public workspace libraries; `pnpm pack` rewrites it to a registry SemVer range. Keep a normal SemVer range in `peerDependencies` and add a `workspace:*` development dependency when the peer should resolve to local source. A normal SemVer runtime dependency intentionally selects the published registry artifact.
 
 After editing `packages/<slug>/package.json`, synchronize the workspace lockfile and projections:
 

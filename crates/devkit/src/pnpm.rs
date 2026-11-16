@@ -684,7 +684,9 @@ fn remap_environment(
                 )),
             );
             resolution.insert("tarball".into(), json!(next));
-            package.insert("version".into(), json!(current));
+            if !current.starts_with("file:") {
+                package.insert("version".into(), json!(current));
+            }
         } else {
             resolution.remove("tarball");
             package.remove("version");
@@ -739,6 +741,11 @@ pub fn refresh_importers(
                 }
                 let specifier = text(&value, "dependency specifier")?.to_owned();
                 let parsed = native::parse_npm_dependency_spec(&specifier)?;
+                let previous = old
+                    .field(field)
+                    .get(&name)
+                    .or_else(|| old.dependency(&name))
+                    .filter(|dep| dep.specifier == specifier || name == "@docouno/env");
                 let local = match &parsed {
                     NpmDepSpec::Workspace(_) => Some(
                         names
@@ -752,29 +759,33 @@ pub fn refresh_importers(
                         let target = native::local_path(root, &path, value)?;
                         fs::symlink_metadata(input_path(root, &target)?)
                             .ok()
-                            .filter(|m| m.is_dir())
+                            .filter(|m| m.is_dir() && state.components.contains_key(&target))
                             .map(|_| target)
                     }
                     _ => None,
                 };
-                let version = if let Some(target) = local {
+                let version = if matches!(parsed, NpmDepSpec::LocalFile(_))
+                    && let Some(dep) = previous
+                {
+                    dep.version.clone()
+                } else if let Some(target) = local {
                     format!("link:{}", relative_link(&path, &target))
-                } else if let Some(dep) = old.field(field).get(&name) {
+                } else if let Some(dep) = previous {
                     dep.version.clone()
                 } else {
                     let requested = match &parsed {
                         NpmDepSpec::Alias { target_name, .. } => target_name.as_str(),
                         _ => &name,
                     };
-                    let key = lock
-                        .snapshots
-                        .keys()
-                        .find(|key| {
-                            package_parts(key).is_ok_and(|(package, version)| {
-                                package == requested && version == specifier
-                            })
+                    let Some(key) = lock.snapshots.keys().find(|key| {
+                        package_parts(key).is_ok_and(|(package, version)| {
+                            package == requested && version == specifier
                         })
-                        .with_context(|| format!("Native lock omits dependency {path}:{name}"))?;
+                    }) else {
+                        // A seed is intentionally incomplete for newly authored
+                        // declarations. The ecosystem resolver selects them later.
+                        continue;
+                    };
                     reference_for(&name, key)
                 };
                 let version = if name == "@docouno/env" {
@@ -1343,6 +1354,10 @@ impl Lock {
         if let Some(path) = reference.strip_prefix("link:") {
             let path = native::local_path(root, root_path(id), path)?;
             native::native_manifest(root, &path)?;
+            ensure!(
+                self.importers.contains_key(importer_id(&path)),
+                "Local pnpm link has no importer; use a file directory snapshot: {path}"
+            );
             return Ok(path);
         }
         let key = snapshot_key(name, reference)?;
@@ -1407,6 +1422,31 @@ impl Lock {
             id
         };
         let target = self.resolve(root, reference_id, name, &entry.version)?;
+        if let NpmDepSpec::LocalFile(relative) = &parsed {
+            let expected = native::local_path(root, path, relative)?;
+            let actual = if entry.version.starts_with("link:") {
+                target.clone()
+            } else {
+                let resolution = object(
+                    &self.packages[strip_peer_suffixes(&target)]["resolution"],
+                    "Local package resolution",
+                )?;
+                if let Some(directory) = resolution.get("directory").and_then(Value::as_str) {
+                    native::local_path(root, "", directory)?
+                } else {
+                    let tarball = resolution
+                        .get("tarball")
+                        .and_then(Value::as_str)
+                        .and_then(|url| url.strip_prefix("file:"))
+                        .context("Local package must resolve to its declared file")?;
+                    native::local_path(root, "", tarball)?
+                }
+            };
+            ensure!(
+                actual == expected,
+                "Local dependency resolves to a different path: {path}:{name}"
+            );
+        }
         if matches!(parsed, NpmDepSpec::Workspace(_)) {
             ensure!(
                 entry.version.starts_with("link:"),

@@ -3,6 +3,7 @@ use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
 use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -521,7 +522,22 @@ impl<'a> PreparedContext<'a> {
         let cached = safe_path(&distributions, &format!("{version}-linux-x64"))?;
         ensure_directory(&cached)?;
         let marker = safe_path(&cached, ".complete")?;
-        if identity(&marker)?.is_none() {
+        if !exists(&marker)? {
+            ensure!(
+                !exists(&cached)? || fs::read_dir(&cached)?.next().is_none(),
+                "Incomplete Electron cache: {}; remove it and rerun make setup",
+                cached.display()
+            );
+            // A previous local install may be partial even when its executable
+            // exists. Force a complete verified extraction before first publish.
+            let dist = safe_path(&package, "dist")?;
+            if exists(&dist)? {
+                ensure_directory(&dist)?;
+                fs::remove_dir_all(&dist)?;
+            }
+            let installed = safe_path(&package, "path.txt")?;
+            identity(&installed)?;
+            remove_file(&installed)?;
             self.task(ContainerTask {
                 component: Some(path),
                 profile: ToolingProfile::Node,
@@ -542,27 +558,50 @@ impl<'a> PreparedContext<'a> {
             let stage = tempfile::Builder::new()
                 .prefix(".stage-")
                 .tempdir_in(&distributions)?;
+            let inventory = distribution_inventory(&package.join("dist"), self.runner)?;
+            ensure_electron_executable(&inventory)?;
             hardlink_distribution(
                 &package.join("dist"),
                 &stage.path().join("dist"),
                 self.runner,
             )?;
-            write_atomic(
+            ensure!(
+                distribution_inventory(&stage.path().join("dist"), self.runner)? == inventory,
+                "Electron distribution changed while linking"
+            );
+            write_json(
                 &stage.path().join(".complete"),
-                format!("{version}\n").as_bytes(),
-                0o644,
+                &ElectronDistributionReceipt {
+                    schema_version: 1,
+                    version: version.into(),
+                    entries: inventory,
+                },
             )?;
             crate::archive::publish_new_directory(stage.path(), &cached)?;
         }
+        let receipt = read_distribution_receipt(&marker)?;
         ensure!(
-            fs::read_to_string(&marker)?.trim() == version,
+            receipt.schema_version == 1 && receipt.version == version,
             "Invalid cached Electron distribution marker"
+        );
+        ensure_electron_executable(&receipt.entries)?;
+        ensure!(
+            distribution_inventory(&safe_path(&cached, "dist")?, self.runner)? == receipt.entries,
+            "Cached Electron distribution is incomplete or corrupt: {}; remove it and rerun make setup",
+            cached.display()
         );
         let source = safe_path(&cached, "dist/electron")?;
         let cached_metadata = fs::metadata(&source)?;
-        let ready = fs::metadata(package.join("dist/electron"))
-            .is_ok_and(|m| m.dev() == cached_metadata.dev() && m.ino() == cached_metadata.ino())
-            && fs::read_to_string(package.join("path.txt")).is_ok_and(|p| p.trim() == "electron");
+        let local = package.join("dist/electron");
+        let linked = fs::metadata(&local)
+            .is_ok_and(|m| m.dev() == cached_metadata.dev() && m.ino() == cached_metadata.ino());
+        let copied_across_mounts = local.is_file()
+            && crate::shared_cache::mount_identity(&local)?
+                != crate::shared_cache::mount_identity(&source)?;
+        let ready = (linked || copied_across_mounts)
+            && fs::read_to_string(package.join("path.txt")).is_ok_and(|p| p.trim() == "electron")
+            && distribution_inventory(&package.join("dist"), self.runner)
+                .is_ok_and(|inventory| inventory == receipt.entries);
         if ready {
             return Ok(());
         }
@@ -575,6 +614,10 @@ impl<'a> PreparedContext<'a> {
             fs::remove_dir_all(&dist)?;
         }
         hardlink_distribution(&cached.join("dist"), &dist, self.runner)?;
+        ensure!(
+            distribution_inventory(&dist, self.runner)? == receipt.entries,
+            "Electron distribution changed while linking"
+        );
         write_atomic(&package.join("path.txt"), b"electron", 0o644)
     }
     fn docker(&self) -> Command {
@@ -977,6 +1020,13 @@ impl<'a> PreparedContext<'a> {
         } else {
             None
         };
+        let ca_cert = if node && network != "none" && forward_npm_secrets {
+            crate::native::resolve_ca_cert_path()?
+                .map(|p| crate::download::additional_ca_file(&p))
+                .transpose()?
+        } else {
+            None
+        };
         let mut budget = self
             .budget
             .borrow()
@@ -1128,6 +1178,7 @@ impl<'a> PreparedContext<'a> {
                 "CI=true",
                 "PATH=/devkit/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
+                "PNPM_CONFIG_IGNORE_PNPMFILE=true",
                 "XDG_CACHE_HOME=/cache/pnpm",
                 "NPM_CONFIG_CACHE=/tmp/devkit-npm-cache",
                 "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
@@ -1158,10 +1209,10 @@ impl<'a> PreparedContext<'a> {
                     for var in &npmrc_policy.required_env_vars {
                         c.args(["--env", var]);
                     }
-                    if let Some(ca_cert) = crate::native::resolve_ca_cert_path()? {
+                    if let Some(ca_cert) = &ca_cert {
                         c.args([
                             "--mount",
-                            &bind_mount(&ca_cert, Path::new("/devkit/ca.pem"), true)?,
+                            &bind_mount(ca_cert.path(), Path::new("/devkit/ca.pem"), true)?,
                             "--env",
                             "NODE_EXTRA_CA_CERTS=/devkit/ca.pem",
                             "--env",
@@ -1232,17 +1283,208 @@ impl<'a> PreparedContext<'a> {
         Ok(())
     }
 }
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum DistributionEntry {
+    Directory {
+        mode: u32,
+    },
+    File {
+        sha256: String,
+        size: u64,
+        mode: u32,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ElectronDistributionReceipt {
+    schema_version: u32,
+    version: String,
+    entries: BTreeMap<String, DistributionEntry>,
+}
+
+fn ensure_electron_executable(entries: &BTreeMap<String, DistributionEntry>) -> Result<()> {
+    ensure!(
+        matches!(entries.get("electron"), Some(DistributionEntry::File {size, mode, ..}) if *size > 0 && mode & 0o111 != 0),
+        "Electron distribution omitted its executable"
+    );
+    Ok(())
+}
+
+fn read_distribution_receipt(path: &Path) -> Result<ElectronDistributionReceipt> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Invalid Electron distribution marker"
+    );
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 4 * 1024 * 1024,
+        "Electron marker exceeds its byte budget"
+    );
+    let receipt: ElectronDistributionReceipt = serde_json::from_slice(&bytes)
+        .context("Invalid Electron distribution marker; remove the cache and rerun make setup")?;
+    ensure!(
+        receipt.entries.len() <= 16_384,
+        "Electron distribution exceeds entry budget"
+    );
+    Ok(receipt)
+}
+
+fn distribution_inventory(
+    root: &Path,
+    runner: &ProcessRunner,
+) -> Result<BTreeMap<String, DistributionEntry>> {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let root = project_root(root)?;
+    ensure!(
+        fs::symlink_metadata(&root)?.is_dir(),
+        "Expected Electron distribution directory"
+    );
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![(root.clone(), 0_u32)];
+    let mut total = 0_u64;
+    while let Some((path, depth)) = pending.pop() {
+        runner.check_cancelled()?;
+        ensure!(
+            depth <= 32 && entries.len() < 16_384,
+            "Electron distribution exceeds tree budget"
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        let mode = metadata.permissions().mode() & 0o7777;
+        let entry = if metadata.is_dir() {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                pending.push((child.path(), depth + 1));
+                ensure!(
+                    pending.len() + entries.len() <= 16_384,
+                    "Electron distribution exceeds entry budget"
+                );
+            }
+            DistributionEntry::Directory { mode }
+        } else if metadata.is_file() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)?;
+            let before = file.metadata()?;
+            ensure!(
+                before.is_file()
+                    && before.dev() == metadata.dev()
+                    && before.ino() == metadata.ino(),
+                "Electron distribution changed while reading"
+            );
+            let mut hash = Sha256::new();
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                runner.check_cancelled()?;
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                total = total
+                    .checked_add(count as u64)
+                    .context("Electron distribution size overflow")?;
+                ensure!(
+                    total <= MAX_BYTES,
+                    "Electron distribution exceeds byte budget"
+                );
+                bytes += count as u64;
+                hash.update(&buffer[..count]);
+            }
+            let after = file.metadata()?;
+            let current = fs::symlink_metadata(&path)?;
+            ensure!(
+                before.len() == bytes
+                    && after.len() == bytes
+                    && before.mtime() == after.mtime()
+                    && before.mtime_nsec() == after.mtime_nsec()
+                    && before.permissions().mode() == after.permissions().mode()
+                    && metadata.permissions().mode() == before.permissions().mode()
+                    && current.permissions().mode() == before.permissions().mode()
+                    && current.dev() == before.dev()
+                    && current.ino() == before.ino(),
+                "Electron distribution changed while reading"
+            );
+            DistributionEntry::File {
+                sha256: format!("{:x}", hash.finalize()),
+                size: bytes,
+                mode,
+            }
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)?;
+            ensure!(
+                !target.is_absolute()
+                    && lexical(
+                        &path
+                            .parent()
+                            .context("Electron symlink parent")?
+                            .join(&target)
+                    )?
+                    .starts_with(&root),
+                "Electron distribution symlink escapes its root"
+            );
+            DistributionEntry::Symlink { target }
+        } else {
+            anyhow::bail!("Unsupported Electron distribution entry");
+        };
+        let name = if path == root {
+            ".".into()
+        } else {
+            relative_name(&root, &path)?
+        };
+        entries.insert(name, entry);
+    }
+    Ok(entries)
+}
+
 fn hardlink_distribution(source: &Path, target: &Path, runner: &ProcessRunner) -> Result<()> {
     let source = project_root(source)?;
     let target = project_root(target)?;
-    fn copy(root: &Path, source: &Path, target: &Path, runner: &ProcessRunner) -> Result<()> {
+    fn copy(
+        root: &Path,
+        source: &Path,
+        target: &Path,
+        runner: &ProcessRunner,
+        depth: u32,
+        count: &mut usize,
+    ) -> Result<()> {
         runner.check_cancelled()?;
+        *count += 1;
+        ensure!(
+            depth <= 32 && *count <= 16_384,
+            "Electron distribution exceeds tree budget"
+        );
         let metadata = fs::symlink_metadata(source)?;
         if metadata.is_dir() {
             fs::create_dir(target)?;
-            for entry in sorted_entries(source)? {
-                copy(root, &entry.path(), &target.join(entry.file_name()), runner)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                copy(
+                    root,
+                    &entry.path(),
+                    &target.join(entry.file_name()),
+                    runner,
+                    depth + 1,
+                    count,
+                )?;
             }
+            fs::set_permissions(target, metadata.permissions())?;
         } else if metadata.is_file() {
             match fs::hard_link(source, target) {
                 Ok(()) => {}
@@ -1270,7 +1512,7 @@ fn hardlink_distribution(source: &Path, target: &Path, runner: &ProcessRunner) -
         }
         Ok(())
     }
-    copy(&source, &source, &target, runner)
+    copy(&source, &source, &target, runner, 0, &mut 0)
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -1569,6 +1811,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                     "--prefer-offline".into(),
                     "--trust-lockfile".into(),
                     "--ignore-scripts".into(),
+                    "--ignore-pnpmfile".into(),
                     "--config.strict-peer-dependencies=true".into(),
                 ],
             ),
@@ -2498,6 +2741,61 @@ mod tests {
 mod electron_cache_tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn inventory_detects_missing_changed_and_unexpected_distribution_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("locales")).unwrap();
+        fs::write(source.join("electron"), b"executable").unwrap();
+        fs::set_permissions(source.join("electron"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(source.join("icudtl.dat"), b"trusted data").unwrap();
+        fs::write(source.join("locales/en.pak"), b"locale").unwrap();
+        let runner = ProcessRunner::new().unwrap();
+        let expected = distribution_inventory(&source, &runner).unwrap();
+        ensure_electron_executable(&expected).unwrap();
+        let marker = temporary.path().join(".complete");
+        write_json(
+            &marker,
+            &ElectronDistributionReceipt {
+                schema_version: 1,
+                version: "1.0.0".into(),
+                entries: expected,
+            },
+        )
+        .unwrap();
+        let receipt = read_distribution_receipt(&marker).unwrap();
+        let target = temporary.path().join("target");
+        hardlink_distribution(&source, &target, &runner).unwrap();
+        assert_eq!(
+            distribution_inventory(&target, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::remove_file(target.join("icudtl.dat")).unwrap();
+        assert_ne!(
+            distribution_inventory(&target, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("icudtl.dat"), b"changed data").unwrap();
+        assert_ne!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("icudtl.dat"), b"trusted data").unwrap();
+        assert_eq!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::write(source.join("unexpected"), b"extra").unwrap();
+        assert_ne!(
+            distribution_inventory(&source, &runner).unwrap(),
+            receipt.entries
+        );
+        fs::remove_file(source.join("unexpected")).unwrap();
+        symlink("../outside", source.join("redirected")).unwrap();
+        assert!(distribution_inventory(&source, &runner).is_err());
+    }
 
     #[test]
     fn distribution_links_share_inodes_and_refuse_redirected_cache_ancestors() {

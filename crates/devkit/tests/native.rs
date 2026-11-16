@@ -280,6 +280,26 @@ fn pnpm_admission_tracks_workspace_links_and_rejects_competing_locks_and_configu
             .contains("Reserved environment variable")
     );
     fs::remove_file(root.join(".npmrc")).unwrap();
+    assert_eq!(admitted.node_inputs.files[".pnpmfile.cjs"], None);
+    for directory in ["", "apps/web/", "packages/ui/"] {
+        for name in [".pnpmfile.cjs", ".pnpmfile.mjs", ".pnpmfile.js"] {
+            let name = format!("{directory}{name}");
+            put(
+                root,
+                &name,
+                "throw new Error('unsupported hook must not execute');\n",
+            );
+            assert!(assert_input_identities(root, &admitted.node_inputs).is_err());
+            assert!(
+                admit_native_components(root, &state)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Unsupported pnpm hook")
+            );
+            fs::remove_file(root.join(name)).unwrap();
+        }
+    }
     put(root, "apps/web/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
     assert!(
         admit_native_components(root, &state)

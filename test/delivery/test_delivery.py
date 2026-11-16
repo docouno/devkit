@@ -589,6 +589,17 @@ class TransportTests(unittest.TestCase):
             self.assertNotEqual(output.returncode, 0, path)
             self.assertFalse(self.output.exists(), path)
 
+    def test_additional_ca_and_explicit_standard_bundle_have_distinct_trust_semantics(self):
+        extra = environment(self.root, DEVKIT_CA_CERT=self.fixture.root / "ca.pem")
+        self.fetch("/redirect", check=True, env=extra)
+        self.assertEqual(self.output.read_bytes(), b"native bytes\n")
+        self.output.unlink()
+        unrelated = HttpsFixture(self.root / uuid.uuid4().hex)
+        explicit = environment(self.root, DEVKIT_CA_CERT=self.fixture.root / "ca.pem",
+                               SSL_CERT_FILE=unrelated.root / "ca.pem")
+        self.assertNotEqual(self.fetch("/ok", env=explicit).returncode, 0)
+        self.assertFalse(self.output.exists())
+
     def test_parent_cancellation_reaps_https_worker_and_discards_unaccepted_cache(self):
         work = self.root / uuid.uuid4().hex
         work.mkdir()

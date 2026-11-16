@@ -1595,6 +1595,14 @@ impl<'a> ReadContext<'a> {
             if !directories.insert(path.clone()) {
                 continue;
             }
+            if self.is_pnpm() {
+                reject_pnpm_hooks(self.root, &path)?;
+                for file in PNPM_HOOK_FILES {
+                    let name = prefixed(&path, file);
+                    record(self.root, &mut files, &name, false)?;
+                    ensure!(files[&name].is_none(), "Unsupported pnpm hook: {name}");
+                }
+            }
             record(
                 self.root,
                 &mut files,
@@ -2457,6 +2465,9 @@ fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {
 }
 
 pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
+    if exists(&input_path(root, "pnpm-workspace.yaml")?)? {
+        reject_pnpm_hooks(root, "")?;
+    }
     let path = input_path(root, ".npmrc")?;
     if identity(&path)?.is_none() {
         return Ok(NpmrcPolicy::default());
@@ -2582,6 +2593,9 @@ pub fn parse_and_admit_npmrc(root: &Path, directories: &[String]) -> Result<Npmr
     let policy = parse_manifest_npmrc_policy(root)?;
     let defaults = npmrc_safe_defaults(root);
     for directory in directories.iter().filter(|d| !d.is_empty()) {
+        if exists(&input_path(root, "pnpm-workspace.yaml")?)? {
+            reject_pnpm_hooks(root, directory)?;
+        }
         let path = input_path(root, format!("{directory}/.npmrc"))?;
         if identity(&path)?.is_none() {
             continue;
@@ -2609,6 +2623,19 @@ pub fn parse_and_admit_npmrc(root: &Path, directories: &[String]) -> Result<Npmr
         }
     }
     Ok(policy)
+}
+
+const PNPM_HOOK_FILES: [&str; 3] = [".pnpmfile.cjs", ".pnpmfile.mjs", ".pnpmfile.js"];
+
+fn reject_pnpm_hooks(root: &Path, directory: &str) -> Result<()> {
+    for file in PNPM_HOOK_FILES {
+        let name = prefixed(directory, file);
+        ensure!(
+            !exists(&input_path(root, &name)?)?,
+            "Unsupported pnpm hook: {name}; use offline package lifecycle scripts"
+        );
+    }
+    Ok(())
 }
 
 pub fn assert_npmrc_compatibility(root: &Path, directories: &[String]) -> Result<()> {
@@ -2644,6 +2671,10 @@ pub fn resolve_ca_cert_path() -> Result<Option<std::path::PathBuf>> {
         metadata.is_file() && metadata.len() > 0,
         "DEVKIT_CA_CERT must point to a non-empty regular PEM file: {}",
         path.display()
+    );
+    ensure!(
+        metadata.len() <= 8 * 1024 * 1024,
+        "DEVKIT_CA_CERT exceeds its byte budget"
     );
     let contents = fs::read_to_string(&path).with_context(|| {
         format!(

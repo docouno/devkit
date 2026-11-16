@@ -317,7 +317,14 @@ export async function prepareNpmInputs({
     mkdirSync(npmRoot, { recursive: true });
     const npmDirectory = join(stage, 'npm');
     const packed = await runPnpm(
-      ['pack', '--config.ignore-scripts=true', '--json', '--pack-destination', npmRoot],
+      [
+        'pack',
+        '--config.ignore-scripts=true',
+        '--config.ignore-pnpmfile=true',
+        '--json',
+        '--pack-destination',
+        npmRoot,
+      ],
       {
         cwd: envRoot,
         env: npmEnvironment(npmDirectory),
@@ -378,6 +385,7 @@ export async function prepareNpmInputs({
             '--trust-lockfile',
             '--prefer-offline',
             '--ignore-scripts',
+            '--ignore-pnpmfile',
             '--config.strict-peer-dependencies=true',
           ],
           { cwd: appRoot, env, signal },

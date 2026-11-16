@@ -654,6 +654,39 @@ class Verification:
                 require(path.read_bytes() == content, f"Public component operation overwrote {path}")
         self.healthy(root, "added-react-app")
 
+    def electron_cache_corruption(self, root):
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        if state["version"].startswith("0.4."):
+            return
+        component = next(path for path, value in state["components"].items()
+                         if value["toolingProfile"] == "electron")
+        package = root / component / "node_modules/electron"
+        version = json.loads((package / "package.json").read_text())["version"]
+        cached = (Path(self.environment["DEVKIT_CACHE_DIR"]) / "pnpm-store/electron-dist"
+                  / (version + "-linux-x64") / "dist/icudtl.dat")
+        local = package / "dist/icudtl.dat"
+        require(cached.is_file() and local.is_file(), "Electron ICU resource is absent before corruption proof")
+        require((cached.stat().st_dev, cached.stat().st_ino) ==
+                (local.stat().st_dev, local.stat().st_ino), "Electron resource is not shared through hardlinks")
+        expected = sha256(cached.read_bytes())
+        backup = cached.parent.parent / (".verify-icu-" + uuid.uuid4().hex)
+        os.link(cached, backup)
+        before = source_snapshot(root)
+        try:
+            cached.unlink()
+            self.make(root, "setup", expected="Cached Electron distribution is incomplete or corrupt",
+                      label="electron-cache-corruption-refused")
+            receipt = root / ".devkit/state/node-workspace.lock"
+            require(not receipt.exists(), "Failed Electron setup retained a success receipt")
+        finally:
+            if not cached.exists():
+                os.link(backup, cached)
+            backup.unlink()
+        self.make(root, "setup", label="electron-cache-restored-setup")
+        require(sha256(cached.read_bytes()) == expected and sha256(local.read_bytes()) == expected,
+                "Restored Electron distribution differs from its verified resource")
+        require(source_snapshot(root) == before, "Electron cache validation changed product inputs")
+
     def upgrade(self, root):
         if self.next_release is None:
             return
@@ -985,6 +1018,7 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
+            self.electron_cache_corruption(fullstack)
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error

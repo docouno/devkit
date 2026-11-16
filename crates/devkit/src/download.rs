@@ -9,37 +9,90 @@ use std::{
     path::Path,
     time::Duration,
 };
-use ureq::tls::{PemItem, RootCerts, TlsConfig};
+use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig};
 
-fn agent(allow_loopback_http: bool, custom_ca: bool) -> Result<ureq::Agent> {
+const MAX_CA_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_ca(path: &Path) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "CA bundle must be a regular PEM file"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_CA_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CA_BYTES,
+        "CA bundle exceeds its byte budget"
+    );
+    Ok(bytes)
+}
+
+fn certificates(bytes: &[u8]) -> Result<Vec<Certificate<'static>>> {
+    let mut certificates = Vec::new();
+    for item in ureq::tls::parse_pem(bytes) {
+        if let PemItem::Certificate(certificate) = item? {
+            certificates.push(certificate);
+        }
+    }
+    ensure!(
+        !certificates.is_empty(),
+        "CA bundle contains no certificates"
+    );
+    Ok(certificates)
+}
+
+/// DEVKIT_CA_CERT extends the same pinned Mozilla trust set in native HTTPS
+/// and standalone pnpm. Serialize certificates only, never private PEM items.
+pub(crate) fn additional_ca_bundle(path: &Path) -> Result<Vec<u8>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let extra = certificates(&read_ca(path)?)?;
+    let mut bytes = Vec::new();
+    for der in extra.iter().map(|c| c.der()).chain(
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|c| c.as_ref()),
+    ) {
+        bytes.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        for line in STANDARD.encode(der).as_bytes().chunks(64) {
+            bytes.extend_from_slice(line);
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    }
+    ensure!(
+        bytes.len() as u64 <= MAX_CA_BYTES,
+        "CA bundle exceeds its byte budget"
+    );
+    Ok(bytes)
+}
+
+pub(crate) fn additional_ca_file(path: &Path) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new().prefix("devkit-ca-").tempfile()?;
+    file.write_all(&additional_ca_bundle(path)?)?;
+    file.flush()?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))?;
+    Ok(file)
+}
+
+fn agent(allow_loopback_http: bool) -> Result<ureq::Agent> {
     let mut tls = TlsConfig::builder();
     // Defaults use the compiled Mozilla roots. An explicit standard PEM bundle
     // is supported for private proxy roots; certificate verification stays on.
     let standard = std::env::var_os("SSL_CERT_FILE").filter(|v| !v.is_empty());
-    let cert_path = if standard.is_some() {
-        standard
-    } else if custom_ca {
-        crate::native::resolve_ca_cert_path()?.map(|p| p.into_os_string())
+    let bytes = if let Some(path) = standard {
+        Some(read_ca(Path::new(&path))?)
+    } else if let Some(path) = crate::native::resolve_ca_cert_path()? {
+        Some(additional_ca_bundle(&path)?)
     } else {
         None
     };
-    if let Some(path) = cert_path {
-        let bytes = fs::read(&path).context("Cannot read SSL_CERT_FILE")?;
-        ensure!(
-            bytes.len() <= 8 * 1024 * 1024,
-            "SSL_CERT_FILE exceeds its byte budget"
-        );
-        let mut certificates = Vec::new();
-        for item in ureq::tls::parse_pem(&bytes) {
-            if let PemItem::Certificate(certificate) = item? {
-                certificates.push(certificate);
-            }
-        }
-        ensure!(
-            !certificates.is_empty(),
-            "SSL_CERT_FILE contains no certificates"
-        );
-        tls = tls.root_certs(RootCerts::new_with_certs(&certificates));
+    if let Some(bytes) = bytes {
+        tls = tls.root_certs(RootCerts::new_with_certs(&certificates(&bytes)?));
     }
     Ok(ureq::Agent::config_builder()
         .https_only(!allow_loopback_http)
@@ -147,12 +200,7 @@ pub fn fetch_with_options(
     let uri: ureq::http::Uri = url.parse().context("Invalid download URL")?;
     validate_url(&uri, allow_loopback_http)?;
     runner.check_cancelled()?;
-    let primary = agent(allow_loopback_http, true)?;
-    let public = agent(allow_loopback_http, false)?;
-    let fallback = std::env::var_os("SSL_CERT_FILE")
-        .filter(|v| !v.is_empty())
-        .is_none()
-        && crate::native::resolve_ca_cert_path()?.is_some();
+    let primary = agent(allow_loopback_http)?;
     let bearer = std::env::var("DEVKIT_INTERNAL_FETCH_BEARER").ok();
     let mut hop = uri.clone();
     let mut redirects = 0;
@@ -170,13 +218,7 @@ pub fn fetch_with_options(
             }
             request.call()
         };
-        let response = match request(&primary) {
-            Err(err) if fallback && matches!(err, ureq::Error::Rustls(_) | ureq::Error::Tls(_)) => {
-                request(&public)
-            }
-            result => result,
-        }
-        .context("HTTPS download failed")?;
+        let response = request(&primary).context("HTTPS download failed")?;
         if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             break response;
         }
@@ -258,4 +300,65 @@ pub fn fetch_with_options(
         let _ = fs::remove_file(&output);
     }
     result
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn additional_ca_preserves_public_roots_and_only_serializes_certificates() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let path = temporary.path().join("extra.pem");
+        let extra = webpki_root_certs::TLS_SERVER_ROOT_CERTS[0].as_ref();
+        fs::write(&path, format!("# discarded operator comment\n-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", STANDARD.encode(extra))).unwrap();
+        let bundle = additional_ca_bundle(&path).unwrap();
+        let parsed = certificates(&bundle).unwrap();
+        assert_eq!(
+            parsed.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
+        );
+        assert_eq!(parsed[0].der(), extra);
+        for (actual, expected) in parsed[1..]
+            .iter()
+            .zip(webpki_root_certs::TLS_SERVER_ROOT_CERTS)
+        {
+            assert_eq!(actual.der(), expected.as_ref());
+        }
+        assert!(
+            !String::from_utf8(bundle)
+                .unwrap()
+                .contains("operator comment")
+        );
+        fs::write(&path, b"not a PEM certificate").unwrap();
+        assert!(additional_ca_bundle(&path).is_err());
+        fs::write(&path, vec![b'x'; MAX_CA_BYTES as usize + 1]).unwrap();
+        assert!(
+            additional_ca_bundle(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("byte budget")
+        );
+    }
+
+    #[test]
+    fn full_certificates_and_native_trust_anchors_use_the_same_mozilla_release() {
+        let lock: toml::Value = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../Cargo.lock"
+        )))
+        .unwrap();
+        let version = |name: &str| {
+            lock["package"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"].as_str() == Some(name))
+                .unwrap()["version"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(version("webpki-root-certs"), version("webpki-roots"));
+    }
 }

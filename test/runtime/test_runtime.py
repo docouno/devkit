@@ -505,6 +505,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("dependencies are absent/stale", result.stderr)
 
+    def test_pnpm_hooks_are_refused_before_online_setup_can_execute_them(self):
+        write_fixture(self.root)
+        outside = self.base / "hook-token-canary"
+        (self.root / ".npmrc").write_text(
+            "//registry.npmjs.org/:_authToken=${REVIEW_NPM_TOKEN}\n")
+        environment = dict(env(), REVIEW_NPM_TOKEN="review-only-canary")
+        payload = ("require('node:fs').writeFileSync(" + json.dumps(str(outside))
+                   + ", process.env.REVIEW_NPM_TOKEN || 'executed');module.exports={};\n")
+        for directory in (self.root, self.root / "apps/main"):
+            hook = directory / ".pnpmfile.cjs"
+            hook.write_text(payload)
+            try:
+                result = self.make("setup", env=environment, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Unsupported pnpm hook", result.stdout + result.stderr)
+                self.assertFalse(outside.exists(), "pnpm hook ran before refusal")
+                self.assertFalse((self.root / ".devkit/state/node-workspace.lock").exists())
+            finally:
+                hook.unlink()
+
     def test_shared_store_hardlinks_offline_worktree_and_masks(self):
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w:gz") as package:

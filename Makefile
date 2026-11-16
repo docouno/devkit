@@ -23,7 +23,7 @@ help:
 	  'Ordinary checks use cached SDKs. Only setup prepares images and dependencies.'
 setup: bootstrap
 	@docker image inspect "$$DEVKIT_AUTHOR_NODE_IMAGE" >/dev/null 2>&1 || docker pull "$$DEVKIT_AUTHOR_NODE_IMAGE"
-	$(call author_node_setup,bridge,pnpm install --frozen-lockfile --ignore-scripts --prefer-offline --trust-lockfile)
+	$(call author_node_setup,bridge,pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --prefer-offline --trust-lockfile)
 # The only command before a native engine exists: exec Docker, with no host SDK.
 bootstrap:
 	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
@@ -115,7 +115,7 @@ build-controller:
 	@cp "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/devkit-release" "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops/devkit-release"
 npm-lock: pnpm-lock
 pnpm-lock:
-	$(call author_node_setup,bridge,pnpm install --lockfile-only --ignore-scripts)
+	$(call author_node_setup,bridge,pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile)
 npm-inputs:
 	$(call author_node,bridge,node tooling/prepare-npm-inputs.mjs --root /workspace --version "$$DEVKIT_RELEASE_VERSION" --output "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-npm" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-npm-producer.json")
 notices:

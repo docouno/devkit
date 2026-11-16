@@ -190,7 +190,14 @@ export async function verifyPackableComponent(componentDir, options = {}) {
     const npmCmd = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
     const packed = spawnSync(
       npmCmd,
-      ['pack', '--pack-destination', workDir, '--config.ignore-scripts=true', '--json'],
+      [
+        'pack',
+        '--pack-destination',
+        workDir,
+        '--config.ignore-scripts=true',
+        '--config.ignore-pnpmfile=true',
+        '--json',
+      ],
       {
         cwd: resolvedComponent,
         encoding: 'utf8',
