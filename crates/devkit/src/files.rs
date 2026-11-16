@@ -8,8 +8,8 @@ use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
-    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
+    io::{Read, Write},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
 
@@ -292,6 +292,47 @@ pub fn identity(path: &Path) -> Result<Option<FileIdentity>> {
         sha256: digest(fs::read(path)?),
         mode: info.permissions().mode() & 0o777,
     }))
+}
+
+/// Acquire bounded generated/native metadata without opening pipes or links.
+pub(crate) fn read_regular_file(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Option<(Vec<u8>, FileIdentity)>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if absent(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "{label} must be a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= maximum,
+        "{label} exceeds byte budget: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take(maximum.checked_add(1).context("Invalid file byte budget")?)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= maximum,
+        "{label} exceeds byte budget: {}",
+        path.display()
+    );
+    let identity = FileIdentity {
+        sha256: digest(&bytes),
+        mode: metadata.permissions().mode() & 0o777,
+    };
+    Ok(Some((bytes, identity)))
 }
 pub fn validate_identity(value: &FileIdentity) -> Result<()> {
     ensure!(

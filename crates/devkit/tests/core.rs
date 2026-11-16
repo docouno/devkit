@@ -783,6 +783,116 @@ fn sync_preserves_unregistered_directory_snapshots_and_rejects_dangling_links() 
 }
 
 #[test]
+fn register_rebases_standalone_local_directory_chains_before_resolution() {
+    struct InspectSeed;
+    impl LockResolver for InspectSeed {
+        fn regenerate(
+            &self,
+            root: &Path,
+            release: &AdmittedRelease,
+            registry: Option<&str>,
+        ) -> Result<()> {
+            let lock = devkit::pnpm::Lock::read(root)?;
+            assert_eq!(
+                lock.importers["apps/extra"].dependencies["local"].version,
+                "file:apps/extra/vendor/local"
+            );
+            assert_eq!(
+                lock.packages["local@file:apps/extra/vendor/local"]["resolution"]["directory"],
+                "apps/extra/vendor/local"
+            );
+            assert_eq!(
+                lock.snapshots["local@file:apps/extra/vendor/local"]["dependencies"]["leaf"],
+                "file:apps/extra/vendor/leaf"
+            );
+            FixtureResolver.regenerate(root, release, registry)
+        }
+    }
+    let temporary = TempDir::new().unwrap();
+    let release = fixture_release(temporary.path(), "0.5.0");
+    let target = temporary.path().join("consumer");
+    init(&release, &target, "node", PackageMode::Registry);
+    let extra = target.join("apps/extra");
+    copy_tree(
+        &release.join("templates/node-api"),
+        &extra,
+        &|_| false,
+        false,
+    )
+    .unwrap();
+    let mut manifest: Value = read_json(&extra.join("package.json")).unwrap();
+    manifest["name"] = json!("existing-extra");
+    manifest["dependencies"] = json!({"local":"file:vendor/local"});
+    put_json(&extra, "package.json", &manifest);
+    put_json(
+        &extra,
+        "vendor/local/package.json",
+        &json!({"name":"local","version":"1.0.0","private":true,"dependencies":{"leaf":"file:../leaf"}}),
+    );
+    put_json(
+        &extra,
+        "vendor/leaf/package.json",
+        &json!({"name":"leaf","version":"1.0.0","private":true}),
+    );
+    let mut lock = devkit::pnpm::import_legacy_npm_lock_seed(
+        &extra,
+        &devkit::native::package_lock(&extra).unwrap(),
+    )
+    .unwrap();
+    lock.importers.get_mut(".").unwrap().dependencies.insert(
+        "local".into(),
+        devkit::pnpm::Dependency {
+            specifier: "file:vendor/local".into(),
+            version: "file:vendor/local".into(),
+        },
+    );
+    for name in ["local", "leaf"] {
+        let key = format!("{name}@file:vendor/{name}");
+        lock.packages.insert(key.clone(), json!({"version":"1.0.0","resolution":{"type":"directory","directory":format!("vendor/{name}")}}).as_object().unwrap().clone());
+        lock.snapshots.insert(
+            key,
+            if name == "local" {
+                json!({"dependencies":{"leaf":"file:vendor/leaf"}})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            } else {
+                Default::default()
+            },
+        );
+    }
+    lock.write(&extra).unwrap();
+    let before = source_signature(&target, None).unwrap();
+    let preview = register_project_component(
+        &release,
+        &target,
+        Role::App,
+        "extra".into(),
+        ToolingProfile::Node,
+        &UpdateOptions {
+            preview: true,
+            ..Default::default()
+        },
+        &InspectSeed,
+    )
+    .unwrap();
+    assert!(!preview.applied);
+    assert_eq!(source_signature(&target, None).unwrap(), before);
+    register_project_component(
+        &release,
+        &target,
+        Role::App,
+        "extra".into(),
+        ToolingProfile::Node,
+        &UpdateOptions::default(),
+        &InspectSeed,
+    )
+    .unwrap();
+    read_runtime_project(&target, "0.5.0").unwrap();
+    assert!(!extra.join("pnpm-lock.yaml").exists());
+}
+
+#[test]
 fn same_release_accepts_native_renames_and_preserves_root_product_graph() {
     let f = TempDir::new().unwrap();
     let release = fixture_release(f.path(), "0.5.0");

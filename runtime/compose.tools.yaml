@@ -18,6 +18,8 @@ x-node-environment: &node-environment
   NPM_CONFIG_CACHE: /tmp/devkit-npm-cache
   XDG_CACHE_HOME: /tmp/devkit-xdg-cache
   PNPM_CONFIG_PM_ON_FAIL: ignore
+  PNPM_CONFIG_RUNTIME: "false"
+  PNPM_CONFIG_RUNTIME_ON_FAIL: ignore
   PNPM_CONFIG_IGNORE_PNPMFILE: "true"
   PATH: /devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   NPM_CONFIG_USERCONFIG: /dev/null

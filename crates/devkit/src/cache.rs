@@ -708,7 +708,9 @@ mod npm_auth_tests {
         let temporary = tempfile::TempDir::new().unwrap();
         fs::write(temporary.path().join(".npmrc"),
             "//registry.example/:_authToken=${ROOT_TOKEN}\n//registry.example/private/:_auth=${PRIVATE_BASIC}\n//registry.example/both/:_authToken=${SCOPED_TOKEN}\n//registry.example/both/:_auth=${SCOPED_BASIC}\n").unwrap();
-        let policy = parse_manifest_npmrc_policy(temporary.path()).unwrap();
+        let policy =
+            parse_manifest_npmrc_policy(temporary.path(), crate::native::NodeLockKind::Npm)
+                .unwrap();
         for (path, kind, variable) in [
             ("/pkg", NpmAuthKind::Bearer, "ROOT_TOKEN"),
             ("/private/pkg", NpmAuthKind::Basic, "PRIVATE_BASIC"),

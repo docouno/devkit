@@ -785,11 +785,15 @@ class Verification:
         native_packages = {}
         native_dev_dependencies = {}
         manager_metadata = None
+        engine_metadata = None
         root_package = root / "package.json"
         if root_package.is_file() and any(c["toolchain"] == "node" for c in state["components"].values()):
             package = json.loads(root_package.read_text())
             manager_metadata = "npm@11.21.1" if semver_tuple(state["version"]) < (0, 5, 0) else "pnpm@0.0.0"
             package["packageManager"] = manager_metadata
+            pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
+            engine_metadata = {"runtime": {"name": "node", "version": pins["DEVKIT_NODE_VERSION"], "onFail": "download"}}
+            package["devEngines"] = engine_metadata
             root_package.write_text(json.dumps(package, indent=2) + "\n")
         preserve = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml")}
         for path, component in state["components"].items():
@@ -836,6 +840,8 @@ class Verification:
         if manager_metadata:
             require(json.loads(root_package.read_text())["packageManager"] == manager_metadata,
                     "Migration changed consumer-owned packageManager metadata")
+            require(json.loads(root_package.read_text())["devEngines"] == engine_metadata,
+                    "Migration changed consumer-owned runtime metadata")
         for path, old in state["components"].items():
             current = after["components"][path]
             require(current["verificationExtension"] == old["verificationExtension"]

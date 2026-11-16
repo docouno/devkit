@@ -388,6 +388,24 @@ mod tests {
                 .iter()
                 .any(|e| e.field == "peerDependencies")
         );
+        web.insert("devDependencies".into(), json!({"react":"19.3.2"}));
+        for optional in [false, true] {
+            if optional {
+                web.insert(
+                    "peerDependenciesMeta".into(),
+                    json!({"react":{"optional":true}}),
+                );
+            }
+            write_json(&root.join("apps/web/package.json"), &web).unwrap();
+            assert!(
+                !lock.retained_graph(root).unwrap().roots["apps/web"]
+                    .iter()
+                    .any(|e| e.field == "peerDependencies")
+            );
+        }
+        web.remove("devDependencies");
+        web.remove("peerDependenciesMeta");
+        write_json(&root.join("apps/web/package.json"), &web).unwrap();
         write_json(
             &root.join("package.json"),
             &json!({"name":"fixture","private":true,"devDependencies":{"react":"19.3.2"}}),
@@ -427,6 +445,72 @@ mod tests {
         }
         workspace.minimum_release_age_exclude = vec!["pkg@1.0.0".into(); 4097];
         assert!(workspace.validate(root).is_err());
+    }
+
+    #[test]
+    fn standalone_seed_rebases_local_artifacts_transitive_aliases_and_nested_peer_contexts() {
+        let mut lock = Lock::from_value(&json!({"lockfileVersion":"9.0",
+            "importers":{".":{"dependencies":{
+                "local":{"specifier":"file:vendor/local","version":"file:vendor/local"},
+                "alias":{"specifier":"file:vendor/archive.tgz","version":"archive@file:vendor/archive.tgz"},
+                "member":{"specifier":"file:vendor/member","version":"link:vendor/member"}
+            }}},
+            "packages":{
+                "local@file:vendor/local":{"resolution":{"type":"directory","directory":"vendor/local"}},
+                "archive@file:vendor/archive.tgz":{"resolution":{"tarball":"file:vendor/archive.tgz"}},
+                "external@1.0.0":{"resolution":{"tarball":"https://registry.example/external.tgz"}}
+            },
+            "snapshots":{
+                "local@file:vendor/local":{"dependencies":{"alias":"archive@file:vendor/archive.tgz"},"optionalDependencies":{"member":"link:vendor/member"}},
+                "archive@file:vendor/archive.tgz":{},
+                "external@1.0.0(local@file:vendor/local(archive@file:vendor/archive.tgz))(patch_hash=abc)":{"dependencies":{"local":"file:vendor/local","external":"1.0.0"}}
+            }
+        })).unwrap();
+        lock.rebase_local_paths("apps/extra").unwrap();
+        assert_eq!(
+            lock.importers["."].dependencies["local"].specifier,
+            "file:vendor/local"
+        );
+        assert_eq!(
+            lock.importers["."].dependencies["local"].version,
+            "file:apps/extra/vendor/local"
+        );
+        assert_eq!(
+            lock.importers["."].dependencies["alias"].version,
+            "archive@file:apps/extra/vendor/archive.tgz"
+        );
+        assert_eq!(
+            lock.importers["."].dependencies["member"].version,
+            "link:vendor/member"
+        );
+        assert_eq!(
+            lock.packages["local@file:apps/extra/vendor/local"]["resolution"]["directory"],
+            "apps/extra/vendor/local"
+        );
+        assert_eq!(
+            lock.packages["archive@file:apps/extra/vendor/archive.tgz"]["resolution"]["tarball"],
+            "file:apps/extra/vendor/archive.tgz"
+        );
+        assert_eq!(
+            lock.packages["external@1.0.0"]["resolution"]["tarball"],
+            "https://registry.example/external.tgz"
+        );
+        let snapshot = &lock.snapshots["external@1.0.0(local@file:apps/extra/vendor/local(archive@file:apps/extra/vendor/archive.tgz))(patch_hash=abc)"];
+        assert_eq!(
+            snapshot["dependencies"]["local"],
+            "file:apps/extra/vendor/local"
+        );
+        assert_eq!(snapshot["dependencies"]["external"], "1.0.0");
+        assert_eq!(
+            lock.snapshots["local@file:apps/extra/vendor/local"]["dependencies"]["alias"],
+            "archive@file:apps/extra/vendor/archive.tgz"
+        );
+        assert_eq!(
+            lock.snapshots["local@file:apps/extra/vendor/local"]["optionalDependencies"]["member"],
+            "link:apps/extra/vendor/member"
+        );
+        assert!(rebase_file_path("apps/extra", "../../../outside").is_err());
+        assert!(rebase_file_path("apps/extra", "/outside").is_err());
     }
 
     #[test]
@@ -488,11 +572,12 @@ mod tests {
 
 pub fn read_yaml<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<T> {
     let path = input_path(root, name)?;
-    ensure!(
-        fs::metadata(&path)?.len() <= MAX_BYTES as u64,
-        "pnpm YAML exceeds byte budget"
-    );
-    parse_yaml(&fs::read(path)?)
+    let (bytes, _) = read_yaml_file(&path)?.context("Missing pnpm YAML input")?;
+    parse_yaml(&bytes)
+}
+
+pub(crate) fn read_yaml_file(path: &Path) -> Result<Option<(Vec<u8>, crate::model::FileIdentity)>> {
+    read_regular_file(path, MAX_BYTES as u64, "pnpm YAML")
 }
 
 pub fn write_yaml(root: &Path, name: &str, value: &impl Serialize) -> Result<()> {
@@ -707,6 +792,68 @@ pub fn relative_link(from: &str, to: &str) -> String {
     } else {
         path.join("/")
     }
+}
+
+fn rebase_file_path(prefix: &str, path: &str) -> Result<String> {
+    let path = crate::graph::joined_local(prefix, path)?;
+    relative_path(&path)?;
+    Ok(path)
+}
+
+fn rebase_snapshot_key(key: &str, prefix: &str, depth: usize) -> Result<String> {
+    ensure!(depth < 64, "pnpm peer graph exceeds depth budget");
+    let (name, version) = package_parts(key)?;
+    let version = if let Some(path) = version.strip_prefix("file:") {
+        format!("file:{}", rebase_file_path(prefix, path)?)
+    } else {
+        version.to_owned()
+    };
+    let mut result = format!("{name}@{version}");
+    let suffix = &key[strip_peer_suffixes(key).len()..];
+    let mut start = 0;
+    while start < suffix.len() {
+        ensure!(suffix.as_bytes()[start] == b'(', "Invalid pnpm peer suffix");
+        let mut nesting = 1;
+        let mut end = start + 1;
+        while end < suffix.len() && nesting > 0 {
+            match suffix.as_bytes()[end] {
+                b'(' => nesting += 1,
+                b')' => nesting -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        ensure!(nesting == 0, "Unbalanced pnpm peer suffix");
+        let peer = &suffix[start + 1..end - 1];
+        result.push('(');
+        if peer.contains("@file:") {
+            result.push_str(&rebase_snapshot_key(peer, prefix, depth + 1)?);
+        } else {
+            result.push_str(peer);
+        }
+        result.push(')');
+        start = end;
+    }
+    Ok(result)
+}
+
+fn qualified_reference(reference: &str) -> bool {
+    let base = strip_peer_suffixes(reference);
+    !base.starts_with("file:") && base[usize::from(base.starts_with('@'))..].contains('@')
+}
+
+fn rebase_reference(name: &str, reference: &str, prefix: &str) -> Result<String> {
+    if !reference.contains("file:") {
+        return Ok(reference.into());
+    }
+    let key = rebase_snapshot_key(&snapshot_key(name, reference)?, prefix, 0)?;
+    Ok(if qualified_reference(reference) {
+        key
+    } else {
+        key.strip_prefix(&format!("{name}@"))
+            .context("Rebased pnpm reference changed package name")?
+            .into()
+    })
 }
 
 fn legacy_key(
@@ -1209,13 +1356,11 @@ pub fn snapshot_key(name: &str, reference: &str) -> Result<String> {
         native::valid_dependency_name(name),
         "Invalid pnpm dependency name"
     );
-    let base = strip_peer_suffixes(reference);
-    let key =
-        if !base.starts_with("file:") && base[usize::from(base.starts_with('@'))..].contains('@') {
-            reference.to_owned()
-        } else {
-            format!("{name}@{reference}")
-        };
+    let key = if qualified_reference(reference) {
+        reference.to_owned()
+    } else {
+        format!("{name}@{reference}")
+    };
     package_parts(&key)?;
     Ok(key)
 }
@@ -1227,6 +1372,63 @@ pub fn root_path(id: &str) -> &str {
 }
 
 impl Lock {
+    /// Move a standalone lock's root-relative file identities with its source
+    /// subtree. Manifest specifiers and importer-relative links stay unchanged.
+    pub(crate) fn rebase_local_paths(&mut self, prefix: &str) -> Result<()> {
+        for importer in self.importers.values_mut() {
+            for field in PHYSICAL_FIELDS {
+                for (name, dependency) in importer.field_mut(field) {
+                    dependency.version = rebase_reference(name, &dependency.version, prefix)?;
+                }
+            }
+        }
+        let mut packages = BTreeMap::new();
+        for (key, mut package) in std::mem::take(&mut self.packages) {
+            if let Some(resolution) = package.get_mut("resolution").and_then(Value::as_object_mut) {
+                if let Some(path) = resolution.get("directory").and_then(Value::as_str) {
+                    resolution.insert("directory".into(), json!(rebase_file_path(prefix, path)?));
+                }
+                if let Some(path) = resolution
+                    .get("tarball")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix("file:"))
+                {
+                    resolution.insert(
+                        "tarball".into(),
+                        json!(format!("file:{}", rebase_file_path(prefix, path)?)),
+                    );
+                }
+            }
+            let key = rebase_snapshot_key(&key, prefix, 0)?;
+            ensure!(
+                packages.insert(key, package).is_none(),
+                "Conflicting rebased pnpm package identities"
+            );
+        }
+        self.packages = packages;
+        let mut snapshots = BTreeMap::new();
+        for (key, mut snapshot) in std::mem::take(&mut self.snapshots) {
+            for field in ["dependencies", "optionalDependencies"] {
+                if let Some(dependencies) = snapshot.get_mut(field).and_then(Value::as_object_mut) {
+                    for (name, reference) in dependencies {
+                        let value = text(reference, "pnpm snapshot reference")?;
+                        *reference = json!(if let Some(path) = value.strip_prefix("link:") {
+                            format!("link:{}", rebase_file_path(prefix, path)?)
+                        } else {
+                            rebase_reference(name, value, prefix)?
+                        });
+                    }
+                }
+            }
+            let key = rebase_snapshot_key(&key, prefix, 0)?;
+            ensure!(
+                snapshots.insert(key, snapshot).is_none(),
+                "Conflicting rebased pnpm snapshot identities"
+            );
+        }
+        self.snapshots = snapshots;
+        Ok(())
+    }
     pub fn native_graph(&self, root: &Path) -> Result<crate::graph::NativeGraph> {
         self.graph(root, true)
     }
@@ -1263,15 +1465,26 @@ impl Lock {
                     if !strict
                         && field == "peerDependencies"
                         && self.importers[id].dependency(&name).is_none()
-                        && self
-                            .importers
-                            .get(".")
-                            .and_then(|i| i.dependency(&name))
-                            .is_none()
                     {
-                        // An unresolved new peer is a resolver input, not a
-                        // previously selected product artifact to preserve.
-                        continue;
+                        let own_declared =
+                            PHYSICAL_FIELDS.iter().try_fold(false, |found, field| {
+                                Ok::<_, anyhow::Error>(
+                                    found
+                                        || native::dependency_table(&manifest, field)?
+                                            .contains_key(&name),
+                                )
+                            })?;
+                        // A future own provider shadows root fallback even
+                        // before its selection exists in this partial graph.
+                        if own_declared
+                            || self
+                                .importers
+                                .get(".")
+                                .and_then(|i| i.dependency(&name))
+                                .is_none()
+                        {
+                            continue;
+                        }
                     }
                     if !strict
                         && field != "peerDependencies"

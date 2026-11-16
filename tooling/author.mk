@@ -102,8 +102,17 @@ define author_node
 	@mkdir -p "$$DEVKIT_AUTHOR_ROOT/node_modules" "$$DEVKIT_AUTHOR_ROOT/packages/env/node_modules" "$$DEVKIT_AUTHOR_PNPM_STORE" "$$DEVKIT_AUTHOR_PNPM_CACHE" "$$DEVKIT_AUTHOR_ROOT/.tmp"
 	@set -eu; read -r token < /proc/sys/kernel/random/uuid; name="devkit-author-$$token"; \
 	pnpm_bin=$$("$$DEVKIT_AUTHOR_ENGINE" --offline internal ensure-pnpm --pin-file "$$DEVKIT_AUTHOR_ROOT/toolchains.env"); \
-	set --; if [ -z '$(4)' ] && [ -d "$$DEVKIT_AUTHOR_ROOT/node_modules/.pnpm" ]; then \
-	  set -- --volume "$$DEVKIT_AUTHOR_ROOT/node_modules/.pnpm:/workspace/node_modules/.pnpm:ro,z"; fi; \
+	set --; \
+	case "$$DEVKIT_AUTHOR_PNPM_STORE" in \
+	  "$$DEVKIT_AUTHOR_ROOT"/*) store="/workspace/$${DEVKIT_AUTHOR_PNPM_STORE#"$$DEVKIT_AUTHOR_ROOT"/}" ;; \
+	  *) store=/pnpm-store; set -- "$$@" --volume "$$DEVKIT_AUTHOR_PNPM_STORE:/pnpm-store:z" ;; \
+	esac; \
+	case "$$DEVKIT_AUTHOR_PNPM_CACHE" in \
+	  "$$DEVKIT_AUTHOR_ROOT"/*) cache="/workspace/$${DEVKIT_AUTHOR_PNPM_CACHE#"$$DEVKIT_AUTHOR_ROOT"/}" ;; \
+	  *) cache=/pnpm-cache; set -- "$$@" --volume "$$DEVKIT_AUTHOR_PNPM_CACHE:/pnpm-cache:z" ;; \
+	esac; \
+	if [ -z '$(4)' ] && [ -d "$$DEVKIT_AUTHOR_ROOT/node_modules/.pnpm" ]; then \
+	  set -- "$$@" --volume "$$DEVKIT_AUTHOR_ROOT/node_modules/.pnpm:/workspace/node_modules/.pnpm:ro,z"; fi; \
 	res_flags=$$("$$DEVKIT_AUTHOR_ENGINE" internal docker-flags --cpus 2 --memory 1024m --pids-limit 512 --node-fallback); \
 	exec "$$DEVKIT_AUTHOR_ENGINE" internal guard "$$name" "$$token" -- \
 	  docker run --pull never --rm --init --name "$$name" \
@@ -120,11 +129,12 @@ define author_node
 	    --volume "$$pnpm_bin:/devkit/bin/pnpm:ro,z" "$$@" \
 	    --env PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	    --workdir /workspace --env HOME=/tmp/devkit-author-home --env CI=true \
-	    --env XDG_CACHE_HOME=/workspace/.artifacts/author/pnpm-cache \
+	    --env "XDG_CACHE_HOME=$$cache" --env "PNPM_CONFIG_STORE_DIR=$$store" \
 	    --env npm_config_cache=/tmp/devkit-author-npm-cache \
 	    --env npm_config_userconfig=/tmp/devkit-author-user.npmrc \
 	    --env PNPM_CONFIG_IGNORE_PNPMFILE=true \
 	    --env PNPM_CONFIG_PM_ON_FAIL=ignore \
+	    --env PNPM_CONFIG_RUNTIME=false --env PNPM_CONFIG_RUNTIME_ON_FAIL=ignore \
 	    --env npm_config_globalconfig=/tmp/devkit-author-global.npmrc \
 	    --env npm_config_update_notifier=false --env npm_config_fund=false --env npm_config_audit=false \
 	    $(3) "$$DEVKIT_AUTHOR_NODE_IMAGE" /devkit/devkit internal node "$$DEVKIT_NODE_VERSION" -- $(2)
@@ -159,6 +169,7 @@ define author_node_setup
 	    --env "XDG_CACHE_HOME=$$cache" --env "PNPM_CONFIG_STORE_DIR=$$store" \
 	    --env PNPM_CONFIG_IGNORE_PNPMFILE=true \
 	    --env PNPM_CONFIG_PM_ON_FAIL=ignore \
+	    --env PNPM_CONFIG_RUNTIME=false --env PNPM_CONFIG_RUNTIME_ON_FAIL=ignore \
 	    --env npm_config_cache=/tmp/devkit-author-npm-cache \
 	    "$$DEVKIT_AUTHOR_NODE_IMAGE" /devkit/devkit internal node "$$DEVKIT_NODE_VERSION" -- \
 	    $(2) --config.package-import-method="$$method"

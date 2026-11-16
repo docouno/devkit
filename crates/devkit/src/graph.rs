@@ -4,9 +4,9 @@ use crate::{
     files::{exists, input_path, object, text, write_json},
     model::{ProjectState, Toolchain},
     native::{
-        DEPENDENCY_FIELDS, Fields, Packages, admitted_dependency_target, dependency_table,
-        native_manifest, package_lock, parse_npm_dependency_spec, resolve_lock_node,
-        root_workspace_link,
+        DEPENDENCY_FIELDS, Fields, NodeLockKind, Packages, admitted_dependency_target,
+        dependency_table, native_manifest, package_lock, parse_npm_dependency_spec,
+        resolve_lock_node, root_workspace_link,
     },
 };
 use anyhow::{Context, ensure};
@@ -64,7 +64,7 @@ fn normalized_local(value: &str) -> Result<String> {
         parts.join("/")
     })
 }
-fn joined_local(base: &str, value: &str) -> Result<String> {
+pub(crate) fn joined_local(base: &str, value: &str) -> Result<String> {
     ensure!(
         !value.starts_with('/'),
         "External native lock path: {value}"
@@ -114,8 +114,8 @@ fn artifact_identity(location: &str, data: &Fields) -> Result<Fields> {
     Ok(result)
 }
 
-pub fn read_native_graph(root: &Path) -> Result<NativeGraph> {
-    if exists(&input_path(root, "pnpm-lock.yaml")?)? {
+pub fn read_native_graph(root: &Path, kind: NodeLockKind) -> Result<NativeGraph> {
+    if kind == NodeLockKind::Pnpm {
         return crate::pnpm::Lock::read(root)?.native_graph(root);
     }
     read_npm_graph(root)
@@ -169,7 +169,7 @@ fn read_npm_graph(root: &Path) -> Result<NativeGraph> {
 }
 
 pub fn capture_product_graph(root: &Path, state: &ProjectState) -> Result<ProductGraph> {
-    let graph = read_native_graph(root)?;
+    let graph = read_native_graph(root, NodeLockKind::for_state(state)?)?;
     Ok(product_graph(graph, state))
 }
 
@@ -478,6 +478,9 @@ pub(crate) fn seed_workspace_lock_with_reconciliation(
         } else {
             crate::pnpm::Lock::from_value(&seed.lock)?
         };
+        if !legacy && !seed.prefix.is_empty() {
+            source.rebase_local_paths(&seed.prefix)?;
+        }
         source.importers = source
             .importers
             .into_iter()

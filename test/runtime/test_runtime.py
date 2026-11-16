@@ -531,6 +531,10 @@ class RuntimeTests(unittest.TestCase):
         manifest = json.loads(path.read_text())
         for manager in ("pnpm@0.0.0", "npm@11.21.1"):
             manifest["packageManager"] = manager
+            manifest["devEngines"] = {
+                "packageManager": {"name": manager.split("@")[0], "version": manager.split("@")[1], "onFail": "error"},
+                "runtime": {"name": "node", "version": "24.22.1", "onFail": "download"},
+            }
             path.write_text(json.dumps(manifest, indent=2) + "\n")
             before = path.read_bytes()
             self.make("setup")

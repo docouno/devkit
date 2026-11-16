@@ -36,7 +36,11 @@ test(
     );
     const childEnv = {
       ...inherited,
-      XDG_CACHE_HOME: '/workspace/.artifacts/author/pnpm-cache',
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? path.join(root, 'pnpm-cache'),
+      PNPM_CONFIG_IGNORE_PNPMFILE: 'true',
+      PNPM_CONFIG_PM_ON_FAIL: 'ignore',
+      PNPM_CONFIG_RUNTIME: 'false',
+      PNPM_CONFIG_RUNTIME_ON_FAIL: 'ignore',
       npm_config_cache:
         process.env.npm_config_cache ??
         process.env.NPM_CONFIG_CACHE ??
@@ -100,6 +104,10 @@ test(
           snapshots,
         }),
       );
+      assert.ok(
+        process.env.PNPM_CONFIG_STORE_DIR,
+        'Run make test-env with its configured pnpm store',
+      );
       const install = run(
         'pnpm',
         [
@@ -110,7 +118,7 @@ test(
           '--ignore-workspace',
           '--ignore-scripts',
           '--store-dir',
-          '/workspace/.artifacts/author/pnpm-store',
+          process.env.PNPM_CONFIG_STORE_DIR,
           '--config.package-import-method=copy',
         ],
         75_000,

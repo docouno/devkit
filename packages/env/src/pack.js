@@ -197,6 +197,8 @@ export async function verifyPackableComponent(componentDir, options = {}) {
         '--config.ignore-scripts=true',
         '--config.ignore-pnpmfile=true',
         '--config.pm-on-fail=ignore',
+        '--config.runtime=false',
+        '--config.runtime-on-fail=ignore',
         '--json',
       ],
       {

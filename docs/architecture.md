@@ -28,7 +28,7 @@ A Devkit repository contains at least one registered component across two direct
 Devkit deliberately avoids duplicating native package metadata in `.devkit/manifest.json`:
 
 - **Node components** share one root pnpm workspace (`pnpm-workspace.yaml` + `pnpm-lock.yaml`) with `nodeLinker: isolated` and `packageImportMethod: hardlink`. Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
-  Devkit commands use the release's verified pnpm executable with automatic manager switching disabled; user-owned `packageManager` metadata is preserved.
+  Devkit commands use the release's verified pnpm executable and container Node runtime with automatic manager and SDK installation disabled; user-owned `packageManager` and `devEngines` metadata is preserved.
 - **Rust components** own `{component}/Cargo.toml` and `{component}/Cargo.lock`. A single registered Rust component (for example `apps/api`) can organize multiple internal crates using a native Cargo `[workspace]` inside `apps/api/Cargo.toml` (`members = [".", "crates/*"]`) while preserving a single `{component}/rust-toolchain.toml` and `{component}/Cargo.lock`.
 
 When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `pnpm-lock.yaml` transactionally without changing the accepted Devkit release.

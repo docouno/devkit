@@ -493,7 +493,10 @@ impl<'a> PreparedContext<'a> {
             return Ok(path.clone());
         }
         let pin = PnpmPin::from_checkout(&self.admission.root)?;
-        let policy = crate::native::parse_manifest_npmrc_policy(&self.admission.root)?;
+        let policy = crate::native::parse_manifest_npmrc_policy(
+            &self.admission.root,
+            crate::native::NodeLockKind::for_state(&self.admission.state)?,
+        )?;
         let cache = crate::cache::ReleaseCache::new(self.cache_dir.as_deref(), self.runner)?;
         let path = cache.ensure_pnpm(&pin, Some(&policy), allow_network)?;
         *self.pnpm_path.borrow_mut() = Some(path.clone());
@@ -539,7 +542,13 @@ impl<'a> PreparedContext<'a> {
                 fs::remove_dir_all(&dist)?;
             }
             let installed = safe_path(&package, "path.txt")?;
-            identity(&installed)?;
+            if exists(&installed)? {
+                ensure!(
+                    fs::symlink_metadata(&installed)?.is_file(),
+                    "Electron metadata must be a regular file: {}",
+                    installed.display()
+                );
+            }
             remove_file(&installed)?;
             self.task(ContainerTask {
                 component: Some(path),
@@ -1006,7 +1015,11 @@ impl<'a> PreparedContext<'a> {
                 .filter(|(_, c)| c.toolchain == Toolchain::Node)
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>();
-            Some(crate::native::parse_and_admit_npmrc(root, &directories)?)
+            Some(crate::native::parse_and_admit_npmrc(
+                root,
+                &directories,
+                crate::native::NodeLockKind::for_state(&self.admission.state)?,
+            )?)
         } else {
             None
         };
@@ -1186,6 +1199,8 @@ impl<'a> PreparedContext<'a> {
                 "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
                 "PNPM_CONFIG_IGNORE_PNPMFILE=true",
                 "PNPM_CONFIG_PM_ON_FAIL=ignore",
+                "PNPM_CONFIG_RUNTIME=false",
+                "PNPM_CONFIG_RUNTIME_ON_FAIL=ignore",
                 "XDG_CACHE_HOME=/cache/pnpm",
                 "NPM_CONFIG_CACHE=/tmp/devkit-npm-cache",
                 "NPM_CONFIG_USERCONFIG=/devkit/user.npmrc",
@@ -1323,29 +1338,7 @@ fn ensure_electron_executable(entries: &BTreeMap<String, DistributionEntry>) -> 
 }
 
 fn read_electron_metadata(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    ensure!(
-        file.metadata()?.is_file(),
-        "Electron metadata must be a regular file: {}",
-        path.display()
-    );
-    let mut bytes = Vec::new();
-    file.take(maximum + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= maximum,
-        "Electron metadata exceeds its byte budget: {}",
-        path.display()
-    );
-    Ok(Some(bytes))
+    Ok(read_regular_file(path, maximum, "Electron metadata")?.map(|(bytes, _)| bytes))
 }
 
 fn read_distribution_receipt(path: &Path) -> Result<ElectronDistributionReceipt> {
@@ -2354,7 +2347,10 @@ fn run_development(
     if identity(&legacy_npm_overlay)?.is_some() {
         let _ = remove_file(&legacy_npm_overlay);
     }
-    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(&ctx.admission.root)?;
+    let npmrc_policy = crate::native::parse_manifest_npmrc_policy(
+        &ctx.admission.root,
+        crate::native::NodeLockKind::for_state(&ctx.admission.state)?,
+    )?;
     if !npmrc_policy.required_env_vars.is_empty() {
         let mut services_map = serde_json::Map::new();
         for (path, c) in &full.state.components {

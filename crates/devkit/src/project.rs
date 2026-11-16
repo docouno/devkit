@@ -218,10 +218,11 @@ pub trait LockResolver {
         release: &AdmittedRelease,
         registry: Option<&str>,
     ) -> Result<ReconcileStrategy> {
-        let npmrc_policy = parse_manifest_npmrc_policy(root)?;
+        let lock_kind = NodeLockKind::for_version(&release.manifest.version)?;
+        let npmrc_policy = parse_manifest_npmrc_policy(root, lock_kind)?;
         verify_required_npm_env_vars(&npmrc_policy)?;
         resolve_ca_cert_path()?;
-        let pnpm = exists(&safe_path(root, "pnpm-workspace.yaml")?)?;
+        let pnpm = lock_kind == NodeLockKind::Pnpm;
         let lock_path = safe_path(
             root,
             if pnpm {
@@ -283,7 +284,10 @@ impl LockResolver for DockerPnpmResolver {
         }
         let image = image.context("Missing digest-pinned Node image")?;
         let root = project_root(root)?;
-        let npmrc_policy = parse_manifest_npmrc_policy(&root)?;
+        let npmrc_policy = parse_manifest_npmrc_policy(
+            &root,
+            NodeLockKind::for_version(&release.manifest.version)?,
+        )?;
         if !self.offline {
             verify_required_npm_env_vars(&npmrc_policy)?;
         }
@@ -386,6 +390,8 @@ impl LockResolver for DockerPnpmResolver {
                     "PNPM_CONFIG_NPMRC_AUTH_FILE=/devkit/user.npmrc",
                     "PNPM_CONFIG_IGNORE_PNPMFILE=true",
                     "PNPM_CONFIG_PM_ON_FAIL=ignore",
+                    "PNPM_CONFIG_RUNTIME=false",
+                    "PNPM_CONFIG_RUNTIME_ON_FAIL=ignore",
                     "PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                     "npm_config_globalconfig=/tmp/devkit-global.npmrc",
                     "npm_config_update_notifier=false",
@@ -1115,7 +1121,10 @@ pub fn init_project(
         seed_workspace_lock(stage.path(), &state, &seeds)?;
         let product = capture_product_graph(stage.path(), &state)?;
         resolver.regenerate(stage.path(), &release, options.registry)?;
-        assert_product_graphs_preserved(&product, &read_native_graph(stage.path())?)?;
+        assert_product_graphs_preserved(
+            &product,
+            &read_native_graph(stage.path(), NodeLockKind::for_state(&state)?)?,
+        )?;
     }
     let deps = derive_component_dependencies(stage.path(), &state)?;
     for (path, c) in &mut state.components {
@@ -1439,7 +1448,7 @@ fn mutate(
         if !node_components(old).is_empty() {
             seeds.push(LockSeed {
                 prefix: String::new(),
-                lock: read_workspace_lock(&staged_root)?,
+                lock: read_workspace_lock(&staged_root, NodeLockKind::for_state(old)?)?,
             });
         }
         let mut created = vec![];
@@ -1529,7 +1538,7 @@ fn mutate(
                     });
                 } else {
                     ensure!(
-                        if staged_root.join("pnpm-lock.yaml").is_file() {
+                        if NodeLockKind::for_state(old)? == NodeLockKind::Pnpm {
                             crate::pnpm::Lock::read(&staged_root)?
                                 .importers
                                 .contains_key(&path)
@@ -1603,7 +1612,7 @@ fn mutate(
             if options.reconcile_lock {
                 let strategy =
                     resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
-                let after_graph = read_native_graph(&staged_root)?;
+                let after_graph = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                 assert_direct_product_roots_preserved(&product, &after_graph)?;
                 lock_reconciliation = Some(compute_reconciliation_report(
                     strategy,
@@ -1612,7 +1621,7 @@ fn mutate(
                 ));
             } else {
                 resolver.regenerate(&staged_root, &release, options.registry)?;
-                let after_graph = read_native_graph(&staged_root)?;
+                let after_graph = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                 assert_product_graphs_preserved(&product, &after_graph).map_err(|err| {
                     crate::cli::error(
                         "PRODUCT_GRAPH_DRIFT",
@@ -1725,8 +1734,8 @@ fn mutate(
     result
 }
 
-fn read_workspace_lock(root: &Path) -> Result<Value> {
-    if exists(&safe_path(root, "pnpm-lock.yaml")?)? {
+fn read_workspace_lock(root: &Path, kind: NodeLockKind) -> Result<Value> {
+    if kind == NodeLockKind::Pnpm {
         let lock: crate::pnpm::Lock = crate::pnpm::read_yaml(root, "pnpm-lock.yaml")?;
         Ok(serde_json::to_value(lock)?)
     } else {
@@ -2071,11 +2080,15 @@ pub fn sync_project(
     let result: Result<MutationOutcome> = (|| {
         copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
         let staged_closure = collect_native_input_closure(&staged_root, &next)?;
-        let npmrc_policy = parse_and_admit_npmrc(&staged_root, &staged_closure.directories)?;
+        let npmrc_policy = parse_and_admit_npmrc(
+            &staged_root,
+            &staged_closure.directories,
+            NodeLockKind::for_state(&next)?,
+        )?;
         sync_node_workspace(&staged_root, &next, None)?;
         let mut lock_reconciliation = None;
         if !node_components(&next).is_empty() {
-            let old_lock = read_workspace_lock(&staged_root)?;
+            let old_lock = read_workspace_lock(&staged_root, NodeLockKind::for_state(old)?)?;
             let (before_graph, retained_product) =
                 capture_retained_product_graph(&staged_root, &next, &old_lock)?;
             seed_workspace_lock_with_reconciliation(
@@ -2087,20 +2100,20 @@ pub fn sync_project(
                 }],
                 options.reconcile_lock,
             )?;
-            let seeded_packages = if exists(&safe_path(&staged_root, "pnpm-lock.yaml")?)? {
+            let seeded_packages = if NodeLockKind::for_state(&next)? == NodeLockKind::Pnpm {
                 Packages::new()
             } else {
                 package_lock(&staged_root)?
             };
             let mut needs_resolver = options.reconcile_lock
                 || external_deps_changed(&staged_root, &next, &old_lock, &seeded_packages)?
-                || if exists(&safe_path(&staged_root, "pnpm-lock.yaml")?)? {
+                || if NodeLockKind::for_state(&next)? == NodeLockKind::Pnpm {
                     pnpm_registries_drifted(&npmrc_policy, &crate::pnpm::Lock::read(&staged_root)?)
                 } else {
                     npmrc_registries_drifted(&npmrc_policy, &seeded_packages)
                 };
             if !needs_resolver {
-                let offline_ok = read_native_graph(&staged_root)
+                let offline_ok = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)
                     .and_then(|_| derive_component_dependencies(&staged_root, &next))
                     .is_ok();
                 if !offline_ok {
@@ -2111,7 +2124,8 @@ pub fn sync_project(
                 if options.reconcile_lock {
                     let strategy =
                         resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
-                    let after_graph = read_native_graph(&staged_root)?;
+                    let after_graph =
+                        read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                     let expected_current = capture_product_graph(&staged_root, &next)?;
                     assert_direct_product_roots_preserved(&expected_current, &after_graph)?;
                     lock_reconciliation = Some(compute_reconciliation_report(
@@ -2121,7 +2135,8 @@ pub fn sync_project(
                     ));
                 } else {
                     resolver.regenerate(&staged_root, &release, options.registry)?;
-                    let after_graph = read_native_graph(&staged_root)?;
+                    let after_graph =
+                        read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                     assert_retained_product_graph_preserved(&retained_product, &after_graph)
                         .map_err(|err| {
                             crate::cli::error(
@@ -2131,7 +2146,7 @@ pub fn sync_project(
                         })?;
                 }
             } else {
-                let after_graph = read_native_graph(&staged_root)?;
+                let after_graph = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                 assert_retained_product_graph_preserved(&retained_product, &after_graph).map_err(
                     |err| {
                         crate::cli::error(

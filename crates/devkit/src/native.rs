@@ -4,8 +4,8 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        SemVer, digest, exists, identity, input_path, object, project_root, read_json,
-        relative_name, safe_path, sorted_entries, text,
+        SemVer, digest, exists, identity as file_identity, input_path, object, project_root,
+        read_json, relative_name, safe_path, sorted_entries, text,
     },
     model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
@@ -27,6 +27,38 @@ pub const DEPENDENCY_FIELDS: [&str; 4] = [
 ];
 pub type Fields = Map<String, Value>;
 pub type Packages = BTreeMap<String, Fields>;
+
+fn is_pnpm_yaml(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("pnpm-lock.yaml" | "pnpm-workspace.yaml")
+    )
+}
+fn identity(path: &Path) -> Result<Option<FileIdentity>> {
+    if is_pnpm_yaml(path) {
+        Ok(crate::pnpm::read_yaml_file(path)?.map(|(_, identity)| identity))
+    } else {
+        file_identity(path)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLockKind {
+    Npm,
+    Pnpm,
+}
+impl NodeLockKind {
+    pub fn for_version(version: &str) -> Result<Self> {
+        Ok(if SemVer::parse(version)? >= SemVer::parse("0.5.0")? {
+            Self::Pnpm
+        } else {
+            Self::Npm
+        })
+    }
+    pub fn for_state(state: &ProjectState) -> Result<Self> {
+        Self::for_version(&state.version)
+    }
+}
 
 pub fn valid_dependency_name(name: &str) -> bool {
     if name.is_empty() || name.contains(['\\', '\0', '\n', '\r', '\t']) {
@@ -264,7 +296,13 @@ pub fn dependency_table(data: &Fields, field: &str) -> Result<Fields> {
 fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
     let before =
         identity(path)?.with_context(|| format!("Missing native input: {}", path.display()))?;
-    let bytes = fs::read(path)?;
+    let bytes = if is_pnpm_yaml(path) {
+        crate::pnpm::read_yaml_file(path)?
+            .context("Missing pnpm YAML input")?
+            .0
+    } else {
+        fs::read(path)?
+    };
     ensure!(
         digest(&bytes) == before.sha256 && identity(path)? == Some(before.clone()),
         "Native input changed while reading: {}",
@@ -305,7 +343,7 @@ pub fn assert_pnpm_lock_mode(root: &Path) -> Result<()> {
         "bun.lockb",
     ] {
         ensure!(
-            identity(&input_path(root, name)?)?.is_none(),
+            !exists(&input_path(root, name)?)?,
             "Competing root lockfile {name} is not allowed in a Devkit 0.5 pnpm workspace; remove it or run devkit update"
         );
     }
@@ -524,7 +562,7 @@ pub fn local_dependency_map(
         return Ok(BTreeMap::new());
     }
     let manifest = native_manifest(root, path)?;
-    let mut context = ReadContext::new(root);
+    let mut context = ReadContext::new(root, NodeLockKind::for_state(state)?);
     let mut result = BTreeMap::new();
     for field in DEPENDENCY_FIELDS {
         for (name, spec) in dependency_table(&manifest, field)? {
@@ -801,6 +839,7 @@ impl NativeStructure {
 /// manifests and a single physical lock graph.
 struct ReadContext<'a> {
     root: &'a Path,
+    lock_kind: NodeLockKind,
     packages: Option<Packages>,
     pnpm_lock: Option<crate::pnpm::Lock>,
     manifests: BTreeMap<String, Fields>,
@@ -811,9 +850,10 @@ struct ReadContext<'a> {
     read_identities: BTreeMap<String, FileIdentity>,
 }
 impl<'a> ReadContext<'a> {
-    fn new(root: &'a Path) -> Self {
+    fn new(root: &'a Path, lock_kind: NodeLockKind) -> Self {
         Self {
             root,
+            lock_kind,
             packages: None,
             pnpm_lock: None,
             manifests: BTreeMap::new(),
@@ -825,7 +865,7 @@ impl<'a> ReadContext<'a> {
         }
     }
     fn is_pnpm(&self) -> bool {
-        self.root.join("pnpm-workspace.yaml").exists()
+        self.lock_kind == NodeLockKind::Pnpm
     }
     fn pnpm(&mut self) -> Result<&crate::pnpm::Lock> {
         if self.pnpm_lock.is_none() {
@@ -1536,6 +1576,7 @@ impl<'a> ReadContext<'a> {
         if !queue.is_empty() {
             queue.push_front(String::new());
             if self.is_pnpm() {
+                assert_pnpm_lock_mode(self.root)?;
                 record(self.root, &mut files, "pnpm-workspace.yaml", true)?;
                 record(self.root, &mut files, "pnpm-lock.yaml", true)?;
                 let workspace = crate::pnpm::Workspace::read(self.root)?;
@@ -1619,9 +1660,18 @@ impl<'a> ReadContext<'a> {
                 "bun.lockb",
                 ".npmrc",
             ] {
-                if self.is_pnpm() && !path.is_empty() && file != ".npmrc" {
+                if !self.is_pnpm()
+                    && !["package-lock.json", "npm-shrinkwrap.json", ".npmrc"].contains(&file)
+                {
+                    continue;
+                }
+                if self.is_pnpm()
+                    && file != ".npmrc"
+                    && !(path.is_empty()
+                        && ["pnpm-lock.yaml", "pnpm-workspace.yaml"].contains(&file))
+                {
                     ensure!(
-                        identity(&input_path(self.root, prefixed(&path, file))?)?.is_none(),
+                        !exists(&input_path(self.root, prefixed(&path, file))?)?,
                         "Competing lockfile in workspace context: {}/{}",
                         path,
                         file
@@ -1831,10 +1881,12 @@ pub fn derive_component_dependencies(
     root: &Path,
     state: &ProjectState,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    Ok(ReadContext::new(root).derive(state)?.projected)
+    Ok(ReadContext::new(root, NodeLockKind::for_state(state)?)
+        .derive(state)?
+        .projected)
 }
 pub fn collect_native_input_closure(root: &Path, state: &ProjectState) -> Result<InputIdentitySet> {
-    ReadContext::new(root).closure(state)
+    ReadContext::new(root, NodeLockKind::for_state(state)?).closure(state)
 }
 pub fn native_input_digest(root: &Path, state: &ProjectState) -> Result<String> {
     Ok(collect_native_input_closure(root, state)?.digest)
@@ -1917,9 +1969,10 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
     let structure = NativeStructure::capture(root, state)?;
     structure.assert_registered(state)?;
     assert_tool_profiles(root, state)?;
-    let mut context = ReadContext::new(root);
+    let lock_kind = NodeLockKind::for_state(state)?;
+    let mut context = ReadContext::new(root, lock_kind);
     let nodes = node_components(state);
-    let pnpm_mode = SemVer::parse(&state.version)? >= SemVer::parse("0.5.0")?;
+    let pnpm_mode = lock_kind == NodeLockKind::Pnpm;
     if !nodes.is_empty() && pnpm_mode {
         let workspace_path = input_path(root, "pnpm-workspace.yaml")?;
         let workspace_identity =
@@ -2112,7 +2165,7 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
         context.assert_npm_targets()?;
     }
     let inputs = context.closure_with_structure(state, &structure)?;
-    let npmrc_policy = parse_and_admit_npmrc(root, &inputs.directories)?;
+    let npmrc_policy = parse_and_admit_npmrc(root, &inputs.directories, lock_kind)?;
     assert_input_identities(root, &inputs)?;
     let node_inputs = context
         .node_inputs
@@ -2429,12 +2482,20 @@ const RESERVED_NPMRC_ENV_PREFIXES: &[&str] = &[
     "TOKIO_",
 ];
 
-fn npmrc_safe_defaults(root: &Path) -> BTreeMap<&'static str, &'static str> {
-    let pnpm = root.join("pnpm-workspace.yaml").exists();
+fn npmrc_safe_defaults(kind: NodeLockKind) -> BTreeMap<&'static str, &'static str> {
     NPMRC_SAFE_DEFAULTS
         .iter()
         .copied()
-        .filter(|(key, _)| !pnpm || !["package-lock", "install-strategy"].contains(key))
+        .filter(|(key, _)| match kind {
+            NodeLockKind::Pnpm => !["package-lock", "install-strategy"].contains(key),
+            NodeLockKind::Npm => ![
+                "node-linker",
+                "package-import-method",
+                "strict-peer-dependencies",
+                "auto-install-peers",
+            ]
+            .contains(key),
+        })
         .collect()
 }
 
@@ -2478,8 +2539,8 @@ fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {
     Ok(var)
 }
 
-pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
-    if exists(&input_path(root, "pnpm-workspace.yaml")?)? {
+pub fn parse_manifest_npmrc_policy(root: &Path, kind: NodeLockKind) -> Result<NpmrcPolicy> {
+    if kind == NodeLockKind::Pnpm {
         reject_pnpm_hooks(root, "")?;
     }
     let path = input_path(root, ".npmrc")?;
@@ -2488,7 +2549,7 @@ pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
     }
     let mut policy = NpmrcPolicy::default();
     let mut seen_keys = BTreeSet::new();
-    let defaults = npmrc_safe_defaults(root);
+    let defaults = npmrc_safe_defaults(kind);
     for raw_line in fs::read_to_string(&path)?.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
@@ -2612,11 +2673,15 @@ pub fn parse_manifest_npmrc_policy(root: &Path) -> Result<NpmrcPolicy> {
     Ok(policy)
 }
 
-pub fn parse_and_admit_npmrc(root: &Path, directories: &[String]) -> Result<NpmrcPolicy> {
-    let policy = parse_manifest_npmrc_policy(root)?;
-    let defaults = npmrc_safe_defaults(root);
+pub fn parse_and_admit_npmrc(
+    root: &Path,
+    directories: &[String],
+    kind: NodeLockKind,
+) -> Result<NpmrcPolicy> {
+    let policy = parse_manifest_npmrc_policy(root, kind)?;
+    let defaults = npmrc_safe_defaults(kind);
     for directory in directories.iter().filter(|d| !d.is_empty()) {
-        if exists(&input_path(root, "pnpm-workspace.yaml")?)? {
+        if kind == NodeLockKind::Pnpm {
             reject_pnpm_hooks(root, directory)?;
         }
         let path = input_path(root, format!("{directory}/.npmrc"))?;
@@ -2661,8 +2726,12 @@ fn reject_pnpm_hooks(root: &Path, directory: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn assert_npmrc_compatibility(root: &Path, directories: &[String]) -> Result<()> {
-    parse_and_admit_npmrc(root, directories).map(|_| ())
+pub fn assert_npmrc_compatibility(
+    root: &Path,
+    directories: &[String],
+    kind: NodeLockKind,
+) -> Result<()> {
+    parse_and_admit_npmrc(root, directories, kind).map(|_| ())
 }
 
 pub fn verify_required_npm_env_vars(policy: &NpmrcPolicy) -> Result<()> {

@@ -139,6 +139,8 @@ Hardlinks require a shared filesystem and mount. If the configured cache cannot 
 
 Run `make help` for author commands. Releases are built, tested and published through [GitHub Actions](https://github.com/docouno/devkit/actions/workflows/release.yml).
 
+`DEVKIT_AUTHOR_PNPM_STORE` and `DEVKIT_AUTHOR_PNPM_CACHE` configure the author SDK caches for setup and subsequent Node gates, including offline integration tests. They default to `.artifacts/author/pnpm-store` and `.artifacts/author/pnpm-cache` in this checkout; external directories are mounted into the SDK containers.
+
 Before releasing a version, add its changes to [CHANGELOG.md](https://github.com/docouno/devkit/blob/main/CHANGELOG.md). The release workflow uses that version's entry as its description; build and verification metadata stays in a collapsed section.
 
 ## License
