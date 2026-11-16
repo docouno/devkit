@@ -26,6 +26,9 @@ importers:
       publint:
         specifier: 0.3.25
         version: 0.3.25
+      semver:
+        specifier: 7.8.6
+        version: 7.8.6
       typescript:
         specifier: 6.0.3
         version: 6.0.3

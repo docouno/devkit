@@ -23,6 +23,7 @@
     "eslint": "10.13.0",
     "prettier": "3.9.10",
     "publint": "0.3.25",
+    "semver": "7.8.6",
     "typescript": "6.0.3",
     "@docouno/env": "workspace:*",
     "yaml": "2.9.1",

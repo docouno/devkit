@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   assertCanonicalLock,
+  assertEnvironmentSelections,
   assertManifestImporter,
   encodeLock,
   parseLock,
@@ -357,6 +358,13 @@ export async function prepareNpmInputs({
           sourceEnvironmentVersion,
           version,
         );
+        try {
+          assertEnvironmentSelections(envManifest, template.lock, version);
+        } catch (error) {
+          throw new Error(`Template ${name}: ${error instanceof Error ? error.message : error}`, {
+            cause: error,
+          });
+        }
         template.lock.packages[`@docouno/env@${version}`].resolution = {
           integrity: archive.integrity,
         };
@@ -367,20 +375,15 @@ export async function prepareNpmInputs({
           lock: `templates/${name}/pnpm-lock.yaml`,
         };
         write(join(payload, paths.manifest), encode(template.manifest));
-        const installSeed = structuredClone(seeded);
-        delete installSeed.packages[`@docouno/env@${version}`];
-        for (const key of Object.keys(installSeed.snapshots)) {
-          if (key.startsWith(`@docouno/env@${version}(`) || key === `@docouno/env@${version}`) {
-            delete installSeed.snapshots[key];
-          }
-        }
-        write(join(payload, paths.lock), encodeLock(installSeed));
+        // Publication validates the complete reviewed graph; it never repairs
+        // or re-resolves unrelated selections while replacing the SDK archive.
+        write(join(payload, paths.lock), encodeLock(seeded));
         write(join(appRoot, 'pnpm-workspace.yaml'), 'packages: []\n');
         await runPnpm(
           [
             'install',
             '--lockfile-only',
-            '--fix-lockfile',
+            '--frozen-lockfile',
             '--ignore-workspace',
             '--trust-lockfile',
             '--prefer-offline',

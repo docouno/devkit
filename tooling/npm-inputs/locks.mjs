@@ -1,5 +1,6 @@
 import { parse, stringify } from 'yaml';
 import { isDeepStrictEqual } from 'node:util';
+import semver from 'semver';
 const dependencyFields = [
   'dependencies',
   'devDependencies',
@@ -384,6 +385,91 @@ export function canonicalizeLock(value, registry) {
   assertCanonicalLock(lock);
   return lock;
 }
+/** Validate the SDK manifest against its reviewed graph without selecting versions. */
+export function assertEnvironmentSelections(manifest, lock, version) {
+  const envKey = `@docouno/env@${version}`,
+    record = entries(lock)[envKey];
+  const stale = (detail) => {
+    throw new Error(
+      `Source environment differs from template source lock (${detail}); regenerate the template locks explicitly`,
+    );
+  };
+  if (
+    !record ||
+    !isDeepStrictEqual(record.peerDependencies ?? {}, manifest.peerDependencies ?? {}) ||
+    Boolean(record.hasBin) !== Boolean(manifest.bin && Object.keys(manifest.bin).length)
+  ) {
+    stale('package metadata');
+  }
+  for (const field of ['engines', 'os', 'cpu', 'libc']) {
+    const empty = field === 'engines' ? {} : [];
+    if (!isDeepStrictEqual(record[field] ?? empty, manifest[field] ?? empty)) {
+      stale(`package metadata: ${field}`);
+    }
+  }
+  for (const name of new Set([
+    ...Object.keys(record.peerDependenciesMeta ?? {}),
+    ...Object.keys(manifest.peerDependenciesMeta ?? {}),
+  ])) {
+    if (
+      Boolean(record.peerDependenciesMeta?.[name]?.optional) !==
+      Boolean(manifest.peerDependenciesMeta?.[name]?.optional)
+    ) {
+      stale(`peer metadata: ${name}`);
+    }
+  }
+  const snapshots = Object.entries(lock.snapshots ?? {}).filter(([key]) => baseKey(key) === envKey);
+  if (!snapshots.length) {
+    stale('missing environment snapshot');
+  }
+  for (const [, snapshot] of snapshots) {
+    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+      for (const [name, spec] of Object.entries(manifest[field] ?? {})) {
+        if (field === 'dependencies' && Object.hasOwn(manifest.optionalDependencies ?? {}, name)) {
+          continue;
+        }
+        const selectedField =
+          field === 'peerDependencies'
+            ? Object.hasOwn(snapshot.optionalDependencies ?? {}, name)
+              ? 'optionalDependencies'
+              : 'dependencies'
+            : field;
+        const reference = snapshot[selectedField]?.[name];
+        if (
+          reference === undefined &&
+          field === 'peerDependencies' &&
+          manifest.peerDependenciesMeta?.[name]?.optional === true
+        ) {
+          continue;
+        }
+        if (reference === undefined) {
+          stale(`missing ${field}.${name}`);
+        }
+        const parsed = parseRegistryDependencySpec(spec, `environment ${name}`),
+          selected = parts(snapshotKey(name, reference)),
+          target = parsed.kind === 'alias' ? parsed.targetName : name,
+          range = parsed.kind === 'alias' ? (parsed.innerSpec ?? '*') : parsed.spec;
+        if (selected.name !== target || !semver.satisfies(selected.version, range)) {
+          stale(`${field}.${name}`);
+        }
+      }
+    }
+    const allowed = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.optionalDependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {}),
+      ...(snapshot.transitivePeerDependencies ?? []),
+    ]);
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      for (const name of Object.keys(snapshot[field] ?? {})) {
+        if (!allowed.has(name)) {
+          stale(`removed dependency: ${name}`);
+        }
+      }
+    }
+  }
+}
+
 export function assertSelectedIdentities(previous, next, version, integrity) {
   const before = entries(previous),
     after = entries(next),

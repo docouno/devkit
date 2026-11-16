@@ -18,6 +18,7 @@ import { gunzipSync } from 'node:zlib';
 import { prepareNpmInputs, validatePack, verifyNpmInputs } from '../tooling/prepare-npm-inputs.mjs';
 import {
   assertCanonicalLock,
+  assertEnvironmentSelections,
   assertManifestImporter,
   encodeLock,
   parseLock,
@@ -309,6 +310,53 @@ test('canonicalization removes only the fixture origin and rejects external sele
   assert.throws(() => canonicalizeLock(next, registry), /identity conflict/);
 });
 
+test('frozen SDK graphs validate runtime ranges, aliases, peers and removals against the source manifest', () => {
+  const manifest = {
+    dependencies: { alias: 'npm:leaf@^1.0.0' },
+    peerDependencies: { peer: '^2.0.0' },
+    peerDependenciesMeta: { peer: { optional: true } },
+  };
+  const input = lock({
+    '@docouno/env@0.5.0': {
+      ...identity('@docouno/env', '0.5.0'),
+      peerDependencies: manifest.peerDependencies,
+      peerDependenciesMeta: manifest.peerDependenciesMeta,
+    },
+    'leaf@1.2.3': identity('leaf'),
+    'peer@2.1.0': identity('peer', '2.1.0'),
+  });
+  input.snapshots['@docouno/env@0.5.0'] = {
+    dependencies: { alias: 'leaf@1.2.3' },
+    optionalDependencies: { peer: '2.1.0' },
+  };
+  assertEnvironmentSelections(manifest, input, '0.5.0');
+  for (const changed of [
+    { ...manifest, dependencies: { alias: 'npm:leaf@^2.0.0' } },
+    { ...manifest, dependencies: { alias: 'npm:other@^1.0.0' } },
+    { ...manifest, dependencies: { missing: '1.0.0' } },
+    { ...manifest, dependencies: {} },
+    { ...manifest, engines: { node: '<1.0.0' } },
+    { ...manifest, os: ['darwin'] },
+    { ...manifest, cpu: ['arm64'] },
+    { ...manifest, libc: ['musl'] },
+    { ...manifest, peerDependencies: { peer: '^3.0.0' } },
+    { ...manifest, peerDependenciesMeta: { peer: { optional: false } } },
+  ]) {
+    assert.throws(
+      () => assertEnvironmentSelections(changed, input, '0.5.0'),
+      /Source environment differs/,
+    );
+  }
+  delete input.snapshots['@docouno/env@0.5.0'].optionalDependencies.peer;
+  assertEnvironmentSelections(manifest, input, '0.5.0');
+  const required = { ...manifest, peerDependenciesMeta: {} };
+  input.packages['@docouno/env@0.5.0'].peerDependenciesMeta = {};
+  assert.throws(
+    () => assertEnvironmentSelections(required, input, '0.5.0'),
+    /missing peerDependencies.peer/,
+  );
+});
+
 test('prepared graphs retain every selected edge and peer context, with an unchanged artifact set', () => {
   const { manifest, input } = templateFixture();
   input.packages['leaf@1.0.0'] = identity('leaf', '1.0.0');
@@ -483,10 +531,43 @@ npmTest(
   async (t) => {
     const f = fixture(t);
     const original = readFileSync(join(f.root, 'packages/env/package.json'), 'utf8');
+    // Lock-only external identities are not fetched or installed. Keeping two
+    // compatible choices catches release preparation that re-resolves the graph.
+    for (const name of names) {
+      const manifestPath = join(f.root, `templates/${name}/package.json`),
+        lockPath = join(f.root, `templates/${name}/pnpm-lock.yaml`),
+        manifest = JSON.parse(readFileSync(manifestPath)),
+        selected = parseLock(readFileSync(lockPath, 'utf8'));
+      manifest.devDependencies['devkit-lock-only-parent'] = '1.0.0';
+      selected.importers['.'].devDependencies['devkit-lock-only-parent'] = dep('1.0.0');
+      for (const [key, packageName, version] of [
+        ['devkit-lock-only-parent@1.0.0', 'devkit-lock-only-parent', '1.0.0'],
+        ['devkit-lock-only-leaf@1.0.0', 'devkit-lock-only-leaf', '1.0.0'],
+        ['devkit-lock-only-leaf@1.1.0', 'devkit-lock-only-leaf', '1.1.0'],
+      ]) {
+        selected.packages[key] = identity(packageName, version);
+        selected.snapshots[key] = {};
+      }
+      selected.snapshots['devkit-lock-only-parent@1.0.0'] = {
+        dependencies: { 'devkit-lock-only-leaf': '1.0.0' },
+      };
+      put(manifestPath, manifest);
+      put(lockPath, encodeLock(selected));
+    }
     const receipt = await prepareNpmInputs({ ...f, version: '0.5.0' });
     assert.equal(receipt.sourceVersion, '0.4.1');
     assert.equal(receipt.version, '0.5.0');
     assert.deepEqual(verifyNpmInputs(f.output), receipt);
+    for (const name of names) {
+      const prepared = parseLock(
+        readFileSync(join(f.output, `templates/${name}/pnpm-lock.yaml`), 'utf8'),
+      );
+      assert.equal(
+        prepared.snapshots['devkit-lock-only-parent@1.0.0'].dependencies['devkit-lock-only-leaf'],
+        '1.0.0',
+      );
+      assert.ok(prepared.packages['devkit-lock-only-leaf@1.1.0']);
+    }
     const archive = join(f.output, receipt.environment.archive),
       bytes = readFileSync(archive);
     assert.equal(JSON.parse(tarFile(bytes, 'package/package.json')).version, '0.5.0');
@@ -514,33 +595,44 @@ npmTest(
   },
 );
 
-npmTest('native npm failure and input changes publish no output and clean staging', async (t) => {
-  const f = fixture(t);
-  const manifestPath = join(f.root, 'packages/env/package.json');
-  const manifest = JSON.parse(readFileSync(manifestPath));
-  manifest.peerDependencies = { '@docouno/missing': '1.0.0' };
-  put(manifestPath, manifest);
-  await assert.rejects(prepareNpmInputs({ ...f, version: '0.5.0' }), /pnpm install failed/);
-  assert.equal(existsSync(f.output), false);
-  assert.equal(
-    readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
-    false,
-  );
-  delete manifest.peerDependencies;
-  put(manifestPath, manifest);
-  const pending = prepareNpmInputs({ ...f, version: '0.5.0' });
-  put(join(f.root, 'packages/env/index.js'), 'changed while npm runs\n');
-  await assert.rejects(pending, /Source inputs changed/);
-  assert.equal(existsSync(f.output), false);
-  assert.equal(
-    readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
-    false,
-  );
-  assert.equal(
-    readFileSync(join(f.root, 'packages/env/index.js'), 'utf8'),
-    'changed while npm runs\n',
-  );
-});
+npmTest(
+  'native pack failure, stale SDK graphs and concurrent inputs publish no output',
+  async (t) => {
+    const f = fixture(t);
+    const manifestPath = join(f.root, 'packages/env/package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath));
+    manifest.publishConfig = { directory: 'missing-output' };
+    put(manifestPath, manifest);
+    await assert.rejects(prepareNpmInputs({ ...f, version: '0.5.0' }), /pnpm pack failed/);
+    assert.equal(existsSync(f.output), false);
+    delete manifest.publishConfig;
+    manifest.peerDependencies = { '@docouno/missing': '1.0.0' };
+    put(manifestPath, manifest);
+    await assert.rejects(
+      prepareNpmInputs({ ...f, version: '0.5.0' }),
+      /Source environment differs from template source lock/,
+    );
+    assert.equal(existsSync(f.output), false);
+    assert.equal(
+      readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
+      false,
+    );
+    delete manifest.peerDependencies;
+    put(manifestPath, manifest);
+    const pending = prepareNpmInputs({ ...f, version: '0.5.0' });
+    put(join(f.root, 'packages/env/index.js'), 'changed while npm runs\n');
+    await assert.rejects(pending, /Source inputs changed/);
+    assert.equal(existsSync(f.output), false);
+    assert.equal(
+      readdirSync(f.parent).some((name) => name.startsWith('.npm-inputs-')),
+      false,
+    );
+    assert.equal(
+      readFileSync(join(f.root, 'packages/env/index.js'), 'utf8'),
+      'changed while npm runs\n',
+    );
+  },
+);
 
 npmTest('cancellation reaps native npm before staging cleanup', async (t) => {
   const directory = temporary(t),
