@@ -1533,7 +1533,12 @@ fn mutate(
         next.version = release.manifest.version.clone();
         sync_node_workspace(&staged_root, &next, None)?;
         if !node_components(&next).is_empty() {
-            seed_workspace_lock(&staged_root, &next, &seeds)?;
+            seed_workspace_lock_with_reconciliation(
+                &staged_root,
+                &next,
+                &seeds,
+                options.reconcile_lock,
+            )?;
         }
         let product = if node_components(&next).is_empty() {
             None
@@ -2001,13 +2006,14 @@ pub fn sync_project(
             let old_lock = read_workspace_lock(&staged_root)?;
             let (before_graph, retained_product) =
                 capture_retained_product_graph(&staged_root, &next, &old_lock)?;
-            seed_workspace_lock(
+            seed_workspace_lock_with_reconciliation(
                 &staged_root,
                 &next,
                 &[LockSeed {
                     prefix: String::new(),
                     lock: old_lock.clone(),
                 }],
+                options.reconcile_lock,
             )?;
             let seeded_packages = if exists(&safe_path(&staged_root, "pnpm-lock.yaml")?)? {
                 Packages::new()

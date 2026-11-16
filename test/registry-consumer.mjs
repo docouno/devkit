@@ -131,13 +131,19 @@ if (mode === 'serve') {
     // Public v9 packages need only SRI; remove the exact local fixture tarball URL.
     const text = readFileSync(lock, 'utf8').replace(/,? ?tarball: ([^,}\n]+)/gu, (match, url) => {
       const value = url.trim().replace(/^['"]|['"]$/gu, '');
-      assert(value.startsWith(registry), `Unexpected fixture tarball ${value}`);
-      return '';
+      if (value.startsWith(registry)) {
+        return '';
+      }
+      assert(
+        value.startsWith('https://registry.npmjs.org/'),
+        `Unexpected fixture tarball ${value}`,
+      );
+      return match;
     });
     writeFileSync(lock, text);
   }
   const original = readFileSync(lock);
-  assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|file:|\/workspace\//);
+  assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|\bfile:|\/workspace\//);
   if (mode === 'first' || mode === 'second') {
     if (mode === 'first') {
       npm(['ci', '--include=dev', '--strict-peer-deps']);

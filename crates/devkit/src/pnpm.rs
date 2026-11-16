@@ -71,6 +71,209 @@ mod tests {
         assert!(!lock.snapshots["foo@1.0.0"].contains_key("optional"));
     }
 
+    fn legacy_variants(root: &Path) -> (native::Packages, crate::model::ProjectState) {
+        let root_manifest = json!({"name":"root","version":"1.0.0","private":true});
+        let library = json!({"name":"lib","version":"1.0.0","private":true,"dependencies":{"foo":"1.0.0"},"devDependencies":{"tool":"1.0.0"}});
+        write_json(&root.join("package.json"), &root_manifest).unwrap();
+        write_json(&root.join("packages/lib/package.json"), &library).unwrap();
+        let artifact = |name: &str, version: &str| json!({"version":version,"resolved":format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"),"integrity":format!("sha512-{}", "A".repeat(86)+"==")});
+        let mut tool = artifact("tool", "1.0.0");
+        tool["dependencies"] = json!({"foo":"1.0.0"});
+        let mut foo = artifact("foo", "1.0.0");
+        foo["dependencies"] = json!({"leaf":"*"});
+        let packages = [
+            ("", root_manifest),
+            ("packages/lib", library),
+            ("node_modules/tool", tool),
+            ("node_modules/tool/node_modules/foo", foo.clone()),
+            (
+                "node_modules/tool/node_modules/foo/node_modules/leaf",
+                artifact("leaf", "1.0.0"),
+            ),
+            ("packages/lib/node_modules/foo", foo),
+            (
+                "packages/lib/node_modules/foo/node_modules/leaf",
+                artifact("leaf", "2.0.0"),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, value)| (path.into(), value.as_object().unwrap().clone()))
+        .collect::<native::Packages>();
+        let state = serde_json::from_value(json!({"schemaVersion":2,"version":"0.5.0","releaseIdentity":"a".repeat(64),"generation":"00000000-0000-4000-8000-000000000000","packageMode":"registry","managed":{},"components":{"packages/lib":{"role":"library","toolchain":"node","toolingProfile":"react-library","origin":{"template":"react-client","version":"0.4.1"},"toolDependencies":{"tool":"1.0.0"},"dependencies":[]}}})).unwrap();
+        (packages, state)
+    }
+
+    #[test]
+    fn legacy_tooling_variants_prefer_product_resolutions_and_keep_an_independent_graph_guard() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let (packages, state) = legacy_variants(root);
+        write_json(
+            &root.join("package-lock.json"),
+            &json!({"lockfileVersion":3,"packages":packages}),
+        )
+        .unwrap();
+        let baseline = crate::graph::read_legacy_npm_product_graph(root, &state).unwrap();
+        let protected = legacy_product_locations(root, &state, &packages).unwrap();
+        assert!(protected.contains("packages/lib/node_modules/foo"));
+        assert!(!protected.contains("node_modules/tool/node_modules/foo"));
+        let mut lock =
+            import_legacy_npm_lock_seed_preserving(root, &packages, &protected, false).unwrap();
+        assert_eq!(lock.snapshots["foo@1.0.0"]["dependencies"]["leaf"], "2.0.0");
+        crate::graph::assert_product_graphs_preserved(&baseline, &lock.native_graph(root).unwrap())
+            .unwrap();
+        lock.snapshots
+            .get_mut("foo@1.0.0")
+            .unwrap()
+            .insert("dependencies".into(), json!({"leaf":"1.0.0"}));
+        assert!(
+            crate::graph::assert_product_graphs_preserved(
+                &baseline,
+                &lock.native_graph(root).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn product_dev_variants_require_reconciliation_with_consistent_artifacts() {
+        let temporary = TempDir::new().unwrap();
+        let (mut packages, mut state) = legacy_variants(temporary.path());
+        state
+            .components
+            .get_mut("packages/lib")
+            .unwrap()
+            .tool_dependencies
+            .clear();
+        let protected = legacy_product_locations(temporary.path(), &state, &packages).unwrap();
+        assert!(protected.contains("node_modules/tool/node_modules/foo"));
+        let error =
+            import_legacy_npm_lock_seed_preserving(temporary.path(), &packages, &protected, false)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting product resolutions")
+        );
+        import_legacy_npm_lock_seed_preserving(temporary.path(), &packages, &protected, true)
+            .unwrap();
+        packages
+            .get_mut("packages/lib/node_modules/foo")
+            .unwrap()
+            .insert("integrity".into(), json!("different artifact"));
+        assert!(
+            import_legacy_npm_lock_seed_preserving(temporary.path(), &packages, &protected, true)
+                .unwrap_err()
+                .to_string()
+                .contains("Conflicting legacy identity")
+        );
+        let integrity = packages["node_modules/tool/node_modules/foo"]["integrity"].clone();
+        let changed = packages.get_mut("packages/lib/node_modules/foo").unwrap();
+        changed.insert("integrity".into(), integrity);
+        changed.insert("dependencies".into(), json!({"leaf":"^9.0.0"}));
+        assert!(
+            import_legacy_npm_lock_seed_preserving(temporary.path(), &packages, &protected, true)
+                .unwrap_err()
+                .to_string()
+                .contains("Conflicting legacy dependency declarations")
+        );
+    }
+
+    #[test]
+    fn merging_v9_seeds_preserves_product_paths_and_protects_peers_even_when_development_tools() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let (packages, mut state) = legacy_variants(root);
+        let full = import_legacy_npm_lock_seed_preserving(root, &packages, &BTreeSet::new(), true)
+            .unwrap();
+        let mut tooling = full.clone();
+        tooling
+            .importers
+            .get_mut("packages/lib")
+            .unwrap()
+            .dependencies
+            .clear();
+        write_json(&root.join("packages/lib/package.json"), &json!({"name":"lib","version":"1.0.0","private":true,"devDependencies":{"tool":"1.0.0"}})).unwrap();
+        tooling.prune_unused().unwrap();
+        write_json(
+            &root.join("apps/main/package.json"),
+            &json!({"name":"main","version":"1.0.0","private":true,"dependencies":{"foo":"1.0.0"}}),
+        )
+        .unwrap();
+        let mut component = state.components["packages/lib"].clone();
+        component.role = crate::model::Role::App;
+        component.tooling_profile = crate::model::ToolingProfile::Node;
+        component.tool_dependencies.clear();
+        state.components.insert("apps/main".into(), component);
+        let mut product = Lock::default();
+        let mut importer = Importer::default();
+        importer.dependencies.insert(
+            "foo".into(),
+            Dependency {
+                specifier: "1.0.0".into(),
+                version: "1.0.0".into(),
+            },
+        );
+        product.importers.insert(".".into(), importer);
+        product
+            .packages
+            .insert("foo@1.0.0".into(), full.packages["foo@1.0.0"].clone());
+        product
+            .packages
+            .insert("leaf@2.0.0".into(), full.packages["leaf@2.0.0"].clone());
+        product.snapshots.insert(
+            "foo@1.0.0".into(),
+            object(&json!({"dependencies":{"leaf":"2.0.0"}}), "snapshot")
+                .unwrap()
+                .clone(),
+        );
+        product.snapshots.insert("leaf@2.0.0".into(), Fields::new());
+        let seeds = |tooling: &Lock| {
+            vec![
+                crate::graph::LockSeed {
+                    prefix: String::new(),
+                    lock: serde_json::to_value(tooling).unwrap(),
+                },
+                crate::graph::LockSeed {
+                    prefix: "apps/main".into(),
+                    lock: serde_json::to_value(&product).unwrap(),
+                },
+            ]
+        };
+        crate::graph::seed_workspace_lock(root, &state, &seeds(&tooling)).unwrap();
+        assert_eq!(
+            read_yaml::<Lock>(root, "pnpm-lock.yaml").unwrap().snapshots["foo@1.0.0"]["dependencies"]
+                ["leaf"],
+            "2.0.0"
+        );
+
+        // A declared peer remains a product root when its physical installation
+        // also appears in the managed development-tool subset.
+        write_json(&root.join("packages/lib/package.json"), &json!({"name":"lib","version":"1.0.0","private":true,"peerDependencies":{"foo":"*"},"devDependencies":{"foo":"1.0.0"}})).unwrap();
+        state
+            .components
+            .get_mut("packages/lib")
+            .unwrap()
+            .tool_dependencies = BTreeMap::from([("foo".into(), "1.0.0".into())]);
+        let importer = tooling.importers.get_mut("packages/lib").unwrap();
+        importer.dev_dependencies.clear();
+        importer.dev_dependencies.insert(
+            "foo".into(),
+            Dependency {
+                specifier: "1.0.0".into(),
+                version: "1.0.0".into(),
+            },
+        );
+        assert!(
+            crate::graph::seed_workspace_lock(root, &state, &seeds(&tooling))
+                .unwrap_err()
+                .to_string()
+                .contains("Conflicting product resolutions")
+        );
+        crate::graph::seed_workspace_lock_with_reconciliation(root, &state, &seeds(&tooling), true)
+            .unwrap();
+    }
+
     fn fixture(root: &Path) -> Lock {
         write_yaml(
             root,
@@ -592,8 +795,26 @@ pub fn refresh_importers(
 /// Convert already selected npm v3 resolutions in memory. This never asks a
 /// registry to resolve a range and keeps peer recursion bounded by the graph.
 pub fn import_legacy_npm_lock_seed(root: &Path, packages: &native::Packages) -> Result<Lock> {
+    import_legacy_npm_lock_seed_preserving(
+        root,
+        packages,
+        &packages.keys().cloned().collect(),
+        false,
+    )
+}
+
+/// Collapse managed tooling variants while preserving every product-owned path.
+/// Product graphs are independently compared again after ecosystem resolution.
+pub(crate) fn import_legacy_npm_lock_seed_preserving(
+    root: &Path,
+    packages: &native::Packages,
+    protected: &BTreeSet<String>,
+    reconcile: bool,
+) -> Result<Lock> {
     let mut lock = Lock::default();
     let mut keys = BTreeMap::new();
+    let mut protected_snapshots = BTreeSet::new();
+    let mut declarations = BTreeMap::new();
     for (location, record) in packages {
         if location.contains("node_modules/") && record.get("link") != Some(&Value::Bool(true)) {
             legacy_key(packages, location, &mut BTreeSet::new(), &mut keys)?;
@@ -604,7 +825,18 @@ pub fn import_legacy_npm_lock_seed(root: &Path, packages: &native::Packages) -> 
             continue;
         }
         if let Some(key) = keys.get(location) {
-            let (name, _) = package_parts(key)?;
+            let declared = ["dependencies", "optionalDependencies"]
+                .iter()
+                .map(|field| native::dependency_table(record, field))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(previous) =
+                declarations.insert(strip_peer_suffixes(key).to_owned(), declared.clone())
+            {
+                ensure!(
+                    previous == declared,
+                    "Conflicting legacy dependency declarations: {key}"
+                );
+            }
             let mut resolution = Fields::new();
             for (source, target) in [("integrity", "integrity"), ("resolved", "tarball")] {
                 if let Some(value) = record.get(source) {
@@ -674,16 +906,22 @@ pub fn import_legacy_npm_lock_seed(root: &Path, packages: &native::Packages) -> 
                         .insert(dependency.clone(), json!(reference));
                 }
             }
-            if let Some(mut previous) = lock.snapshots.remove(key) {
-                let optional = previous.remove("optional") == Some(json!(true))
-                    && snapshot.get("optional") == Some(&json!(true));
-                snapshot.remove("optional");
-                ensure!(previous == snapshot, "Conflicting legacy snapshot: {name}");
-                if optional {
-                    snapshot.insert("optional".into(), json!(true));
-                }
+            let product = protected.contains(location);
+            if let Some(previous) = lock.snapshots.get_mut(key) {
+                merge_snapshot(
+                    previous,
+                    snapshot,
+                    protected_snapshots.contains(key),
+                    product,
+                    reconcile,
+                    key,
+                )?;
+            } else {
+                lock.snapshots.insert(key.clone(), snapshot);
             }
-            lock.snapshots.insert(key.clone(), snapshot);
+            if product {
+                protected_snapshots.insert(key.clone());
+            }
         } else {
             let manifest = native::native_manifest(root, location)?;
             let mut importer = Importer::default();
@@ -744,6 +982,96 @@ pub fn import_legacy_npm_lock_seed(root: &Path, packages: &native::Packages) -> 
     }
     Ok(lock)
 }
+/// npm can install one artifact in several physical locations with different
+/// compatible transitive versions; pnpm needs one snapshot per peer context.
+pub(crate) fn merge_snapshot(
+    previous: &mut Fields,
+    next: Fields,
+    previous_product: bool,
+    next_product: bool,
+    reconcile: bool,
+    key: &str,
+) -> Result<()> {
+    let same = ["dependencies", "optionalDependencies"]
+        .iter()
+        .map(|field| {
+            Ok(native::dependency_table(previous, field)?
+                == native::dependency_table(&next, field)?)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|same| same);
+    ensure!(
+        same || !previous_product || !next_product || reconcile,
+        "Conflicting product resolutions for {key}; inspect and retry with --reconcile-lock"
+    );
+    let optional = previous.get("optional") == Some(&json!(true))
+        && next.get("optional") == Some(&json!(true));
+    if same {
+        previous.extend(next);
+    } else if next_product && !previous_product {
+        *previous = next;
+    }
+    if optional {
+        previous.insert("optional".into(), json!(true));
+    } else {
+        previous.remove("optional");
+    }
+    Ok(())
+}
+
+pub(crate) fn legacy_product_locations(
+    root: &Path,
+    state: &crate::model::ProjectState,
+    packages: &native::Packages,
+) -> Result<BTreeSet<String>> {
+    let mut pending = Vec::new();
+    for location in packages.keys().filter(|p| !p.contains("node_modules/")) {
+        if !location.is_empty() && !state.components.contains_key(location) {
+            continue;
+        }
+        let manifest = native::native_manifest(root, location)?;
+        for field in native::DEPENDENCY_FIELDS {
+            for name in native::dependency_table(&manifest, field)?.keys() {
+                if field == "devDependencies"
+                    && state
+                        .components
+                        .get(location)
+                        .is_some_and(|c| c.tool_dependencies.contains_key(name))
+                {
+                    continue;
+                }
+                if let Some(target) = native::locked_dependency(packages, location, name)? {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+    let mut protected = BTreeSet::new();
+    while let Some(location) = pending.pop() {
+        if !protected.insert(location.clone()) {
+            continue;
+        }
+        let manifest;
+        let record = if location.contains("node_modules/") {
+            packages
+                .get(&location)
+                .context("Missing legacy product package")?
+        } else {
+            manifest = native::native_manifest(root, &location)?;
+            &manifest
+        };
+        for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            for name in native::dependency_table(record, field)?.keys() {
+                if let Some(target) = native::locked_dependency(packages, &location, name)? {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+    Ok(protected)
+}
+
 pub fn snapshot_key(name: &str, reference: &str) -> Result<String> {
     ensure!(
         native::valid_dependency_name(name),

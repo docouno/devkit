@@ -114,6 +114,15 @@ fn init_legacy_registry(release: &Path, target: &Path, registry: &str) -> Result
         identity(&target.join(CHECKSUM_PATH))?.ok_or_else(|| anyhow::anyhow!("Checksums"))?,
     );
     write_json(&target.join(MANIFEST_PATH), &state)?;
+    // npm can reuse a file identity when its version satisfies the new registry
+    // specifier. Remove only that env selection before refreshing the v3 lock.
+    let lock_path = target.join("package-lock.json");
+    let mut lock: Value = read_json(&lock_path)?;
+    lock["packages"]
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Legacy packages"))?
+        .retain(|location, _| !location.ends_with("node_modules/@docouno/env"));
+    write_json(&lock_path, &lock)?;
     // The baseline's real npm resolves its original v3 graph, independently of the new engine.
     let pins =
         devkit::runtime::ToolPins::parse(&fs::read(release.join("runtime/toolchains.env"))?)?;
@@ -176,7 +185,6 @@ fn init_legacy_registry(release: &Path, target: &Path, registry: &str) -> Result
         OutputMode::Inherit,
         &OwnedContainer::new(name, token),
     )?;
-    let lock_path = target.join("package-lock.json");
     let mut lock: Value = read_json(&lock_path)?;
     for entry in lock["packages"]
         .as_object_mut()

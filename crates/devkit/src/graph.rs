@@ -1,4 +1,4 @@
-//! Product-rooted graph preservation over the physical lock graph chosen by npm.
+//! Product-rooted graph preservation over ecosystem lock graphs.
 use crate::{
     Result,
     files::{exists, input_path, object, text, write_json},
@@ -413,13 +413,23 @@ pub struct LockSeed {
     pub lock: Value,
 }
 pub fn seed_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]) -> Result<()> {
+    seed_workspace_lock_with_reconciliation(root, state, seeds, false)
+}
+
+pub(crate) fn seed_workspace_lock_with_reconciliation(
+    root: &Path,
+    state: &ProjectState,
+    seeds: &[LockSeed],
+    reconcile: bool,
+) -> Result<()> {
     if crate::files::SemVer::parse(&state.version)? < crate::files::SemVer::parse("0.5.0")? {
         return seed_legacy_workspace_lock(root, state, seeds);
     }
     let mut lock = crate::pnpm::Lock::default();
+    let mut protected_snapshots = BTreeSet::new();
     for seed in seeds {
         let legacy = seed.lock.get("lockfileVersion") == Some(&json!(3));
-        let source = if legacy {
+        let mut source = if legacy {
             let mut packages = Packages::new();
             for (key, value) in object(
                 seed.lock
@@ -451,10 +461,28 @@ pub fn seed_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]
                 }
                 packages.insert(target, record);
             }
-            crate::pnpm::import_legacy_npm_lock_seed(root, &packages)?
+            let protected = crate::pnpm::legacy_product_locations(root, state, &packages)?;
+            crate::pnpm::import_legacy_npm_lock_seed_preserving(
+                root, &packages, &protected, reconcile,
+            )?
         } else {
             crate::pnpm::Lock::from_value(&seed.lock)?
         };
+        source.importers = source
+            .importers
+            .into_iter()
+            .map(|(id, importer)| {
+                let target = if legacy || seed.prefix.is_empty() {
+                    id
+                } else if id == "." {
+                    seed.prefix.clone()
+                } else {
+                    format!("{}/{id}", seed.prefix)
+                };
+                (target, importer)
+            })
+            .collect();
+        let source_protected = protected_snapshot_keys(root, state, &source)?;
         lock.settings.extend(source.settings);
         lock.extra.extend(source.extra);
         for (key, value) in source.packages {
@@ -471,36 +499,137 @@ pub fn seed_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]
         }
         for (key, value) in source.snapshots {
             if let Some(previous) = lock.snapshots.get_mut(&key) {
-                for field in ["dependencies", "optionalDependencies"] {
-                    ensure!(
-                        dependency_table(previous, field)? == dependency_table(&value, field)?,
-                        "Conflicting pnpm snapshot seed: {key}"
-                    );
-                }
-                let optional = previous.get("optional") == Some(&Value::Bool(true))
-                    && value.get("optional") == Some(&Value::Bool(true));
-                previous.extend(value);
-                if !optional {
-                    previous.remove("optional");
-                }
+                crate::pnpm::merge_snapshot(
+                    previous,
+                    value,
+                    protected_snapshots.contains(&key),
+                    source_protected.contains(&key),
+                    reconcile,
+                    &key,
+                )?;
             } else {
                 lock.snapshots.insert(key, value);
             }
         }
-        for (id, importer) in source.importers {
-            let target = if legacy || seed.prefix.is_empty() {
-                id
-            } else if id == "." {
-                seed.prefix.clone()
-            } else {
-                format!("{}/{id}", seed.prefix)
-            };
-            lock.importers.insert(target, importer);
-        }
+        protected_snapshots.extend(source_protected);
+        lock.importers.extend(source.importers);
     }
     crate::pnpm::refresh_importers(root, state, &mut lock)?;
     crate::files::remove_file(&input_path(root, "package-lock.json")?)?;
     lock.write(root)
+}
+
+fn protected_snapshot_keys(
+    root: &Path,
+    state: &ProjectState,
+    lock: &crate::pnpm::Lock,
+) -> Result<BTreeSet<String>> {
+    enum Pending {
+        Importer(String, bool),
+        Snapshot(String),
+    }
+    fn enqueue(
+        root: &Path,
+        id: &str,
+        name: &str,
+        reference: &str,
+        pending: &mut Vec<Pending>,
+    ) -> Result<()> {
+        if let Some(path) = reference.strip_prefix("link:") {
+            let target = crate::pnpm::importer_id(&crate::native::local_path(
+                root,
+                crate::pnpm::root_path(id),
+                path,
+            )?)
+            .to_owned();
+            pending.push(Pending::Importer(target, false));
+        } else {
+            pending.push(Pending::Snapshot(crate::pnpm::snapshot_key(
+                name, reference,
+            )?));
+        }
+        Ok(())
+    }
+    let mut pending = lock
+        .importers
+        .keys()
+        .filter(|id| id.as_str() == "." || state.components.contains_key(id.as_str()))
+        .map(|id| Pending::Importer(id.clone(), true))
+        .collect::<Vec<_>>();
+    let mut visited_importers = BTreeMap::new();
+    let mut protected = BTreeSet::new();
+    while let Some(item) = pending.pop() {
+        match item {
+            Pending::Importer(id, include_dev) => {
+                if visited_importers
+                    .get(&id)
+                    .is_some_and(|old: &bool| *old || !include_dev)
+                {
+                    continue;
+                }
+                visited_importers.insert(id.clone(), include_dev);
+                let path = crate::pnpm::root_path(&id);
+                let Some(importer) = lock.importers.get(&id) else {
+                    // A template can link to another registered component whose
+                    // importer is supplied by a separate seed.
+                    ensure!(
+                        state.components.contains_key(path),
+                        "Missing product importer in lock seed"
+                    );
+                    continue;
+                };
+                for field in crate::pnpm::PHYSICAL_FIELDS {
+                    for (name, entry) in importer.field(field) {
+                        if field == "devDependencies"
+                            && (!include_dev
+                                || state
+                                    .components
+                                    .get(path)
+                                    .is_some_and(|c| c.tool_dependencies.contains_key(name)))
+                        {
+                            continue;
+                        }
+                        enqueue(root, &id, name, &entry.version, &mut pending)?;
+                    }
+                }
+                let manifest = native_manifest(root, path)?;
+                for name in dependency_table(&manifest, "peerDependencies")?.keys() {
+                    if let Some(entry) = importer
+                        .dependency(name)
+                        .or_else(|| lock.importers.get(".").and_then(|i| i.dependency(name)))
+                    {
+                        let from = if importer.dependency(name).is_some() {
+                            &id
+                        } else {
+                            "."
+                        };
+                        enqueue(root, from, name, &entry.version, &mut pending)?;
+                    }
+                }
+            }
+            Pending::Snapshot(key) => {
+                if !protected.insert(key.clone()) {
+                    continue;
+                }
+                let snapshot = lock
+                    .snapshots
+                    .get(&key)
+                    .context("Missing product snapshot in lock seed")?;
+                for field in ["dependencies", "optionalDependencies"] {
+                    for (name, reference) in dependency_table(snapshot, field)? {
+                        enqueue(
+                            root,
+                            ".",
+                            &name,
+                            text(&reference, "Product snapshot reference")?,
+                            &mut pending,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(protected)
 }
 
 fn seed_legacy_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]) -> Result<()> {
