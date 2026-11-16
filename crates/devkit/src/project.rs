@@ -231,7 +231,7 @@ pub trait LockResolver {
                 "package-lock.json"
             },
         )?;
-        let seeded_backup = fs::read(&lock_path)?;
+        let seeded_backup = read_input_bytes(&lock_path)?;
         match self.regenerate(root, release, registry) {
             Ok(()) => return Ok(ReconcileStrategy::Seeded),
             Err(err) if !is_reconcilable_lock_conflict(&err) => return Err(err),

@@ -309,6 +309,72 @@ test('canonicalization removes only the fixture origin and rejects external sele
   assert.throws(() => canonicalizeLock(next, registry), /identity conflict/);
 });
 
+test('prepared graphs retain every selected edge and peer context, with an unchanged artifact set', () => {
+  const { manifest, input } = templateFixture();
+  input.packages['leaf@1.0.0'] = identity('leaf', '1.0.0');
+  input.packages['leaf@2.0.0'] = identity('leaf', '2.0.0');
+  input.snapshots['leaf@1.0.0'] = {};
+  input.snapshots['leaf@2.0.0'] = {};
+  delete input.snapshots['zod@1.2.3'];
+  const first = 'zod@1.2.3(leaf@1.0.0)',
+    second = 'zod@1.2.3(leaf@2.0.0)';
+  input.snapshots[first] = { dependencies: { leaf: '1.0.0' } };
+  input.snapshots[second] = { dependencies: { leaf: '2.0.0' } };
+  input.importers['.'].dependencies.zod.version = '1.2.3(leaf@1.0.0)';
+  const seeded = prepareTemplate(manifest, input, '0.4.1', '0.5.0').lock;
+  seeded.packages['@docouno/env@0.5.0'].resolution = { integrity };
+  assertSelectedIdentities(seeded, structuredClone(seeded), '0.5.0', integrity);
+  for (const mutate of [
+    (value) => {
+      value.snapshots[first].dependencies.leaf = '2.0.0';
+    },
+    (value) => {
+      value.importers['.'].dependencies.zod.version = '1.2.3(leaf@2.0.0)';
+    },
+    (value) => {
+      value.snapshots[first].optionalDependencies = value.snapshots[first].dependencies;
+      delete value.snapshots[first].dependencies;
+    },
+    (value) => {
+      value.snapshots[first].optional = true;
+    },
+  ]) {
+    const changed = structuredClone(seeded);
+    mutate(changed);
+    assert.deepEqual(changed.packages, seeded.packages);
+    assert.throws(
+      () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+      /selected template graph/,
+    );
+  }
+  const changed = structuredClone(seeded);
+  changed.packages['leaf@1.0.0'].os = ['darwin'];
+  assert.deepEqual(
+    changed.packages['leaf@1.0.0'].resolution,
+    seeded.packages['leaf@1.0.0'].resolution,
+  );
+  assert.throws(
+    () => assertSelectedIdentities(seeded, changed, '0.5.0', integrity),
+    /selected template package metadata/,
+  );
+});
+
+test('environment rewrites preserve other versions and nested contexts, and reject collisions', () => {
+  const { manifest, input } = templateFixture();
+  input.packages['@docouno/env@0.4.10'] = identity('@docouno/env', '0.4.10');
+  input.snapshots['@docouno/env@0.4.10'] = {};
+  const key = 'zod@1.2.3(@docouno/env@0.4.1)(@docouno/env@0.4.10)';
+  input.snapshots[key] = { dependencies: { '@docouno/env': '0.4.1', zod: '1.2.3' } };
+  input.importers['.'].dependencies.zod.version = key.slice('zod@'.length);
+  const next = prepareTemplate(manifest, input, '0.4.1', '0.5.0').lock;
+  const target = 'zod@1.2.3(@docouno/env@0.5.0)(@docouno/env@0.4.10)';
+  assert.equal(next.snapshots[target].dependencies['@docouno/env'], '0.5.0');
+  assert.deepEqual(next.packages['@docouno/env@0.4.10'], input.packages['@docouno/env@0.4.10']);
+  input.packages['@docouno/env@0.5.0'] = identity('@docouno/env', '0.5.0');
+  input.snapshots['@docouno/env@0.5.0'] = {};
+  assert.throws(() => prepareTemplate(manifest, input, '0.4.1', '0.5.0'), /collides/);
+});
+
 test('npm aliases resolve by target identity and cannot redirect the selected snapshot', async () => {
   const input = lock(
     { 'string-width@4.2.3': { resolution: {} }, '@acme/core@1.0.2': { resolution: {} } },

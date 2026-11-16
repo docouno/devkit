@@ -279,9 +279,9 @@ fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
         .write(root)
         .unwrap();
     fs::remove_file(root.join("package-lock.json")).unwrap();
-    let mut manifest: Value = read_json(&root.join("package.json")).unwrap();
-    manifest.as_object_mut().unwrap().remove("workspaces");
-    put_json(root, "package.json", &manifest);
+    let mut root_manifest: Value = read_json(&root.join("package.json")).unwrap();
+    root_manifest.as_object_mut().unwrap().remove("workspaces");
+    put_json(root, "package.json", &root_manifest);
     devkit::pnpm::write_yaml(
         root,
         "pnpm-workspace.yaml",
@@ -311,6 +311,342 @@ fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
         fs::write(path, original).unwrap();
     }
     assert_input_identities(root, &admitted.inputs).unwrap();
+
+    // The public lifecycle snapshot and numeric journal slots must retain the
+    // same input budget, even when no native parser is about to read them.
+    let (_, project, _) = runtime_project(&root.join("lifecycle"), "node-api");
+    let snapshot = devkit::project::AdmissionSnapshot::capture(&project).unwrap();
+    let yaml = project.join("pnpm-workspace.yaml");
+    let original = fs::read(&yaml).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&yaml)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        snapshot
+            .recheck()
+            .unwrap_err()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::write(&yaml, &original).unwrap();
+    snapshot.recheck().unwrap();
+
+    put_json(
+        &project,
+        "apps/extra/package.json",
+        &manifest("extra", json!({}), false),
+    );
+    let adopted_lock = project.join("apps/extra/pnpm-lock.yaml");
+    fs::File::create(&adopted_lock)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        devkit::project::AdmissionSnapshot::capture(&project)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::remove_dir_all(project.join("apps/extra")).unwrap();
+
+    let staged = root.join("transaction-source");
+    devkit::files::copy_tree(
+        &project,
+        &staged,
+        &|name| devkit::state::excluded_snapshot_path(name),
+        true,
+    )
+    .unwrap();
+    for name in ["pnpm-workspace.yaml", devkit::state::MANIFEST_PATH] {
+        let path = staged.join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+    }
+    let paths = [
+        "pnpm-workspace.yaml".to_owned(),
+        devkit::state::MANIFEST_PATH.to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let stage = ".devkit/state/update-00000000-0000-4000-8000-000000000001";
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&yaml)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        devkit::transaction::PreparedTransaction::prepare(&project, stage, &staged, &paths, vec![])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pnpm YAML exceeds byte budget")
+    );
+    fs::write(&yaml, original).unwrap();
+    let tx =
+        devkit::transaction::PreparedTransaction::prepare(&project, stage, &staged, &paths, vec![])
+            .unwrap();
+    let file = tx
+        .journal
+        .files
+        .iter()
+        .find(|file| file.path == "pnpm-workspace.yaml")
+        .unwrap();
+    for saved in [&file.staged, &file.backup] {
+        let path = project.join(saved.as_ref().unwrap());
+        let bytes = fs::read(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            tx.commit(&project, None, &|| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("pnpm YAML exceeds byte budget")
+        );
+        write_json(&project.join(devkit::state::PENDING_PATH), &tx.journal).unwrap();
+        assert!(
+            devkit::transaction::recover_project(&project)
+                .unwrap_err()
+                .to_string()
+                .contains("pnpm YAML exceeds byte budget")
+        );
+        fs::write(path, bytes).unwrap();
+        fs::remove_file(project.join(devkit::state::PENDING_PATH)).unwrap();
+    }
+    write_json(&project.join(devkit::state::PENDING_PATH), &tx.journal).unwrap();
+    assert!(devkit::transaction::recover_project(&project).unwrap());
+    devkit::project::AdmissionSnapshot::capture(&project).unwrap();
+}
+
+#[test]
+fn npmrc_policy_versions_the_complete_reserved_namespace_and_fetch_allowlist() {
+    use devkit::native::parse_manifest_npmrc_policy;
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    for variable in ["PNPM_PRIVATE_TOKEN", "XDG_REGISTRY_TOKEN", "REGISTRY_TOKEN"] {
+        put(
+            root,
+            ".npmrc",
+            &format!("//registry.example/:_authToken=${{{variable}}}\n"),
+        );
+        assert!(parse_manifest_npmrc_policy(root, NodeLockKind::Npm).is_ok());
+        assert_eq!(
+            parse_manifest_npmrc_policy(root, NodeLockKind::Pnpm).is_ok(),
+            variable == "REGISTRY_TOKEN"
+        );
+    }
+    for setting in ["fetch-retries=2", "fetch-timeout=100"] {
+        put(root, ".npmrc", setting);
+        assert!(
+            parse_manifest_npmrc_policy(root, NodeLockKind::Npm)
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported npm configuration key")
+        );
+        parse_manifest_npmrc_policy(root, NodeLockKind::Pnpm).unwrap();
+    }
+    for variable in [
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "PWD",
+        "TMPDIR",
+        "CI",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "GOMAXPROCS",
+        "UV_THREADPOOL_SIZE",
+        "LD_TOKEN",
+        "DYLD_TOKEN",
+        "NODE_TOKEN",
+        "NPM_CONFIG_TOKEN",
+        "DEVKIT_TOKEN",
+        "CARGO_TOKEN",
+        "RUST_TOKEN",
+        "DOCKER_TOKEN",
+        "GIT_TOKEN",
+        "SSH_TOKEN",
+        "SSL_TOKEN",
+        "RAYON_TOKEN",
+        "ROLLDOWN_TOKEN",
+        "VITEST_TOKEN",
+        "TOKIO_TOKEN",
+    ] {
+        put(
+            root,
+            ".npmrc",
+            &format!("//registry.example/:_authToken=${{{variable}}}\n"),
+        );
+        for kind in [NodeLockKind::Npm, NodeLockKind::Pnpm] {
+            assert!(
+                parse_manifest_npmrc_policy(root, kind)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Reserved environment variable"),
+                "{kind:?}: {variable}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_snapshots_project_physical_component_roles_dependencies_and_cycles() {
+    for target in ["apps/secondary", "packages/core"] {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let mut state = state(&[("apps/main", "node"), (target, "node")]);
+        state.version = "0.5.0".into();
+        if target.starts_with("packages/") {
+            state.components.get_mut("apps/main").unwrap().dependencies = vec![target.into()];
+        }
+        let relative = if target.starts_with("apps/") {
+            "../secondary"
+        } else {
+            "../../packages/core"
+        };
+        node_project(
+            root,
+            &state,
+            &[
+                (
+                    "apps/main",
+                    manifest("main", json!({"target":format!("file:{relative}")}), false),
+                ),
+                (
+                    target,
+                    manifest("target", json!({}), target.starts_with("packages/")),
+                ),
+            ],
+            json!({}),
+        );
+        let mut lock =
+            devkit::pnpm::import_legacy_npm_lock_seed(root, &package_lock(root).unwrap()).unwrap();
+        let key = format!("target@file:{target}");
+        lock.importers
+            .get_mut("apps/main")
+            .unwrap()
+            .dependencies
+            .get_mut("target")
+            .unwrap()
+            .version = format!("file:{target}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"resolution":{"type":"directory","directory":target}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, serde_json::Map::new());
+        lock.write(root).unwrap();
+        fs::remove_file(root.join("package-lock.json")).unwrap();
+        devkit::project::sync_node_workspace(root, &state, None).unwrap();
+        if target.starts_with("apps/") {
+            assert!(
+                admit_native_components(root, &state)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        } else {
+            assert_eq!(
+                admit_native_components(root, &state).unwrap().dependencies["apps/main"],
+                vec![target.to_owned()]
+            );
+            assert_eq!(
+                devkit::native::local_dependency_map(root, &state, "apps/main").unwrap()["target"],
+                target
+            );
+            let mut core: Value = read_json(&root.join("packages/core/package.json")).unwrap();
+            core["dependencies"]["main"] = json!("file:../../apps/main");
+            put_json(root, "packages/core/package.json", &core);
+            let entry = devkit::pnpm::Dependency {
+                specifier: "file:../../apps/main".into(),
+                version: "file:apps/main".into(),
+            };
+            lock.importers
+                .get_mut("packages/core")
+                .unwrap()
+                .dependencies
+                .insert("main".into(), entry);
+            lock.packages.insert(
+                "main@file:apps/main".into(),
+                json!({"resolution":{"type":"directory","directory":"apps/main"}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            lock.snapshots
+                .insert("main@file:apps/main".into(), serde_json::Map::new());
+            lock.write(root).unwrap();
+            assert!(
+                derive_component_dependencies(root, &state)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Application dependency is forbidden")
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_snapshot_library_edges_cannot_hide_a_component_cycle() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let mut state = state(&[("packages/a", "node"), ("packages/b", "node")]);
+    state.version = "0.5.0".into();
+    node_project(
+        root,
+        &state,
+        &[
+            ("packages/a", manifest("a", json!({"b":"file:../b"}), true)),
+            ("packages/b", manifest("b", json!({"a":"file:../a"}), true)),
+        ],
+        json!({}),
+    );
+    let mut lock =
+        devkit::pnpm::import_legacy_npm_lock_seed(root, &package_lock(root).unwrap()).unwrap();
+    for (from, name) in [("packages/a", "b"), ("packages/b", "a")] {
+        let target = format!("packages/{name}");
+        lock.importers
+            .get_mut(from)
+            .unwrap()
+            .dependencies
+            .get_mut(name)
+            .unwrap()
+            .version = format!("file:{target}");
+        let key = format!("{name}@file:{target}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"resolution":{"type":"directory","directory":target}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, serde_json::Map::new());
+    }
+    lock.write(root).unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    devkit::project::sync_node_workspace(root, &state, None).unwrap();
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Component dependency cycle")
+    );
 }
 
 #[test]

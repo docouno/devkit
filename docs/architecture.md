@@ -33,6 +33,10 @@ Devkit deliberately avoids duplicating native package metadata in `.devkit/manif
 
 When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `pnpm-lock.yaml` transactionally without changing the accepted Devkit release.
 
+Local directory snapshots retain their exact artifact and peer-context identities in the lock graph. Component dependency checks use their physical directories, so application dependencies, library build ordering, and cycle detection apply equally to directory snapshots and workspace links.
+
+pnpm YAML acquisition is limited to 32 MiB before allocation throughout admission, source snapshots, staging, and transaction recovery. Saved transaction files retain the policy of their original target path. Git worktree pointers used to select a shared store are regular files limited to 16 KiB before reading or hashing.
+
 ## Container Isolation and Security Model
 
 Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, `DEVKIT_RUST_IMAGE`, `DEVKIT_DESKTOP_IMAGE`) with dropped capabilities (`--cap-drop ALL`), `no-new-privileges:true`, `--init`, and host UID/GID mapping:

@@ -141,6 +141,8 @@ Run `make help` for author commands. Releases are built, tested and published th
 
 `DEVKIT_AUTHOR_PNPM_STORE` and `DEVKIT_AUTHOR_PNPM_CACHE` configure the author SDK caches for setup and subsequent Node gates, including offline integration tests. They default to `.artifacts/author/pnpm-store` and `.artifacts/author/pnpm-cache` in this checkout; external directories are mounted into the SDK containers.
 
+Template v9 locks record the complete native pnpm selection graph, including peer contexts. Release preparation changes only the owned environment version and archive identity; the producer and independent assembler reject other selection changes even when the package set and integrity values match. Regenerate and commit template locks explicitly when changing their dependency graph.
+
 Before releasing a version, add its changes to [CHANGELOG.md](https://github.com/docouno/devkit/blob/main/CHANGELOG.md). The release workflow uses that version's entry as its description; build and verification metadata stays in a collapsed section.
 
 ## License

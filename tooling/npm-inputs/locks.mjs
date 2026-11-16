@@ -1,4 +1,5 @@
 import { parse, stringify } from 'yaml';
+import { isDeepStrictEqual } from 'node:util';
 const dependencyFields = [
   'dependencies',
   'devDependencies',
@@ -264,6 +265,73 @@ export function assertCanonicalLock(value) {
     throw new Error('Source/local endpoint remains in canonical lock');
   }
 }
+function rewriteEnvironmentKey(key, sourceVersion, version, depth = 0) {
+  if (depth >= 64) {
+    throw new Error('Template peer context exceeds depth budget');
+  }
+  const base = baseKey(key);
+  let result = base === `@docouno/env@${sourceVersion}` ? `@docouno/env@${version}` : base;
+  let offset = base.length;
+  while (offset < key.length) {
+    if (key[offset] !== '(') {
+      throw new Error(`Invalid template peer context: ${key}`);
+    }
+    let end = offset + 1,
+      nesting = 1;
+    while (end < key.length && nesting > 0) {
+      if (key[end] === '(') {
+        nesting++;
+      }
+      if (key[end] === ')') {
+        nesting--;
+      }
+      end++;
+    }
+    if (nesting !== 0) {
+      throw new Error(`Invalid template peer context: ${key}`);
+    }
+    const peer = key.slice(offset + 1, end - 1);
+    result += `(${rewriteEnvironmentKey(peer, sourceVersion, version, depth + 1)})`;
+    offset = end;
+  }
+  return result;
+}
+
+function rewriteEnvironmentSelections(input, sourceVersion, version) {
+  const lock = structuredClone(input);
+  const rewriteKey = (key) => rewriteEnvironmentKey(key, sourceVersion, version);
+  const rewriteRef = (name, ref) => {
+    const key = rewriteKey(snapshotKey(name, ref));
+    return baseKey(ref).includes('@') ? key : key.slice(name.length + 1);
+  };
+  const remap = (value, change) => {
+    const mapped = Object.entries(value).map(([key, record]) => [rewriteKey(key), change(record)]);
+    if (new Set(mapped.map(([key]) => key)).size !== mapped.length) {
+      throw new Error('Template environment rewrite collides with another selection');
+    }
+    return Object.fromEntries(mapped);
+  };
+  for (const importer of Object.values(lock.importers)) {
+    for (const field of fields) {
+      for (const [name, dependency] of Object.entries(importer[field] ?? {})) {
+        dependency.version = rewriteRef(name, dependency.version);
+      }
+    }
+  }
+  lock.packages = remap(lock.packages, (record) => record);
+  lock.snapshots = remap(lock.snapshots ?? {}, (snapshot) => {
+    for (const field of ['dependencies', 'optionalDependencies']) {
+      if (snapshot[field]) {
+        snapshot[field] = Object.fromEntries(
+          Object.entries(snapshot[field]).map(([name, ref]) => [name, rewriteRef(name, ref)]),
+        );
+      }
+    }
+    return snapshot;
+  });
+  return lock;
+}
+
 export function prepareTemplate(manifestInput, lockInput, sourceVersion, version) {
   const manifest = structuredClone(object(manifestInput, 'template manifest'));
   assertRegistryDependencies(manifest);
@@ -284,30 +352,16 @@ export function prepareTemplate(manifestInput, lockInput, sourceVersion, version
   if (!Object.hasOwn(entries(lockInput), oldKey)) {
     throw new Error('Template accepted env lock version differs from source');
   }
-  // Rewrite env references including peer suffixes, preserving every external selection.
-  const rewrite = (v) => {
-    if (typeof v === 'string') {
-      return v.replaceAll(oldKey, newKey);
-    }
-    if (Array.isArray(v)) {
-      return v.map(rewrite);
-    }
-    if (!v || typeof v !== 'object') {
-      return v;
-    }
-    return Object.fromEntries(
-      Object.entries(v).map(([key, child]) => [key.replaceAll(oldKey, newKey), rewrite(child)]),
-    );
-  };
-  const lock = rewrite(lockInput);
+  // Only typed selections and the owned environment identity are rewritten.
+  const lock = rewriteEnvironmentSelections(lockInput, sourceVersion, version);
   manifest.devDependencies['@docouno/env'] = version;
   lock.importers['.'].devDependencies['@docouno/env'].specifier = version;
   const envRef = lock.importers['.'].devDependencies['@docouno/env'];
-  if (baseKey(envRef.version) !== sourceVersion && !baseKey(envRef.version).startsWith(newKey)) {
+  if (snapshotKey('@docouno/env', envRef.version).split('(')[0] !== newKey) {
     throw new Error('Template accepted env lock version differs from source');
   }
-  if (baseKey(envRef.version) === sourceVersion) {
-    envRef.version = version + envRef.version.slice(sourceVersion.length);
+  if (lock.packages[newKey].version !== undefined) {
+    lock.packages[newKey].version = version;
   }
   lock.packages[newKey].resolution = {};
   return { manifest, lock };
@@ -341,6 +395,18 @@ export function assertSelectedIdentities(previous, next, version, integrity) {
     if (key !== envKey && record.resolution.integrity !== after[key]?.resolution?.integrity) {
       throw new Error(`pnpm changed a selected external identity: ${key}`);
     }
+    const metadata = (value) =>
+      Object.fromEntries(Object.entries(value).filter(([field]) => field !== 'resolution'));
+    if (!isDeepStrictEqual(metadata(record), metadata(after[key]))) {
+      throw new Error(`pnpm changed selected template package metadata: ${key}`);
+    }
+  }
+  const graph = (value) => ({
+    ...Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'packages')),
+    snapshots: value.snapshots ?? {},
+  });
+  if (!isDeepStrictEqual(graph(previous), graph(next))) {
+    throw new Error('pnpm changed the selected template graph');
   }
   if (
     after[envKey]?.resolution?.integrity !== integrity ||

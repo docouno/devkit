@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -283,11 +283,8 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
                 rows.push(json!([n, "directory"]));
                 visit(root, &p, state, rows)?;
             } else if m.is_file() {
-                rows.push(json!([
-                    n,
-                    m.permissions().mode() & 0o777,
-                    digest(fs::read(&p)?)
-                ]));
+                let identity = identity(&p)?.context("Project source disappeared")?;
+                rows.push(json!([n, identity.mode, identity.sha256]));
             } else if m.file_type().is_socket() || m.file_type().is_fifo() {
                 continue;
             } else {

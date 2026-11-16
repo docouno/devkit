@@ -202,6 +202,100 @@ fn lock_integrity(value: &str) -> bool {
         .is_ok_and(|raw| raw.len() == length && STANDARD.encode(raw) == encoded)
 }
 
+fn template_environment_key(key: &str, from: &str, to: &str, depth: usize) -> Result<String> {
+    ensure!(depth < 64, "Template peer context exceeds depth budget");
+    let base = pnpm::strip_peer_suffixes(key);
+    let mut result = if base == format!("@docouno/env@{from}") {
+        format!("@docouno/env@{to}")
+    } else {
+        base.to_owned()
+    };
+    let mut offset = base.len();
+    while offset < key.len() {
+        ensure!(
+            key.as_bytes()[offset] == b'(',
+            "Invalid template peer context"
+        );
+        let mut nesting = 1;
+        let mut end = offset + 1;
+        while end < key.len() && nesting > 0 {
+            match key.as_bytes()[end] {
+                b'(' => nesting += 1,
+                b')' => nesting -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        ensure!(nesting == 0, "Invalid template peer context");
+        result.push('(');
+        result.push_str(&template_environment_key(
+            &key[offset + 1..end - 1],
+            from,
+            to,
+            depth + 1,
+        )?);
+        result.push(')');
+        offset = end;
+    }
+    Ok(result)
+}
+
+fn template_reference(name: &str, reference: &str, from: &str, to: &str) -> Result<String> {
+    let key = template_environment_key(&pnpm::snapshot_key(name, reference)?, from, to, 0)?;
+    Ok(if pnpm::strip_peer_suffixes(reference).contains('@') {
+        key
+    } else {
+        key.strip_prefix(&format!("{name}@"))
+            .context("Template rewrite changed dependency name")?
+            .to_owned()
+    })
+}
+
+fn template_selection_graph(lock: &Lock, from: &str, to: &str) -> Result<Value> {
+    let mut expected = lock.clone();
+    for importer in expected.importers.values_mut() {
+        for field in PHYSICAL_FIELDS {
+            for (name, dependency) in importer.field_mut(field) {
+                dependency.version = template_reference(name, &dependency.version, from, to)?;
+            }
+        }
+    }
+    expected
+        .importers
+        .get_mut(".")
+        .and_then(|importer| importer.dev_dependencies.get_mut("@docouno/env"))
+        .context("Template source environment selection")?
+        .specifier = to.to_owned();
+    let mut snapshots = BTreeMap::new();
+    for (key, mut snapshot) in expected.snapshots {
+        for field in ["dependencies", "optionalDependencies"] {
+            if let Some(dependencies) = snapshot.get_mut(field).and_then(Value::as_object_mut) {
+                for (name, reference) in dependencies {
+                    *reference = json!(template_reference(
+                        name,
+                        text(reference, "Template reference")?,
+                        from,
+                        to
+                    )?);
+                }
+            }
+        }
+        ensure!(
+            snapshots
+                .insert(template_environment_key(&key, from, to, 0)?, snapshot)
+                .is_none(),
+            "Template environment rewrite collides with another selection"
+        );
+    }
+    expected.snapshots = snapshots;
+    let mut graph = serde_json::to_value(expected)?;
+    graph
+        .as_object_mut()
+        .context("Template graph")?
+        .remove("packages");
+    Ok(graph)
+}
+
 fn verify_template_lock(
     root: &Path,
     directory: &Path,
@@ -279,17 +373,42 @@ fn verify_template_lock(
         .specifier
         .clone();
     let env_key = format!("@docouno/env@{version}");
-    let old_env_key = format!("@docouno/env@{source_version}");
     let expected_keys: BTreeSet<_> = original
         .packages
         .keys()
-        .map(|k| k.replace(&old_env_key, &env_key))
-        .collect();
+        .map(|k| template_environment_key(k, &source_version, version, 0))
+        .collect::<Result<_>>()?;
     ensure!(
-        expected_keys == lock.packages.keys().cloned().collect(),
+        expected_keys.len() == original.packages.len()
+            && expected_keys == lock.packages.keys().cloned().collect(),
         "Selected external template identities changed: {name}"
     );
+    ensure!(
+        template_selection_graph(&original, &source_version, version)?
+            == template_selection_graph(&lock, version, version)?,
+        "Selected template graph changed: {name}"
+    );
     for (key, record) in &lock.packages {
+        let source_key = if key == &env_key {
+            format!("@docouno/env@{source_version}")
+        } else {
+            key.clone()
+        };
+        let mut expected_metadata = original
+            .packages
+            .get(&source_key)
+            .context("Added external template metadata")?
+            .clone();
+        expected_metadata.remove("resolution");
+        if key == &env_key && expected_metadata.contains_key("version") {
+            expected_metadata.insert("version".into(), json!(version));
+        }
+        let mut metadata = record.clone();
+        metadata.remove("resolution");
+        ensure!(
+            metadata == expected_metadata,
+            "Selected template package metadata changed: {key}"
+        );
         let (package_name, selected) = pnpm::package_parts(key)?;
         static EXACT_VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$").unwrap()
@@ -1047,7 +1166,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     for name in inputs.files.keys() {
         write_atomic(
             &safe_path(&payload, name)?,
-            &fs::read(safe_path(&npm_inputs, name)?)?,
+            &read_input_bytes(&safe_path(&npm_inputs, name)?)?,
             0o644,
         )?;
     }

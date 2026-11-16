@@ -15,7 +15,7 @@ importers:
       "@testing-library/react":
         specifier: "16.3.3"
         version: >-
-          16.3.3(@testing-library/dom@10.4.2)(@types/react@19.3.0)(@types/react-dom@19.3.0(@types/react@19.3.0))(react@19.3.1)(react-dom@19.3.1(react@19.3.1))
+          16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       "@types/node":
         specifier: "24.19.2"
         version: "24.19.2"
@@ -145,8 +145,7 @@ packages:
         sha512-CjXrNHTnvqBVqHgdBysY3vk2T8tpJHb5/RMeHJBTyVa9xgugCB0CJTx/3oO8RV2QRQP391RWpB7D6hLjm8V9uA==
     engines:
       node: ">=6.0.0"
-    bin:
-      parser: bin/babel-parser.js
+    hasBin: true
   "@babel/runtime@7.29.10":
     resolution:
       integrity: >-
@@ -175,8 +174,7 @@ packages:
     resolution:
       integrity: >-
         sha512-0GEz8qJWokkUVYQYRukmkSHIFNoBH8QTreeHrAFbvz1XFYc3Y+puhMs8PQ5x8GNugiC2l5jvDBXKLbBIByeSBw==
-    bin:
-      specificity: bin/cli.js
+    hasBin: true
   "@cacheable/memory@2.2.0":
     resolution:
       integrity: >-
@@ -245,9 +243,7 @@ packages:
     peerDependenciesMeta:
       vitest:
         optional: true
-    bin:
-      devkit-pack: bin/devkit-pack.js
-      devkit-verify: bin/devkit-verify.js
+    hasBin: true
   "@eslint-community/eslint-utils@4.10.1":
     resolution:
       integrity: >-
@@ -389,9 +385,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - android
+      - android
     cpu:
-    - arm
+      - arm
   "@rolldown/binding-android-arm64@1.2.15":
     resolution:
       integrity: >-
@@ -399,9 +395,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - android
+      - android
     cpu:
-    - arm64
+      - arm64
   "@rolldown/binding-darwin-arm64@1.2.15":
     resolution:
       integrity: >-
@@ -409,9 +405,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - darwin
+      - darwin
     cpu:
-    - arm64
+      - arm64
   "@rolldown/binding-darwin-x64@1.2.15":
     resolution:
       integrity: >-
@@ -419,9 +415,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - darwin
+      - darwin
     cpu:
-    - x64
+      - x64
   "@rolldown/binding-freebsd-x64@1.2.15":
     resolution:
       integrity: >-
@@ -429,9 +425,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - freebsd
+      - freebsd
     cpu:
-    - x64
+      - x64
   "@rolldown/binding-linux-arm-gnueabihf@1.2.15":
     resolution:
       integrity: >-
@@ -439,9 +435,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - arm
+      - arm
   "@rolldown/binding-linux-arm64-gnu@1.2.15":
     resolution:
       integrity: >-
@@ -449,11 +445,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - arm64
+      - arm64
     libc:
-    - glibc
+      - glibc
   "@rolldown/binding-linux-arm64-musl@1.2.15":
     resolution:
       integrity: >-
@@ -461,11 +457,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - arm64
+      - arm64
     libc:
-    - musl
+      - musl
   "@rolldown/binding-linux-ppc64-gnu@1.2.15":
     resolution:
       integrity: >-
@@ -473,11 +469,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - ppc64
+      - ppc64
     libc:
-    - glibc
+      - glibc
   "@rolldown/binding-linux-s390x-gnu@1.2.15":
     resolution:
       integrity: >-
@@ -485,11 +481,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - s390x
+      - s390x
     libc:
-    - glibc
+      - glibc
   "@rolldown/binding-linux-x64-gnu@1.2.15":
     resolution:
       integrity: >-
@@ -497,11 +493,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - x64
+      - x64
     libc:
-    - glibc
+      - glibc
   "@rolldown/binding-linux-x64-musl@1.2.15":
     resolution:
       integrity: >-
@@ -509,11 +505,11 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - linux
+      - linux
     cpu:
-    - x64
+      - x64
     libc:
-    - musl
+      - musl
   "@rolldown/binding-openharmony-arm64@1.2.15":
     resolution:
       integrity: >-
@@ -521,9 +517,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - openharmony
+      - openharmony
     cpu:
-    - arm64
+      - arm64
   "@rolldown/binding-win32-arm64-msvc@1.2.15":
     resolution:
       integrity: >-
@@ -531,9 +527,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - win32
+      - win32
     cpu:
-    - arm64
+      - arm64
   "@rolldown/binding-win32-x64-msvc@1.2.15":
     resolution:
       integrity: >-
@@ -541,9 +537,9 @@ packages:
     engines:
       node: ^20.19.0 || >=22.12.0
     os:
-    - win32
+      - win32
     cpu:
-    - x64
+      - x64
   "@rolldown/pluginutils@1.0.1":
     resolution:
       integrity: >-
@@ -734,8 +730,7 @@ packages:
         sha512-oJlA3XiRm7Cyk6qFD2Jn8ak9B7jSy0qy00ADO3+8dpT0LSjFihQYv4C02LFCSYJV3Q37xYwwRy5m+IpIiUzqWw==
     engines:
       node: ">=0.4.0"
-    bin:
-      acorn: bin/acorn
+    hasBin: true
   ajv@6.15.0:
     resolution:
       integrity: >-
@@ -774,8 +769,7 @@ packages:
         sha512-b0k7wXlWjpuL/Uxb/pYlpjY0ej5BjAmurtPUk3eRGuloI4yjK32m8TiKUQ81l1ptcLjKS/KH2+uqIolZti1x4Q==
     engines:
       node: ">=6.0.0"
-    bin:
-      baseline-browser-mapping: dist/cli.cjs
+    hasBin: true
   bidi-js@1.1.0:
     resolution:
       integrity: >-
@@ -792,8 +786,7 @@ packages:
         sha512-2TcbbiwXEq+N0kD36tykpCfyyQigUXmuwNQbnPp4Xk4PX9JOqVIKjJlIDjpH7uY6tmRGoAd+apeT1p60T8wsdA==
     engines:
       node: ^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7
-    bin:
-      browserslist: cli.js
+    hasBin: true
   cacheable@2.5.0:
     resolution:
       integrity: >-
@@ -843,6 +836,8 @@ packages:
     peerDependenciesMeta:
       supports-color:
         optional: true
+    peerDependencies:
+      supports-color: "*"
   decimal.js@10.6.0:
     resolution:
       integrity: >-
@@ -900,7 +895,8 @@ packages:
     engines:
       node: ">=18"
     peerDependencies:
-      eslint: ^3.0.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0-0 || ^9.0.0 || ^10.0.0
+      eslint: ^3.0.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0-0 || ^9.0.0 ||
+        ^10.0.0
   eslint-plugin-react-refresh@0.5.7:
     resolution:
       integrity: >-
@@ -936,8 +932,7 @@ packages:
     peerDependenciesMeta:
       jiti:
         optional: true
-    bin:
-      eslint: bin/eslint.js
+    hasBin: true
   espree@11.2.0:
     resolution:
       integrity: >-
@@ -1026,7 +1021,7 @@ packages:
     engines:
       node: ^8.16.0 || ^10.6.0 || >=11.0.0
     os:
-    - darwin
+      - darwin
   gensync@1.0.0-beta.2:
     resolution:
       integrity: >-
@@ -1132,8 +1127,7 @@ packages:
         sha512-/sM3dO2FOzXjKQhJuo0Q173wf2KOo8t4I8vHy6lF9poUp7bKT0/NHE8fPX23PwfhnykfqnC2xRxOnVw5XuGIaA==
     engines:
       node: ">=6"
-    bin:
-      jsesc: bin/jsesc
+    hasBin: true
   json-schema-traverse@0.4.1:
     resolution:
       integrity: >-
@@ -1148,8 +1142,7 @@ packages:
         sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg==
     engines:
       node: ">=6"
-    bin:
-      json5: lib/cli.js
+    hasBin: true
   keyv@5.6.0:
     resolution:
       integrity: >-
@@ -1167,9 +1160,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - android
+      - android
     cpu:
-    - arm64
+      - arm64
   lightningcss-darwin-arm64@1.33.0:
     resolution:
       integrity: >-
@@ -1177,9 +1170,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - darwin
+      - darwin
     cpu:
-    - arm64
+      - arm64
   lightningcss-darwin-x64@1.33.0:
     resolution:
       integrity: >-
@@ -1187,9 +1180,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - darwin
+      - darwin
     cpu:
-    - x64
+      - x64
   lightningcss-freebsd-x64@1.33.0:
     resolution:
       integrity: >-
@@ -1197,9 +1190,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - freebsd
+      - freebsd
     cpu:
-    - x64
+      - x64
   lightningcss-linux-arm-gnueabihf@1.33.0:
     resolution:
       integrity: >-
@@ -1207,9 +1200,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - linux
+      - linux
     cpu:
-    - arm
+      - arm
   lightningcss-linux-arm64-gnu@1.33.0:
     resolution:
       integrity: >-
@@ -1217,11 +1210,11 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - linux
+      - linux
     cpu:
-    - arm64
+      - arm64
     libc:
-    - glibc
+      - glibc
   lightningcss-linux-arm64-musl@1.33.0:
     resolution:
       integrity: >-
@@ -1229,11 +1222,11 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - linux
+      - linux
     cpu:
-    - arm64
+      - arm64
     libc:
-    - musl
+      - musl
   lightningcss-linux-x64-gnu@1.33.0:
     resolution:
       integrity: >-
@@ -1241,11 +1234,11 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - linux
+      - linux
     cpu:
-    - x64
+      - x64
     libc:
-    - glibc
+      - glibc
   lightningcss-linux-x64-musl@1.33.0:
     resolution:
       integrity: >-
@@ -1253,11 +1246,11 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - linux
+      - linux
     cpu:
-    - x64
+      - x64
     libc:
-    - musl
+      - musl
   lightningcss-win32-arm64-msvc@1.33.0:
     resolution:
       integrity: >-
@@ -1265,9 +1258,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - win32
+      - win32
     cpu:
-    - arm64
+      - arm64
   lightningcss-win32-x64-msvc@1.33.0:
     resolution:
       integrity: >-
@@ -1275,9 +1268,9 @@ packages:
     engines:
       node: ">= 12.0.0"
     os:
-    - win32
+      - win32
     cpu:
-    - x64
+      - x64
   lightningcss@1.33.0:
     resolution:
       integrity: >-
@@ -1304,8 +1297,7 @@ packages:
     resolution:
       integrity: >-
         sha512-h5bgJWpxJNswbU7qCrV0tIKQCaS3blPDrqKWx+QxzuzL1zGUzij9XCWLrSLsJPu5t+eWA/ycetzYAO5IOMcWAQ==
-    bin:
-      lz-string: bin/bin.js
+    hasBin: true
   magic-string@1.4.3:
     resolution:
       integrity: >-
@@ -1330,8 +1322,7 @@ packages:
         sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==
     engines:
       node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1
-    bin:
-      nanoid: bin/nanoid.cjs
+    hasBin: true
   natural-compare@1.4.0:
     resolution:
       integrity: >-
@@ -1410,8 +1401,7 @@ packages:
         sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==
     engines:
       node: ">=14"
-    bin:
-      prettier: bin/prettier.cjs
+    hasBin: true
   pretty-format@27.5.1:
     resolution:
       integrity: >-
@@ -1458,8 +1448,7 @@ packages:
         sha512-6odND+fel5zVw3I4Yc2e69gvguDnX0CAAGiNDZSq4ik5WUcaLrkD2GLuog0XcODbor31hZ5ayEMgVDno+KPV5g==
     engines:
       node: ^20.19.0 || >=22.12.0
-    bin:
-      rolldown: bin/cli.mjs
+    hasBin: true
   saxes@6.0.0:
     resolution:
       integrity: >-
@@ -1474,16 +1463,14 @@ packages:
     resolution:
       integrity: >-
         sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==
-    bin:
-      semver: bin/semver.js
+    hasBin: true
   semver@7.8.5:
     resolution:
       integrity: >-
         sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==
     engines:
       node: ">=10"
-    bin:
-      semver: bin/semver.js
+    hasBin: true
   shebang-command@2.0.0:
     resolution:
       integrity: >-
@@ -1532,8 +1519,7 @@ packages:
     resolution:
       integrity: >-
         sha512-48dH6aSpQnpbzDUc4vIQZ1VjB8tkK+e8c1yx05/SZK+rkssgjEOlxDd/yU8/a4vGYQ9vRgJr9dwMq9TJ0b3X2Q==
-    bin:
-      tldts: bin/cli.js
+    hasBin: true
   tough-cookie@6.0.2:
     resolution:
       integrity: >-
@@ -1575,9 +1561,7 @@ packages:
         sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==
     engines:
       node: ">=14.17"
-    bin:
-      tsc: bin/tsc
-      tsserver: bin/tsserver
+    hasBin: true
   undici-types@7.24.6:
     resolution:
       integrity: >-
@@ -1594,8 +1578,7 @@ packages:
         sha512-t8wonIOdQyOjtPd2VktlBu6QjTVTks6v8bSi7kd0r2Vll8TK1JYDZtRRdbmCHOAMphkZgrzK+L+vXK4pyZ8t4A==
     peerDependencies:
       browserslist: ">= 4.21.0"
-    bin:
-      update-browserslist-db: cli.js
+    hasBin: true
   uri-js@4.4.1:
     resolution:
       integrity: >-
@@ -1644,8 +1627,7 @@ packages:
         optional: true
       yaml:
         optional: true
-    bin:
-      vite: bin/vite.js
+    hasBin: true
   vitest@5.0.5:
     resolution:
       integrity: >-
@@ -1688,10 +1670,7 @@ packages:
         optional: true
       jsdom:
         optional: true
-      vite:
-        optional: false
-    bin:
-      vitest: vitest.mjs
+    hasBin: true
   w3c-xmlserializer@6.0.0:
     resolution:
       integrity: >-
@@ -1722,16 +1701,14 @@ packages:
         sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==
     engines:
       node: ">= 8"
-    bin:
-      node-which: bin/node-which
+    hasBin: true
   why-is-node-running@3.2.1:
     resolution:
       integrity: >-
         sha512-Tb2FUhB4vUsGQlfSquQLYkApkuPAFQXGFzxWKHHumVz2dK+X1RUm/HnID4+TfIGYJ1kTcwOaCk/buYCEJr6YjQ==
     engines:
       node: ">=20.11"
-    bin:
-      why-is-node-running: cli.js
+    hasBin: true
   word-wrap@1.2.5:
     resolution:
       integrity: >-
@@ -1809,6 +1786,8 @@ snapshots:
       gensync: 1.0.0-beta.2
       json5: "2.2.3"
       semver: "6.3.1"
+    transitivePeerDependencies:
+      - supports-color
   "@babel/generator@7.29.8":
     dependencies:
       "@babel/parser": "7.29.9"
@@ -1828,12 +1807,16 @@ snapshots:
     dependencies:
       "@babel/traverse": "7.29.10"
       "@babel/types": "7.29.8"
+    transitivePeerDependencies:
+      - supports-color
   "@babel/helper-module-transforms@7.29.7(@babel/core@7.29.7)":
     dependencies:
       "@babel/helper-module-imports": "7.29.7"
       "@babel/helper-validator-identifier": "7.29.7"
       "@babel/traverse": "7.29.10"
       "@babel/core": "7.29.7"
+    transitivePeerDependencies:
+      - supports-color
   "@babel/helper-string-parser@7.29.7": {}
   "@babel/helper-validator-identifier@7.29.7": {}
   "@babel/helper-validator-option@7.29.7": {}
@@ -1859,6 +1842,8 @@ snapshots:
       "@babel/template": "7.29.7"
       "@babel/types": "7.29.8"
       debug: "4.4.3"
+    transitivePeerDependencies:
+      - supports-color
   "@babel/types@7.29.8":
     dependencies:
       "@babel/helper-string-parser": "7.29.7"
@@ -1906,6 +1891,8 @@ snapshots:
       typescript: "6.0.3"
     optionalDependencies:
       vitest: 5.0.5(@types/node@24.19.2)(jsdom@30.1.3)(vite@8.3.5(@types/node@24.19.2))
+    transitivePeerDependencies:
+      - supports-color
   "@eslint-community/eslint-utils@4.10.1(eslint@10.13.0)":
     dependencies:
       eslint-visitor-keys: "3.4.3"
@@ -1916,6 +1903,8 @@ snapshots:
       "@eslint/object-schema": "3.0.5"
       debug: "4.4.3"
       minimatch: "10.2.6"
+    transitivePeerDependencies:
+      - supports-color
   "@eslint/config-helpers@0.7.0":
     dependencies:
       "@eslint/core": "1.2.1"
@@ -2004,15 +1993,6 @@ snapshots:
       lz-string: "1.5.0"
       picocolors: "1.1.1"
       pretty-format: "27.5.1"
-  "@testing-library/react@16.3.3(@testing-library/dom@10.4.2)(@types/react@19.3.0)(@types/react-dom@19.3.0(@types/react@19.3.0))(react@19.3.1)(react-dom@19.3.1(react@19.3.1))":
-    dependencies:
-      "@babel/runtime": "7.29.10"
-      "@testing-library/dom": "10.4.2"
-      react: "19.3.1"
-      react-dom: 19.3.1(react@19.3.1)
-    optionalDependencies:
-      "@types/react": "19.3.0"
-      "@types/react-dom": 19.3.0(@types/react@19.3.0)
   "@types/aria-query@5.0.4": {}
   "@types/chai@5.2.3":
     dependencies:
@@ -2044,6 +2024,8 @@ snapshots:
       "@typescript-eslint/parser": 8.72.0(eslint@10.13.0)(typescript@6.0.3)
       eslint: "10.13.0"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/parser@8.72.0(eslint@10.13.0)(typescript@6.0.3)":
     dependencies:
       "@typescript-eslint/scope-manager": "8.72.0"
@@ -2053,12 +2035,16 @@ snapshots:
       debug: "4.4.3"
       eslint: "10.13.0"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/project-service@8.72.0(typescript@6.0.3)":
     dependencies:
       "@typescript-eslint/tsconfig-utils": 8.72.0(typescript@6.0.3)
       "@typescript-eslint/types": "8.72.0"
       debug: "4.4.3"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/scope-manager@8.72.0":
     dependencies:
       "@typescript-eslint/types": "8.72.0"
@@ -2075,6 +2061,8 @@ snapshots:
       ts-api-utils: 2.5.0(typescript@6.0.3)
       eslint: "10.13.0"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/types@8.72.0": {}
   "@typescript-eslint/typescript-estree@8.72.0(typescript@6.0.3)":
     dependencies:
@@ -2088,6 +2076,8 @@ snapshots:
       tinyglobby: "0.2.17"
       ts-api-utils: 2.5.0(typescript@6.0.3)
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/utils@8.72.0(eslint@10.13.0)(typescript@6.0.3)":
     dependencies:
       "@eslint-community/eslint-utils": 4.10.1(eslint@10.13.0)
@@ -2096,6 +2086,8 @@ snapshots:
       "@typescript-eslint/typescript-estree": 8.72.0(typescript@6.0.3)
       eslint: "10.13.0"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   "@typescript-eslint/visitor-keys@8.72.0":
     dependencies:
       "@typescript-eslint/types": "8.72.0"
@@ -2168,6 +2160,8 @@ snapshots:
     dependencies:
       whatwg-mimetype: "5.0.0"
       whatwg-url: "17.3.0"
+    transitivePeerDependencies:
+      - "@noble/hashes"
   debug@4.4.3:
     dependencies:
       ms: "2.1.3"
@@ -2189,6 +2183,8 @@ snapshots:
       zod: "4.6.7"
       zod-validation-error: 4.0.2(zod@4.6.7)
       eslint: "10.13.0"
+    transitivePeerDependencies:
+      - supports-color
   eslint-plugin-react-refresh@0.5.7(eslint@10.13.0):
     dependencies:
       eslint: "10.13.0"
@@ -2232,6 +2228,8 @@ snapshots:
       minimatch: "10.2.6"
       natural-compare: "1.4.0"
       optionator: "0.9.4"
+    transitivePeerDependencies:
+      - supports-color
   espree@11.2.0:
     dependencies:
       acorn: "8.19.0"
@@ -2287,6 +2285,8 @@ snapshots:
   html-encoding-sniffer@7.0.0:
     dependencies:
       "@exodus/bytes": "1.16.0"
+    transitivePeerDependencies:
+      - "@noble/hashes"
   ignore@5.3.2: {}
   ignore@7.0.13: {}
   imurmurhash@0.1.4: {}
@@ -2319,6 +2319,8 @@ snapshots:
       whatwg-mimetype: "5.0.0"
       whatwg-url: "17.3.0"
       xml-name-validator: "5.0.0"
+    transitivePeerDependencies:
+      - "@noble/hashes"
   jsesc@3.1.0: {}
   json-schema-traverse@0.4.1: {}
   json-stable-stringify-without-jsonify@1.0.1: {}
@@ -2494,6 +2496,8 @@ snapshots:
       "@typescript-eslint/utils": 8.72.0(eslint@10.13.0)(typescript@6.0.3)
       eslint: "10.13.0"
       typescript: "6.0.3"
+    transitivePeerDependencies:
+      - supports-color
   typescript@6.0.3: {}
   undici-types@7.24.6: {}
   undici@8.12.3: {}
@@ -2534,6 +2538,8 @@ snapshots:
     optionalDependencies:
       "@types/node": "24.19.2"
       jsdom: "30.1.3"
+    transitivePeerDependencies:
+      - msw
   w3c-xmlserializer@6.0.0:
     dependencies:
       xml-name-validator: "5.0.0"
@@ -2544,6 +2550,8 @@ snapshots:
       "@exodus/bytes": "1.16.0"
       tr46: "7.0.0"
       webidl-conversions: "8.0.1"
+    transitivePeerDependencies:
+      - "@noble/hashes"
   which@2.0.2:
     dependencies:
       isexe: "2.0.0"
@@ -2557,3 +2565,12 @@ snapshots:
     dependencies:
       zod: "4.6.7"
   zod@4.6.7: {}
+  "@testing-library/react@16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)":
+    dependencies:
+      "@babel/runtime": 7.29.10
+      "@testing-library/dom": 10.4.2
+      react: 19.3.1
+      react-dom: 19.3.1(react@19.3.1)
+    optionalDependencies:
+      "@types/react": 19.3.0
+      "@types/react-dom": 19.3.0(@types/react@19.3.0)

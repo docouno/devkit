@@ -4,7 +4,7 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        SemVer, digest, exists, identity as file_identity, input_path, object, project_root,
+        SemVer, digest, exists, identity, input_path, is_pnpm_yaml, object, project_root,
         read_json, relative_name, safe_path, sorted_entries, text,
     },
     model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
@@ -27,20 +27,6 @@ pub const DEPENDENCY_FIELDS: [&str; 4] = [
 ];
 pub type Fields = Map<String, Value>;
 pub type Packages = BTreeMap<String, Fields>;
-
-fn is_pnpm_yaml(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("pnpm-lock.yaml" | "pnpm-workspace.yaml")
-    )
-}
-fn identity(path: &Path) -> Result<Option<FileIdentity>> {
-    if is_pnpm_yaml(path) {
-        Ok(crate::pnpm::read_yaml_file(path)?.map(|(_, identity)| identity))
-    } else {
-        file_identity(path)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeLockKind {
@@ -888,8 +874,23 @@ impl<'a> ReadContext<'a> {
     ) -> Result<Option<String>> {
         if self.is_pnpm() {
             let root = self.root;
-            self.pnpm()?
-                .target(root, path, manifest, field, (name, spec), false)
+            let lock = self.pnpm()?;
+            let Some(target) = lock.target(root, path, manifest, field, (name, spec), false)?
+            else {
+                return Ok(None);
+            };
+            // Component ownership follows the physical directory, while the
+            // artifact graph retains the exact snapshot and peer context.
+            if let Some(directory) = lock
+                .packages
+                .get(crate::pnpm::strip_peer_suffixes(&target))
+                .and_then(|package| package.get("resolution"))
+                .and_then(|resolution| resolution.get("directory"))
+                .and_then(Value::as_str)
+            {
+                return Ok(Some(local_path(root, "", directory)?));
+            }
+            Ok(Some(target))
         } else {
             locked_dependency(self.packages()?, path, name)
         }
@@ -2467,8 +2468,6 @@ const RESERVED_NPMRC_ENV_PREFIXES: &[&str] = &[
     "DYLD_",
     "NODE_",
     "NPM_CONFIG_",
-    "PNPM_",
-    "XDG_",
     "DEVKIT_",
     "CARGO_",
     "RUST",
@@ -2514,7 +2513,7 @@ fn valid_nerf_dart_host_path(host_and_path: &str) -> bool {
     valid_registry_authority(authority, "https") && !path_rest.split('/').any(|seg| seg == "..")
 }
 
-fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {
+fn parse_npmrc_env_var<'a>(key: &str, value: &'a str, kind: NodeLockKind) -> Result<&'a str> {
     let Some(var) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
         bail!(
             "Unsupported secret value in .npmrc ({key}); use nerf-dart environment expansion ${{ENV_VAR}}"
@@ -2533,7 +2532,11 @@ fn parse_npmrc_env_var<'a>(key: &str, value: &'a str) -> Result<&'a str> {
         !RESERVED_NPMRC_ENV_EXACT.contains(&var)
             && !RESERVED_NPMRC_ENV_PREFIXES
                 .iter()
-                .any(|prefix| var.starts_with(prefix)),
+                .any(|prefix| var.starts_with(prefix))
+            && !(kind == NodeLockKind::Pnpm
+                && ["PNPM_", "XDG_"]
+                    .iter()
+                    .any(|prefix| var.starts_with(prefix))),
         "Reserved environment variable '{var}' is not allowed in .npmrc ({key})"
     );
     Ok(var)
@@ -2577,7 +2580,7 @@ pub fn parse_manifest_npmrc_policy(root: &Path, kind: NodeLockKind) -> Result<Np
             "Duplicate npm configuration key in .npmrc ({key})"
         );
         policy.sanitized_lines.push(format!("{key}={value}"));
-        if ["fetch-retries", "fetch-timeout"].contains(&key) {
+        if kind == NodeLockKind::Pnpm && ["fetch-retries", "fetch-timeout"].contains(&key) {
             ensure!(
                 value.parse::<u64>().is_ok(),
                 "Invalid nonnegative .npmrc setting: {key}"
@@ -2635,7 +2638,7 @@ pub fn parse_manifest_npmrc_policy(root: &Path, kind: NodeLockKind) -> Result<Np
             );
             match option {
                 "_authToken" | "_auth" => {
-                    let var = parse_npmrc_env_var(key, value)?;
+                    let var = parse_npmrc_env_var(key, value, kind)?;
                     policy.required_env_vars.insert(var.to_owned());
                     policy.authentication.push(NpmAuthentication {
                         prefix: format!("{host_and_path}/"),

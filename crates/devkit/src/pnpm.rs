@@ -15,7 +15,7 @@ use std::{
 };
 
 pub const PHYSICAL_FIELDS: [&str; 3] = ["dependencies", "optionalDependencies", "devDependencies"];
-const MAX_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BYTES: usize = PNPM_YAML_MAX_BYTES;
 
 pub fn parse_yaml<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     ensure!(bytes.len() <= MAX_BYTES, "pnpm YAML exceeds byte budget");
@@ -448,6 +448,24 @@ mod tests {
     }
 
     #[test]
+    fn rebasing_preserves_native_local_path_names_and_rejects_checkout_escape() {
+        for path in [
+            "vendor packages/space",
+            "vendor/percent%20name",
+            "vendor/本地",
+            "vendor/archive with spaces.tgz",
+        ] {
+            assert_eq!(
+                rebase_file_path("apps/extra", path).unwrap(),
+                format!("apps/extra/{path}")
+            );
+        }
+        assert!(rebase_file_path("apps/extra", "../../../outside").is_err());
+        assert!(rebase_file_path("apps/extra", "/outside").is_err());
+        assert!(rebase_file_path("apps/extra", "../..").is_err());
+    }
+
+    #[test]
     fn standalone_seed_rebases_local_artifacts_transitive_aliases_and_nested_peer_contexts() {
         let mut lock = Lock::from_value(&json!({"lockfileVersion":"9.0",
             "importers":{".":{"dependencies":{
@@ -796,7 +814,13 @@ pub fn relative_link(from: &str, to: &str) -> String {
 
 fn rebase_file_path(prefix: &str, path: &str) -> Result<String> {
     let path = crate::graph::joined_local(prefix, path)?;
-    relative_path(&path)?;
+    ensure!(
+        !path.is_empty()
+            && Path::new(&path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "Local pnpm path escapes the checkout: {path}"
+    );
     Ok(path)
 }
 

@@ -4,7 +4,7 @@ use devkit::{
         AssemblyOptions, assemble, verify_migration_index, verify_npm_inputs, verify_npm_pack,
         verify_runtime_notices, verify_rust_template, verify_source_checkout,
     },
-    files::{digest, file_map, write_atomic, write_json},
+    files::{digest, file_map, read_json, write_atomic, write_json},
     processes::ProcessRunner,
 };
 use serde_json::{Value, json};
@@ -140,6 +140,75 @@ fn a_self_consistent_receipt_cannot_reselect_external_template_artifacts() {
             .to_string()
             .contains("Selected external template identities changed")
     );
+}
+
+#[test]
+fn a_self_consistent_receipt_cannot_reselect_edges_or_peer_contexts() {
+    for corruption in [
+        "edge",
+        "context",
+        "optional-field",
+        "optional-flag",
+        "package-metadata",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let (root, prepared) = prepared_fixture(temp.path());
+        let name = "templates/node-api/pnpm-lock.yaml";
+        for directory in [&root, &prepared] {
+            let mut lock: Value = read_json(&directory.join(name)).unwrap();
+            for version in ["1.0.0", "2.0.0"] {
+                let key = format!("leaf@{version}");
+                lock["packages"][&key] =
+                    json!({"resolution":{"integrity":sri(version.as_bytes())}});
+                lock["snapshots"][&key] = json!({});
+                lock["snapshots"][format!("external@1.2.3(leaf@{version})")] =
+                    json!({"dependencies":{"leaf":version}});
+            }
+            lock["snapshots"]
+                .as_object_mut()
+                .unwrap()
+                .remove("external@1.2.3");
+            lock["importers"]["."]["devDependencies"]["external"]["version"] =
+                json!("1.2.3(leaf@1.0.0)");
+            write_json(&directory.join(name), &lock).unwrap();
+        }
+        let mut receipt: Value = read_json(&prepared.join("inputs.json")).unwrap();
+        receipt["sources"] = json!(file_map(&root).unwrap());
+        refresh_file(&mut receipt, &prepared, name);
+        verify_npm_inputs(&root, &prepared).unwrap();
+        let mut changed: Value = read_json(&prepared.join(name)).unwrap();
+        let first = "external@1.2.3(leaf@1.0.0)";
+        match corruption {
+            "edge" => changed["snapshots"][first]["dependencies"]["leaf"] = json!("2.0.0"),
+            "context" => {
+                changed["importers"]["."]["devDependencies"]["external"]["version"] =
+                    json!("1.2.3(leaf@2.0.0)")
+            }
+            "optional-field" => {
+                changed["snapshots"][first]["optionalDependencies"] =
+                    changed["snapshots"][first]["dependencies"].clone();
+                changed["snapshots"][first]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("dependencies");
+            }
+            "package-metadata" => changed["packages"]["leaf@1.0.0"]["os"] = json!(["darwin"]),
+            _ => changed["snapshots"][first]["optional"] = json!(true),
+        }
+        write_json(&prepared.join(name), &changed).unwrap();
+        refresh_file(&mut receipt, &prepared, name);
+        assert!(
+            verify_npm_inputs(&root, &prepared)
+                .unwrap_err()
+                .to_string()
+                .contains(if corruption == "package-metadata" {
+                    "Selected template package metadata changed"
+                } else {
+                    "Selected template graph changed"
+                }),
+            "{corruption}"
+        );
+    }
 }
 
 #[test]

@@ -87,26 +87,106 @@ fn git_common_dir(checkout: &Path) -> Result<Option<PathBuf>> {
     if metadata.is_dir() {
         return Ok(Some(git));
     }
-    ensure!(
-        metadata.is_file() && metadata.len() <= 16 * 1024,
-        "Invalid Git worktree pointer"
-    );
-    let value = fs::read_to_string(&git)?;
+    let (bytes, _) = read_regular_file(&git, 16 * 1024, "Git worktree pointer")?
+        .context("Missing Git worktree pointer")?;
+    let value = std::str::from_utf8(&bytes).context("Invalid Git worktree pointer")?;
     let path = value
         .trim()
         .strip_prefix("gitdir: ")
         .context("Invalid Git worktree pointer")?;
     let directory = project_root(&checkout.join(path))?;
     let common = directory.join("commondir");
-    if common.exists() {
-        ensure!(
-            identity(&common)?.is_some() && fs::metadata(&common)?.len() <= 16 * 1024,
-            "Invalid Git common directory pointer"
-        );
-        let value = fs::read_to_string(common)?;
+    if let Some((bytes, _)) = read_regular_file(&common, 16 * 1024, "Git common directory pointer")?
+    {
+        let value = std::str::from_utf8(&bytes).context("Invalid Git common directory pointer")?;
         Ok(Some(project_root(&directory.join(value.trim()))?))
     } else {
         Ok(Some(directory))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn git_pointer_metadata_is_bounded_before_any_identity() {
+        const WORKER: &str = "DEVKIT_TEST_GIT_POINTER_BUDGET";
+        if std::env::var(WORKER).as_deref() != Ok("1") {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shared_cache::tests::git_pointer_metadata_is_bounded_before_any_identity",
+                    "--test-threads=1",
+                ])
+                .env(WORKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let pages: u64 = fs::read_to_string("/proc/self/statm")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: this disposable worker limits only its own address space.
+        let maximum =
+            pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 + 64 * 1024 * 1024;
+        let limit = libc::rlimit {
+            rlim_cur: maximum,
+            rlim_max: maximum,
+        };
+        // SAFETY: limit is a live rlimit and no other process is modified.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+        let temp = tempfile::TempDir::new().unwrap();
+        let checkout = temp.path().join("checkout");
+        let repository = temp.path().join("repo");
+        let gitdir = repository.join("worktrees/check");
+        fs::create_dir(&checkout).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        let pointer = checkout.join(".git");
+        let common = gitdir.join("commondir");
+        fs::write(&pointer, "gitdir: ../repo/worktrees/check\n").unwrap();
+        fs::write(&common, "../..\n").unwrap();
+        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository.clone()));
+        for path in [&pointer, &common] {
+            let original = fs::read(path).unwrap();
+            for size in [16 * 1024 + 1, 1024 * 1024 * 1024] {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(size)
+                    .unwrap();
+                assert!(
+                    git_common_dir(&checkout)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeds byte budget")
+                );
+                fs::write(path, &original).unwrap();
+            }
+        }
+        fs::remove_file(&common).unwrap();
+        symlink(&pointer, &common).unwrap();
+        assert!(git_common_dir(&checkout).is_err());
+        fs::remove_file(&common).unwrap();
+        let name = CString::new(common.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid terminated pathname, in the disposable fixture only.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(git_common_dir(&checkout).is_err());
+        fs::remove_file(&common).unwrap();
+        fs::write(&common, "../..\n").unwrap();
+        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository));
     }
 }
 
