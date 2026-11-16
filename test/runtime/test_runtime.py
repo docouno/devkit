@@ -238,7 +238,7 @@ def accept_runtime(root, native=False, package_profiles=None):
             for name in nodes:
                 for filename in ("package-lock.json", "pnpm-lock.yaml"):
                     (root / name / filename).unlink(missing_ok=True)
-            fixture_tool(root, "import {spawnSync} from 'node:child_process';const r=spawnSync('pnpm',['install','--lockfile-only','--ignore-scripts','--offline','--trust-lockfile','--config.strict-peer-dependencies=true'],{stdio:'inherit'});process.exit(r.status??1)")
+            fixture_tool(root, "import {spawnSync} from 'node:child_process';const r=spawnSync('pnpm',['install','--lockfile-only','--fix-lockfile','--ignore-scripts','--offline','--trust-lockfile','--config.strict-peer-dependencies=true'],{stdio:'inherit'});process.exit(r.status??1)")
         else:
             for filename in ("package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
                 (root / filename).unlink(missing_ok=True)
