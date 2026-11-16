@@ -66,7 +66,7 @@ devkit-verify
 devkit-verify --pack
 ```
 
-For `"private": false` libraries, `devkit-pack` (invoked by `make package`) stages `npm pack --ignore-scripts`, checks public `exports`, blocks leaked `src/`/test/config files and test ambient `/// <reference types="..." />` directives, runs `publint` (`strict: true`) and `@arethetypeswrong/core` (`node16-esm` and `bundler`), and atomically writes `<name>-<version>.tgz` and `package-receipt.json` into `release/`. Programmatic helpers (`verifyPackableComponent`, `packComponent`) are exported from `@docouno/env/pack`.
+For `"private": false` libraries, `devkit-pack` (invoked by `make package`) stages `pnpm pack --config.ignore-scripts=true`, checks public `exports`, blocks leaked `src/`/test/config files and test ambient `/// <reference types="..." />` directives, runs `publint` (`strict: true`) and `@arethetypeswrong/core` (`node16-esm` and `bundler`), and atomically writes `<name>-<version>.tgz` and `package-receipt.json` into `release/`. Programmatic helpers (`verifyPackableComponent`, `packComponent`) are exported from `@docouno/env/pack`.
 
 Source defaults can be customized in `package.json`:
 

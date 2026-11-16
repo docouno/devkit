@@ -94,6 +94,7 @@ fn project_volume(path: &str) -> Value {
     )
 }
 pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
+    let modern = SemVer::parse(&state.version)? >= SemVer::parse("0.5.0")?;
     // Insertion order is part of the accepted0.2 JS runtime projection wire
     // format. New native output uses this same deterministic serializer.
     let mut services = Map::new();
@@ -164,21 +165,45 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
         if rust {
             volumes.push(project_volume(&format!("{path}/target")));
             volumes.push(volume(
-                "${DEVKIT_PROJECT_ROOT:?}/.devkit/cache/cargo".to_string(),
+                if modern {
+                    "${DEVKIT_CARGO_CACHE_DIR:?}"
+                } else {
+                    "${DEVKIT_PROJECT_ROOT:?}/.devkit/cache/cargo"
+                }
+                .to_string(),
                 "/cache/cargo".to_string(),
                 false,
             ));
         } else {
             volumes.extend(node_volumes.clone());
+            if modern {
+                volumes.push(volume(
+                    "${DEVKIT_PNPM_PATH:?}".into(),
+                    "/devkit/bin/pnpm".into(),
+                    true,
+                ));
+                env.extend([
+                    ("PATH".into(),json!("/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")),
+                    ("XDG_CACHE_HOME".into(),json!("/tmp/devkit-xdg-cache")),
+                    ("NPM_CONFIG_CACHE".into(),json!("/tmp/devkit-npm-cache")),
+                ]);
+            }
         }
         let command = if rust {
             vec!["cargo", "run", "--locked", "--offline"]
         } else if desktop {
             vec!["/devkit/devkit", "internal", "desktop"]
         } else {
-            vec!["npm", "run", "dev"]
+            vec![
+                if modern { "/devkit/bin/pnpm" } else { "npm" },
+                "run",
+                "dev",
+            ]
         };
         let mut service = json!({"image":if rust{"${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"}else if desktop{"${DEVKIT_DESKTOP_IMAGE:-devkit-unprepared-desktop}"}else{"${DEVKIT_NODE_IMAGE:?}"},"init":true,"user":"${DEVKIT_UID:?}:${DEVKIT_GID:?}","working_dir":format!("/workspace/{path}"),"command":command,"environment":env,"volumes":volumes});
+        if modern && !rust && !desktop {
+            service["tmpfs"] = json!(["/tmp:mode=1777"]);
+        }
         if desktop {
             service["volumes"].as_array_mut().unwrap().push(volume(
                 "${DEVKIT_ENGINE_PATH:?}".into(),

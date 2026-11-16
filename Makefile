@@ -5,11 +5,11 @@ include toolchains.env
 include tooling/author.mk
 
 .PHONY: verify-engine fix-rust-format pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
-	test-env test-npm-inputs build build-fixtures build-controller npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
+	test-env test-npm-inputs build build-fixtures build-controller pnpm-lock npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
 	@printf '%s\n' 'Devkit author workspace (Linux x86_64 + Docker Compose >=5.0.0 + Python 3)' \
-	  'make setup          Prepare pinned SDK images, native engine and npm dependencies' \
+	  'make setup          Prepare pinned SDK images, native engine and pnpm dependencies' \
 	  'make fix-format     Apply source formatting explicitly' \
 	  'make check          Rust fmt/Clippy and env declarations/lint/format/shell checks' \
 	  'make test           Native units, Cargo/Git/strace gates and Node env/npm tests' \
@@ -23,7 +23,7 @@ help:
 	  'Ordinary checks use cached SDKs. Only setup prepares images and dependencies.'
 setup: bootstrap
 	@docker image inspect "$$DEVKIT_AUTHOR_NODE_IMAGE" >/dev/null 2>&1 || docker pull "$$DEVKIT_AUTHOR_NODE_IMAGE"
-	$(call author_node,bridge,npm ci --include=dev --strict-peer-deps --bin-links=false)
+	$(call author_node_setup,bridge,pnpm install --frozen-lockfile --ignore-scripts --prefer-offline --trust-lockfile)
 # The only command before a native engine exists: exec Docker, with no host SDK.
 bootstrap:
 	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
@@ -89,9 +89,9 @@ check-native:
 fix-rust-format:
 	$(call author_rust,cargo fmt --all,rw)
 fix-format: fix-rust-format
-	$(call author_node,none,npm run fix:format,,rw)
+	$(call author_node,none,pnpm run fix:format,,rw)
 check-env:
-	$(call author_node,none,npm run check)
+	$(call author_node,none,pnpm run check)
 test: test-native test-special test-env test-npm-inputs
 test-native:
 	$(call author_rust,cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl -- --test-threads=1)
@@ -102,9 +102,9 @@ test-special:
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test notices -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core linux_strace_checks_actual_commit_and_recovery_durability_order -- --ignored --exact --test-threads=1)
 test-env:
-	$(call author_node,bridge,npm run test:env)
+	$(call author_node,none,pnpm run test:env)
 test-npm-inputs:
-	$(call author_node,bridge,npm run test:npm-inputs,--env DEVKIT_TEST_NPM=1)
+	$(call author_node,bridge,pnpm run test:npm-inputs,--env DEVKIT_TEST_NPM=1)
 build:
 	$(call author_rust,cargo build --release --locked --offline --target x86_64-unknown-linux-musl --bin devkit)
 build-fixtures:
@@ -113,8 +113,9 @@ build-controller:
 	$(call author_rust,cargo build --locked --offline --target x86_64-unknown-linux-musl --bin devkit-release)
 	@mkdir -p "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops"
 	@cp "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/devkit-release" "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops/devkit-release"
-npm-lock:
-	$(call author_node,bridge,npm install --package-lock-only --ignore-scripts --include=dev --strict-peer-deps,--volume "$$DEVKIT_AUTHOR_ROOT/package-lock.json:/workspace/package-lock.json:z")
+npm-lock: pnpm-lock
+pnpm-lock:
+	$(call author_node_setup,bridge,pnpm install --lockfile-only --ignore-scripts)
 npm-inputs:
 	$(call author_node,bridge,node tooling/prepare-npm-inputs.mjs --root /workspace --version "$$DEVKIT_RELEASE_VERSION" --output "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-npm" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-npm-producer.json")
 notices:

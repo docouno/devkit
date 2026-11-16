@@ -76,6 +76,15 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
         true,
     );
     put(&release, "templates/rust-api/src/main.rs", "fn main() {}\n");
+    let pin = devkit::runtime::PnpmPin::from_source_pins(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    put(&release, "runtime/pnpm.env", &pin.encode());
     write_json(
         &release.join("release.json"),
         &Release {
@@ -101,7 +110,11 @@ impl LockResolver for SeedFixtureResolver {
     fn regenerate(&self, root: &Path, _: &AdmittedRelease, _: Option<&str>) -> devkit::Result<()> {
         // The fixture release supplies the full selected graph. Admit it rather
         // than implementing an alternate ecosystem resolver in the test.
-        package_lock(root)?;
+        if root.join("pnpm-lock.yaml").is_file() {
+            devkit::pnpm::Lock::read(root)?;
+        } else {
+            package_lock(root)?;
+        }
         Ok(())
     }
 }
@@ -210,6 +223,71 @@ fn node_project(root: &Path, state: &ProjectState, members: &[(&str, Value)], ar
         &json!({"lockfileVersion":3,"packages":packages}),
     );
     profiles(root, state);
+}
+
+#[test]
+fn pnpm_admission_tracks_workspace_links_and_rejects_competing_locks_and_configuration() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let mut state = state(&[("apps/web", "node"), ("packages/ui", "node")]);
+    state.version = "0.5.0".into();
+    state.components.get_mut("apps/web").unwrap().dependencies = vec!["packages/ui".into()];
+    node_project(
+        root,
+        &state,
+        &[
+            (
+                "apps/web",
+                manifest("web", json!({"ui":"workspace:*"}), false),
+            ),
+            ("packages/ui", manifest("ui", json!({}), true)),
+        ],
+        json!({}),
+    );
+    let packages = package_lock(root).unwrap();
+    devkit::project::sync_node_workspace(root, &state, None).unwrap();
+    let lock = devkit::pnpm::import_legacy_npm_lock_seed(root, &packages).unwrap();
+    lock.write(root).unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert_eq!(admitted.dependencies["apps/web"], vec!["packages/ui"]);
+    assert!(admitted.node_inputs.files.contains_key("pnpm-lock.yaml"));
+    assert!(
+        admitted
+            .node_inputs
+            .files
+            .contains_key("pnpm-workspace.yaml")
+    );
+    put(root, "package-lock.json", "{}");
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Competing root lockfile")
+    );
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    put(
+        root,
+        ".npmrc",
+        "//registry.npmjs.org/:_authToken=${PNPM_FORBIDDEN}\n",
+    );
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Reserved environment variable")
+    );
+    fs::remove_file(root.join(".npmrc")).unwrap();
+    put(root, "apps/web/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    assert!(
+        admit_native_components(root, &state)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("workspace context: apps/web/pnpm-lock.yaml")
+    );
 }
 fn rust(root: &Path, path: &str, contents: &str, registered: bool) {
     put(root, &format!("{path}/Cargo.toml"), contents);
@@ -777,18 +855,38 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
     for location in ["root", "member", "transitive", "development", "peer"] {
         let f = TempDir::new().unwrap();
         let (release, root, state) = runtime_project(f.path(), "node");
-        let mut lock: Value = read_json(&root.join("package-lock.json")).unwrap();
+        let mut lock = devkit::pnpm::Lock::read(&root).unwrap();
         let mut member: Value = read_json(&root.join("apps/main/package.json")).unwrap();
         if location == "root" {
             let mut manifest: Value = read_json(&root.join("package.json")).unwrap();
             manifest["dependencies"] = json!({"missing-required":"1.0.0"});
             put_json(&root, "package.json", &manifest);
-            lock["packages"][""] = manifest;
         } else if location == "transitive" {
             member["dependencies"] = json!({"parent":"1.0.0"});
-            lock["packages"]["node_modules/parent"] = artifact(
-                "parent",
-                json!({"dependencies":{"missing-required":"1.0.0"}}),
+            lock.importers
+                .get_mut("apps/main")
+                .unwrap()
+                .dependencies
+                .insert(
+                    "parent".into(),
+                    devkit::pnpm::Dependency {
+                        specifier: "1.0.0".into(),
+                        version: "1.0.0".into(),
+                    },
+                );
+            lock.packages.insert(
+                "parent@1.0.0".into(),
+                json!({"resolution":{"integrity":sri(1)}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            lock.snapshots.insert(
+                "parent@1.0.0".into(),
+                json!({"dependencies":{"missing-required":"1.0.0"}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
             );
         } else {
             let field = match location {
@@ -802,15 +900,19 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
             member[field]["missing-required"] = json!("1.0.0");
         }
         put_json(&root, "apps/main/package.json", &member);
-        lock["packages"]["apps/main"] = member;
-        put_json(&root, "package-lock.json", &lock);
+        lock.write(&root).unwrap();
+        let diagnostic = if location == "transitive" {
+            "Native lock target is missing"
+        } else {
+            "Native lock omits dependency"
+        };
         let before = source_signature(&root, Some(&state)).unwrap();
         assert!(
             admit_native_components(&root, &state)
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("Native lock omits dependency"),
+                .contains(diagnostic),
             "{location}"
         );
         assert!(
@@ -818,14 +920,14 @@ fn required_npm_targets_reject_root_member_transitive_and_same_release_noop() {
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("Native lock omits dependency"),
+                .contains(diagnostic),
             "{location}"
         );
         let error = update_project(&release, &root, &UpdateOptions::default(), &RefuseResolver)
             .err()
             .unwrap();
         assert!(
-            error.to_string().contains("Native lock omits dependency"),
+            error.to_string().contains(diagnostic),
             "{location}: {error}"
         );
         assert_eq!(source_signature(&root, Some(&state)).unwrap(), before);

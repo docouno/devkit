@@ -40,6 +40,7 @@ def main():
     engine = Path(os.environ.get('DEVKIT_AUTHOR_ENGINE', target_dir / 'devkit')).resolve()
     fixture = Path(os.environ.get('DEVKIT_REGISTRY_FIXTURE', target_dir / 'examples/registry_fixture')).resolve()
     assert engine.is_file() and fixture.is_file(), 'Run make setup build-fixtures'
+    pnpm_bin = subprocess.check_output([str(engine), 'internal', 'ensure-pnpm', '--pin-file', str(ROOT / 'toolchains.env')], text=True).strip()
     before = [{str(p.relative_to(root)): digest(p) for p in root.rglob('*') if p.is_file()} for root in releases]
     proof = ROOT / '.artifacts/registry' / uuid.uuid4().hex
     proof.mkdir(parents=True)
@@ -52,13 +53,13 @@ def main():
         blocker = scratch / 'without host SDK'
         blocker.mkdir()
         forbidden = scratch / 'host-sdk-attempts'
-        for name in ('node', 'npm', 'npx', 'cargo', 'rustc', 'rustup', 'tsc', 'eslint'):
+        for name in ('node', 'npm', 'npx', 'pnpm', 'pnpx', 'corepack', 'cargo', 'rustc', 'rustup', 'tsc', 'eslint'):
             path = blocker / name
             path.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$DEVKIT_FORBIDDEN_HOST_SDK_LOG"\nexit 97\n')
             path.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'LC_ALL', 'TERM')}
         env.update(PATH=str(blocker) + os.pathsep + env['PATH'], HOME=str(scratch / 'home'),
-                   DEVKIT_FORBIDDEN_HOST_SDK_LOG=str(forbidden), CI='true')
+                   DEVKIT_FORBIDDEN_HOST_SDK_LOG=str(forbidden), DEVKIT_PNPM_BIN_OVERRIDE=pnpm_bin, CI='true')
         consumer = scratch / 'consumer'
         consumer.mkdir()
         def node(mode):
@@ -70,6 +71,7 @@ def main():
                     '--user', f'{os.getuid()}:{os.getgid()}', '--read-only',
                     *author_docker_flags(2, 768, pids_limit=512, node_fallback=True),
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777,size=256m',
+                    '--volume', f'{pnpm_bin}:/devkit/bin/pnpm:ro,z', '--env', 'PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                     '--volume', f'{ROOT}:/source:ro,z', '--volume', f'{engine}:/devkit/devkit:ro,z',
                     '--volume', f'{releases[0]}:/release-v1:ro,z', '--volume', f'{releases[1]}:/release-v2:ro,z',
                     '--volume', f'{scratch}:/proof:z', '--volume', f'{consumer}:/consumer:z',

@@ -7,7 +7,7 @@ use crate::{
     files::*,
     model::*,
     processes::ProcessRunner,
-    project::{self, ComponentSpec, DockerNpmResolver, InitOptions, UpdateOptions},
+    project::{self, ComponentSpec, DockerPnpmResolver, InitOptions, UpdateOptions},
 };
 use anyhow::{Context, ensure};
 use serde_json::json;
@@ -43,6 +43,10 @@ fn ensure_supported_target_version(ver: &str) -> Result<()> {
 }
 
 pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
+    let resolver = DockerPnpmResolver {
+        cache_dir: globals.cache_dir.clone(),
+        offline: globals.offline,
+    };
     let args = if globals.args.is_empty() {
         &[][..]
     } else {
@@ -296,7 +300,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                 hooks: Some(&cancellation),
                 ..Default::default()
             },
-            &DockerNpmResolver,
+            &resolver,
         )?;
         runner.check_cancelled()?;
         globals.emit(command, json!({"root":root,"version":state.version,"releaseIdentity":state.release_identity,"generation":state.generation,"components":state.components.keys().collect::<Vec<_>>()}),
@@ -375,8 +379,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         ..Default::default()
     };
     let outcome = match command {
-        "sync" => project::sync_project(&release.root, &root, &update, &DockerNpmResolver)?,
-        "update" => project::update_project(&release.root, &root, &update, &DockerNpmResolver)?,
+        "sync" => project::sync_project(&release.root, &root, &update, &resolver)?,
+        "update" => project::update_project(&release.root, &root, &update, &resolver)?,
         "register" => {
             ensure!(
                 options.flag("--app") != options.flag("--package"),
@@ -395,7 +399,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                 name.to_owned(),
                 profile,
                 &update,
-                &DockerNpmResolver,
+                &resolver,
             )?
         }
         "add-app" | "add-package" => {
@@ -425,7 +429,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                     uses,
                 },
                 &update,
-                &DockerNpmResolver,
+                &resolver,
             )?
         }
         _ => unreachable!(),

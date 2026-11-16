@@ -7,13 +7,13 @@
     "node": "^24.22.1"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
-    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
-    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "check": "devkit-verify && pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "format": "prettier --write . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run --config vitest.config.mjs",
-    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "fix": "pnpm run format && eslint --max-warnings 0 --fix . && pnpm run format",
     "build": "vite build",
     "dev": "vite --host 0.0.0.0 --port 5173 --strictPort"
   },

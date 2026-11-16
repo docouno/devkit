@@ -18,6 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   assertCanonicalLock,
+  assertManifestImporter,
+  encodeLock,
+  parseLock,
   assertRegistryDependencies,
   assertSelectedIdentities,
   canonicalizeLock,
@@ -26,7 +29,7 @@ import {
   object,
   prepareTemplate,
 } from './npm-inputs/locks.mjs';
-import { npmEnvironment, runNpm, withEnvRegistry } from './npm-inputs/npm.mjs';
+import { npmEnvironment, runPnpm, withEnvRegistry } from './npm-inputs/npm.mjs';
 
 const templateNames = [
   'node-api',
@@ -140,7 +143,7 @@ function sources(root) {
   visit('packages/env');
   for (const name of templateNames) {
     read(`templates/${name}/package.json`);
-    read(`templates/${name}/package-lock.json`);
+    read(`templates/${name}/pnpm-lock.yaml`);
   }
   return result;
 }
@@ -183,27 +186,24 @@ function payloadFiles(root) {
 
 /** Match npm's reported name/version/file and SRI to the actual regular archive. */
 export function validatePack(result, directory, version) {
-  if (!Array.isArray(result) || result.length !== 1) {
-    throw new Error('npm pack returned an unexpected result');
-  }
-  const entry = object(result[0], 'npm pack result');
+  const entry = object(
+    Array.isArray(result) && result.length === 1 ? result[0] : result,
+    'pnpm pack result',
+  );
   const expected = `docouno-env-${version}.tgz`;
   if (
     entry.name !== '@docouno/env' ||
     entry.version !== version ||
-    entry.filename !== expected ||
-    basename(entry.filename) !== entry.filename
+    typeof entry.filename !== 'string' ||
+    basename(entry.filename) !== expected ||
+    (isAbsolute(entry.filename) && resolve(entry.filename) !== resolve(directory, expected))
   ) {
     throw new Error('npm pack returned a conflicting package identity/filename');
   }
   const path = join(directory, expected),
     { bytes } = regularBytes(path);
   const integrity = sri(bytes);
-  if (
-    entry.integrity !== integrity ||
-    entry.shasum !== createHash('sha1').update(bytes).digest('hex') ||
-    entry.size !== bytes.length
-  ) {
+  if (entry.integrity !== integrity || entry.size !== bytes.length) {
     throw new Error('npm pack integrity/size differs from its actual archive');
   }
   if (JSON.stringify(readdirSync(directory).sort()) !== JSON.stringify([expected])) {
@@ -241,13 +241,14 @@ export function verifyNpmInputs(directory) {
     const template = object(object(receipt.templates, 'npm templates')[name], name);
     if (
       template.manifest !== `templates/${name}/package.json` ||
-      template.lock !== `templates/${name}/package-lock.json`
+      template.lock !== `templates/${name}/pnpm-lock.yaml`
     ) {
       throw new Error(`Unexpected template snapshot paths: ${name}`);
     }
     expectedFiles.push(template.manifest, template.lock);
     const manifest = object(json(join(directory, template.manifest)), 'template manifest');
-    const lock = json(join(directory, template.lock));
+    const lock = parseLock(readFileSync(join(directory, template.lock), 'utf8'));
+    assertManifestImporter(manifest, lock);
     assertCanonicalLock(lock);
     if (object(manifest.devDependencies, 'template devDependencies')['@docouno/env'] !== version) {
       throw new Error('Template accepted env version differs from npm inputs');
@@ -300,6 +301,7 @@ export async function prepareNpmInputs({
   try {
     // Stop npm's project-config search here, even if output is inside a checkout.
     write(join(stage, 'package.json'), encode({ private: true }));
+    write(join(stage, 'pnpm-workspace.yaml'), 'packages: []\n');
     const payload = join(stage, 'payload'),
       envRoot = join(stage, 'environment');
     for (const [name, { bytes, mode }] of snapshot) {
@@ -314,8 +316,8 @@ export async function prepareNpmInputs({
     const npmRoot = join(payload, 'npm');
     mkdirSync(npmRoot, { recursive: true });
     const npmDirectory = join(stage, 'npm');
-    const packed = await runNpm(
-      ['pack', '--ignore-scripts', '--json', '--pack-destination', npmRoot],
+    const packed = await runPnpm(
+      ['pack', '--config.ignore-scripts=true', '--json', '--pack-destination', npmRoot],
       {
         cwd: envRoot,
         env: npmEnvironment(npmDirectory),
@@ -331,7 +333,7 @@ export async function prepareNpmInputs({
       const fetchDist = async (name, selected) => {
         const key = `${name}@${selected}`;
         if (!metadata.has(key)) {
-          const result = await runNpm(['view', key, 'dist', '--json', '--prefer-offline'], {
+          const result = await runPnpm(['view', key, 'dist', '--json', '--prefer-offline'], {
             cwd: stage,
             env,
             signal,
@@ -344,34 +346,53 @@ export async function prepareNpmInputs({
         signal?.throwIfAborted();
         const template = prepareTemplate(
           sourceJson(`templates/${name}/package.json`),
-          sourceJson(`templates/${name}/package-lock.json`),
+          parseLock(snapshot.get(`templates/${name}/pnpm-lock.yaml`).bytes.toString('utf8')),
           sourceEnvironmentVersion,
           version,
         );
+        template.lock.packages[`@docouno/env@${version}`].resolution = {
+          integrity: archive.integrity,
+        };
         const seeded = await hydrateLockIdentities(template.lock, fetchDist);
         const appRoot = join(payload, 'templates', name);
         const paths = {
           manifest: `templates/${name}/package.json`,
-          lock: `templates/${name}/package-lock.json`,
+          lock: `templates/${name}/pnpm-lock.yaml`,
         };
         write(join(payload, paths.manifest), encode(template.manifest));
-        write(join(payload, paths.lock), encode(seeded));
-        await runNpm(
+        const installSeed = structuredClone(seeded);
+        delete installSeed.packages[`@docouno/env@${version}`];
+        for (const key of Object.keys(installSeed.snapshots)) {
+          if (key.startsWith(`@docouno/env@${version}(`) || key === `@docouno/env@${version}`) {
+            delete installSeed.snapshots[key];
+          }
+        }
+        write(join(payload, paths.lock), encodeLock(installSeed));
+        write(join(appRoot, 'pnpm-workspace.yaml'), 'packages: []\n');
+        await runPnpm(
           [
             'install',
-            '--package-lock-only',
+            '--lockfile-only',
+            '--fix-lockfile',
+            '--ignore-workspace',
+            '--trust-lockfile',
+            '--prefer-offline',
             '--ignore-scripts',
-            '--include=dev',
-            '--strict-peer-deps',
+            '--config.strict-peer-dependencies=true',
           ],
           { cwd: appRoot, env, signal },
         );
-        const canonical = canonicalizeLock(json(join(payload, paths.lock)), registry);
+        const canonical = canonicalizeLock(
+          parseLock(readFileSync(join(payload, paths.lock), 'utf8')),
+          registry,
+        );
+        assertManifestImporter(template.manifest, canonical);
         assertSelectedIdentities(seeded, canonical, version, archive.integrity);
+        rmSync(join(appRoot, 'pnpm-workspace.yaml'));
         if (readFileSync(join(payload, paths.manifest), 'utf8') !== encode(template.manifest)) {
           throw new Error(`npm changed the template manifest: ${name}`);
         }
-        write(join(payload, paths.lock), encode(canonical));
+        write(join(payload, paths.lock), encodeLock(canonical));
         templates[name] = paths;
       }
     });

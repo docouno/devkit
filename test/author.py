@@ -45,7 +45,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='devkit author ') as directory:
         root = Path(directory) / 'literal $(not-a-function)'
         (root / 'tooling').mkdir(parents=True)
-        for name in ('Makefile', 'toolchains.env', 'VERSION', 'tooling/author.mk', 'tooling/native.Dockerfile'):
+        for name in ('Makefile', 'toolchains.env', 'VERSION', 'pnpm-workspace.yaml', 'tooling/author.mk', 'tooling/native.Dockerfile'):
             shutil.copy2(ROOT / name, root / name)
         # GNU Make command-line values are recursive by default. Treat every
         # operator path/argument as data, including literal Make function syntax.
@@ -57,7 +57,9 @@ def main():
             'from_version': 'DEVKIT_FROM_VERSION', 'build_id': 'DEVKIT_BUILD_ID',
             'build_run': 'DEVKIT_BUILD_RUN', 'expected_index_sha256': 'DEVKIT_EXPECTED_INDEX_SHA256',
             'DEVKIT_AUTHOR_CARGO_HOME': 'DEVKIT_AUTHOR_CARGO_HOME',
-            'DEVKIT_AUTHOR_RUST_IMAGE': 'DEVKIT_AUTHOR_RUST_IMAGE'}
+            'DEVKIT_AUTHOR_RUST_IMAGE': 'DEVKIT_AUTHOR_RUST_IMAGE',
+            'DEVKIT_AUTHOR_PNPM_STORE': 'DEVKIT_AUTHOR_PNPM_STORE',
+            'DEVKIT_AUTHOR_PNPM_CACHE': 'DEVKIT_AUTHOR_PNPM_CACHE'}
         program = 'import json,os; print(json.dumps({k:os.environ[k] for k in ' + repr(list(fields.values())) + '}))'
         with (root / 'Makefile').open('a') as makefile:
             makefile.write("\n.PHONY: inspect-author-data\ninspect-author-data:\n\t@python3 -c " + "'" + program.replace("'", "'\"'\"'") + "'\n")
@@ -80,6 +82,8 @@ def main():
         local_engine = root / '.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit'
         local_engine.parent.mkdir(parents=True)
         shutil.copy2(engine, local_engine)
+        (root / 'packages/env').mkdir(parents=True)
+        (root / 'packages/env/package.json').write_text(json.dumps({'name': '@docouno/env', 'version': '0.5.0', 'private': True}))
         (root / 'source.txt').write_text('readonly source\n')
         script = """import fs from 'node:fs';
 import assert from 'node:assert/strict';
@@ -100,13 +104,16 @@ if (process.argv[2] === 'cancel') { console.log('READY'); setInterval(() => {}, 
             f'with open({str(docker_log)!r}, "a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
             f'os.execv({real_docker!r},[{real_docker!r},*sys.argv[1:]])\n')
         (wrappers / 'docker').chmod(0o755)
+        for name in ('pnpm', 'pnpx', 'corepack'):
+            (wrappers / name).write_text('#!/bin/sh\nexit 97\n')
+            (wrappers / name).chmod(0o755)
         env = dict(os.environ, PATH=str(wrappers) + os.pathsep + os.environ['PATH'], DEVKIT_HOST_SECRET='must-not-enter-sdk')
         for mode, expected in [('success', 0), ('failure', 2)]:
             (root / 'package.json').write_text(json.dumps({'private': True, 'type': 'module', 'scripts': {'check': f'node probe.mjs {mode}'}}))
             result = subprocess.run(['make', 'check-env'], cwd=root, env=env, capture_output=True, text=True, timeout=25)
             (proof / f'{mode}.log').write_text(result.stdout + result.stderr)
             assert result.returncode == expected, result.stdout + result.stderr
-            if mode == 'failure': assert '42' in result.stderr
+            if mode == 'failure': assert '42' in (result.stdout + result.stderr)
             rows.append(dict(name=mode, makeExit=result.returncode, nativeExit=42 if mode == 'failure' else 0))
         (root / 'package.json').write_text(json.dumps({'private': True, 'type': 'module', 'scripts': {'check': 'node probe.mjs cancel'}}))
         with (proof / 'cancel.log').open('w') as output:

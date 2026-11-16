@@ -30,7 +30,7 @@ jobs:
           path: |
             ${{ runner.temp }}/devkit-cache
             .devkit/cache
-          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'package-lock.json', '**/Cargo.lock') }}
+          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
           restore-keys: |
             devkit-${{ runner.os }}-
 
@@ -65,16 +65,15 @@ stages:
   - publish
 
 variables:
-  DEVKIT_CACHE_DIR: '$CI_PROJECT_DIR/.ci-devkit-cache'
+  DEVKIT_CACHE_DIR: '$CI_PROJECT_DIR/.devkit/cache/ci'
   GITLAB_NPM_TOKEN: '$CI_JOB_TOKEN'
 
 cache:
   key:
     files:
       - .devkit/manifest.json
-      - package-lock.json
+      - pnpm-lock.yaml
   paths:
-    - .ci-devkit-cache/
     - .devkit/cache/
 
 verify:

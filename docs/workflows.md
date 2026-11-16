@@ -58,7 +58,7 @@ npx @docouno/devkit@0.5.0 add-app . --name docs --template react-web --use token
 make setup
 ```
 
-`--use <slug>` adds `"<pkgName>": "file:../../packages/<slug>"` to the consumer's `package.json`, updates `package-lock.json`, and derives the build/check DAG automatically in `.devkit/manifest.json` and `.devkit/project.mk`.
+`--use <slug>` adds `"<pkgName>": "workspace:*"` to the consumer's `package.json`, updates `pnpm-lock.yaml`, and derives the build/check DAG automatically in `.devkit/manifest.json` and `.devkit/project.mk`.
 
 ## 3. Add or Update Third-Party Dependencies (`devkit exec`)
 
@@ -67,10 +67,10 @@ Never run host `npm install` or `cargo` directly on the checkout. Always execute
 ```sh
 # Node.js / React / TypeScript component (including npm: aliases)
 npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
-  npm install clsx
+  pnpm add clsx
 
 npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
-  npm install legacy-zod@npm:zod@^3.24.0
+  pnpm add legacy-zod@npm:zod@^3.24.0
 
 # Rust component
 npx @docouno/devkit@0.5.0 exec --component apps/api --write --network bridge -- \
@@ -80,7 +80,7 @@ npx @docouno/devkit@0.5.0 exec --component apps/api --write --network bridge -- 
 Without host Node.js, use the root `Makefile` wrapper:
 
 ```sh
-make exec package=ui write=1 network=bridge command="npm install clsx"
+make exec package=ui write=1 network=bridge command="pnpm add clsx"
 ```
 
 Follow dependency mutations with `make setup` to refresh the verified workspace lock receipt.

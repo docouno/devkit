@@ -52,7 +52,7 @@ fullstack-product/
     └── client/    # UI and logic shared by web and desktop
 ```
 
-Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. npm components share a root workspace and lockfile; Rust components own their Cargo manifests and locks.
+Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. Node components share `pnpm-workspace.yaml` and `pnpm-lock.yaml` with isolated package links; Rust components own their Cargo manifests and locks.
 
 Add components as the repository grows:
 
@@ -74,7 +74,7 @@ make sync
 | Command            | Purpose                                                                   |
 | ------------------ | ------------------------------------------------------------------------- |
 | `make setup`       | Prepare accepted images and dependencies                                  |
-| `make sync`        | Synchronize projections and `package-lock.json` after manifest edits      |
+| `make sync`        | Synchronize projections and `pnpm-lock.yaml` after manifest edits         |
 | `make check`       | Check source, types, formatting, lint and applicable native gates         |
 | `make test`        | Run the registered components' native test suites                         |
 | `make build`       | Build the registered components                                           |
@@ -88,7 +88,7 @@ Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package.
 Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 
 ```sh
-npx @docouno/devkit@0.5.0 exec --component apps/web --write --network bridge -- npm install zod
+npx @docouno/devkit@0.5.0 exec --component apps/web --write --network bridge -- pnpm add zod
 make setup
 make check
 ```
@@ -128,6 +128,12 @@ Every initialized repository includes a concise offline reference at `.devkit/ru
 ## CLI and automation
 
 Use `--help` for command options. Complete arguments run without prompts; `--non-interactive` makes missing choices an error. Lifecycle and metadata commands support `--json`. Runtime tasks stream native output and preserve their exit codes.
+
+## Shared package cache
+
+`make setup` lazily obtains the SHA-256-pinned static pnpm executable and installs from `pnpm-lock.yaml`. `DEVKIT_CACHE_DIR` (default `~/.cache/docouno/devkit`) holds the pnpm store/cache, Cargo downloads, and Electron distributions across repositories and Git worktrees. Daily gates run offline and mount `node_modules/.pnpm` read-only. Rust-only projects never download pnpm.
+
+Hardlinks require a shared filesystem and mount. If the configured cache cannot share one with the checkout, Devkit uses the repository's common Git directory (`devkit-store`) or `.devkit/cache/pnpm-store` for a non-Git checkout. See the [0.5 migration guide](docs/migrations/0.5.0.md#migrate-node-workspaces-to-pnpm) for existing projects and CI cache placement.
 
 ## Develop Devkit
 

@@ -33,14 +33,21 @@ pub fn run(runner: &ProcessRunner) -> Result<()> {
     fs::create_dir_all(home)?;
     let mut command = if std::env::var("DEVKIT_HEADLESS").as_deref() == Ok("1") {
         let mut c = Command::new("xvfb-run");
-        c.args(["-a", "-s", "-screen 0 1280x800x24", "npm", "run", "dev"]);
+        c.args([
+            "-a",
+            "-s",
+            "-screen 0 1280x800x24",
+            "/devkit/bin/pnpm",
+            "run",
+            "dev",
+        ]);
         c
     } else {
         ensure!(
             !std::env::var("DISPLAY").unwrap_or_default().is_empty(),
             "Desktop development needs DISPLAY; use headless=1 for a virtual display"
         );
-        let mut c = Command::new("npm");
+        let mut c = Command::new("/devkit/bin/pnpm");
         c.args(["run", "dev"]);
         c
     };

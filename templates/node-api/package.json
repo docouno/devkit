@@ -7,12 +7,12 @@
     "node": "^24.22.1"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
-    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
-    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "check": "devkit-verify && pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "format": "prettier --write . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "fix": "pnpm run format && eslint --max-warnings 0 --fix . && pnpm run format",
     "test": "node --test --test-concurrency=2 --test-reporter=@docouno/env/node-test-reporter 'src/**/*.test.ts'",
     "build": "tsc -p tsconfig.build.json",
     "dev": "node --watch src/index.ts",

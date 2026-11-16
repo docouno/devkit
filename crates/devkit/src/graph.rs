@@ -115,6 +115,9 @@ fn artifact_identity(location: &str, data: &Fields) -> Result<Fields> {
 }
 
 pub fn read_native_graph(root: &Path) -> Result<NativeGraph> {
+    if exists(&input_path(root, "pnpm-lock.yaml")?)? {
+        return crate::pnpm::Lock::read(root)?.native_graph(root);
+    }
     let packages = package_lock(root)?;
     let mut nodes = BTreeMap::new();
     for (location, raw) in &packages {
@@ -184,6 +187,123 @@ pub fn capture_product_graph(root: &Path, state: &ProjectState) -> Result<Produc
     Ok(ProductGraph { graph, roots })
 }
 
+/// Capture the v3 baseline independently of conversion so a faulty importer
+/// cannot silently redefine the product graph that an upgrade must preserve.
+pub fn read_legacy_npm_product_graph(root: &Path, state: &ProjectState) -> Result<ProductGraph> {
+    let packages = package_lock(root)?;
+    let mut product = capture_product_graph(root, state)?;
+    for (location, node) in &mut product.graph.nodes {
+        if location.is_empty() || state.components.contains_key(location) {
+            continue;
+        }
+        let raw = &packages[location];
+        let local = !location.contains("node_modules/");
+        let mut identity = if local {
+            node.identity.clone()
+        } else {
+            Fields::new()
+        };
+        if !local {
+            identity.insert(
+                "name".into(),
+                json!(node_package_name(location, &node.identity)),
+            );
+            for field in ["version", "integrity"] {
+                if let Some(value) = raw.get(field) {
+                    identity.insert(field.into(), value.clone());
+                }
+            }
+            if let Some(file) = raw
+                .get("resolved")
+                .and_then(Value::as_str)
+                .filter(|v| v.starts_with("file:"))
+            {
+                identity.insert("resolved".into(), json!(file));
+            }
+            identity.insert(
+                "optional".into(),
+                json!(raw.get("optional") == Some(&Value::Bool(true))),
+            );
+        }
+        node.identity = identity;
+        let optional = dependency_table(raw, "optionalDependencies")?;
+        let peer_meta = dependency_table(raw, "peerDependenciesMeta")?;
+        let mut edges = BTreeMap::new();
+        for edge in &node.edges {
+            if edge.field == "devDependencies" || edge.to.is_none() {
+                continue;
+            }
+            if edge.field == "dependencies" && optional.contains_key(&edge.name) {
+                continue;
+            }
+            let is_optional = edge.field == "optionalDependencies"
+                || (edge.field == "peerDependencies"
+                    && peer_meta.get(&edge.name).and_then(|v| v.get("optional"))
+                        == Some(&Value::Bool(true)));
+            let field = if is_optional {
+                "optionalDependencies"
+            } else {
+                "dependencies"
+            };
+            edges.insert(
+                (field.to_owned(), edge.name.clone()),
+                Edge {
+                    field: field.into(),
+                    name: edge.name.clone(),
+                    spec: String::new(),
+                    to: edge.to.clone(),
+                },
+            );
+        }
+        node.edges = edges.into_values().collect();
+    }
+    for (path, edges) in &mut product.graph.roots {
+        if !path.is_empty() && !state.components.contains_key(path) {
+            continue;
+        }
+        let manifest = native_manifest(root, path)?;
+        for edge in edges.iter_mut() {
+            if edge.field == "peerDependencies" {
+                continue;
+            }
+            if let Some(target) = edge
+                .to
+                .as_ref()
+                .filter(|t| state.components.contains_key(*t))
+                && !matches!(
+                    parse_npm_dependency_spec(&edge.spec)?,
+                    crate::native::NpmDepSpec::Alias { .. }
+                )
+            {
+                let target_manifest = native_manifest(root, target)?;
+                let public = manifest.get("private") == Some(&Value::Bool(false))
+                    && target_manifest.get("private") == Some(&Value::Bool(false));
+                edge.spec = if public && edge.field != "devDependencies" {
+                    "workspace:^"
+                } else {
+                    "workspace:*"
+                }
+                .into();
+            }
+        }
+        if let Some(node) = product.graph.nodes.get_mut(path) {
+            node.edges = edges.clone();
+        }
+    }
+    for (path, edges) in &mut product.roots {
+        let current = &product.graph.roots[path];
+        for edge in edges {
+            if let Some(updated) = current
+                .iter()
+                .find(|e| e.field == edge.field && e.name == edge.name)
+            {
+                *edge = updated.clone();
+            }
+        }
+    }
+    Ok(product)
+}
+
 pub fn assert_product_graphs_preserved(before: &ProductGraph, after: &NativeGraph) -> Result<()> {
     struct Comparison<'a> {
         before: &'a NativeGraph,
@@ -206,11 +326,14 @@ pub fn assert_product_graphs_preserved(before: &ProductGraph, after: &NativeGrap
             };
             if let Some(mapped) = self.mapping.get(old_target) {
                 ensure!(
-                    mapped == next_target,
+                    mapped == crate::pnpm::strip_peer_suffixes(next_target),
                     "Product shared dependency split: {label}"
                 );
             }
-            self.mapping.insert(old_target.clone(), next_target.clone());
+            self.mapping.insert(
+                old_target.clone(),
+                crate::pnpm::strip_peer_suffixes(next_target).to_owned(),
+            );
             if !self.seen.insert((old_target.clone(), next_target.clone())) {
                 return Ok(());
             }
@@ -290,6 +413,97 @@ pub struct LockSeed {
     pub lock: Value,
 }
 pub fn seed_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]) -> Result<()> {
+    if crate::files::SemVer::parse(&state.version)? < crate::files::SemVer::parse("0.5.0")? {
+        return seed_legacy_workspace_lock(root, state, seeds);
+    }
+    let mut lock = crate::pnpm::Lock::default();
+    for seed in seeds {
+        let legacy = seed.lock.get("lockfileVersion") == Some(&json!(3));
+        let source = if legacy {
+            let mut packages = Packages::new();
+            for (key, value) in object(
+                seed.lock
+                    .get("packages")
+                    .context("Missing legacy seed packages")?,
+                "legacy packages",
+            )? {
+                let target = joined_local(&seed.prefix, key)?;
+                let target = if target == "." { String::new() } else { target };
+                let mut record = object(value, "legacy record")?.clone();
+                if record.get("link") == Some(&Value::Bool(true)) {
+                    let resolved = text(
+                        record.get("resolved").context("Missing legacy link")?,
+                        "legacy link",
+                    )?;
+                    record.insert(
+                        "resolved".into(),
+                        json!(joined_local(&seed.prefix, resolved)?),
+                    );
+                } else if let Some(file) = record
+                    .get("resolved")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix("file:"))
+                {
+                    record.insert(
+                        "resolved".into(),
+                        json!(format!("file:{}", joined_local(&seed.prefix, file)?)),
+                    );
+                }
+                packages.insert(target, record);
+            }
+            crate::pnpm::import_legacy_npm_lock_seed(root, &packages)?
+        } else {
+            crate::pnpm::Lock::from_value(&seed.lock)?
+        };
+        lock.settings.extend(source.settings);
+        lock.extra.extend(source.extra);
+        for (key, value) in source.packages {
+            if let Some(previous) = lock.packages.get_mut(&key) {
+                ensure!(
+                    previous.get("resolution").and_then(|v| v.get("integrity"))
+                        == value.get("resolution").and_then(|v| v.get("integrity")),
+                    "Conflicting pnpm package seed: {key}"
+                );
+                previous.extend(value);
+            } else {
+                lock.packages.insert(key, value);
+            }
+        }
+        for (key, value) in source.snapshots {
+            if let Some(previous) = lock.snapshots.get_mut(&key) {
+                for field in ["dependencies", "optionalDependencies"] {
+                    ensure!(
+                        dependency_table(previous, field)? == dependency_table(&value, field)?,
+                        "Conflicting pnpm snapshot seed: {key}"
+                    );
+                }
+                let optional = previous.get("optional") == Some(&Value::Bool(true))
+                    && value.get("optional") == Some(&Value::Bool(true));
+                previous.extend(value);
+                if !optional {
+                    previous.remove("optional");
+                }
+            } else {
+                lock.snapshots.insert(key, value);
+            }
+        }
+        for (id, importer) in source.importers {
+            let target = if legacy || seed.prefix.is_empty() {
+                id
+            } else if id == "." {
+                seed.prefix.clone()
+            } else {
+                format!("{}/{id}", seed.prefix)
+            };
+            lock.importers.insert(target, importer);
+        }
+    }
+    crate::pnpm::refresh_importers(root, state, &mut lock)?;
+    crate::files::remove_file(&input_path(root, "package-lock.json")?)?;
+    lock.write(root)
+}
+
+fn seed_legacy_workspace_lock(root: &Path, state: &ProjectState, seeds: &[LockSeed]) -> Result<()> {
     let manifest = native_manifest(root, "")?;
     let mut packages: Packages = BTreeMap::from([(String::new(), manifest.clone())]);
     for seed in seeds {
@@ -452,30 +666,45 @@ pub fn compute_reconciliation_report(
     before: &NativeGraph,
     after: &NativeGraph,
 ) -> LockReconciliationReport {
+    fn external(graph: &NativeGraph) -> BTreeMap<String, BTreeMap<String, (&String, &Node)>> {
+        let mut packages: BTreeMap<String, BTreeMap<String, (&String, &Node)>> = BTreeMap::new();
+        for (path, node) in &graph.nodes {
+            if !graph.roots.contains_key(path) {
+                packages
+                    .entry(node_package_name(path, &node.identity))
+                    .or_default()
+                    .insert(node_version(&node.identity), (path, node));
+            }
+        }
+        packages
+    }
+    let old = external(before);
+    let next = external(after);
     let mut changed_packages = Vec::new();
-    let mut added_count = 0usize;
-    let mut removed_count = 0usize;
-    let all_locations: BTreeSet<&String> = before
-        .nodes
-        .keys()
-        .chain(after.nodes.keys())
-        .filter(|loc| loc.contains("node_modules/"))
-        .collect();
-    for location in all_locations {
-        match (before.nodes.get(location), after.nodes.get(location)) {
-            (Some(old_node), Some(new_node)) => {
-                if old_node.identity != new_node.identity {
+    let mut added_count = 0;
+    let mut removed_count = 0;
+    for name in old.keys().chain(next.keys()).collect::<BTreeSet<_>>() {
+        match (old.get(name), next.get(name)) {
+            (Some(a), Some(b)) => {
+                let old_versions = a.keys().cloned().collect::<Vec<_>>().join(", ");
+                let next_versions = b.keys().cloned().collect::<Vec<_>>().join(", ");
+                if old_versions != next_versions
+                    || a.iter().any(|(version, (_, node))| {
+                        b.get(version)
+                            .is_none_or(|(_, next)| node.identity != next.identity)
+                    })
+                {
                     changed_packages.push(ReconciledPackageChange {
-                        path: location.clone(),
-                        name: node_package_name(location, &new_node.identity),
-                        before_version: node_version(&old_node.identity),
-                        after_version: node_version(&new_node.identity),
+                        path: b.values().next().unwrap().0.clone(),
+                        name: name.clone(),
+                        before_version: old_versions,
+                        after_version: next_versions,
                     });
                 }
             }
-            (None, Some(_)) => added_count += 1,
-            (Some(_), None) => removed_count += 1,
-            (None, None) => {}
+            (None, Some(b)) => added_count += b.len(),
+            (Some(a), None) => removed_count += a.len(),
+            _ => {}
         }
     }
     LockReconciliationReport {
@@ -508,14 +737,15 @@ pub fn format_product_graph_drift(
             if details.len() >= 10 {
                 break;
             }
-            if location.contains("node_modules/") && !after.nodes.contains_key(location) {
+            if !before.graph.roots.contains_key(location) && !after.nodes.contains_key(location) {
                 let pkg = node_package_name(location, &old_node.identity);
                 let old_ver = node_version(&old_node.identity);
                 let relocated = after
                     .nodes
                     .iter()
                     .find(|(loc, n)| {
-                        loc.contains("node_modules/") && node_package_name(loc, &n.identity) == pkg
+                        !after.roots.contains_key(*loc)
+                            && node_package_name(loc, &n.identity) == pkg
                     })
                     .map(|(_, n)| node_version(&n.identity))
                     .unwrap_or_else(|| "removed".to_owned());
@@ -589,6 +819,31 @@ pub fn capture_retained_product_graph(
     state: &ProjectState,
     old_lock: &Value,
 ) -> Result<(NativeGraph, ProductGraph)> {
+    if old_lock.get("lockfileVersion") == Some(&json!("9.0")) {
+        let graph = crate::pnpm::Lock::from_value(old_lock)?.retained_graph(root)?;
+        let roots = graph
+            .roots
+            .iter()
+            .filter(|(path, _)| path.is_empty() || state.components.contains_key(*path))
+            .map(|(path, edges)| {
+                (
+                    path.clone(),
+                    edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.field != "devDependencies"
+                                || !state
+                                    .components
+                                    .get(path)
+                                    .is_some_and(|c| c.tool_dependencies.contains_key(&edge.name))
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .collect();
+        return Ok((graph.clone(), ProductGraph { graph, roots }));
+    }
     let raw_packages = object(
         old_lock
             .get("packages")
@@ -710,11 +965,14 @@ pub fn assert_retained_product_graph_preserved(
             };
             if let Some(mapped) = self.mapping.get(old_target) {
                 ensure!(
-                    mapped == next_target,
+                    mapped == crate::pnpm::strip_peer_suffixes(next_target),
                     "Product shared dependency split: {label}"
                 );
             }
-            self.mapping.insert(old_target.clone(), next_target.clone());
+            self.mapping.insert(
+                old_target.clone(),
+                crate::pnpm::strip_peer_suffixes(next_target).to_owned(),
+            );
             if !self.seen.insert((old_target.clone(), next_target.clone())) {
                 return Ok(());
             }

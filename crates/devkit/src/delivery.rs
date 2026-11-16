@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::CString,
     fs,
-    io::Read,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    io::{Read, Seek, SeekFrom},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::Path,
     process::Command,
 };
@@ -61,10 +64,31 @@ pub fn file_digest(path: &Path) -> Result<String> {
 
 pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
     pin.validate()?;
-    let path = project_root(path)?;
+    verify_static_elf_file(path, &pin.sha256, false)
+}
+
+/// Verify an executable without retaining its contents in memory. Open once so
+/// the checksum and ELF inspection always refer to the same inode.
+pub fn verify_static_elf_file(
+    path: &Path,
+    expected_sha256: &str,
+    require_mode_0755: bool,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
     ensure!(
-        fs::symlink_metadata(&path)?.is_file(),
-        "Native engine must be a regular file"
+        SHA256_RE.is_match(expected_sha256),
+        "Invalid executable SHA256"
+    );
+    let path = project_root(path)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "Native engine must be a regular file");
+    ensure!(
+        !require_mode_0755 || metadata.permissions().mode() & 0o7777 == 0o755,
+        "Cached executable mode differs from canonical 0755"
     );
     let encoded = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: one live C path; faccessat evaluates the current effective user's
@@ -80,11 +104,23 @@ pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
         } == 0,
         "Native engine is not executable by the current user"
     );
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
     ensure!(
-        file_digest(&path)? == pin.sha256,
+        format!("{:x}", hash.finalize()) == expected_sha256,
         "Native engine checksum differs from accepted pin"
     );
-    let bytes = fs::read(&path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = [0_u8; 64];
+    file.read_exact(&mut bytes)
+        .context("Truncated native ELF header")?;
     ensure!(
         bytes.len() >= 64
             && &bytes[..7] == b"\x7fELF\x02\x01\x01"
@@ -101,24 +137,27 @@ pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
     for n in 0..count {
         let start = offset
             .checked_add(n * entry_size)
-            .context("ELF header overflow")? as usize;
-        let record = bytes
-            .get(start..start + 56)
+            .context("ELF header overflow")?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut record = [0_u8; 56];
+        file.read_exact(&mut record)
             .context("Truncated native ELF")?;
         let kind = u32::from_le_bytes(record[..4].try_into().unwrap());
         ensure!(kind != 3, "Native engine has a dynamic program interpreter");
         if kind == 2 {
-            let start = u64::from_le_bytes(record[8..16].try_into().unwrap()) as usize;
-            let length = u64::from_le_bytes(record[32..40].try_into().unwrap()) as usize;
+            let start = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            let length = u64::from_le_bytes(record[32..40].try_into().unwrap());
             let end = start
                 .checked_add(length)
                 .context("ELF dynamic segment overflow")?;
-            for item in bytes
-                .get(start..end)
-                .context("Truncated ELF dynamic segment")?
-                .as_chunks::<16>()
-                .0
-            {
+            ensure!(
+                end <= metadata.len() && length % 16 == 0,
+                "Truncated ELF dynamic segment"
+            );
+            file.seek(SeekFrom::Start(start))?;
+            for _ in 0..length / 16 {
+                let mut item = [0_u8; 16];
+                file.read_exact(&mut item)?;
                 ensure!(
                     u64::from_le_bytes(item[..8].try_into().unwrap()) != 1,
                     "Native engine requires a dynamic library"

@@ -13,12 +13,19 @@ pub trait MutationHooks {
 pub fn transaction_path<'a>(name: &'a str, created: &[String]) -> Result<&'a str> {
     relative_path(name)?;
     if name == MANIFEST_PATH
-        || ["package.json", "package-lock.json"].contains(&name)
+        || [
+            "package.json",
+            "package-lock.json",
+            "pnpm-workspace.yaml",
+            "pnpm-lock.yaml",
+            ".npmrc",
+        ]
+        .contains(&name)
         || {
             let parts = name.split('/').collect::<Vec<_>>();
             parts.len() == 3
                 && valid_component_path(&format!("{}/{}", parts[0], parts[1])).is_ok()
-                && ["package.json", "package-lock.json"].contains(&parts[2])
+                && ["package.json", "package-lock.json", "pnpm-lock.yaml"].contains(&parts[2])
         }
         || created.iter().any(|d| name.starts_with(&format!("{d}/")))
     {

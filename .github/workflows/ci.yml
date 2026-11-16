@@ -33,6 +33,16 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
       - uses: ./.github/actions/setup-compose
+      - name: Cache verified pnpm executable
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/docouno/devkit/tools
+          key: pnpm-tools-${{ runner.os }}-${{ hashFiles('toolchains.env') }}
+      - name: Cache author pnpm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .artifacts/author/pnpm-store
+          key: author-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'toolchains.env') }}
       - name: Cache author Cargo registry
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:

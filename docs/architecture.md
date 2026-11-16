@@ -27,10 +27,10 @@ A Devkit repository contains at least one registered component across two direct
 
 Devkit deliberately avoids duplicating native package metadata in `.devkit/manifest.json`:
 
-- **npm components** share a single root npm workspace (`package.json` + `package-lock.json`). Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
+- **Node components** share one root pnpm workspace (`pnpm-workspace.yaml` + `pnpm-lock.yaml`) with `nodeLinker: isolated` and `packageImportMethod: hardlink`. Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
 - **Rust components** own `{component}/Cargo.toml` and `{component}/Cargo.lock`. A single registered Rust component (for example `apps/api`) can organize multiple internal crates using a native Cargo `[workspace]` inside `apps/api/Cargo.toml` (`members = [".", "crates/*"]`) while preserving a single `{component}/rust-toolchain.toml` and `{component}/Cargo.lock`.
 
-When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `package-lock.json` transactionally without changing the accepted Devkit release.
+When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `pnpm-lock.yaml` transactionally without changing the accepted Devkit release.
 
 ## Container Isolation and Security Model
 
@@ -42,7 +42,7 @@ Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, 
    - Network access is disabled (`--network none`).
 2. **Isolated library packaging (`package` for `ts-library` and `react-ui`)**:
    - Runs under `--network none` with `/workspace`, `node_modules`, and `{component}/dist` mounted read-only.
-   - Only `{component}/release` (and `/tmp`) is writable, ensuring `npm pack`, `publint`, and `@arethetypeswrong/core` validate the exact `dist/` produced by `build` without mutating build outputs or workspace state.
+   - Only `{component}/release` (and `/tmp`) is writable, ensuring `pnpm pack`, `publint`, and `@arethetypeswrong/core` validate the exact `dist/` produced by `build` without mutating build outputs or workspace state.
 3. **Explicit write sessions (`make fix`, `devkit exec --write`)**:
    - Formatting (`make fix`) mounts source writable under `--network none`.
    - Dependency mutations (`devkit exec --component ... --write --network bridge`) allow explicit registry access and invalidate `.devkit/state/node-workspace.lock` so the next `make setup` verifies the updated lockfile cleanly.

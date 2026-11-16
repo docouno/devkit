@@ -6,6 +6,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
+import { parse, stringify } from 'yaml';
 
 const environment = fileURLToPath(new URL('..', import.meta.url));
 const compiler = fileURLToPath(import.meta.resolve('typescript/bin/tsc'));
@@ -29,11 +30,13 @@ test(
     };
     const inherited = Object.fromEntries(
       Object.entries(process.env).filter(
-        ([name]) => !/^npm_/iu.test(name) && !['NODE_OPTIONS', 'NODE_PATH'].includes(name),
+        ([name]) =>
+          !/^(?:pnpm_|npm_)/iu.test(name) && !['NODE_OPTIONS', 'NODE_PATH'].includes(name),
       ),
     );
     const childEnv = {
       ...inherited,
+      XDG_CACHE_HOME: '/workspace/.artifacts/author/pnpm-cache',
       npm_config_cache:
         process.env.npm_config_cache ??
         process.env.NPM_CONFIG_CACHE ??
@@ -58,15 +61,57 @@ test(
         type: 'module',
         devDependencies: { vitest: '5.0.5', '@types/node': '24.19.2' },
       });
+      const source = parse(fs.readFileSync('/workspace/pnpm-lock.yaml', 'utf8'), {
+        maxAliasCount: 0,
+      });
+      const rootDeps = Object.fromEntries(
+        ['vitest', '@types/node'].map((name) => [
+          name,
+          source.importers['.'].devDependencies[name],
+        ]),
+      );
+      const snapshots = {},
+        packages = {};
+      const visit = (name, version) => {
+        const key = version.split('(')[0].includes('@') ? version : `${name}@${version}`;
+        if (snapshots[key]) {
+          return;
+        }
+        assert.ok(source.snapshots[key], `Missing seeded snapshot ${key}`);
+        snapshots[key] = source.snapshots[key];
+        packages[key.split('(')[0]] = source.packages[key.split('(')[0]];
+        for (const field of ['dependencies', 'optionalDependencies']) {
+          for (const [dependency, ref] of Object.entries(snapshots[key][field] ?? {})) {
+            visit(dependency, ref);
+          }
+        }
+      };
+      for (const [name, entry] of Object.entries(rootDeps)) {
+        visit(name, entry.version);
+      }
+      write(
+        app,
+        'pnpm-lock.yaml',
+        stringify({
+          lockfileVersion: '9.0',
+          settings: source.settings,
+          importers: { '.': { devDependencies: rootDeps } },
+          packages,
+          snapshots,
+        }),
+      );
       const install = run(
-        'npm',
+        'pnpm',
         [
           'install',
-          '--workspaces=false',
+          '--frozen-lockfile',
+          '--offline',
+          '--trust-lockfile',
+          '--ignore-workspace',
           '--ignore-scripts',
-          '--strict-peer-deps',
-          '--no-audit',
-          '--no-fund',
+          '--store-dir',
+          '/workspace/.artifacts/author/pnpm-store',
+          '--config.package-import-method=copy',
         ],
         75_000,
       );

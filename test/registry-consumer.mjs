@@ -107,8 +107,9 @@ if (mode === 'serve') {
   const target = '/consumer';
   const env = npmEnvironment(join(proof, `npm-${mode}`), registry);
   delete env.npm_config_workspaces;
+  const binary = mode === 'first' ? 'npm' : 'pnpm';
   function npm(args, cwd = target, expected) {
-    const result = spawnSync('npm', args, {
+    const result = spawnSync(binary, args, {
       cwd,
       env,
       encoding: 'utf8',
@@ -116,7 +117,7 @@ if (mode === 'serve') {
       maxBuffer: 8 * 1024 * 1024,
     });
     process.stdout.write(
-      `npm ${args.join(' ')}: ${result.status}\n${result.stdout}${result.stderr}\n`,
+      `${binary} ${args.join(' ')}: ${result.status}\n${result.stdout}${result.stderr}\n`,
     );
     if (expected) {
       assert.notEqual(result.status, 0);
@@ -125,26 +126,41 @@ if (mode === 'serve') {
       assert.equal(result.status, 0, result.error?.message);
     }
   }
-  const lock = join(target, 'package-lock.json');
-  // The private registry seam can produce fixture origins after native npm
-  // resolution. Restore only that exact origin, as the former registry test did.
-  // The public CLI never supplies this override and is tested after publication.
+  const lock = join(target, mode === 'first' ? 'package-lock.json' : 'pnpm-lock.yaml');
   if (mode === 'second') {
-    const value = read(lock);
-    for (const entry of Object.values(value.packages)) {
-      if (typeof entry.resolved === 'string' && entry.resolved.startsWith(registry)) {
-        entry.resolved = `https://registry.npmjs.org/${entry.resolved.slice(registry.length)}`;
-      }
-    }
-    writeFileSync(lock, `${JSON.stringify(value, null, 2)}\n`);
+    // Public v9 packages need only SRI; remove the exact local fixture tarball URL.
+    const text = readFileSync(lock, 'utf8').replace(/,? ?tarball: ([^,}\n]+)/gu, (match, url) => {
+      const value = url.trim().replace(/^['"]|['"]$/gu, '');
+      assert(value.startsWith(registry), `Unexpected fixture tarball ${value}`);
+      return '';
+    });
+    writeFileSync(lock, text);
   }
   const original = readFileSync(lock);
   assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|file:|\/workspace\//);
   if (mode === 'first' || mode === 'second') {
-    npm(['ci', '--include=dev', '--strict-peer-deps']);
+    if (mode === 'first') {
+      npm(['ci', '--include=dev', '--strict-peer-deps']);
+    } else {
+      assert(!existsSync(join(target, 'package-lock.json')));
+      assert(existsSync(join(target, 'pnpm-workspace.yaml')));
+      npm([
+        'install',
+        '--frozen-lockfile',
+        '--ignore-scripts',
+        '--trust-lockfile',
+        '--store-dir',
+        '/proof/pnpm-store',
+      ]);
+    }
     assert.deepEqual(readFileSync(lock), original);
-    npm(['run', '--workspace=apps/main', 'check']);
-    npm(['run', '--workspace=apps/main', 'build']);
+    for (const task of ['check', 'build']) {
+      npm(
+        mode === 'first'
+          ? ['run', '--workspace=apps/main', task]
+          : ['--dir', 'apps/main', 'run', task],
+      );
+    }
     const probe = spawnSync(
       'node',
       [
@@ -157,19 +173,50 @@ if (mode === 'serve') {
     assert.equal(probe.status, 0, probe.stderr);
     assert.equal(JSON.parse(probe.stdout).version, metadata[mode === 'first' ? 0 : 1].version);
   } else if (mode === 'negative') {
-    const value = read(lock);
-    const locations = Object.keys(value.packages).filter((p) =>
-      p.endsWith('node_modules/@docouno/env'),
+    const selected = `@docouno/env@${metadata[1].version}`;
+    const lines = original.toString().split('\n');
+    let inside = false,
+      changed = false;
+    for (let index = 0; index < lines.length; index++) {
+      if (/^ {2}\S/u.test(lines[index])) {
+        inside = lines[index].includes(selected);
+      }
+      if (inside && lines[index].includes('integrity: sha512-')) {
+        lines[index] = lines[index].replace(
+          /sha512-[A-Za-z0-9+/=]+/u,
+          `sha512-${Buffer.alloc(64).toString('base64')}`,
+        );
+        changed = true;
+        break;
+      }
+    }
+    assert(changed, 'Missing env integrity');
+    writeFileSync(lock, lines.join('\n'));
+    npm(
+      [
+        'install',
+        '--frozen-lockfile',
+        '--ignore-scripts',
+        '--trust-lockfile',
+        '--store-dir',
+        '/proof/pnpm-neg-store',
+        '--config.fetch-retries=0',
+      ],
+      target,
+      /ERR_PNPM_TARBALL_INTEGRITY|EINTEGRITY/,
     );
-    assert.equal(locations.length, 1);
-    value.packages[locations[0]].integrity = `sha512-${Buffer.alloc(64).toString('base64')}`;
-    writeFileSync(lock, JSON.stringify(value));
-    npm(['ci', '--include=dev', '--strict-peer-deps', '--fetch-retries=0'], target, /EINTEGRITY/);
     writeFileSync(lock, original);
     npm(
-      ['install', '--package-lock-only', '--ignore-scripts', '@docouno/env@99.99.99'],
+      [
+        'add',
+        '--lockfile-only',
+        '--ignore-scripts',
+        '--trust-lockfile',
+        '@docouno/env@99.99.99',
+        '--config.fetch-retries=0',
+      ],
       join(target, 'apps/main'),
-      /ETARGET|No matching version/,
+      /ERR_PNPM_NO_MATCHING_VERSION|No matching version/,
     );
     const unknown = await fetch(registry + '@docouno/unsupplied');
     assert.equal(unknown.status, 404);
