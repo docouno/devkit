@@ -178,6 +178,8 @@ Preview links are rendered for actual published TCP endpoints of all services, i
 
 Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/devkit/preview-hosts.json`, falling back to `/devkit/preview-hosts.json`. The file is limited to 32 MiB and 65,535 sorted unique hosts. Managed launches clear the legacy `DEVKIT_PREVIEW_HOSTS` CSV carrier. Short `DEVKIT_PREVIEW_HOSTS_FILE`, `DEVKIT_PREVIEW_HOSTS_SHA256`, `DEVKIT_PREVIEW_URL`, `DEVKIT_SERVICE` and `DEVKIT_BRANCH` variables describe it; automatic host sets are never expanded into a large environment variable.
 
+Host metadata uses browser URL canonicalization. For example, `127.1` becomes `127.0.0.1` and `::ffff:127.0.0.1` becomes `::ffff:7f00:1`. Invalid numeric/IDNA hosts and aliases of wildcard addresses fail before launch. The rendered URL retains its path and query; its resolved hostname must belong to the canonical file set.
+
 Custom images/builds are acquired through Compose and inspected in stopped image-only containers before any user-backed service starts. Image symlink ancestry, mount aliases, inherited volumes, configs, secrets, devices and retained namespaces must leave a provable literal slot. Keep one slot outside project/volume namespaces; an opaque layout fails with a bounded diagnostic. Actual launch pins inspected image IDs and external volume-provider IDs, retaining declared platforms. Inspectors never run image commands, receive service mounts or remove service volumes. Their anonymous inspection volumes are cleaned separately.
 
 Docker does not inherit a provider's tmpfs or devices through `volumes_from`. A provider's deeper tmpfs therefore cannot protect the receiver from an inherited source bind. A receiver's own writable tmpfs remains supported.

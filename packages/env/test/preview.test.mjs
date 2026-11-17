@@ -7,8 +7,26 @@ import { fileURLToPath } from 'node:url';
 const pnpmRoot = fileURLToPath(new URL('../../../node_modules/.pnpm', import.meta.url));
 import test from 'node:test';
 import { devkitWorkspaceSource } from '../src/vite.js';
-import { previewHosts, hostAllowed } from '../src/preview.js';
+import { exactHost, previewHosts, hostAllowed } from '../src/preview.js';
 import { hmrRecovery } from '../src/hmr.js';
+
+test('producer and consumer share browser-equivalent canonical host vectors', () => {
+  const corpus = JSON.parse(
+    fs.readFileSync(new URL('../../../test/fixtures/preview-hosts.json', import.meta.url), 'utf8'),
+  );
+  for (const [raw, canonical] of corpus.hosts) {
+    assert.equal(exactHost(raw), canonical, raw);
+  }
+  for (const raw of corpus.invalidHosts) {
+    assert.throws(() => exactHost(raw), raw);
+  }
+  for (const [raw, canonical] of corpus.urls) {
+    assert.deepEqual(previewHosts({ DEVKIT_PREVIEW_URL: raw }), [canonical], raw);
+  }
+  for (const raw of corpus.invalidUrls) {
+    assert.throws(() => previewHosts({ DEVKIT_PREVIEW_URL: raw }), raw);
+  }
+});
 
 function environment(values, run) {
   const before = { ...process.env };
@@ -149,6 +167,20 @@ test('literal metadata carrier verifies digest, schema, nofollow file and bounde
     assert.deepEqual(previewHosts({ ...env, DEVKIT_PREVIEW_HOSTS: '*' }), ['a.test', 'b.test']);
     assert.throws(() => previewHosts({ ...env, DEVKIT_SERVICE: 'other' }));
     assert.throws(() => previewHosts({ ...env, DEVKIT_PREVIEW_HOSTS_SHA256: '0'.repeat(64) }));
+    for (const host of ['127.1', '0x7f000001', '::ffff:127.0.0.1', '0:0:0:0:0:0:0:1']) {
+      const noncanonical = Buffer.from(
+        JSON.stringify({ schemaVersion: 1, service: 'web', hosts: [host] }),
+      );
+      fs.writeFileSync(source, noncanonical);
+      assert.throws(
+        () =>
+          previewHosts({
+            ...env,
+            DEVKIT_PREVIEW_HOSTS_SHA256: createHash('sha256').update(noncanonical).digest('hex'),
+          }),
+        host,
+      );
+    }
     fs.unlinkSync(source);
     fs.symlinkSync('/etc/passwd', source);
     assert.throws(() => previewHosts(env));

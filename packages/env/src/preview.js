@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
+import { domainToUnicode } from 'node:url';
 
 const slots = ['/run/devkit/preview-hosts.json', '/devkit/preview-hosts.json'];
 const maxBytes = 32 * 1024 * 1024;
@@ -14,19 +15,33 @@ export function exactHost(raw) {
     fail('invalid exact host');
   }
   const host = raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw;
-  if (isIP(host)) {
-    if (host === '0.0.0.0' || host === '::') {
-      fail('wildcard address');
-    }
-    return host.toLowerCase();
-  }
-  const normalized = host.toLowerCase();
-  const name = normalized.endsWith('.') ? normalized.slice(0, -1) : normalized;
+  const ip = isIP(host);
+  const lower = host.toLowerCase();
+  const name = lower.endsWith('.') ? lower.slice(0, -1) : lower;
   if (
-    name.length > 253 ||
-    !name.split('.').every((label) => /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/u.test(label))
+    !ip &&
+    (name.length > 253 ||
+      !name.split('.').every((label) => /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/u.test(label)))
   ) {
     fail('invalid exact hostname');
+  }
+  for (const label of !ip ? name.split('.') : []) {
+    if (label.startsWith('xn--')) {
+      const decoded = domainToUnicode(label);
+      if (!decoded || decoded === label) {
+        fail('invalid IDNA hostname');
+      }
+    }
+  }
+  let normalized;
+  try {
+    normalized = new URL(`http://${ip === 6 ? `[${host}]` : host}/`).hostname;
+  } catch {
+    fail('invalid browser hostname');
+  }
+  normalized = normalized.startsWith('[') ? normalized.slice(1, -1) : normalized;
+  if (normalized === '0.0.0.0' || normalized === '::') {
+    fail('wildcard address');
   }
   return normalized;
 }

@@ -594,6 +594,7 @@ class Verification:
         self.make(root, "up", "app=web", label="fullstack-web-selected-start")
         api, web = self.service(root, "api"), self.service(root, "web")
         self.http(self.port(web, 5173), "/api/greeting?name=Connected", {"message": "Hello, Connected!"})
+        self.preview_host_wire(root)
         self.make(root, "down", label="fullstack-web-stop")
         before = source_snapshot(root)
         self.run("invalid-api-connection", self.cli(self.manager, "add-app", root, "--name", "dashboard", "--template", "react-web", "--api", "web"), expected="Node or Rust API")
@@ -610,6 +611,36 @@ class Verification:
         node = self.create("node", "h-new-node-bind", release=self.manager)
         self.make(node, "setup", "build", label="new-node-bind-build")
         self.starter_bind_options(node, "node")
+
+    def preview_host_wire(self, root):
+        """The native producer's literal FILE must start the released Vite plugin."""
+        corpus = json.loads((Path(__file__).parents[1] / "fixtures/preview-hosts.json").read_text())
+        rows = []
+        for index, (raw, canonical) in enumerate(corpus["urls"]):
+            template = raw.replace(":1234", ":{port}")
+            self.make(root, "up", "app=web", "DEVKIT_PREVIEW_URL_TEMPLATE=" + template,
+                      label=f"preview-canonical-start-{index}")
+            web = self.service(root, "web")
+            actual = self.inspect("container", web)
+            environment = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
+            slot = environment["DEVKIT_PREVIEW_HOSTS_FILE"]
+            mount = next(item for item in actual["Mounts"] if item["Destination"] == slot)
+            data = Path(mount["Source"]).read_bytes()
+            require(sha256(data) == environment["DEVKIT_PREVIEW_HOSTS_SHA256"], "Canonical host FILE digest differs")
+            require(json.loads(data)["hosts"] == [canonical], "Native host differs from the browser corpus")
+            authority = f"[{canonical}]" if ":" in canonical else canonical
+            port = self.port(web, 5173)
+            for host, expected in ((authority, 200), ("unrelated.preview.example.test", 403)):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    connection.request("GET", "/", headers={"Host": host})
+                    response = connection.getresponse()
+                    response.read()
+                    require(response.status == expected, "Canonical native FILE-to-Vite host policy differs")
+                finally:
+                    connection.close()
+            rows.append({"template": template, "host": canonical, "passed": True})
+        self.results.append({"label": "preview-native-host-canonicalization", "passed": True, "rows": rows})
 
     def preview_transport(self, root):
         """Consume the actual released plugin in separate server/browser namespaces."""

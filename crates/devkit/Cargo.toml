@@ -26,3 +26,4 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # Keep the full certificates aligned with ureq's webpki-roots in Cargo.lock.
 webpki-root-certs = "=1.0.11"
 uuid = { version = "1", features = ["v4"] }
+url = "2.5.8"

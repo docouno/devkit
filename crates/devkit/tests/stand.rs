@@ -368,6 +368,33 @@ fn preview_renderer_covers_tcp_replicas_and_rejects_ambiguous_authorities() {
 }
 
 #[test]
+fn preview_host_wire_matches_the_browser_canonicalization_corpus() {
+    use devkit::stand::preview::{canonical_host, url_host};
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../../../test/fixtures/preview-hosts.json")).unwrap();
+    for pair in corpus["hosts"].as_array().unwrap() {
+        assert_eq!(
+            canonical_host(pair[0].as_str().unwrap()).unwrap(),
+            pair[1].as_str().unwrap(),
+            "{pair}"
+        );
+    }
+    for raw in corpus["invalidHosts"].as_array().unwrap() {
+        assert!(canonical_host(raw.as_str().unwrap()).is_err(), "{raw}");
+    }
+    for pair in corpus["urls"].as_array().unwrap() {
+        assert_eq!(
+            url_host(pair[0].as_str().unwrap()).unwrap(),
+            pair[1].as_str().unwrap(),
+            "{pair}"
+        );
+    }
+    for raw in corpus["invalidUrls"].as_array().unwrap() {
+        assert!(url_host(raw.as_str().unwrap()).is_err(), "{raw}");
+    }
+}
+
+#[test]
 fn preview_file_publication_precedes_claims_and_is_immutable() {
     use devkit::stand::{inspection::Proof, preview::*};
     let root = tempfile::tempdir().unwrap();

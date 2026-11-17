@@ -113,24 +113,42 @@ pub fn canonical_host(raw: &str) -> Result<String> {
             !ip.is_unspecified(),
             "A preview host cannot be a wildcard address"
         );
-        return Ok(ip.to_string());
+    } else {
+        let host = raw.to_ascii_lowercase();
+        let name = host.strip_suffix('.').unwrap_or(&host);
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 253
+                && host.len() <= 254
+                && name.split('.').all(|label| !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+            "Invalid exact preview hostname; use an ASCII or IDNA hostname/IP without wildcards"
+        );
     }
-    let host = raw.to_ascii_lowercase();
-    let name = host.strip_suffix('.').unwrap_or(&host);
+    // The wire must use browser URL semantics, including mapped IPv6 and the
+    // numeric IPv4 forms that a DNS-only validator would otherwise preserve.
+    let authority = if raw.contains(':') {
+        format!("[{raw}]")
+    } else {
+        raw.to_owned()
+    };
+    let parsed = url::Url::parse(&format!("http://{authority}/"))
+        .context("Invalid browser preview hostname")?;
+    let host = parsed.host_str().context("Missing preview hostname")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
     ensure!(
-        !name.is_empty()
-            && name.len() <= 253
-            && host.len() <= 254
-            && name.split('.').all(|label| !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-        "Invalid exact preview hostname; use an ASCII or IDNA hostname/IP without wildcards"
+        !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()),
+        "A preview host cannot be a wildcard address"
     );
-    Ok(host)
+    Ok(host.to_owned())
 }
 pub fn url_host(url: &str) -> Result<String> {
     ensure!(
@@ -175,7 +193,14 @@ pub fn url_host(url: &str) -> Result<String> {
             .context("Invalid preview port")?;
         ensure!(number > 0, "Preview port must be 1..65535");
     }
-    canonical_host(host)
+    let host = canonical_host(host)?;
+    let parsed = url::Url::parse(url).context("Invalid browser preview URL")?;
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "Preview URL must have no userinfo"
+    );
+    ensure!(parsed.port() != Some(0), "Preview port must be 1..65535");
+    Ok(host)
 }
 
 pub fn local_url(host: &str, port: u16) -> String {
