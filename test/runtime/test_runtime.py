@@ -786,6 +786,25 @@ class RuntimeTests(unittest.TestCase):
                   "depends_on": {"provider": {"condition": "service_completed_successfully"}}}
         self.resources.extend([project + "-provider-1", project + "-middle-1"])
         environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+
+        def discard_inspectors(owner, intents):
+            # Dispose of this test's stopped image-only fixtures after tearDown.
+            # This does not stand in for a successful public cleanup receipt.
+            for intent in intents.values():
+                for helper in intent["helpers"].values():
+                    actual = container(helper["name"])
+                    if actual is None:
+                        continue
+                    labels = actual["Config"]["Labels"]
+                    self.assertEqual(labels["io.docouno.devkit.inspection"], helper["token"])
+                    self.assertEqual(labels["io.docouno.devkit.inspection-role"], helper["role"])
+                    self.assertEqual(labels["io.docouno.devkit.inspection-owner"], owner)
+                    if helper["observed"]:
+                        self.assertEqual(actual["Id"], helper["observed"]["id"])
+                    self.assertEqual(actual["State"]["Pid"], 0)
+                    self.assertEqual(actual["Mounts"], [])
+                    run("docker", "rm", "--force", actual["Id"])
+
         for form in ("service", "volume"):
             with self.subTest(form=form):
                 current = json.loads(json.dumps(provider))
@@ -798,6 +817,9 @@ class RuntimeTests(unittest.TestCase):
                 (self.root / "compose.yaml").write_text(json.dumps(spec))
                 self.make("setup", env=environment)
                 launched = self.make("up", "app=main", env=environment, check=False)
+                active = self.root / ".devkit/state/stand.active"
+                ledger = json.loads(active.read_text())
+                self.addCleanup(discard_inspectors, ledger["owner"]["key"], ledger["inspections"])
                 receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
                 self.assertEqual(receipt["previewFiles"][0]["slot"], "/devkit/preview-hosts.json")
                 actual = container(project + "-main-1")
@@ -818,7 +840,24 @@ class RuntimeTests(unittest.TestCase):
                     self.assertFalse(actual["HostConfig"].get("Tmpfs"))
                     self.assertFalse(actual["HostConfig"].get("Devices"))
                 self.assertEqual(snapshot(), before)
-                self.make("down", "cleanup=1", env=environment)
+                if launched.returncode:
+                    ports = self.root / ".devkit/state/ports.json"
+                    saved = ports.read_bytes()
+                    refused = self.make("down", "cleanup=1", env=environment, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("incomplete daemon outcomes", refused.stderr)
+                    self.assertEqual(ports.read_bytes(), saved)
+                    self.assertTrue(json.loads(saved)["possibleActors"])
+                    retained = json.loads(active.read_text())
+                    self.assertFalse(retained["launch"]["daemonFinished"])
+                    self.assertTrue(retained["inspections"])
+                    for intent in retained["inspections"].values():
+                        for helper in intent["helpers"].values():
+                            actual = container(helper["name"])
+                            self.assertIsNotNone(actual, "Unknown main outcome lost its image pin")
+                            self.assertEqual(actual["Id"], helper["observed"]["id"])
+                else:
+                    self.make("down", "cleanup=1", env=environment)
                 self.assertEqual(snapshot(), before)
 
     def test_preview_cancellation_tracks_delayed_daemon_create_and_anonymous_volumes(self):
