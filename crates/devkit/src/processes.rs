@@ -276,6 +276,23 @@ impl ProcessRunner {
             remaining.min(Duration::from_secs(3)),
         )
     }
+    /// Reconcile already accepted writes after cancellation, within one deadline.
+    pub fn capture_recovery_before(
+        &self,
+        command: &mut Command,
+        deadline: Instant,
+    ) -> Result<ProcessOutput> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("Creator recovery deadline exceeded")?;
+        self.run_inner(
+            command,
+            OutputMode::Capture(16 * 1024 * 1024),
+            true,
+            Some(remaining.min(Duration::from_secs(3))),
+        )?
+        .success("Creator recovery query")
+    }
     fn run_inner(
         &self,
         command: &mut Command,

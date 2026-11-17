@@ -201,3 +201,5 @@ Keep ignored stand state while services or inspection creators may exist. A miss
 Changing to a tree with only libraries does not erase an earlier stand. Status still shows its containers, and `make down cleanup=1` verifies and removes owned remnants before releasing leases.
 
 A failed or interrupted acquisition may complete a Docker create after the client exits. Cleanup observes late helpers and retains incomplete creator outcomes with a bounded diagnostic. Rerun cleanup after pending daemon work completes; keep the recorded state while the outcome remains unknown.
+
+This also applies to the main Compose launch. Cleanup waits for a proven outcome for every planned replica, preserving leases and metadata while accepted creates may still arrive. Existing containers do not prove that a failed replacement completed. If some planned outcomes remain unknown, automated cleanup keeps refusing; inspect the original daemon failure and preserve the recorded state.

@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     process::Command,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub const OWNER_LABEL: &str = "io.docouno.devkit.stand-owner";
@@ -24,7 +24,17 @@ pub struct Ledger {
     #[serde(default)]
     pub launch_finished: bool,
     #[serde(default)]
+    pub launch: Option<LaunchIntent>,
+    #[serde(default)]
     pub inspections: BTreeMap<String, InspectionIntent>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchIntent {
+    pub daemon_finished: bool,
+    pub expected: BTreeMap<String, u16>,
+    pub before: BTreeSet<String>,
+    pub observed: BTreeMap<String, BTreeMap<u16, String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -48,6 +58,10 @@ pub struct InspectionIntent {
     pub creation_uncertain: bool,
 }
 impl Ledger {
+    pub fn launch_terminal(&self) -> bool {
+        !self.launch_pending
+            || (self.launch_finished && self.launch.as_ref().is_some_and(|l| l.daemon_finished))
+    }
     pub fn completed_empty(&self) -> bool {
         self.services.is_empty()
             && self.containers.is_empty()
@@ -59,18 +73,45 @@ impl Ledger {
         let value = read_bounded::<Self>(&safe_path(root, ACTIVE)?, 4 * 1024 * 1024)?;
         if let Some(value) = &value {
             ensure!(value.schema_version == 1, "Unsupported stand ledger schema");
+            if let Some(launch) = &value.launch {
+                ensure!(value.launch_pending, "Creator plan has no launch intent");
+                ensure!(!launch.expected.is_empty(), "Empty stand creator plan");
+                let id = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+                ensure!(
+                    launch.before.iter().all(|s| id(s)),
+                    "Invalid prior creator identity"
+                );
+                for (service, rows) in &launch.observed {
+                    let count = launch
+                        .expected
+                        .get(service)
+                        .context("Unplanned creator service")?;
+                    ensure!(
+                        rows.iter()
+                            .all(|(number, exact)| (1..=*count).contains(number)
+                                && id(exact)
+                                && !launch.before.contains(exact)),
+                        "Invalid creator outcome"
+                    );
+                }
+                ensure!(
+                    launch.expected.values().all(|n| *n > 0),
+                    "Invalid creator replica count"
+                );
+            }
         }
         Ok(value)
     }
     pub fn intent(root: &Path, owner: &Owner, services: &BTreeSet<String>) -> Result<Self> {
         let mut value = Self::open(root, owner)?;
         ensure!(
-            !value.launch_pending || value.launch_finished,
+            value.launch_terminal(),
             "An unfinished stand launch requires recovery; preserving its ownership intent"
         );
         value.services.extend(services.iter().cloned());
-        value.launch_pending = true;
-        value.launch_finished = false;
+        value.launch_pending = false;
+        value.launch_finished = true;
+        value.launch = None;
         value.save(root)?;
         Ok(value)
     }
@@ -82,6 +123,7 @@ impl Ledger {
             containers: BTreeSet::new(),
             launch_pending: false,
             launch_finished: true,
+            launch: None,
             inspections: BTreeMap::new(),
         });
         ensure!(
@@ -101,11 +143,104 @@ impl Ledger {
         write_atomic(&safe_path(root, ACTIVE)?, &bytes, 0o644)
     }
     pub fn observed(&mut self, root: &Path, rows: &[Container]) -> Result<()> {
+        ensure!(self.launch_terminal(), "Unproved stand creator outcome");
         verify_owners(rows, &self.owner)?;
         self.containers = rows.iter().map(|c| c.id.clone()).collect();
         self.launch_pending = false;
         self.launch_finished = true;
+        self.launch = None;
         self.save(root)
+    }
+    pub fn begin_launch(
+        &mut self,
+        root: &Path,
+        model: &Value,
+        active: &BTreeSet<String>,
+        rows: &[Container],
+    ) -> Result<()> {
+        ensure!(
+            self.launch_terminal(),
+            "Unproved previous stand creator outcome"
+        );
+        verify_owners(rows, &self.owner)?;
+        let mut expected = BTreeMap::new();
+        for service in active {
+            let value = &model["services"][service];
+            let count = value
+                .get("scale")
+                .or_else(|| value.pointer("/deploy/replicas"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            ensure!(
+                (1..=65535).contains(&count),
+                "Stand replicas must be 1..65535"
+            );
+            expected.insert(service.clone(), count as u16);
+        }
+        self.launch = Some(LaunchIntent {
+            daemon_finished: false,
+            expected,
+            before: rows.iter().map(|r| r.id.clone()).collect(),
+            observed: BTreeMap::new(),
+        });
+        self.launch_pending = true;
+        self.launch_finished = false;
+        self.save(root)
+    }
+    pub fn recover_launch(
+        &mut self,
+        root: &Path,
+        project: &str,
+        runner: &ProcessRunner,
+    ) -> Result<()> {
+        if self.launch_terminal() {
+            return Ok(());
+        }
+        ensure!(
+            self.launch_finished,
+            "Stand creator has no terminal receipt; preserving its launch intent and leases"
+        );
+        ensure!(
+            self.launch.is_some(),
+            "Stand creator has unknown daemon history; preserving its launch intent and leases"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for round in 0..10 {
+            let rows = observe_query(project, runner, Query::Recovery(deadline))?;
+            verify_owners(&rows, &self.owner)?;
+            let launch = self.launch.as_mut().unwrap();
+            for row in rows {
+                if launch.before.contains(&row.id) {
+                    continue;
+                }
+                if let Some(count) = launch.expected.get(&row.service)
+                    && let Ok(number) = row.replica.parse::<u16>()
+                    && (1..=*count).contains(&number)
+                {
+                    launch
+                        .observed
+                        .entry(row.service)
+                        .or_default()
+                        .insert(number, row.id);
+                }
+            }
+            launch.daemon_finished = launch.expected.iter().all(|(service, count)| {
+                launch
+                    .observed
+                    .get(service)
+                    .is_some_and(|rows| rows.len() == usize::from(*count))
+            });
+            self.save(root)?;
+            if self.launch_terminal() {
+                return Ok(());
+            }
+            if round < 9 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        anyhow::bail!(
+            "Stand creator has incomplete daemon outcomes; preserving its launch intent and leases"
+        )
     }
 }
 
@@ -116,6 +251,8 @@ pub struct Container {
     pub owner: String,
     pub project: String,
     pub service: String,
+    #[serde(default)]
+    pub replica: String,
     pub running: bool,
     pub image: String,
     pub ports: Value,
@@ -128,24 +265,26 @@ pub struct Container {
 }
 
 pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
-    inspect_before(id, runner, None)
+    inspect_query(id, runner, Query::Normal)
+}
+#[derive(Clone, Copy)]
+enum Query {
+    Normal,
+    Metadata(Instant),
+    Recovery(Instant),
 }
 fn capture(
     command: &mut Command,
     runner: &ProcessRunner,
-    deadline: Option<Instant>,
+    query: Query,
 ) -> Result<crate::processes::ProcessOutput> {
-    if let Some(deadline) = deadline {
-        runner.capture_before(command, deadline)
-    } else {
-        runner.capture(command)
+    match query {
+        Query::Normal => runner.capture(command),
+        Query::Metadata(deadline) => runner.capture_before(command, deadline),
+        Query::Recovery(deadline) => runner.capture_recovery_before(command, deadline),
     }
 }
-fn inspect_before(
-    id: &str,
-    runner: &ProcessRunner,
-    deadline: Option<Instant>,
-) -> Result<Container> {
+fn inspect_query(id: &str, runner: &ProcessRunner, query: Query) -> Result<Container> {
     ensure!(
         id.len() >= 12 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid container ID"
@@ -166,16 +305,17 @@ fn inspect_before(
             "\n{{{{$v := \"\"}}}}{{{{range .Config.Env}}}}{{{{if eq (index (split . \"=\") 0) \"{key}\"}}}}{{{{$v = .}}}}{{{{end}}}}{{{{end}}}}{{{{json $v}}}}"
         );
     }
+    format += "\n{{json (index .Config.Labels \"com.docker.compose.container-number\")}}";
     let output = capture(Command::new("docker").args(["container", "inspect", "--format",
-        &format!("{{{{json .Id}}}}\n{{{{json (index .Config.Labels \"{OWNER_LABEL}\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.project\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.service\")}}}}\n{{{{json .State.Running}}}}\n{{{{json .Image}}}}\n{{{{json .NetworkSettings.Ports}}}}\n{{{{json .Mounts}}}}\n{{{{json .HostConfig.PortBindings}}}}\n{format}"), id]), runner, deadline)?;
+        &format!("{{{{json .Id}}}}\n{{{{json (index .Config.Labels \"{OWNER_LABEL}\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.project\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.service\")}}}}\n{{{{json .State.Running}}}}\n{{{{json .Image}}}}\n{{{{json .NetworkSettings.Ports}}}}\n{{{{json .Mounts}}}}\n{{{{json .HostConfig.PortBindings}}}}\n{format}"), id]), runner, query)?;
     let lines = output
         .text()?
         .lines()
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<Value>, _>>()?;
-    ensure!(lines.len() == 16, "Invalid bounded stand observation");
+    ensure!(lines.len() == 17, "Invalid bounded stand observation");
     let mut preview_env = BTreeMap::new();
-    for line in &lines[10..] {
+    for line in &lines[10..16] {
         if let Some((key, value)) = line.as_str().and_then(|s| s.split_once('=')) {
             preview_env.insert(key, value);
         }
@@ -183,7 +323,7 @@ fn inspect_before(
     let row: Container = serde_json::from_value(
         json!({"id":lines[0],"owner":lines[1].as_str().unwrap_or(""),
         "project":lines[2].as_str().unwrap_or(""),"service":lines[3].as_str().unwrap_or(""),
-        "running":lines[4],"image":lines[5],"ports":lines[6],"mounts":lines[7],"configuredPorts":lines[8],"deployment":lines[9].as_str().unwrap_or(""),"previewEnv":preview_env}),
+        "running":lines[4],"image":lines[5],"ports":lines[6],"mounts":lines[7],"configuredPorts":lines[8],"deployment":lines[9].as_str().unwrap_or(""),"previewEnv":preview_env,"replica":lines[16].as_str().unwrap_or("")}),
     )?;
     ensure!(
         row.id.len() == 64 && row.id.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -192,20 +332,16 @@ fn inspect_before(
     Ok(row)
 }
 pub fn observe(project: &str, runner: &ProcessRunner) -> Result<Vec<Container>> {
-    observe_before(project, runner, None)
+    observe_query(project, runner, Query::Normal)
 }
 pub fn observe_until(
     project: &str,
     runner: &ProcessRunner,
     deadline: Instant,
 ) -> Result<Vec<Container>> {
-    observe_before(project, runner, Some(deadline))
+    observe_query(project, runner, Query::Metadata(deadline))
 }
-fn observe_before(
-    project: &str,
-    runner: &ProcessRunner,
-    deadline: Option<Instant>,
-) -> Result<Vec<Container>> {
+fn observe_query(project: &str, runner: &ProcessRunner, query: Query) -> Result<Vec<Container>> {
     let out = capture(
         Command::new("docker").args([
             "ps",
@@ -216,7 +352,7 @@ fn observe_before(
             &format!("label=com.docker.compose.project={project}"),
         ]),
         runner,
-        deadline,
+        query,
     )?;
     let mut rows = Vec::new();
     for id in out.text()?.split_whitespace() {
@@ -224,7 +360,7 @@ fn observe_before(
             rows.len() < 1024,
             "Stand observation exceeds container budget"
         );
-        let row = inspect_before(id, runner, deadline)?;
+        let row = inspect_query(id, runner, query)?;
         ensure!(
             row.project == project,
             "Container project changed during observation"

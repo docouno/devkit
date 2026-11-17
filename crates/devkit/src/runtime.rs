@@ -2210,10 +2210,7 @@ fn run_service(
     if request.command == "down"
         && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
     {
-        ensure!(
-            !ledger.launch_pending || ledger.launch_finished,
-            "Stand creator has no terminal receipt; preserving its launch intent and leases"
-        );
+        ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
         crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
     }
     let stand_rows = if request.command == "down" && request.cleanup {
@@ -2701,10 +2698,7 @@ fn run_development(
         );
     }
     let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
-    ensure!(
-        !ledger.launch_pending || ledger.launch_finished,
-        "Unfinished stand creator; preserving its launch intent"
-    );
+    ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
     crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
     let proof = if renderer.template.is_some() && !carrier_frontends.is_empty() {
         let mut references = BTreeMap::new();
@@ -2871,12 +2865,10 @@ fn run_development(
                 },
                 &service,
             ]);
-            ledger.launch_finished = true;
-            ledger.save(&ctx.admission.root)?;
             full.recheck()?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
-            ledger.launch_finished = false;
-            ledger.save(&ctx.admission.root)?;
+            let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+            ledger.begin_launch(&ctx.admission.root, &model, &active_services, &before)?;
             let mut reaped = false;
             let up_result = ctx.runner.run_tracked(
                 &mut command,
@@ -2885,11 +2877,14 @@ fn run_development(
                 &mut reaped,
             );
             ledger.launch_finished = reaped;
+            ledger.launch.as_mut().unwrap().daemon_finished =
+                matches!(up_result.as_ref(), Ok(output) if output.code == 0) && reaped;
             ledger.save(&ctx.admission.root)?;
             let mut up_output = up_result?;
             if up_output.code == 0 {
                 break;
             }
+            ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
             if !cgroup_retried
                 && crate::resources::is_compose_cgroup_delegation_failure(
                     up_output.code,
@@ -2977,16 +2972,17 @@ fn run_development(
         assert_compose_inventory(&ctx.admission.root, &inventory)?;
         Ok(())
     })();
-    // Reap only this invocation's stopped image inspectors, including failed up.
-    // An unproved actual creator keeps the inspectors and its durable intent.
-    if !ledger.launch_pending || ledger.launch_finished {
-        let cleanup =
-            crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner);
-        if result.is_ok() {
-            cleanup?;
-        } else if let Err(error) = cleanup {
-            eprintln!("devkit: image inspection recovery retained: {error:#}");
-        }
+    // Neither OS reap nor an empty observation proves accepted daemon writes
+    // have completed. Keep images and files until the whole creator outcome is known.
+    let cleanup = ledger
+        .recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)
+        .and_then(|()| {
+            crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)
+        });
+    if result.is_ok() {
+        cleanup?;
+    } else if let Err(error) = cleanup {
+        eprintln!("devkit: stand creator recovery retained: {error:#}");
     }
     result
 }

@@ -100,7 +100,7 @@ def wait_until(predicate, timeout=8):
 class DelayedInspectionCreate:
     """Fault injection: daemon completion can outlive a cancelled CLI request."""
 
-    def __init__(self, path, stalled_query=None, project=None, external=None):
+    def __init__(self, path, stalled_query=None, project=None, external=None, creator="inspection"):
         self.path = path
         host = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
         if not host.startswith("unix://"):
@@ -114,6 +114,7 @@ class DelayedInspectionCreate:
         self.project = project
         self.external = external
         self.image_read = False
+        self.creator = creator
         fixture = self
 
         class Connection(http.client.HTTPConnection):
@@ -155,7 +156,7 @@ class DelayedInspectionCreate:
                 parsed = urllib.parse.urlsplit(self.path)
                 create = (self.command == "POST"
                            and self.path.split("?", 1)[0].endswith("/containers/create")
-                           and b'"io.docouno.devkit.inspection"' in (body or b""))
+                           and ('"io.docouno.devkit.' + ("stand-owner" if fixture.creator == "main" else "inspection") + '"').encode() in (body or b""))
                 image = self.command == "GET" and "/images/sha256:" in parsed.path and parsed.path.endswith("/json")
                 if fixture.stalled_query == "image":
                     delayed = image
@@ -168,7 +169,7 @@ class DelayedInspectionCreate:
                 else:
                     delayed = create
                 delayed = delayed and not fixture.accepted.is_set()
-                if create:
+                if create and (delayed or "labels" not in fixture.record):
                     payload = json.loads(body)
                     fixture.record.update(labels=payload["Labels"])
                 if delayed:
@@ -949,6 +950,113 @@ class RuntimeTests(unittest.TestCase):
         self.make("down", "cleanup=1", env=environment)
         self.assertIsNone(container(original["Id"]))
         self.assertFalse((self.root / ".devkit/state/ports.json").exists())
+
+    def test_main_creator_cancellation_retains_the_complete_daemon_outcome_set(self):
+        service, project = self.preview_fixture()
+        service["network_mode"] = "bridge"
+        service["deploy"] = {"replicas": 2}
+        (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": service}}))
+        self.resources.append(project + "-main-2")
+        environment = env()
+        self.make("setup", env=environment)
+        for preview, beyond_window in ((False, False), (False, True), (True, True)):
+            with self.subTest(preview=preview, retained=beyond_window):
+                selected = dict(environment)
+                before_ids = set()
+                replicas = 1 if preview else 2
+                service["deploy"]["replicas"] = replicas
+                (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": service}}))
+                if preview:
+                    self.make("up", "app=main", env=environment)
+                    before_ids = {container(project + "-main-1")["Id"]}
+                    selected["DEVKIT_PREVIEW_URL_TEMPLATE"] = "https://{port}.example.test"
+                proxy = DelayedInspectionCreate(self.base / "main.sock", creator="main")
+                proc = None
+                try:
+                    with proxy:
+                        fault = dict(selected, DOCKER_HOST="unix://" + str(proxy.path))
+                        proc = subprocess.Popen([str(ENGINE), "task", "dev", "--root", str(self.root), "--app", "main"],
+                                                env=fault, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                        self.assertTrue(proxy.accepted.wait(20), "Main create never reached the daemon barrier")
+                        held = urllib.parse.parse_qs(urllib.parse.urlsplit(proxy.record["path"]).query)["name"][0]
+                        peer = project + "-main-" + ("2" if held.endswith("-1") else "1") if replicas == 2 else None
+                        if peer:
+                            deadline = time.monotonic() + 5
+                            while container(peer) is None and time.monotonic() < deadline:
+                                time.sleep(.05)
+                            self.assertIsNotNone(container(peer), "The other planned replica was never created")
+                        active = self.root / ".devkit/state/stand.active"
+                        ports = self.root / ".devkit/state/ports.json"
+                        if not beyond_window:
+                            threading.Timer(.15, proxy.release.set).start()
+                        os.kill(proc.pid, signal.SIGTERM)
+                        stdout, stderr = proc.communicate(timeout=15)
+                        self.assertEqual(proc.returncode, 143, stdout + stderr)
+                        ledger = json.loads(active.read_text())
+                        self.assertTrue(ledger["launchFinished"])
+                        self.assertEqual(ledger["launch"]["expected"], {"main": replicas})
+                        self.assertEqual(set(ledger["launch"]["before"]), before_ids)
+                        self.assertTrue(all(exact not in before_ids for rows in ledger["launch"]["observed"].values() for exact in rows.values()))
+                        if beyond_window:
+                            self.assertFalse(ledger["launch"]["daemonFinished"])
+                            self.assertTrue(json.loads(ports.read_text())["possibleActors"])
+                            before = ports.read_bytes()
+                            refused = self.make("down", "cleanup=1", env=selected, check=False)
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn("incomplete daemon outcomes", refused.stderr)
+                            self.assertEqual(ports.read_bytes(), before)
+                            if peer:
+                                self.assertIsNotNone(container(peer))
+                            if preview:
+                                self.assertTrue(json.loads(active.read_text())["inspections"], "Image pins were released before the main daemon outcome")
+                            proxy.release.set()
+                            self.assertTrue(proxy.completed.wait(10))
+                        else:
+                            self.assertTrue(ledger["launch"]["daemonFinished"])
+                        self.assertEqual(proxy.record["status"], 201)
+                        self.assertIsNotNone(container(proxy.record["reply"]["Id"]))
+                    self.make("down", "cleanup=1", env=selected)
+                    self.assertIsNone(container(held))
+                    if peer:
+                        self.assertIsNone(container(peer))
+                    self.assertFalse(active.exists())
+                    self.assertFalse(ports.exists())
+                finally:
+                    proxy.release.set()
+                    if proc is not None and proc.poll() is None:
+                        os.kill(proc.pid, signal.SIGTERM)
+                        proc.communicate(timeout=15)
+                    active = self.root / ".devkit/state/stand.active"
+                    if active.exists():
+                        ledger = json.loads(active.read_text())
+                        for intent in ledger["inspections"].values():
+                            for helper in intent["helpers"].values():
+                                actual = container(helper["name"])
+                                if actual is not None:
+                                    labels = actual["Config"]["Labels"]
+                                    self.assertEqual(labels["io.docouno.devkit.inspection"], helper["token"])
+                                    self.assertEqual(labels["io.docouno.devkit.inspection-owner"], ledger["owner"]["key"])
+                                    self.assertEqual(actual["State"]["Pid"], 0)
+                                    run("docker", "rm", "--force", "--volumes", actual["Id"])
+                    # Compose may leave replacement containers under temporary
+                    # names. Test teardown uses only this fixture's exact labels.
+                    remnants = run("docker", "ps", "--all", "--quiet", "--no-trunc", "--filter",
+                                   "label=" + LABEL + "=" + self.token, "--filter",
+                                   "label=com.docker.compose.project=" + project).stdout.split()
+                    for exact in remnants:
+                        actual = container(exact)
+                        self.assertEqual(actual["Config"]["Labels"][LABEL], self.token)
+                        self.assertEqual(actual["Config"]["Labels"]["com.docker.compose.project"], project)
+                        run("docker", "rm", "--force", exact)
+
+    def test_repeated_successful_up_keeps_unchanged_container_identity(self):
+        _, project = self.preview_fixture()
+        self.make("setup")
+        self.make("up", "app=main")
+        before = container(project + "-main-1")["Id"]
+        self.make("up", "app=main")
+        self.assertEqual(container(project + "-main-1")["Id"], before)
+        self.make("down", "cleanup=1")
 
     def test_image_external_and_retained_metadata_reads_obey_deadlines(self):
         service, project = self.preview_fixture()
