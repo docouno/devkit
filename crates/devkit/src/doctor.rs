@@ -195,6 +195,9 @@ pub fn local_receipts(
 #[serde(rename_all = "camelCase")]
 pub struct ComposeServiceStatus {
     pub service: String,
+    pub id: String,
+    #[serde(flatten)]
+    pub preview: crate::stand::preview::PreviewStatus,
     pub component: Option<String>,
     pub name: String,
     pub state: String,
@@ -203,27 +206,8 @@ pub struct ComposeServiceStatus {
     pub urls: Vec<String>,
 }
 
-fn normalize_url_host(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || matches!(
-            trimmed,
-            "0.0.0.0" | "::" | "[::]" | "*" | "::1" | "localhost"
-        )
-    {
-        "127.0.0.1"
-    } else {
-        trimmed
-    }
-}
-
 fn format_http_url(host: &str, port: u64) -> String {
-    let h = normalize_url_host(host);
-    if h.contains(':') && !h.starts_with('[') {
-        format!("http://[{h}]:{port}")
-    } else {
-        format!("http://{h}:{port}")
-    }
+    crate::stand::preview::local_url(host.trim(), port as u16)
 }
 
 fn extract_urls_from_ports_string(ports: &str, urls: &mut BTreeSet<String>) {
@@ -332,6 +316,8 @@ pub fn parse_compose_ps_json(
             extract_urls_from_ports_string(ports_str, &mut urls);
         }
         services.push(ComposeServiceStatus {
+            id: item.get("ID").and_then(Value::as_str).unwrap_or("").into(),
+            preview: Default::default(),
             component: service_to_component.get(&service).cloned(),
             service,
             name,

@@ -10,7 +10,15 @@
 
 - Raise the minimum supported project checkout and `--to` release floor to `0.4.0` (`minSupportedFromVersion: "0.4.0"` in `release.json`) and remove pre-`0.4.0` compatibility branches (`0.1.x`–`0.3.x`, `schemaVersion: 1` manifests and update journals, legacy `.sha256` archive metadata, and `0.2.x` runtime projections). Projects on `0.2.x` or `0.3.x` fail fast before taking checkout locks or touching the filesystem and can upgrade through the `0.4.1` bridge release first (`npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check`).
 
+### Added
+
+- Sticky per-checkout TCP/UDP host-port leases, replica ranges, ownership-aware cleanup, and cold cleanup before setup without Docker or downloads.
+- Vendor-neutral preview URL templates, bounded immutable host metadata with image-aware read-only mount proof, and applied/desired endpoint status.
+- A web-only `fullstack-web` preset and transactional `add-app --api` connections, API library development prerequisites, configurable starter bind addresses, and display-free aggregate Electron skipping.
+
 ### Changed
+
+- Extend `devkitWorkspaceSource()` serve behavior to zero-library projects, exact preview hosts, automatic HTTP/WebSocket API proxies with Host validation, and guarded first-handshake HMR recovery.
 
 - Deliver a verified static pnpm executable lazily and share pnpm, Cargo, and Electron caches across repositories and Git worktrees; preserve real hardlinks and protect the virtual store during offline gates.
 

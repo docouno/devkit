@@ -95,6 +95,7 @@ pub struct InitOptions<'a> {
 }
 #[derive(Default)]
 pub struct UpdateOptions<'a> {
+    pub api: Option<String>,
     pub package_mode: Option<PackageMode>,
     pub registry: Option<&'a str>,
     pub compose_inventory: Option<&'a ComposeInventory>,
@@ -1028,6 +1029,10 @@ pub fn init_project(
     };
     let specs = if let Some(preset) = &options.preset {
         match preset.as_str() {
+            "fullstack-web" => vec![
+                (Role::App, app("api", "rust-api")),
+                (Role::App, app("web", "react-web")),
+            ],
             "fullstack-desktop" => vec![
                 (Role::Library, app("client", "react-client")),
                 (Role::App, app("api", "rust-api")),
@@ -1104,7 +1109,7 @@ pub fn init_project(
             seeds.push(seed);
         }
     }
-    if options.preset.as_deref() == Some("fullstack-desktop")
+    if [Some("fullstack-web"), Some("fullstack-desktop")].contains(&options.preset.as_deref())
         || options.template.as_deref() == Some("mixed")
     {
         for path in ["apps/web", "apps/desktop"] {
@@ -1472,7 +1477,7 @@ fn mutate(
             } else {
                 String::new()
             };
-            let (path, c, seed) = render_component(
+            let (path, mut c, seed) = render_component(
                 &release,
                 &staged_root,
                 &name,
@@ -1481,6 +1486,49 @@ fn mutate(
                 mode,
                 &next.components,
             )?;
+            if let Some(api) = &options.api {
+                slug(api)?;
+                ensure!(
+                    *role == Role::App
+                        && ["react-web", "electron-react"].contains(&spec.template.as_str())
+                        && SemVer::parse(&next.version)? >= SemVer::parse("0.5.0")?,
+                    "--api requires a React web or Electron app on Devkit 0.5 or newer"
+                );
+                let backend_path = format!("apps/{api}");
+                let backend = next
+                    .components
+                    .get(&backend_path)
+                    .context("--api requires a registered API application")?;
+                ensure!(
+                    backend_path != path
+                        && backend.role == Role::App
+                        && matches!(
+                            backend.tooling_profile,
+                            ToolingProfile::Node | ToolingProfile::Rust
+                        ),
+                    "--api target must be a Node or Rust API application"
+                );
+                let integration = backend
+                    .development
+                    .as_ref()
+                    .context("API has no development integration")?;
+                ensure!(
+                    integration.kind == DevelopmentKind::Compose,
+                    "API must be a Compose service"
+                );
+                ensure!(
+                    compose_inventory
+                        .context("Missing Compose inventory")?
+                        .services
+                        .iter()
+                        .any(|s| s == integration.service.as_deref().unwrap_or(api)),
+                    "API Compose service is missing"
+                );
+                c.development
+                    .as_mut()
+                    .context("Frontend has no development integration")?
+                    .api = Some(backend_path);
+            }
             next.components.insert(path.clone(), c);
             created.push(path);
             if let Some(seed) = seed {

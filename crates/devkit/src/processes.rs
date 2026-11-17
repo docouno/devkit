@@ -1,8 +1,10 @@
 //! One process boundary for native tools and Docker creators. No shell interprets argv.
 use crate::Result;
 use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fmt,
     io::{self, Read, Write},
     os::{
@@ -62,6 +64,18 @@ pub struct ProcessOutput {
     pub code: u8,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+type MetadataRead = (Option<Box<[u8; 512]>>, Option<ExitStatus>);
+pub enum CpMetadata {
+    Header(Box<[u8; 512]>),
+    Missing,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectionSnapshot {
+    pub id: String,
+    pub image: String,
+    pub anonymous_volumes: BTreeMap<String, String>,
 }
 impl ProcessOutput {
     pub fn success(self, label: &str) -> Result<Self> {
@@ -254,10 +268,54 @@ impl ProcessRunner {
         cleanup: bool,
         timeout: Option<Duration>,
     ) -> Result<ProcessOutput> {
-        if !cleanup {
-            self.check_cancelled()?;
+        self.run_input_inner(command, mode, cleanup, timeout, None, None)
+    }
+    pub fn run_with_input(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        input: &[u8],
+    ) -> Result<ProcessOutput> {
+        ensure!(
+            input.len() <= 8 * 1024 * 1024,
+            "Native stdin exceeds byte budget"
+        );
+        self.run_input_inner(command, mode, false, None, Some(input), None)
+    }
+    pub fn run_tracked(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        input: Option<&[u8]>,
+        reaped: &mut bool,
+    ) -> Result<ProcessOutput> {
+        ensure!(
+            input.is_none_or(|v| v.len() <= 8 * 1024 * 1024),
+            "Native stdin exceeds byte budget"
+        );
+        *reaped = false;
+        self.run_input_inner(command, mode, false, None, input, Some(reaped))
+    }
+    fn run_input_inner(
+        &self,
+        command: &mut Command,
+        mode: OutputMode,
+        cleanup: bool,
+        timeout: Option<Duration>,
+        input: Option<&[u8]>,
+        mut reaped: Option<&mut bool>,
+    ) -> Result<ProcessOutput> {
+        if !cleanup && let Err(error) = self.check_cancelled() {
+            if let Some(flag) = reaped.as_deref_mut() {
+                *flag = true;
+            }
+            return Err(error);
         }
-        command.process_group(0).stdin(Stdio::null());
+        command.process_group(0).stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         match mode {
             OutputMode::Inherit => {
                 command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -272,13 +330,30 @@ impl ProcessRunner {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
-        let child = command
-            .spawn()
-            .with_context(|| format!("Cannot start {}", command.get_program().to_string_lossy()))?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(flag) = reaped.as_deref_mut() {
+                    *flag = true;
+                }
+                return Err(error).with_context(|| {
+                    format!("Cannot start {}", command.get_program().to_string_lossy())
+                });
+            }
+        };
         let mut creator = Creator::new(child);
         let readers_done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_failed = Arc::new(AtomicBool::new(false));
+        let input_failed = Arc::new(AtomicBool::new(false));
+        let input_writer = input.map(|bytes| {
+            stdin_writer(
+                creator.child.stdin.take().expect("piped input"),
+                bytes.to_owned(),
+                readers_done.clone(),
+                input_failed.clone(),
+            )
+        });
         let stdout = creator.child.stdout.take().map(|stream| {
             reader(
                 stream,
@@ -313,20 +388,41 @@ impl ProcessRunner {
             }
             match creator.child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Ok(None) => {
+                    if input_failed.load(Ordering::SeqCst) {
+                        break Err(anyhow::anyhow!("Cannot write native stdin"));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
                 Err(error) => break Err(error.into()),
             }
         };
         // This happens on every path, including wait/read errors. Do not let an
         // early ? bypass termination and reaping of the exact creator PGID.
         let stopped = creator.finish();
+        if stopped.is_ok()
+            && let Some(reaped) = reaped
+        {
+            *reaped = true;
+        }
         readers_done.store(true, Ordering::SeqCst);
         // Join BOTH readers even if one fails. Their reads are nonblocking and
         // finish after the pipe is drained or a bounded post-creator interval.
         let stdout = join_reader(stdout);
         let stderr = join_reader(stderr);
+        let input_result = input_writer
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Cannot join native stdin writer"))
+                    .and_then(|result| result.map_err(Into::into))
+            })
+            .unwrap_or(Ok(()));
         let status = status?;
         let code = status_code(status);
+        if code == 0 {
+            input_result?;
+        }
         for result in [
             stopped,
             stdout
@@ -403,6 +499,264 @@ impl ProcessRunner {
             "Invalid exact-name Docker inventory"
         );
         Ok(ids)
+    }
+    /// Stop at the first exact tar header: never drain or extract image files.
+    pub fn cp_metadata(&self, id: &str, path: &str, timeout: Duration) -> Result<CpMetadata> {
+        ensure!(
+            id.len() == 64
+                && id.bytes().all(|b| b.is_ascii_hexdigit())
+                && path.starts_with('/')
+                && path.len() <= 4096
+                && !path.contains('\0'),
+            "Invalid image metadata query"
+        );
+        self.check_cancelled()?;
+        let mut command = Command::new("docker");
+        command
+            .args(["cp", &format!("{id}:{path}"), "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut creator = Creator::new(
+            command
+                .spawn()
+                .context("Cannot start image metadata query")?,
+        );
+        let mut stdout = creator
+            .child
+            .stdout
+            .take()
+            .context("Missing metadata stream")?;
+        let done = Arc::new(AtomicBool::new(false));
+        let overflow = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let stderr = creator.child.stderr.take().map(|stream| {
+            reader(
+                stream,
+                OutputMode::Capture(8192),
+                done.clone(),
+                overflow.clone(),
+                failed.clone(),
+            )
+        });
+        let result = (|| -> Result<MetadataRead> {
+            let fd = stdout.as_raw_fd();
+            // SAFETY: this is the live, owned pipe descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            ensure!(
+                flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+                "Cannot configure metadata pipe"
+            );
+            let deadline = Instant::now() + timeout.min(Duration::from_secs(3));
+            let mut header = Box::new([0; 512]);
+            let mut count = 0;
+            loop {
+                self.check_cancelled()?;
+                ensure!(
+                    Instant::now() < deadline,
+                    "Image metadata query exceeded deadline"
+                );
+                ensure!(
+                    !overflow.load(Ordering::SeqCst) && !failed.load(Ordering::SeqCst),
+                    "Image metadata stderr exceeds budget or failed"
+                );
+                match stdout.read(&mut header[count..]) {
+                    Ok(0) => {
+                        if let Some(status) = creator.child.try_wait()? {
+                            ensure!(count == 0, "Truncated image metadata header");
+                            return Ok((None, Some(status)));
+                        }
+                    }
+                    Ok(read) => {
+                        count += read;
+                        if count == 512 {
+                            return Ok((Some(header), None));
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error.into()),
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        })();
+        drop(stdout);
+        let stopped = creator.finish();
+        done.store(true, Ordering::SeqCst);
+        let stderr = join_reader(stderr);
+        stopped?;
+        let stderr = stderr?;
+        ensure!(
+            !overflow.load(Ordering::SeqCst),
+            "Image metadata stderr exceeds byte budget"
+        );
+        let (header, status) = result?;
+        if let Some(header) = header {
+            return Ok(CpMetadata::Header(header));
+        }
+        let expected = format!(
+            "Error response from daemon: Could not find the file {path} in container {id}\n"
+        );
+        ensure!(
+            status.is_some_and(|s| status_code(s) == 1) && stderr == expected.as_bytes(),
+            "Unproved image metadata response"
+        );
+        Ok(CpMetadata::Missing)
+    }
+    /// Cleanup observations ignore cancellation but always have a deadline.
+    /// Only the requested labels and namespace fields leave the Docker CLI.
+    pub fn inspection_snapshot(
+        &self,
+        owned: &OwnedContainer,
+        labels: &BTreeMap<String, String>,
+        deadline: Instant,
+    ) -> Result<Option<InspectionSnapshot>> {
+        owned.validate()?;
+        let ids = self.named_ids(owned, deadline)?;
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        let mut expected = labels.clone();
+        ensure!(
+            expected.len() <= 4
+                && expected.iter().all(|(k, v)| !k.is_empty()
+                    && k.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
+                    && v.len() <= 200),
+            "Invalid inspection ownership labels"
+        );
+        if let Some(value) = expected.insert(owned.label.clone(), owned.token.clone()) {
+            ensure!(value == owned.token, "Conflicting inspection token");
+        }
+        let mut format = "{{json .Id}}\n{{json .Name}}\n{{json .State.Status}}\n{{json .State.Pid}}\n{{json .Image}}\n{{json .HostConfig.Binds}}\n{{json .HostConfig.VolumesFrom}}\n{{json .Mounts}}".to_owned();
+        for key in expected.keys() {
+            format.push_str(&format!(
+                "\n{{{{json (index .Config.Labels {})}}}}",
+                serde_json::to_string(key)?
+            ));
+        }
+        let output = self.query(
+            Command::new("docker").args(["container", "inspect", "--format", &format, id]),
+            deadline,
+        )?;
+        let rows = output
+            .text()?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<Value>, _>>()?;
+        ensure!(
+            rows.len() == 8 + expected.len()
+                && rows[0].as_str() == Some(id)
+                && rows[1].as_str() == Some(format!("/{}", owned.name).as_str())
+                && rows[2] == "created"
+                && rows[3] == 0
+                && (rows[5].is_null() || rows[5].as_array().is_some_and(Vec::is_empty))
+                && (rows[6].is_null() || rows[6].as_array().is_some_and(Vec::is_empty)),
+            "Refusing an unowned, started or user-mounted image inspector"
+        );
+        for (row, value) in rows[8..].iter().zip(expected.values()) {
+            ensure!(
+                row.as_str() == Some(value),
+                "Image inspection ownership conflict"
+            );
+        }
+        let image = rows[4]
+            .as_str()
+            .context("Missing inspector image")?
+            .to_owned();
+        ensure!(
+            image
+                .strip_prefix("sha256:")
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            "Invalid immutable inspector image"
+        );
+        let mut anonymous_volumes = BTreeMap::new();
+        for mount in rows[7]
+            .as_array()
+            .context("Invalid image inspector mounts")?
+        {
+            let name = mount["Name"]
+                .as_str()
+                .context("Missing inspection volume name")?;
+            let target = mount["Destination"]
+                .as_str()
+                .context("Missing inspection volume destination")?;
+            ensure!(
+                mount["Type"] == "volume"
+                    && name.len() == 64
+                    && name.bytes().all(|b| b.is_ascii_hexdigit())
+                    && anonymous_volumes
+                        .insert(target.into(), name.into())
+                        .is_none(),
+                "Image inspector has an unproved mount"
+            );
+        }
+        Ok(Some(InspectionSnapshot {
+            id: id.clone(),
+            image,
+            anonymous_volumes,
+        }))
+    }
+    pub fn remove_inspection(
+        &self,
+        owned: &OwnedContainer,
+        labels: &BTreeMap<String, String>,
+        recorded: &InspectionSnapshot,
+        deadline: Instant,
+    ) -> Result<()> {
+        if let Some(actual) = self.inspection_snapshot(owned, labels, deadline)? {
+            ensure!(
+                actual.id == recorded.id
+                    && actual.image == recorded.image
+                    && actual.anonymous_volumes == recorded.anonymous_volumes,
+                "Image inspector changed before cleanup"
+            );
+            self.run_inner(
+                Command::new("docker").args(["rm", "--force", "--volumes", &actual.id]),
+                OutputMode::Capture(8192),
+                true,
+                Some(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(3)),
+                ),
+            )?
+            .success("Image inspector cleanup")?;
+        }
+        ensure!(
+            self.named_ids(owned, deadline)?.is_empty(),
+            "Image inspector remains after cleanup"
+        );
+        self.verify_inspection_volumes_absent(recorded, deadline)
+    }
+    pub fn verify_inspection_volumes_absent(
+        &self,
+        recorded: &InspectionSnapshot,
+        deadline: Instant,
+    ) -> Result<()> {
+        for name in recorded.anonymous_volumes.values() {
+            ensure!(
+                name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()),
+                "Invalid recorded inspection volume"
+            );
+            let output = self.query(
+                Command::new("docker").args([
+                    "volume",
+                    "ls",
+                    "--filter",
+                    &format!("name=^{name}$"),
+                    "--format",
+                    "{{.Name}}",
+                ]),
+                deadline,
+            )?;
+            ensure!(
+                output.text()?.trim().is_empty(),
+                "Image inspection volume remains; preserving its recovery intent"
+            );
+        }
+        Ok(())
     }
     pub fn run_owned(
         &self,
@@ -533,6 +887,55 @@ impl ProcessRunner {
         );
         Ok(())
     }
+}
+
+fn stdin_writer(
+    mut stream: std::process::ChildStdin,
+    bytes: Vec<u8>,
+    done: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let result = (|| {
+            let fd = stream.as_raw_fd();
+            // SAFETY: the live stdin pipe belongs to this writer thread.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut offset = 0;
+            while offset < bytes.len() {
+                if done.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "Native stdin stopped with creator",
+                    ));
+                }
+                match stream.write(&bytes[offset..(offset + 8192).min(bytes.len())]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Native stdin closed",
+                        ));
+                    }
+                    Ok(count) => offset += count,
+                    Err(error)
+                        if [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted]
+                            .contains(&error.kind()) =>
+                    {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            failed.store(true, Ordering::SeqCst);
+        }
+        result
+    })
 }
 
 type Reader = thread::JoinHandle<io::Result<Vec<u8>>>;

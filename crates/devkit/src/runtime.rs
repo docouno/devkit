@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down  (preserves data)\nmake doctor\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down [cleanup=1]  (preserves data; cleanup releases leases)\nmake doctor\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -46,6 +46,7 @@ pub struct RuntimeRequest {
     pub headless: bool,
     pub cleanup: bool,
     pub package_aggregate: bool,
+    pub dev_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
     pub cache_dir: Option<PathBuf>,
@@ -62,6 +63,7 @@ impl RuntimeRequest {
             headless: false,
             cleanup: false,
             package_aggregate: false,
+            dev_aggregate: false,
             follow: false,
             tail: 100,
             cache_dir: None,
@@ -2214,6 +2216,15 @@ fn run_service(
         }
     }
     ctx.env(&mut command);
+    if request.command == "down"
+        && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
+    {
+        ensure!(
+            !ledger.launch_pending || ledger.launch_finished,
+            "Stand creator has no terminal receipt; preserving its launch intent and leases"
+        );
+        crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
+    }
     let stand_rows = if request.command == "down" && request.cleanup {
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if !rows.is_empty() {
@@ -2230,7 +2241,7 @@ fn run_service(
             command.args(["--profile", "*", "down"]);
         }
         "status" => {
-            command.args(["--profile", "*", "ps", "--all"]);
+            command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
             if let Some(s) = &selected {
                 command.arg(s);
             }
@@ -2259,7 +2270,36 @@ fn run_service(
         ctx.runner.checked(&mut command, OutputMode::Inherit)?;
         return Ok(());
     }
-    ctx.runner.checked(&mut command, OutputMode::Inherit)?;
+    if request.command == "status" {
+        let output = ctx.runner.capture(&mut command)?;
+        let mut services = crate::doctor::parse_compose_ps_json(
+            &output.stdout,
+            &app_service_component_map(&ctx.admission.state),
+        )?;
+        crate::stand::preview::enrich_status(
+            &ctx.admission.root,
+            &ctx.project,
+            ctx.runner,
+            &mut services,
+        )?;
+        for service in services {
+            println!(
+                "Service {} ({}): {}",
+                service.service, service.name, service.state
+            );
+            for url in service.urls.iter().chain(&service.preview.preview_urls) {
+                println!("  {url}");
+            }
+            if service.preview.pending_restart {
+                println!("  Preview settings pending restart");
+            }
+            if let Some(diagnostic) = service.preview.diagnostic {
+                println!("  Preview unverified: {diagnostic}");
+            }
+        }
+    } else {
+        ctx.runner.checked(&mut command, OutputMode::Inherit)?;
+    }
     if request.command == "down" {
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if request.cleanup {
@@ -2270,6 +2310,12 @@ fn run_service(
                 ensure!(rows.is_empty(), "Unknown stand remnants remain");
             }
             let _ = stand_rows;
+        }
+        if !request.cleanup
+            && rows.is_empty()
+            && let Some(mut ports) = crate::stand::ports::Ports::read(&ctx.admission.root)?
+        {
+            crate::stand::preview::prune(&mut ports, &rows)?;
         }
         if rows.is_empty() || request.cleanup {
             if exists(&safe_path(
@@ -2328,6 +2374,15 @@ pub fn active_compose_services(model: &Value, selected: &str) -> Result<BTreeSet
             continue;
         }
         seen.insert(name);
+        for raw in service["volumes_from"].as_array().into_iter().flatten() {
+            let raw = raw.as_str().context("Invalid normalized volume provider")?;
+            if !raw.starts_with("container:") {
+                queue.push((
+                    raw.trim_end_matches(":ro").trim_end_matches(":rw").into(),
+                    true,
+                ));
+            }
+        }
         if let Some(deps) = service.get("depends_on") {
             for (name, settings) in object(deps, "Compose dependencies")? {
                 queue.push((
@@ -2353,6 +2408,78 @@ pub fn development_components(
         .filter(|(p, c)| c.role == Role::App && seen.contains(service_name(p, c)))
         .map(|(p, _)| p.clone())
         .collect())
+}
+/// Resolve only selected frontend env files for presence/precedence. Resolved
+/// service values stay in memory and never reach image inspectors or state.
+fn preview_forwarding_presence(
+    ctx: &PreparedContext<'_>,
+    model: &mut Value,
+    frontends: &BTreeSet<String>,
+) -> Result<()> {
+    let keys = [
+        "DEVKIT_ALLOWED_HOSTS",
+        "VITE_ALLOWED_HOSTS",
+        "DEVKIT_API_TARGET",
+    ];
+    if !keys.iter().any(|key| std::env::var(key).is_ok()) {
+        return Ok(());
+    }
+    let mut services = serde_json::Map::new();
+    for name in frontends {
+        let service = &model["services"][name];
+        if let Some(files) = service.get("env_file") {
+            services.insert(name.clone(),json!({"image":"scratch","env_file":files,"environment":service.get("environment").cloned().unwrap_or(json!({}))}));
+        }
+    }
+    if services.is_empty() {
+        return Ok(());
+    }
+    let mut spec = json!({"name":ctx.project,"services":services});
+    crate::stand::preview::escape_compose(&mut spec);
+    let mut command = ctx.docker();
+    command
+        .current_dir(&ctx.admission.root)
+        .args([
+            "compose",
+            "--project-name",
+            &ctx.project,
+            "--project-directory",
+        ])
+        .arg(&ctx.admission.root)
+        .args([
+            "--env-file",
+            "/dev/null",
+            "--file",
+            "-",
+            "config",
+            "--format",
+            "json",
+        ]);
+    ctx.env(&mut command);
+    let output = ctx
+        .runner
+        .run_with_input(
+            &mut command,
+            OutputMode::Capture(16 * 1024 * 1024),
+            &json_bytes(&spec)?,
+        )?
+        .success("Selected frontend environment query")?;
+    let resolved: Value = serde_json::from_slice(&output.stdout)?;
+    for name in frontends {
+        for key in keys {
+            if resolved["services"][name]["environment"].get(key).is_some() {
+                if model["services"][name].get("environment").is_none() {
+                    model["services"][name]["environment"] = json!({});
+                }
+                model["services"][name]["environment"]
+                    .as_object_mut()
+                    .context("Invalid normalized service environment")?
+                    .entry(key)
+                    .or_insert(Value::Null);
+            }
+        }
+    }
+    Ok(())
 }
 fn run_development(
     request: &RuntimeRequest,
@@ -2489,6 +2616,20 @@ fn run_development(
             overlays.push(npm_file);
         }
     }
+    // SDK, display and store overlays participate in the namespace actually launched.
+    let mut effective = ctx.compose()?;
+    for file in &overlays {
+        effective.arg("--file").arg(file.path());
+    }
+    let output = ctx.runner.capture(effective.args([
+        "--profile",
+        "*",
+        "config",
+        "--no-env-resolution",
+        "--format",
+        "json",
+    ]))?;
+    let mut model: Value = serde_json::from_slice(&output.stdout)?;
     let mut budget = ctx
         .budget
         .borrow()
@@ -2519,105 +2660,315 @@ fn run_development(
         .map(|(p, c)| service_name(p, c))
         .find(|s| active_services.contains(*s));
     let branch = crate::stand::branch_name(&ctx.admission.root, ctx.runner)?;
-    ports.allocate(
-        &declarations,
-        primary,
-        &branch,
-        &active_ports,
-        &BTreeSet::new(),
-    )?;
-    let stand_overlay = crate::stand::save_overlay(
-        &ctx.admission.root,
-        &crate::stand::port_overlay(&ports, &active_services)?,
-    )?;
-    let mut ledger =
-        crate::stand::ledger::Ledger::intent(&ctx.admission.root, &ports.owner, &active_services)?;
-    crate::stand::epoch::anchor(&ctx.admission.root)?;
-    let mut bind_attempts = 1;
-    let mut cgroup_retried = false;
-    loop {
-        let mut res_overlay_file = None;
-        if let Some(res_spec) = crate::resources::build_compose_resource_overlay(
-            &budget,
-            &full.state,
-            &ctx.admission.pins.rust_version,
+    let frontends: BTreeSet<_> = full
+        .state
+        .components
+        .iter()
+        .filter(|(_, c)| {
+            matches!(
+                c.tooling_profile,
+                ToolingProfile::Web | ToolingProfile::Electron
+            )
+        })
+        .map(|(p, c)| service_name(p, c).to_owned())
+        .filter(|name| {
+            active_services.contains(name)
+                && declarations
+                    .iter()
+                    .any(|b| b.service == *name && b.protocol == "tcp")
+        })
+        .collect();
+    preview_forwarding_presence(ctx, &mut model, &frontends)?;
+    let renderer = crate::stand::preview::Renderer::from_env(&branch)?;
+    let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
+    ensure!(
+        !ledger.launch_pending || ledger.launch_finished,
+        "Unfinished stand creator; preserving its launch intent"
+    );
+    crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
+    let proof = if renderer.template.is_some() && !frontends.is_empty() {
+        let mut references = BTreeMap::new();
+        for name in crate::stand::inspection::closure(&model, &active_services)? {
+            let image = if let Some(image) = model["services"][&name]["image"].as_str() {
+                image.to_owned()
+            } else {
+                ensure!(
+                    model["services"][&name].get("build").is_some(),
+                    "Service {name} has neither image nor build"
+                );
+                // Ask the same Compose implementation for its project/service
+                // default. A single inert build declaration avoids dependency
+                // images in config --images without guessing its naming rule.
+                let spec = json_bytes(
+                    &json!({"name":ctx.project,"services":{&name:{"build":{"context":"."}}}}),
+                )?;
+                let mut query = ctx.docker();
+                query
+                    .current_dir(&ctx.admission.root)
+                    .args([
+                        "compose",
+                        "--project-name",
+                        &ctx.project,
+                        "--project-directory",
+                    ])
+                    .arg(&ctx.admission.root)
+                    .args([
+                        "--env-file",
+                        "/dev/null",
+                        "--file",
+                        "-",
+                        "config",
+                        "--images",
+                    ]);
+                let output = ctx
+                    .runner
+                    .run_with_input(&mut query, OutputMode::Capture(65536), &spec)?
+                    .success("Compose effective image query")?;
+                let image = output.text()?.trim();
+                ensure!(
+                    !image.is_empty() && !image.contains('\n'),
+                    "Ambiguous effective image for {name}"
+                );
+                image.into()
+            };
+            references.insert(name, image);
+        }
+        crate::stand::inspection::prepare(
+            &ctx.admission.root,
             &model,
             &active_services,
-        )? {
-            let mut file = tempfile::Builder::new()
-                .prefix("compose-resources-")
-                .suffix(".json")
-                .tempfile_in(&state_dir)?;
-            file.write_all(&json_bytes(&res_spec)?)?;
-            res_overlay_file = Some(file);
+            &frontends,
+            &references,
+            &mut ledger,
+            ctx.runner,
+        )?
+    } else {
+        crate::stand::inspection::Proof {
+            slots: BTreeMap::new(),
+            images: BTreeMap::new(),
+            external: BTreeMap::new(),
         }
-        let mut command = ctx.compose()?;
-        for f in &overlays {
-            command.arg("--file").arg(f.path());
-        }
-        if let Some(f) = &res_overlay_file {
-            command.arg("--file").arg(f.path());
-        }
-        command.arg("--file").arg(&stand_overlay);
-        command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
-        full.recheck()?;
-        assert_compose_inventory(&ctx.admission.root, &inventory)?;
-        let mut up_output = ctx
-            .runner
-            .run(&mut command, OutputMode::TeeStderr(64 * 1024))?;
-        if up_output.code == 0 {
-            break;
-        }
-        if !cgroup_retried
-            && crate::resources::is_compose_cgroup_delegation_failure(
-                up_output.code,
-                &up_output.stderr,
-            )
-        {
-            eprintln!(
-                "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
+    };
+    let result = (|| -> Result<()> {
+        ports.allocate_with(
+            &declarations,
+            primary,
+            &branch,
+            &active_ports,
+            &BTreeSet::new(),
+            |ports| {
+                crate::stand::preview::publish_deployment(
+                    ports,
+                    &frontends,
+                    &active_services,
+                    &renderer,
+                    &proof,
+                )
+            },
+        )?;
+        let stand_overlay = crate::stand::save_overlay(
+            &ctx.admission.root,
+            &crate::stand::deployment_overlay(
+                &ports,
+                &active_services,
+                &frontends,
+                &model,
+                &proof,
+            )?,
+        )?;
+        ledger = crate::stand::ledger::Ledger::intent(
+            &ctx.admission.root,
+            &ports.owner,
+            &active_services,
+        )?;
+        ledger.launch_finished = true;
+        ledger.save(&ctx.admission.root)?;
+        crate::stand::epoch::anchor(&ctx.admission.root)?;
+        let mut bind_attempts = 1;
+        let mut cgroup_retried = false;
+        loop {
+            let mut res_overlay_file = None;
+            if let Some(res_spec) = crate::resources::build_compose_resource_overlay(
+                &budget,
+                &full.state,
+                &ctx.admission.pins.rust_version,
+                &model,
+                &active_services,
+            )? {
+                let mut file = tempfile::Builder::new()
+                    .prefix("compose-resources-")
+                    .suffix(".json")
+                    .tempfile_in(&state_dir)?;
+                file.write_all(&json_bytes(&res_spec)?)?;
+                res_overlay_file = Some(file);
+            }
+            let mut command = ctx.compose()?;
+            for f in &overlays {
+                command.arg("--file").arg(f.path());
+            }
+            if let Some(f) = &res_overlay_file {
+                command.arg("--file").arg(f.path());
+            }
+            command.arg("--file").arg(&stand_overlay);
+            if !proof.images.is_empty() {
+                let mut normalized = ctx.compose()?;
+                for f in &overlays {
+                    normalized.arg("--file").arg(f.path());
+                }
+                if let Some(f) = &res_overlay_file {
+                    normalized.arg("--file").arg(f.path());
+                }
+                normalized.arg("--file").arg(&stand_overlay).args([
+                    "--profile",
+                    "*",
+                    "config",
+                    "--no-env-resolution",
+                    "--format",
+                    "json",
+                ]);
+                let output = ctx.runner.capture(&mut normalized)?;
+                crate::stand::inspection::verify_launch(
+                    &serde_json::from_slice(&output.stdout)?,
+                    &ports,
+                    &active_services,
+                    &proof,
+                )?;
+            }
+            command.args([
+                "up",
+                "-d",
+                "--wait",
+                "--pull",
+                if proof.images.is_empty() {
+                    "missing"
+                } else {
+                    "never"
+                },
+                &service,
+            ]);
+            ledger.launch_finished = true;
+            ledger.save(&ctx.admission.root)?;
+            full.recheck()?;
+            assert_compose_inventory(&ctx.admission.root, &inventory)?;
+            ledger.launch_finished = false;
+            ledger.save(&ctx.admission.root)?;
+            let mut reaped = false;
+            let up_result = ctx.runner.run_tracked(
+                &mut command,
+                OutputMode::TeeStderr(64 * 1024),
+                None,
+                &mut reaped,
             );
-            budget.disable_cgroup_limits();
-            cgroup_retried = true;
-            *ctx.budget.borrow_mut() = Some(budget.clone());
-            continue;
+            ledger.launch_finished = reaped;
+            ledger.save(&ctx.admission.root)?;
+            let mut up_output = up_result?;
+            if up_output.code == 0 {
+                break;
+            }
+            if !cgroup_retried
+                && crate::resources::is_compose_cgroup_delegation_failure(
+                    up_output.code,
+                    &up_output.stderr,
+                )
+            {
+                eprintln!(
+                    "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
+                );
+                budget.disable_cgroup_limits();
+                cgroup_retried = true;
+                *ctx.budget.borrow_mut() = Some(budget.clone());
+                continue;
+            }
+            let conflicts = crate::stand::ports::bind_conflicts(&up_output.stderr, &ports.groups)?;
+            if bind_attempts < 3 && !conflicts.is_empty() {
+                let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+                let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
+                ports.allocate_with(
+                    &declarations,
+                    primary,
+                    &branch,
+                    &active_ports,
+                    &conflicts,
+                    |ports| {
+                        crate::stand::preview::publish_deployment(
+                            ports,
+                            &frontends,
+                            &active_services,
+                            &renderer,
+                            &proof,
+                        )
+                    },
+                )?;
+                crate::stand::save_overlay(
+                    &ctx.admission.root,
+                    &crate::stand::deployment_overlay(
+                        &ports,
+                        &active_services,
+                        &frontends,
+                        &model,
+                        &proof,
+                    )?,
+                )?;
+                bind_attempts += 1;
+                continue;
+            }
+            up_output.stderr.clear();
+            up_output.success("docker")?;
         }
-        let conflicts = crate::stand::ports::bind_conflicts(&up_output.stderr, &ports.groups)?;
-        if bind_attempts < 3 && !conflicts.is_empty() {
-            let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
-            let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
-            ports.allocate(&declarations, primary, &branch, &active_ports, &conflicts)?;
-            crate::stand::save_overlay(
-                &ctx.admission.root,
-                &crate::stand::port_overlay(&ports, &active_services)?,
-            )?;
-            bind_attempts += 1;
-            continue;
-        }
-        up_output.stderr.clear();
-        up_output.success("docker")?;
-    }
-    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
-    ledger.observed(&ctx.admission.root, &rows)?;
-    ports.reconcile(&rows)?;
-    let service_to_component = app_service_component_map(&full.state);
-    let mut ps_cmd = ctx.compose()?;
-    ps_cmd.args(["--profile", "*", "ps", "--format", "json"]);
-    let ps_out = ctx.runner.capture(&mut ps_cmd)?;
-    for entry in crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)? {
-        if !active_services.contains(&entry.service) || entry.state != "running" {
-            continue;
-        }
-        for url in &entry.urls {
-            if let Some(comp) = &entry.component {
-                println!("Service {} ({comp}): {url}", entry.service);
-            } else {
-                println!("Service {}: {url}", entry.service);
+        let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+        ledger.observed(&ctx.admission.root, &rows)?;
+        ports.reconcile(&rows)?;
+        crate::stand::preview::prune(&mut ports, &rows)?;
+        for file in ports
+            .desired_deployment
+            .as_ref()
+            .and_then(|id| ports.deployments.get(id))
+            .into_iter()
+            .flat_map(|d| &d.files)
+        {
+            for group in ports
+                .groups
+                .iter()
+                .filter(|g| g.binding.service == file.service && g.binding.protocol == "tcp")
+            {
+                for port in group.first..=group.last {
+                    if let Some(url) = renderer.render(port, &file.service)? {
+                        println!("Preview {}: {}", file.service, url.url);
+                    }
+                }
             }
         }
+        let service_to_component = app_service_component_map(&full.state);
+        let mut ps_cmd = ctx.compose()?;
+        ps_cmd.args(["--profile", "*", "ps", "--format", "json"]);
+        let ps_out = ctx.runner.capture(&mut ps_cmd)?;
+        for entry in crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)? {
+            if !active_services.contains(&entry.service) || entry.state != "running" {
+                continue;
+            }
+            for url in &entry.urls {
+                if let Some(comp) = &entry.component {
+                    println!("Service {} ({comp}): {url}", entry.service);
+                } else {
+                    println!("Service {}: {url}", entry.service);
+                }
+            }
+        }
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
+        Ok(())
+    })();
+    // Reap only this invocation's stopped image inspectors, including failed up.
+    // An unproved actual creator keeps the inspectors and its durable intent.
+    if !ledger.launch_pending || ledger.launch_finished {
+        let cleanup =
+            crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner);
+        if result.is_ok() {
+            cleanup?;
+        } else if let Err(error) = cleanup {
+            eprintln!("devkit: image inspection recovery retained: {error:#}");
+        }
     }
-    assert_compose_inventory(&ctx.admission.root, &inventory)?;
-    Ok(())
+    result
 }
 
 fn app_service_component_map(state: &ProjectState) -> BTreeMap<String, String> {
@@ -2698,7 +3049,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
         .components
         .values()
         .any(|c| c.role == Role::App);
-    let services =
+    let mut services =
         if !has_apps && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none() {
             Vec::new()
         } else {
@@ -2720,6 +3071,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
             let out = ctx.runner.capture(&mut command)?;
             crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?
         };
+    crate::stand::preview::enrich_status(&ctx.admission.root, &ctx.project, runner, &mut services)?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
     ctx.admission.recheck()?;
@@ -2744,7 +3096,15 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
             let url_suffix = if svc.urls.is_empty() {
                 String::new()
             } else {
-                format!(" -> {}", svc.urls.join(", "))
+                format!(
+                    " -> {}",
+                    svc.urls
+                        .iter()
+                        .chain(&svc.preview.preview_urls)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             };
             lines.push(format!(
                 "Service {}{}: {}{}{}",

@@ -15,6 +15,7 @@ import tempfile
 import tarfile
 import time
 import unittest
+import urllib.request
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
@@ -213,7 +214,7 @@ def accept_runtime(root, native=False, package_profiles=None):
             name = area + "/" + path.name
             role = "app" if area == "apps" else "library"
             default_lib_profile = package_profiles.get(name) or previous.get(name, {}).get("toolingProfile") or "react-library"
-            profile = "rust" if rust else "node" if role == "app" else default_lib_profile
+            profile = "rust" if rust else package_profiles.get(name, "node") if role == "app" else default_lib_profile
             default_template = "rust-api" if rust else "node-api" if role == "app" else (
                 profile if profile in ("ts-library", "react-ui") else "react-client")
             components[name] = {"role": role, "toolchain": "rust" if rust else "node",
@@ -312,7 +313,7 @@ elif argv == ['info', '--format', '{{.OSType}}']:
 elif argv[0] == 'compose' and 'config' in argv:
     print(json.dumps({'services': {'api': {}}}))
 elif argv[0] == 'compose' and 'ps' in argv:
-    print('COMPAT_STATUS_READY')
+    print(json.dumps({'ID': 'a'*64, 'Service': 'api', 'Name': 'COMPAT_STATUS_READY', 'State': 'running', 'Status': 'Up'}))
 else:
     print('unexpected Docker query: '+repr(argv), file=sys.stderr)
     sys.exit(90)
@@ -485,6 +486,142 @@ class RuntimeTests(unittest.TestCase):
         name = "devkit-runtime-test-" + self.token + "-" + str(len(self.resources))
         self.resources.append(name)
         return name
+
+    def test_make_aggregate_without_display_skips_desktop_before_its_library_prerequisites(self):
+        # Exercise the real public Make DAG with a controlled task boundary;
+        # SDK/browser behavior is covered separately by packaged consumers.
+        write_fixture(self.root, apps=("web", "desktop"), packages=("desktop-only",))
+        package = self.root / "apps/desktop/package.json"
+        native = json.loads(package.read_text())
+        native["dependencies"] = {"devkit-test-desktop-only": "workspace:*"}
+        package.write_text(json.dumps(native))
+        accept_runtime(self.root, native=True, package_profiles={"apps/web": "web", "apps/desktop": "electron"})
+        loader = self.base / "dag-probe.sh"
+        loader.write_text('printf "%s:%s\\n" "$DEVKIT_TARGET_COMPONENT" "$1"\ncase "$DEVKIT_TARGET_COMPONENT:$1" in packages/desktop-only:build) exit 42 ;; apps/desktop:dev) exit 98 ;; esac\n')
+        override = "devkit_loader=" + str(loader)
+        environment = dict(env(), DISPLAY="")
+        aggregate = self.make("up", override, env=environment)
+        self.assertIn("skipping Electron app desktop", aggregate.stderr)
+        self.assertIn("apps/web:dev", aggregate.stdout)
+        self.assertNotIn("packages/desktop-only", aggregate.stdout)
+        for args in [("up", "app=desktop"), ("dev-desktop",), ("up", "headless=1"), ("up", "DEVKIT_REGISTERED_APPS=desktop")]:
+            selected = self.make(*args, override, env=environment, check=False)
+            self.assertNotEqual(selected.returncode, 0)
+            self.assertIn("42", selected.stderr)
+            self.assertIn("packages/desktop-only:build", selected.stdout)
+
+    def preview_fixture(self):
+        write_fixture(self.root)
+        accept_runtime(self.root, package_profiles={"apps/main": "web"})
+        labels = {LABEL: self.token}
+        service = {"image": "${DEVKIT_NODE_IMAGE:?}", "command": ["node", "-e",
+            "require('node:http').createServer((q,s)=>s.end(require('node:fs').readFileSync(process.env.DEVKIT_PREVIEW_HOSTS_FILE))).listen(8888,'0.0.0.0')"],
+            "ports": [{"target": 8888, "published": "0", "host_ip": "127.0.0.1"}],
+            "volumes": [{"type": "bind", "source": str(self.root), "target": "/workspace", "read_only": True}],
+            "labels": labels}
+        (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": service}, "networks": {"default": {"labels": labels}}}))
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        self.resources.append(project + "-main-1")
+        self.projects.append((project, self.root, "unused-" + self.token))
+        return service, project
+
+    def test_preview_metadata_is_literal_readonly_and_status_uses_applied_snapshot(self):
+        service, project = self.preview_fixture()
+        (self.root / "preview.env").write_text("DEVKIT_ALLOWED_HOSTS=from-file.example.test\n")
+        spec = json.loads((self.root / "compose.yaml").read_text())
+        spec["services"]["main"]["env_file"] = [str(self.root / "preview.env")]
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}-{service}-{branch}.example.test/path?q=$literal", DEVKIT_ALLOWED_HOSTS="from-host.example.test", VITE_ALLOWED_HOSTS="extra.example.test")
+        self.make("setup", env=environment)
+        launched = self.make("up", "app=main", env=environment)
+        receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
+        file = receipt["previewFiles"][0]
+        port = receipt["groups"][0]["first"]
+        self.assertIn(f"https://{port}-main-checkout-with-space.example.test/path?q=$literal", launched.stdout)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=3) as response:
+            document = json.load(response)
+        self.assertEqual(document, {"schemaVersion": 1, "service": "main", "hosts": [f"{port}-main-checkout-with-space.example.test"]})
+        actual = container(project + "-main-1")
+        self.assertIn("DEVKIT_ALLOWED_HOSTS=from-file.example.test", actual["Config"]["Env"])
+        self.assertIn("VITE_ALLOWED_HOSTS=extra.example.test", actual["Config"]["Env"])
+        self.assertNotIn("DEVKIT_ALLOWED_HOSTS=from-host.example.test", actual["Config"]["Env"])
+        mount = next(m for m in actual["Mounts"] if m["Destination"] == file["slot"])
+        self.assertFalse(mount["RW"])
+        self.assertEqual(actual["Image"], receipt["deployments"][receipt["desiredDeployment"]]["images"]["main"])
+        status = run(str(ENGINE), "status", str(self.root), "--json", env=environment)
+        status = json.loads(status.stdout)["result"]["services"][0]
+        self.assertTrue(status["metadataVerified"])
+        self.assertFalse(status["pendingRestart"])
+        changed = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://new-{port}.example.test")
+        status = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=changed).stdout)["result"]["services"][0]
+        self.assertTrue(status["pendingRestart"])
+        self.assertIn("-main-", status["previewUrls"][0])
+        self.assertIn(".example.test", self.make("status", env=environment).stdout)
+        self.assertEqual(json.loads((self.root / ".devkit/state/stand.active").read_text())["inspections"], {})
+        self.make("up", "app=main", env=environment)
+        repeated = json.loads((self.root / ".devkit/state/ports.json").read_text())
+        self.assertEqual(repeated["deployments"][repeated["desiredDeployment"]]["files"][0], file)
+        self.make("down", env=environment)
+        self.assertTrue(Path(file["source"]).exists())
+        self.make("down", "cleanup=1", env=environment)
+        self.assertFalse(Path(file["source"]).exists())
+
+    def test_preview_fallback_masks_only_proved_rw_tmpfs_and_pins_recursive_provider_images(self):
+        service, project = self.preview_fixture()
+        labels = {LABEL: self.token}
+        spec = json.loads((self.root / "compose.yaml").read_text())
+        service["volumes_from"] = ["provider:ro"]
+        spec["services"]["main"] = service
+        spec["services"]["provider"] = {"image": IMAGE, "command": ["node", "-e", "setInterval(()=>{},1000)"],
+            "volumes": [{"type": "bind", "source": str(self.root), "target": "/run", "read_only": True}], "volumes_from": ["nested:ro"], "labels": labels}
+        spec["services"]["nested"] = {"image": IMAGE, "command": ["node", "-e", "setInterval(()=>{},1000)"], "labels": labels}
+        self.resources.extend([project + "-provider-1", project + "-nested-1"])
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        self.make("up", "app=main", env=environment)
+        receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
+        self.assertEqual(receipt["previewFiles"][0]["slot"], "/devkit/preview-hosts.json")
+        applied = receipt["deployments"][receipt["desiredDeployment"]]
+        self.assertEqual(set(applied["images"]), {"main", "provider", "nested"})
+        for name in applied["images"]:
+            self.assertEqual(container(project + "-" + name + "-1")["Image"], applied["images"][name])
+        self.make("up", "app=main", env=environment)
+        self.make("down", env=environment)
+        # A deeper writable tmpfs masks the unsafe outer source ancestry.
+        service.pop("volumes_from")
+        (self.root / "devkit").mkdir()
+        service["volumes"].extend([{"type": "bind", "source": str(self.root), "target": "/run", "read_only": True}, {"type": "tmpfs", "target": "/run/devkit"}])
+        spec["services"] = {"main": service}
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        self.make("up", "app=main", env=environment)
+        receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
+        applied = receipt["deployments"][receipt["desiredDeployment"]]
+        self.assertEqual(applied["files"][0]["slot"], "/run/devkit/preview-hosts.json")
+        self.make("down", "cleanup=1", env=environment)
+
+    def test_preview_image_symlinks_fail_before_actual_launch_or_claims(self):
+        service, project = self.preview_fixture()
+        (self.root / "Dockerfile").write_text("FROM " + IMAGE + "\nRUN rm -rf /run /devkit && ln -s /workspace /run && ln -s /workspace /devkit\n")
+        service["build"] = {"context": str(self.root)}
+        service["image"] = "devkit-preview-proof-" + self.token
+        spec = json.loads((self.root / "compose.yaml").read_text())
+        spec["services"]["main"] = service
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        try:
+            result = self.make("up", "app=main", env=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("No provably safe", result.stderr)
+            self.assertIsNone(container(project + "-main-1"))
+            registry = self.base / "cache/port-leases.json"
+            if registry.exists():
+                self.assertEqual(json.loads(registry.read_text())["claims"], [])
+            self.assertEqual(json.loads((self.root / ".devkit/state/stand.active").read_text())["inspections"], {})
+            self.make("down", "cleanup=1", env=environment)
+        finally:
+            run("docker", "image", "rm", service["image"], check=False)
 
     def test_actual_bind_race_retries_only_the_automatic_endpoint(self):
         write_fixture(self.root)

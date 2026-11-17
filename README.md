@@ -80,10 +80,24 @@ make sync
 | `make build`       | Build the registered components                                           |
 | `make package`     | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) |
 | `make dev app=web` | Start one application's development service                               |
-| `make status`      | Show services and their local ports                                       |
+| `make status`      | Show local URLs, preview URLs and applied stand state                     |
 | `make down`        | Stop services while preserving data volumes                               |
 
 Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
+
+Host ports are leased per checkout and survive `make down`. Concurrent Git worktrees receive separate ports; `make down cleanup=1` also releases that checkout's leases while preserving data volumes. The default automatic range is `10000-19999`, configurable with `DEVKIT_PORT_RANGE=A-B`.
+
+For a reverse proxy that routes published host ports, set a vendor-neutral template before starting the stand:
+
+```sh
+export DEVKIT_PREVIEW_URL_TEMPLATE='https://{port}-{service}-{branch}.preview.example.com'
+make up app=web
+make status
+```
+
+Placeholders are `{port}`, `{service}`, `{branch}` and `{slug}` (the last two use the same DNS-safe branch slug). Configure routing and TLS in your proxy. Devkit prints the URLs and passes exact frontend hosts to its Vite plugin. See [development stands](docs/workflows.md#development-stands-and-preview-urls) for custom images and status semantics.
+
+`init --preset fullstack-web` creates a Rust API and React web app. To connect another frontend to a registered Node or Rust API, use `add-app --name dashboard --template react-web --api api`. Aggregate `make up` skips Electron apps without `DISPLAY`; use `headless=1` to include them through Xvfb.
 
 Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 

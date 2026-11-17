@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { within } from './paths.js';
+import { previewServerPatch, hostAllowed } from './preview.js';
+import { hmrRecovery } from './hmr.js';
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -175,13 +177,18 @@ function collectWorkspaceSourceMap(startDir) {
 
 export function devkitWorkspaceSource(projectDir) {
   let activeSourceMap = new Map();
+  let active = false;
+  let allowedHosts = [];
+  const recovery = hmrRecovery();
 
   return {
     name: 'devkit:workspace-source',
     enforce: 'pre',
     apply: 'serve',
     config(userConfig, env) {
-      if (env && env.command !== 'serve') {
+      active = env?.command === 'serve' && !process.env.VITEST;
+      recovery.configure(userConfig, active);
+      if (!active) {
         activeSourceMap = new Map();
         return undefined;
       }
@@ -189,8 +196,10 @@ export function devkitWorkspaceSource(projectDir) {
       const { projectRoot, sourceMap, allowedDirs, excludedDeps } =
         collectWorkspaceSourceMap(appRoot);
       activeSourceMap = sourceMap;
+      const server = previewServerPatch(userConfig?.server);
+      allowedHosts = server.allowedHosts;
       if (!projectRoot || excludedDeps.size === 0) {
-        return undefined;
+        return { server };
       }
       const existingAllow = Array.isArray(userConfig?.server?.fs?.allow)
         ? userConfig.server.fs.allow
@@ -200,6 +209,7 @@ export function devkitWorkspaceSource(projectDir) {
         : [];
       return {
         server: {
+          ...server,
           fs: {
             allow: [...new Set([...existingAllow, projectRoot, appRoot, ...allowedDirs])],
           },
@@ -208,6 +218,22 @@ export function devkitWorkspaceSource(projectDir) {
           exclude: [...new Set([...existingExclude, ...excludedDeps])],
         },
       };
+    },
+    configureServer(server) {
+      if (!active) {
+        return;
+      }
+      server.middlewares.use((request, response, next) => {
+        if (hostAllowed(request.headers.host, allowedHosts)) {
+          next();
+          return;
+        }
+        response.statusCode = 403;
+        response.end('Blocked request: host is not allowed.');
+      });
+    },
+    transform(code, id) {
+      return recovery.transform(code, id, (message) => this.warn(message));
     },
     resolveId(source) {
       if (activeSourceMap.size === 0 || typeof source !== 'string') {

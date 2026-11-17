@@ -9,6 +9,7 @@ export DEVKIT_CLEANUP := $(or $(cleanup),0)
 export DEVKIT_SYNC_RECONCILE := $(or $(reconcile),0)
 export DEVKIT_SYNC_PREVIEW := $(or $(preview),0)
 export DEVKIT_PACKAGE_AGGREGATE := 0
+export DEVKIT_DEV_AGGREGATE := 0
 export DEVKIT_TARGET_COMPONENT :=
 export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.json 2>/dev/null))
 
@@ -20,7 +21,9 @@ devkit_package_valid := $(if $(strip $(package)),$(if $(findstring %,$(package))
 devkit_selectors_valid := $(if $(and $(strip $(app)),$(strip $(package))),,$(and $(devkit_app_valid),$(devkit_package_valid)))
 devkit_dev_selectors_valid := $(if $(strip $(package)),,$(devkit_app_valid))
 
-devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(strip $(app)),$(app),$(DEVKIT_REGISTERED_APPS)),)
+devkit_dev_aggregate := $(if $(strip $(app)),0,$(if $(word 2,$(DEVKIT_REGISTERED_APPS)),1,0))
+devkit_skipped_desktop := $(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(if $(DISPLAY),,$(DEVKIT_DESKTOP_APPS))))
+devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(strip $(app)),$(app),$(filter-out $(devkit_skipped_desktop),$(DEVKIT_REGISTERED_APPS))),)
 devkit_selected_packages := $(if $(devkit_selectors_valid),$(if $(strip $(package)),$(package),$(DEVKIT_REGISTERED_PACKAGES)),)
 devkit_targets = $(if $(devkit_selectors_valid),$(if $(strip $(app)),$(addprefix $(1)-,$(app)),$(if $(strip $(package)),$(addprefix $(1)/packages/,$(package)),$(addprefix $(1)-,$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
 
@@ -40,7 +43,11 @@ build: $(call devkit_targets,build)
 setup check fix test build:
 	@exec sh $(devkit_loader) snapshot
 
-dev up: $(addprefix dev-,$(devkit_selected_apps))
+dev up: export DEVKIT_DEV_AGGREGATE := $(devkit_dev_aggregate)
+dev up: devkit-dev-selection $(addprefix dev-,$(devkit_selected_apps))
+.PHONY: devkit-dev-selection
+devkit-dev-selection:
+	@$(foreach desktop,$(devkit_skipped_desktop),printf '%s\n' 'devkit: warning: skipping Electron app $(desktop) without DISPLAY; use headless=1 or app=$(desktop).' >&2;):
 dev up:
 	@exec sh $(devkit_loader) dev-snapshot
 package: export DEVKIT_PACKAGE_AGGREGATE := $(if $(strip $(app)$(package)),0,1)

@@ -153,6 +153,16 @@ pub struct Ports {
     pub groups: Vec<Group>,
     pub retained: Vec<Group>,
     pub allocation_intent: bool,
+    #[serde(default)]
+    pub preview_files: Vec<super::preview::HostFile>,
+    #[serde(default)]
+    pub preview_renderer: Option<super::preview::Renderer>,
+    #[serde(default)]
+    pub deployments: std::collections::BTreeMap<String, super::preview::Deployment>,
+    #[serde(default)]
+    pub desired_deployment: Option<String>,
+    #[serde(default)]
+    pub service_desired: std::collections::BTreeMap<String, String>,
 }
 impl Ports {
     pub fn read(root: &Path) -> Result<Option<Self>> {
@@ -187,6 +197,11 @@ impl Ports {
             groups: Vec::new(),
             retained: Vec::new(),
             allocation_intent: false,
+            preview_files: Vec::new(),
+            preview_renderer: None,
+            deployments: std::collections::BTreeMap::new(),
+            desired_deployment: None,
+            service_desired: std::collections::BTreeMap::new(),
         };
         value.save()?;
         Ok(value)
@@ -212,6 +227,17 @@ impl Ports {
         seed: &str,
         active: &ActivePorts,
         retry: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.allocate_with(declarations, primary, seed, active, retry, |_| Ok(()))
+    }
+    pub fn allocate_with(
+        &mut self,
+        declarations: &[Binding],
+        primary: Option<&str>,
+        seed: &str,
+        active: &ActivePorts,
+        retry: &BTreeSet<String>,
+        before_claims: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         ensure!(declarations.len() <= 65535, "Too many published bindings");
         for binding in declarations {
@@ -369,6 +395,7 @@ impl Ports {
                 .cloned(),
         );
         self.groups = next;
+        before_claims(self)?;
         self.allocation_intent = true;
         self.save()?;
         registry.claims.retain(|c| c.owner.key != self.owner.key);
@@ -390,6 +417,7 @@ impl Ports {
         self.save()
     }
     pub fn release(&self) -> Result<()> {
+        super::preview::collect_files(&self.owner.root, &self.owner, &BTreeSet::new())?;
         let _lock = Registry::lock(&self.cache_root)?;
         let mut registry = Registry::read(&self.cache_root)?;
         registry.claims.retain(|c| c.owner.key != self.owner.key);

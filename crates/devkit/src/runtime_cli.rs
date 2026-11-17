@@ -76,6 +76,10 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             &env_string("DEVKIT_CLEANUP").unwrap_or_else(|| "0".into()),
             "cleanup",
         )?;
+        request.dev_aggregate = boolean(
+            &env_string("DEVKIT_DEV_AGGREGATE").unwrap_or_else(|| "0".into()),
+            "dev_aggregate",
+        )?;
         request.package_aggregate = boolean(
             &env_string("DEVKIT_PACKAGE_AGGREGATE").unwrap_or_else(|| "0".into()),
             "package_aggregate",

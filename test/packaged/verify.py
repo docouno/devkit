@@ -327,7 +327,7 @@ class Verification:
         release = release or self.release
         selected_version = json.loads((release / "release.json").read_text())["version"]
         selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
-                      "rust": ["--app", "api=rust-api"], "fullstack": ["--preset", "fullstack-desktop"],
+                      "rust": ["--app", "api=rust-api"], "fullstack-web": ["--preset", "fullstack-web"], "fullstack": ["--preset", "fullstack-desktop"],
                       "tslib": ["--template", "ts-library"], "design-system": ["--preset", "design-system"]}
         arguments = [*selections[kind], "--name", f"verification-{kind}"]
         if not self.public_bootstrap or self.package_source != "registry":
@@ -560,6 +560,94 @@ class Verification:
         with changed_files({path: "" for path in tests}):
             self.make(root, "test", "package=client", expected="No test suite found", label="library-empty-tests-rejected")
 
+    def starter_bind_options(self, root, kind):
+        pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
+        image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else (root / ".devkit/state/rust-image").read_text().strip()
+        command = ["node", "/workspace/apps/main/dist/index.js"] if kind == "node" else ["/workspace/apps/api/target/debug/devkit-api"]
+        common = ["--pull", "never", "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
+                  "--network", "none", "--read-only", "--volume", f"{root}:/workspace:ro,z"]
+        name = f"devkit-packaged-{self.token}-{kind}-bind-zero"
+        self.containers.append(name)
+        self.run(kind + "-ephemeral-bind-start", ["docker", "run", "--detach", "--init", "--name", name, *common, "--env", "HOST=127.0.0.1", "--env", "PORT=0", image, *command])
+        logs = ""
+        for _ in range(50):
+            logs = self.run(kind + "-ephemeral-bind-logs", ["docker", "logs", name])
+            if re.search(r"127\.0\.0\.1:([1-9][0-9]*)", logs):
+                break
+            time.sleep(0.1)
+        match = re.search(r"127\.0\.0\.1:([1-9][0-9]*)", logs)
+        require(match and 0 < int(match.group(1)) <= 65535, "Starter did not log its actual ephemeral bind")
+        self.run(kind + "-ephemeral-bind-stop", ["docker", "stop", "--time", "5", name])
+        require(self.inspect("container", name)["State"]["ExitCode"] == 0, "Starter signal shutdown failed")
+        self.run(kind + "-ephemeral-bind-remove", ["docker", "rm", name])
+        for index, (key, value) in enumerate([("PORT", ""), ("PORT", "65536"), ("PORT", "invalid"), ("HOST", "")]):
+            name = f"devkit-packaged-{self.token}-{kind}-invalid-bind-{index}"
+            self.containers.append(name)
+            self.run(kind + f"-invalid-bind-{index}", ["docker", "run", "--name", name, *common, "--env", key + "=" + value, image, *command], expected=key)
+            self.run(kind + f"-invalid-bind-remove-{index}", ["docker", "rm", name])
+
+    def fullstack_web(self):
+        root = self.create("fullstack-web", "g-fullstack-web", release=self.manager)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(set(state["components"]) == {"apps/api", "apps/web"}, "Web preset added desktop/library components")
+        self.make(root, "setup", label="fullstack-web-setup")
+        self.make(root, "up", "app=web", label="fullstack-web-selected-start")
+        api, web = self.service(root, "api"), self.service(root, "web")
+        self.http(self.port(web, 5173), "/api/greeting?name=Connected", {"message": "Hello, Connected!"})
+        self.make(root, "down", label="fullstack-web-stop")
+        before = source_snapshot(root)
+        self.run("invalid-api-connection", self.cli(self.manager, "add-app", root, "--name", "dashboard", "--template", "react-web", "--api", "web"), expected="Node or Rust API")
+        require(source_snapshot(root) == before and not (root / "apps/dashboard").exists(), "Invalid API add changed product state")
+        self.run("connected-api-add", self.cli(self.manager, "add-app", root, "--name", "dashboard", "--template", "react-web", "--api", "api"))
+        self.make(root, "setup", label="connected-add-setup")
+        self.make(root, "up", "app=dashboard", label="connected-add-selected-start")
+        dashboard = self.service(root, "dashboard")
+        self.http(self.port(dashboard, 5173), "/api/greeting?name=Dashboard", {"message": "Hello, Dashboard!"})
+        self.starter_bind_options(root, "rust")
+        self.make(root, "down", "cleanup=1", label="connected-add-cleanup")
+        require(not (root / ".devkit/state/ports.json").exists(), "Connected cleanup retained port claims")
+        self.results.append({"label": "fullstack-web-and-transactional-api-add", "passed": True})
+        node = self.create("node", "h-new-node-bind", release=self.manager)
+        self.make(node, "setup", "build", label="new-node-bind-build")
+        self.starter_bind_options(node, "node")
+
+    def preview_transport(self, root):
+        """Consume the actual released plugin in separate server/browser namespaces."""
+        output = self.receipt / "preview-transport"
+        output.mkdir()
+        server = f"devkit-packaged-{self.token}-preview-server"
+        browser = f"devkit-packaged-{self.token}-preview-browser"
+        self.containers.extend([server, browser])
+        pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
+        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        common = ["--detach", "--pull", "never", "--label", f"{OWNERSHIP}={self.token}",
+                  "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:rw,exec,mode=1777,size=512m",
+                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                  "--cpus", "1", "--memory", "768m", "--pids-limit", "256",
+                  "--volume", f"{root}:/workspace:ro,z", "--volume", f"{Path(__file__).parent}:/harness:ro,z",
+                  "--volume", f"{output}:/evidence:z", "--env", "HOME=/tmp/devkit-preview-home"]
+        self.run("preview-server-start", ["docker", "run", "--name", server, *common, pins["DEVKIT_NODE_IMAGE"], "node", "/harness/preview-server.mjs"])
+        deadline = time.monotonic() + 20
+        while not (output / "server-ready.json").is_file() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        require((output / "server-ready.json").is_file(), "Preview Vite server did not become ready")
+        captured = self.inspect("container", server)
+        address = captured["NetworkSettings"]["Networks"]["bridge"]["IPAddress"]
+        require(address, "Preview server has no isolated namespace address")
+        self.run("preview-browser-start", ["docker", "run", "--name", browser, *common,
+                 "--add-host", f"preview.test:{address}", "--shm-size", "256m",
+                 "--security-opt", f"seccomp={root}/.devkit/runtime/desktop-seccomp.json",
+                 "--volume", f"{self.electron_runtime(root)}:/electron:ro,z",
+                 "--env", f"PROBE_PROXY_ADDRESS={address}", image, "timeout", "120s", "node", "/harness/preview-browser.mjs"])
+        result = self.run("preview-browser-wait", ["docker", "wait", browser], timeout=130).strip()
+        self.run("preview-browser-logs", ["docker", "logs", browser])
+        require(result == "0" and (output / "result.json").is_file(), "Preview browser transport failed")
+        evidence = json.loads((output / "result.json").read_text())
+        require(evidence["passed"] and len(evidence["results"]) == 14, "Incomplete preview browser matrix")
+        self.results.append({"label": "preview-first-handshake-and-host-guard", "passed": True, "result": evidence})
+        for name in (browser, server):
+            self.run("preview-stop-" + name.rsplit("-", 1)[-1], ["docker", "rm", "--force", name])
+
     def fullstack(self, root, node):
         require(root.name == node.name and self.project_name(root) != self.project_name(node), "Same-name isolation fixture invalid")
         # Product-owned Compose override exposes no inspector on the host; the
@@ -609,6 +697,8 @@ class Verification:
             for mode, label in (("production-web", "production-web"), ("packaged-desktop", "packaged-desktop")):
                 helper = self.helper(root, mode, api, marker, label, packaged=extracted)
                 self.helper_finish(helper, label)
+        if pnpm_project(root):
+            self.preview_transport(root)
         self.make(root, "status", label="fullstack-status")
         self.make(root, "logs", "tail=10", label="fullstack-finite-logs", timeout=30)
         self.make(node, "down", label="node-development-down")
@@ -1048,6 +1138,8 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
+            if semver_tuple(json.loads((self.manager / "release.json").read_text())["version"]) >= (0, 5, 0):
+                self.fullstack_web()
             self.electron_cache_corruption(fullstack)
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:

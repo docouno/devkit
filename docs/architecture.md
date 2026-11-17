@@ -73,3 +73,13 @@ Containerized builds and test suites frequently run on shared CI runners or nest
 - **Lock-free**: `devkit doctor`, `devkit catalog`, `devkit --version`, and `devkit --help` never acquire `task.lock`.
 - **Shared lock (`LOCK_SH`)**: `devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs` (releasing the lock before `--follow` begins streaming), and read-only `devkit exec` run concurrently across terminals and automation agents.
 - **Exclusive lock (`LOCK_EX`)**: Mutating and build tasks write `.devkit/state/task.owner.json` (`pid`, `/proc/<pid>/stat` start ticks, operation name) so concurrent invocations wait adaptively up to `DEVKIT_LOCK_TIMEOUT_MS` (default `120000` ms) while detecting recursive self-deadlocks immediately.
+
+## Host-local development stand authority
+
+Tracked Make/Compose projections describe components and port intent. A checkout-owned, ignored stand override supplies host leases, ownership labels, preview metadata and inspected image pins. Checkout locking precedes the shared cache registry lock; Docker, image builds and network operations never execute under the registry lock. Durable local intent precedes global claims and container creation. Physical checkout identity plus an incarnation nonce prevents a recreated directory from inheriting old ownership. Controlled transactions transfer the verified epoch; unexplained state cannot become fresh by deleting a marker.
+
+Stand observations are scoped to the Compose project and verify exact ownership before removal or socket reuse. Ordinary down retains leases. Cleanup releases only after owned containers and inspection helpers are proven absent, without deleting service volumes. Unknown/unfinished creators keep recovery state. Desired deployments and container-labelled applied deployments retain immutable host files until their last reference disappears.
+
+Preview host authority comes from registered frontend profiles and final normalized TCP bindings. A bounded image-only acquisition phase follows runtime volume providers and build-context dependencies, then proves a literal metadata slot against pinned image ancestry and all mount providers. The launch overlay disables build/pull for inspected images, pins external provider IDs, and is normalized again before up. Status validates observed image, reserved environment, read-only bind and file digest against the applied deployment.
+
+`development.api` is a service relationship, not an import edge. Modern projections add required startup ordering; the development Make DAG includes both frontend and connected API library builds while preserving native library dependency ordering. Historical `0.4.x` projection bytes remain compatible.

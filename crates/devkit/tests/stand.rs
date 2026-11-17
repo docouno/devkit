@@ -318,3 +318,112 @@ fn transaction_commit_and_rollback_carry_forward_the_exact_leased_history() {
         assert!(!root.path().join(".devkit/update-pending.json").exists());
     }
 }
+
+#[test]
+fn preview_renderer_covers_tcp_replicas_and_rejects_ambiguous_authorities() {
+    use devkit::stand::preview::*;
+    let renderer = Renderer::new(
+        Some("https://{port}-{service}-{slug}.example.test/path?q=$literal".into()),
+        "Feature/Some work",
+    )
+    .unwrap();
+    assert_eq!(renderer.branch_slug, "feature-some-work");
+    assert_eq!(dns_slug(&"a".repeat(100)).len(), 63);
+    for raw in [
+        "https://*.example.test",
+        "https://user@example.test",
+        "https://example.test:0",
+        "file://example.test",
+        "https://{unknown}.test",
+        "https://host name.test",
+    ] {
+        assert!(Renderer::new(Some(raw.into()), "main").is_err(), "{raw}");
+    }
+    assert_eq!(local_url("::", 1234), "http://[::1]:1234");
+    assert_eq!(local_url("localhost", 1234), "http://localhost:1234");
+    let mut groups = vec![Group {
+        binding: bindings(2).remove(0),
+        first: 12340,
+        last: 12341,
+        automatic: true,
+    }];
+    groups[0].binding.target = 8888;
+    let (document, primary) = HostsDocument::render("web", &groups, &renderer).unwrap();
+    assert_eq!(
+        document.hosts,
+        vec![
+            "12340-web-feature-some-work.example.test",
+            "12341-web-feature-some-work.example.test"
+        ]
+    );
+    assert!(primary.unwrap().ends_with("/path?q=$literal"));
+    groups[0].binding.protocol = "udp".into();
+    assert!(
+        HostsDocument::render("web", &groups, &renderer)
+            .unwrap()
+            .0
+            .hosts
+            .is_empty()
+    );
+}
+
+#[test]
+fn preview_file_publication_precedes_claims_and_is_immutable() {
+    use devkit::stand::{inspection::Proof, preview::*};
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut ports = Ports::open(root.path(), cache.path()).unwrap();
+    let renderer = Renderer::new(Some("https://{port}.example.test".into()), "main").unwrap();
+    let proof = Proof {
+        slots: std::collections::BTreeMap::from([("web".into(), SLOTS[0].into())]),
+        images: Default::default(),
+        external: Default::default(),
+    };
+    ports
+        .allocate_with(
+            &bindings(2),
+            Some("web"),
+            "seed",
+            &Default::default(),
+            &Default::default(),
+            |p| {
+                publish_deployment(
+                    p,
+                    &BTreeSet::from(["web".into()]),
+                    &BTreeSet::from(["web".into()]),
+                    &renderer,
+                    &proof,
+                )
+            },
+        )
+        .unwrap();
+    let file = ports.preview_files[0].clone();
+    file.validate(root.path(), &ports.owner).unwrap();
+    let bytes = fs::read(&file.source).unwrap();
+    publish_deployment(
+        &mut ports,
+        &BTreeSet::from(["web".into()]),
+        &BTreeSet::from(["web".into()]),
+        &renderer,
+        &proof,
+    )
+    .unwrap();
+    assert_eq!(fs::read(&file.source).unwrap(), bytes);
+    let web_desired = ports.service_desired["web"].clone();
+    publish_deployment(
+        &mut ports,
+        &BTreeSet::new(),
+        &BTreeSet::from(["api".into()]),
+        &renderer,
+        &proof,
+    )
+    .unwrap();
+    assert_eq!(ports.service_desired["web"], web_desired);
+    assert_ne!(ports.service_desired["api"], web_desired);
+    prune(&mut ports, &[]).unwrap();
+    assert!(file.source.exists());
+    fs::write(&file.source, b"{}").unwrap();
+    assert!(file.validate(root.path(), &ports.owner).is_err());
+    ports.release().unwrap();
+    assert!(!file.source.exists());
+}

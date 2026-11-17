@@ -10,6 +10,16 @@
       "profiles": ["node", "web", "electron", "react-library", "ts-library", "react-ui"],
       "docPath": "docs/migrations/0.5.0.md",
       "anchor": "migrate-node-workspaces-to-pnpm"
+    },
+    {
+      "id": "development-stands",
+      "version": "0.5.0",
+      "severity": "recommended",
+      "title": "Review sticky ports and preview behavior",
+      "summary": "Review retained host-port leases, preview routing and connected frontend startup; project-owned source and Vite configuration remain unchanged.",
+      "profiles": ["node", "web", "electron", "rust"],
+      "docPath": "docs/migrations/0.5.0.md",
+      "anchor": "sticky-ports-preview-and-connected-stands"
     }
   ]
 }

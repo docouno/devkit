@@ -2,6 +2,10 @@ export interface DevkitViteUserConfig {
   readonly root?: string | undefined;
   readonly server?:
     | {
+        readonly allowedHosts?: readonly string[] | true | undefined;
+        readonly proxy?: Readonly<Record<string, string | object>> | undefined;
+        readonly hmr?: boolean | object | undefined;
+        readonly ws?: boolean | object | undefined;
         readonly fs?:
           | {
               readonly allow?: readonly string[] | undefined;
@@ -23,11 +27,16 @@ export interface DevkitViteConfigEnv {
 
 export interface DevkitViteConfigPatch {
   readonly server: {
-    readonly fs: {
-      readonly allow: string[];
-    };
+    readonly allowedHosts?: string[] | true | undefined;
+    readonly proxy?:
+      Record<string, { target?: string; changeOrigin?: boolean; ws?: boolean }> | undefined;
+    readonly fs?:
+      | {
+          readonly allow: string[];
+        }
+      | undefined;
   };
-  readonly optimizeDeps: {
+  readonly optimizeDeps?: {
     readonly exclude: string[];
   };
 }
