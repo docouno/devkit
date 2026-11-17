@@ -46,7 +46,6 @@ pub struct RuntimeRequest {
     pub headless: bool,
     pub cleanup: bool,
     pub package_aggregate: bool,
-    pub dev_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
     pub cache_dir: Option<PathBuf>,
@@ -63,7 +62,6 @@ impl RuntimeRequest {
             headless: false,
             cleanup: false,
             package_aggregate: false,
-            dev_aggregate: false,
             follow: false,
             tail: 100,
             cache_dir: None,
@@ -2058,11 +2056,11 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         "Accepted runtime changed during cleanup"
     );
     crate::stand::clear_overlay(root)?;
-    if let Some(ports) = ports {
-        ports.release()?;
-    }
     if ledger.is_some() {
         remove_file(&safe_path(root, crate::stand::ledger::ACTIVE)?)?;
+    }
+    if let Some(ports) = ports {
+        ports.release()?;
     }
     Ok(true)
 }
@@ -2213,17 +2211,14 @@ fn run_service(
         ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
         crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
     }
-    let stand_rows = if request.command == "down" && request.cleanup {
+    if request.command == "down" && request.cleanup {
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if !rows.is_empty() {
             let ports = crate::stand::ports::Ports::read(&ctx.admission.root)?
                 .context("Stand origin is unknown; inspect containers and run make down explicitly before cleanup")?;
             crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
         }
-        Some(rows)
-    } else {
-        None
-    };
+    }
     match request.command.as_str() {
         "down" => {
             command.args(["--profile", "*", "down"]);
@@ -2298,13 +2293,13 @@ fn run_service(
     if request.command == "down" {
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if request.cleanup {
-            if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
+            if let Some(mut ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
                 crate::stand::ledger::remove_owned(&rows, &ctx.project, &ports.owner, ctx.runner)?;
-                ports.release()?;
+                ports.possible_actors = false;
+                ports.save()?;
             } else {
                 ensure!(rows.is_empty(), "Unknown stand remnants remain");
             }
-            let _ = stand_rows;
         }
         if !request.cleanup
             && rows.is_empty()
@@ -2338,6 +2333,9 @@ fn run_service(
         }
         if request.cleanup {
             crate::stand::clear_overlay(&ctx.admission.root)?;
+            if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
+                ports.release()?;
+            }
         }
     }
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
@@ -2428,9 +2426,6 @@ fn preview_forwarding_presence(
         "VITE_ALLOWED_HOSTS",
         "DEVKIT_API_TARGET",
     ];
-    if !keys.iter().any(|key| std::env::var(key).is_ok()) {
-        return Ok(());
-    }
     let mut services = serde_json::Map::new();
     for name in frontends {
         let service = &model["services"][name];
@@ -2644,8 +2639,6 @@ fn run_development(
         .context("Missing host resource budget; prerequisite not checked")?;
     let declarations = crate::stand::ports::declarations(&model, &active_services)?;
     let mut ports = crate::stand::ports::Ports::open(&ctx.admission.root, &ctx.cache_root()?)?;
-    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
-    let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
     for name in &active_services {
         if let Some(label) = model
             .pointer("/services")
@@ -2700,9 +2693,24 @@ fn run_development(
     let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
     ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
     crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
+    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+    let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
+    let stopped = |rows: &[crate::stand::ledger::Container]| {
+        active_services
+            .iter()
+            .filter(|name| !rows.iter().any(|row| &row.service == *name))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
     let proof = if renderer.template.is_some() && !carrier_frontends.is_empty() {
+        let mount_inputs =
+            crate::stand::inspection::mount_dependencies(&model, &carrier_frontends)?;
+        ensure!(
+            mount_inputs.is_subset(&active_services),
+            "Inactive preview mount provider"
+        );
         let mut references = BTreeMap::new();
-        for name in crate::stand::inspection::closure(&model, &active_services)? {
+        for name in crate::stand::inspection::image_dependencies(&model, &mount_inputs)? {
             let image = if let Some(image) = model["services"][&name]["image"].as_str() {
                 image.to_owned()
             } else {
@@ -2750,7 +2758,7 @@ fn run_development(
         crate::stand::inspection::prepare(
             &mut ports,
             &model,
-            &active_services,
+            &mount_inputs,
             &carrier_frontends,
             &references,
             &mut ledger,
@@ -2768,6 +2776,7 @@ fn run_development(
             crate::stand::ports::Allocation {
                 declarations: &declarations,
                 selected: &active_services,
+                stopped: &stopped(&rows),
                 primary,
                 seed: &branch,
             },
@@ -2780,6 +2789,7 @@ fn run_development(
                     &active_services,
                     &renderer,
                     &proof,
+                    &model,
                 )
             },
         )?;
@@ -2848,23 +2858,13 @@ fn run_development(
                 let output = ctx.runner.capture(&mut normalized)?;
                 crate::stand::inspection::verify_launch(
                     &crate::stand::preview::compose_model(&output.stdout)?,
+                    &model,
                     &ports,
                     &active_services,
                     &proof,
                 )?;
             }
-            command.args([
-                "up",
-                "-d",
-                "--wait",
-                "--pull",
-                if proof.images.is_empty() {
-                    "missing"
-                } else {
-                    "never"
-                },
-                &service,
-            ]);
+            command.args(["up", "-d", "--wait", &service]);
             full.recheck()?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
@@ -2907,6 +2907,7 @@ fn run_development(
                     crate::stand::ports::Allocation {
                         declarations: &declarations,
                         selected: &active_services,
+                        stopped: &stopped(&rows),
                         primary,
                         seed: &branch,
                     },
@@ -2919,6 +2920,7 @@ fn run_development(
                             &active_services,
                             &renderer,
                             &proof,
+                            &model,
                         )
                     },
                 )?;
@@ -2941,6 +2943,19 @@ fn run_development(
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         ledger.observed(&ctx.admission.root, &rows)?;
         ports.reconcile(&rows)?;
+        for service in &active_services {
+            if frontends.contains(service) {
+                ports.service_preview_renderer.remove(service);
+            } else if rows.iter().any(|row| {
+                &row.service == service
+                    && ports.service_desired.get(service) == Some(&row.deployment)
+            }) {
+                // A backend's rendered URL does not change its container configuration.
+                ports
+                    .service_preview_renderer
+                    .insert(service.clone(), renderer.clone());
+            }
+        }
         crate::stand::preview::prune(&mut ports, &rows)?;
         let service_to_component = app_service_component_map(&full.state);
         let mut ps_cmd = ctx.compose()?;
@@ -2948,12 +2963,7 @@ fn run_development(
         let ps_out = ctx.runner.capture(&mut ps_cmd)?;
         let mut entries =
             crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)?;
-        crate::stand::preview::enrich_status(
-            &ctx.admission.root,
-            &ctx.project,
-            ctx.runner,
-            &mut entries,
-        )?;
+        crate::stand::preview::enrich_observed(&ports, &rows, &renderer, &mut entries)?;
         for entry in entries {
             if !active_services.contains(&entry.service) || entry.state != "running" {
                 continue;

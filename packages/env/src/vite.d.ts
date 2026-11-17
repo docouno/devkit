@@ -27,9 +27,6 @@ export interface DevkitViteConfigEnv {
 
 export interface DevkitViteConfigPatch {
   readonly server: {
-    readonly allowedHosts?: string[] | true | undefined;
-    readonly proxy?:
-      Record<string, { target?: string; changeOrigin?: boolean; ws?: boolean }> | undefined;
     readonly fs?:
       | {
           readonly allow: string[];

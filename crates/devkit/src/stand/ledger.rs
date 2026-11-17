@@ -75,7 +75,6 @@ impl Ledger {
             ensure!(value.schema_version == 1, "Unsupported stand ledger schema");
             if let Some(launch) = &value.launch {
                 ensure!(value.launch_pending, "Creator plan has no launch intent");
-                ensure!(!launch.expected.is_empty(), "Empty stand creator plan");
                 let id = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
                 ensure!(
                     launch.before.iter().all(|s| id(s)),
@@ -165,17 +164,10 @@ impl Ledger {
         verify_owners(rows, &self.owner)?;
         let mut expected = BTreeMap::new();
         for service in active {
-            let value = &model["services"][service];
-            let count = value
-                .get("scale")
-                .or_else(|| value.pointer("/deploy/replicas"))
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
-            ensure!(
-                (1..=65535).contains(&count),
-                "Stand replicas must be 1..65535"
-            );
-            expected.insert(service.clone(), count as u16);
+            let count = super::ports::replica_count(&model["services"][service])?;
+            if count > 0 {
+                expected.insert(service.clone(), count);
+            }
         }
         self.launch = Some(LaunchIntent {
             daemon_finished: false,
@@ -300,7 +292,10 @@ fn inspect_query(id: &str, runner: &ProcessRunner, query: Query) -> Result<Conta
         "DEVKIT_PREVIEW_URL",
         "DEVKIT_SERVICE",
         "DEVKIT_BRANCH",
-    ] {
+    ]
+    .into_iter()
+    .chain(super::preview::HOST_ENV_KEYS)
+    {
         format += &format!(
             "\n{{{{$v := \"\"}}}}{{{{range .Config.Env}}}}{{{{if eq (index (split . \"=\") 0) \"{key}\"}}}}{{{{$v = .}}}}{{{{end}}}}{{{{end}}}}{{{{json $v}}}}"
         );
@@ -313,9 +308,9 @@ fn inspect_query(id: &str, runner: &ProcessRunner, query: Query) -> Result<Conta
         .lines()
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<Value>, _>>()?;
-    ensure!(lines.len() == 17, "Invalid bounded stand observation");
+    ensure!(lines.len() == 19, "Invalid bounded stand observation");
     let mut preview_env = BTreeMap::new();
-    for line in &lines[10..16] {
+    for line in &lines[10..18] {
         if let Some((key, value)) = line.as_str().and_then(|s| s.split_once('=')) {
             preview_env.insert(key, value);
         }
@@ -323,7 +318,7 @@ fn inspect_query(id: &str, runner: &ProcessRunner, query: Query) -> Result<Conta
     let row: Container = serde_json::from_value(
         json!({"id":lines[0],"owner":lines[1].as_str().unwrap_or(""),
         "project":lines[2].as_str().unwrap_or(""),"service":lines[3].as_str().unwrap_or(""),
-        "running":lines[4],"image":lines[5],"ports":lines[6],"mounts":lines[7],"configuredPorts":lines[8],"deployment":lines[9].as_str().unwrap_or(""),"previewEnv":preview_env,"replica":lines[16].as_str().unwrap_or("")}),
+        "running":lines[4],"image":lines[5],"ports":lines[6],"mounts":lines[7],"configuredPorts":lines[8],"deployment":lines[9].as_str().unwrap_or(""),"previewEnv":preview_env,"replica":lines[18].as_str().unwrap_or("")}),
     )?;
     ensure!(
         row.id.len() == 64 && row.id.bytes().all(|b| b.is_ascii_hexdigit()),

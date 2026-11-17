@@ -235,16 +235,39 @@ pub fn after_lock(root: &Path, creator: Option<Creator>) -> Result<()> {
 /// Caller has either an unbroken producer ticket, a verified transaction
 /// transfer, or a complete empty stand observation. This does not clear history.
 pub fn anchor(root: &Path) -> Result<()> {
+    if trusted(root)? {
+        return Ok(());
+    }
     let Some((mut file, before)) = manifest(root)? else {
         return Ok(());
     };
     let directory = safe_path(root, ".devkit/state/stand-protocol")?;
     create_dir_all_durable(&directory)?;
-    let name = uuid::Uuid::new_v4().to_string();
+    let receipt_path = safe_path(root, RECEIPT)?;
+    let current_root = Physical::at(root)?;
+    let state = Physical::at(&safe_path(root, ".devkit/state")?)?;
+    let previous = read_bounded::<Receipt>(&receipt_path, 65536)?
+        .filter(|receipt| receipt.root == current_root && receipt.state == state)
+        .filter(|receipt| GENERATION_RE.is_match(&receipt.witness_name));
+    let previous = previous.and_then(|receipt| {
+        let path = directory.join(&receipt.witness_name);
+        let meta = fs::symlink_metadata(&path).ok()?;
+        (meta.is_file() && Physical::of(&meta) == receipt.witness.physical)
+            .then_some((receipt, path))
+    });
     let source = safe_path(root, MANIFEST_PATH)?;
-    fs::hard_link(&source, directory.join(&name))
-        .context("Cannot witness accepted runtime; stand history remains unknown")?;
-    sync_directory(&directory)?;
+    let same_manifest = previous
+        .as_ref()
+        .is_some_and(|(old, _)| old.witness.physical == before.physical);
+    let name = if let Some((old, _)) = previous.as_ref().filter(|_| same_manifest) {
+        old.witness_name.clone()
+    } else {
+        let name = uuid::Uuid::new_v4().to_string();
+        fs::hard_link(&source, directory.join(&name))
+            .context("Cannot witness accepted runtime; stand history remains unknown")?;
+        sync_directory(&directory)?;
+        name
+    };
     let witness = Witness::read(&mut file)?;
     ensure!(
         witness.physical == before.physical
@@ -253,16 +276,20 @@ pub fn anchor(root: &Path) -> Result<()> {
         "Accepted runtime changed while anchoring epoch"
     );
     write_json(
-        &safe_path(root, RECEIPT)?,
+        &receipt_path,
         &Receipt {
             protocol_version: 1,
-            root: Physical::at(root)?,
-            state: Physical::at(&safe_path(root, ".devkit/state")?)?,
+            root: current_root,
+            state,
             lock: Physical::at(&safe_path(root, ".devkit/state/task.lock")?)?,
             witness_name: name,
             witness,
         },
-    )
+    )?;
+    if let Some((_, path)) = previous.filter(|_| !same_manifest) {
+        remove_file(&path)?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

@@ -40,7 +40,6 @@ fn labels(owner: &Owner, helper: &InspectionHelper) -> BTreeMap<String, String> 
 /// A missing planned name proves nothing while its creator may still be alive.
 pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let had_inspections = !ledger.inspections.is_empty();
     for key in ledger.inspections.keys().cloned().collect::<Vec<_>>() {
         ensure!(
             ledger.inspections[&key].creation_finished,
@@ -105,17 +104,17 @@ pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Resu
             "Image inspection has incomplete daemon outcomes; preserving recovery intent {key}"
         );
         ledger.inspections.remove(&key);
+        if ledger.completed_empty() {
+            let mut ports =
+                super::ports::Ports::read(root)?.context("Missing preflight ownership receipt")?;
+            ensure!(
+                ports.owner == ledger.owner,
+                "Preflight ownership changed during recovery"
+            );
+            ports.possible_actors = false;
+            ports.save()?;
+        }
         ledger.save(root)?;
-    }
-    if had_inspections && ledger.completed_empty() {
-        let mut ports =
-            super::ports::Ports::read(root)?.context("Missing preflight ownership receipt")?;
-        ensure!(
-            ports.owner == ledger.owner,
-            "Preflight ownership changed during recovery"
-        );
-        ports.possible_actors = false;
-        ports.save()?;
     }
     Ok(())
 }
@@ -266,7 +265,7 @@ fn prove_backing(
         Backing::Opaque => {
             ensure!(
                 relative.is_empty(),
-                "Nested mount destination crosses an opaque persistent namespace; reserve a literal preview slot outside it"
+                "Cannot prove that a nested destination inside an opaque volume stays outside the preview mount; avoid the nested mount or use a bind with verifiable ancestry"
             );
             Ok(())
         }
@@ -531,7 +530,7 @@ pub struct Proof {
 impl Proof {
     pub fn service_overlay(&self, model: &Value, service: &str) -> Result<String> {
         let Some(image) = self.images.get(service) else {
-            return Ok(String::new());
+            return Ok("    pull_policy: missing\n".into());
         };
         let mut out = format!(
             "    image: {}\n    build: !reset null\n    pull_policy: never\n",
@@ -540,31 +539,7 @@ impl Proof {
         if let Some(platform) = model["services"][service].get("platform") {
             out += &format!("    platform: {}\n", serde_json::to_string(platform)?);
         }
-        if let Some(references) = model["services"][service]["volumes_from"].as_array() {
-            let mut pinned = Vec::new();
-            for raw in references {
-                let raw = raw.as_str().context("Invalid volume provider")?;
-                if let Some(rest) = raw.strip_prefix("container:") {
-                    let (name, mode) = rest
-                        .rsplit_once(':')
-                        .filter(|(_, m)| ["ro", "rw"].contains(m))
-                        .unwrap_or((rest, ""));
-                    let id = self
-                        .external
-                        .get(name)
-                        .context("Uncaptured external provider")?;
-                    pinned.push(format!(
-                        "container:{id}{}",
-                        if mode.is_empty() {
-                            String::new()
-                        } else {
-                            format!(":{mode}")
-                        }
-                    ));
-                } else {
-                    pinned.push(raw.into());
-                }
-            }
+        if let Some(pinned) = self.pinned_providers(&model["services"][service])? {
             out += &format!(
                 "    volumes_from: !override {}\n",
                 serde_json::to_string(&pinned)?
@@ -572,48 +547,85 @@ impl Proof {
         }
         Ok(out)
     }
+
+    fn pinned_providers(&self, service: &Value) -> Result<Option<Vec<String>>> {
+        let Some(references) = service["volumes_from"].as_array() else {
+            return Ok(None);
+        };
+        let mut pinned = Vec::new();
+        for raw in references {
+            let raw = raw.as_str().context("Invalid volume provider")?;
+            if let Some((name, suffix)) = external_provider(raw) {
+                let id = self
+                    .external
+                    .get(name)
+                    .context("Uncaptured external provider")?;
+                pinned.push(format!("container:{id}{suffix}"));
+            } else {
+                pinned.push(raw.into());
+            }
+        }
+        Ok(Some(pinned))
+    }
 }
-/// Resolve acquisition closure before the durable intent is installed.
-pub fn closure(model: &Value, active: &BTreeSet<String>) -> Result<BTreeSet<String>> {
-    dependency_closure(model, active, true)
+
+pub(super) fn external_provider(reference: &str) -> Option<(&str, &str)> {
+    let reference = reference.strip_prefix("container:")?;
+    let name = reference.trim_end_matches(":ro").trim_end_matches(":rw");
+    Some((name, &reference[name.len()..]))
 }
-fn dependency_closure(
+pub fn mount_dependencies(model: &Value, frontends: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    dependencies(model, frontends, |service| {
+        let mut providers = Vec::new();
+        for raw in service["volumes_from"].as_array().into_iter().flatten() {
+            let reference = raw.as_str().context("Invalid volumes_from")?;
+            if !reference.starts_with("container:") {
+                providers.push(
+                    reference
+                        .trim_end_matches(":ro")
+                        .trim_end_matches(":rw")
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(providers)
+    })
+}
+
+pub fn image_dependencies(
     model: &Value,
-    active: &BTreeSet<String>,
-    include_build: bool,
+    runtime_images: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
-    let mut all = active.clone();
-    loop {
-        let before = all.len();
-        for name in all.clone() {
-            let service = &model["services"][&name];
-            ensure!(service.is_object(), "Missing inspection service {name}");
-            for raw in service["volumes_from"].as_array().into_iter().flatten() {
-                let raw = raw.as_str().context("Invalid volumes_from")?;
-                if !raw.starts_with("container:") {
-                    all.insert(raw.trim_end_matches(":ro").trim_end_matches(":rw").into());
-                }
-            }
-            for raw in service
-                .pointer("/build/additional_contexts")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flat_map(|m| m.values())
-            {
-                if include_build
-                    && let Some(name) = raw.as_str().and_then(|s| s.strip_prefix("service:"))
-                {
-                    all.insert(name.into());
-                }
-            }
+    dependencies(model, runtime_images, |service| {
+        Ok(service
+            .pointer("/build/additional_contexts")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|contexts| contexts.values())
+            .filter_map(|value| value.as_str()?.strip_prefix("service:").map(str::to_owned))
+            .collect())
+    })
+}
+
+fn dependencies(
+    model: &Value,
+    roots: &BTreeSet<String>,
+    references: impl Fn(&Value) -> Result<Vec<String>>,
+) -> Result<BTreeSet<String>> {
+    let mut all = BTreeSet::new();
+    let mut next: Vec<_> = roots.iter().cloned().collect();
+    while let Some(name) = next.pop() {
+        if all.contains(&name) {
+            continue;
         }
         ensure!(
-            all.len() <= 128,
-            "Image acquisition closure exceeds service budget"
+            all.len() < 128,
+            "Image inspection closure exceeds service budget"
         );
-        if before == all.len() {
-            break;
-        }
+        let service = &model["services"][&name];
+        ensure!(service.is_object(), "Missing inspection service {name}");
+        next.extend(references(service)?);
+        all.insert(name);
     }
     Ok(all)
 }
@@ -621,7 +633,7 @@ fn dependency_closure(
 pub fn prepare(
     ports: &mut super::ports::Ports,
     model: &Value,
-    active: &BTreeSet<String>,
+    runtime_images: &BTreeSet<String>,
     frontends: &BTreeSet<String>,
     references: &BTreeMap<String, String>,
     ledger: &mut Ledger,
@@ -631,74 +643,104 @@ pub fn prepare(
     let root = root_path.as_path();
     recover(root, ledger, runner)?;
     let mut deadline = Instant::now() + Duration::from_secs(30);
-    let all = closure(model, active)?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let mut helpers = BTreeMap::new();
     let mut services = serde_json::Map::new();
+    let mut acquisition = serde_json::Map::new();
     let mut external = BTreeMap::new();
     let mut external_ids = BTreeMap::new();
-    for name in &all {
+    for (name, reference) in references {
         let original = &model["services"][name];
+        let mut image_service = json!({"image":reference,"network_mode":"none","scale":0});
+        for key in ["build", "platform", "pull_policy"] {
+            if let Some(value) = original.get(key) {
+                image_service[key] = value.clone();
+            }
+        }
+        acquisition.insert(name.clone(), image_service);
+        if !runtime_images.contains(name) {
+            continue;
+        }
         for raw in original["volumes_from"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
         {
-            if let Some(rest) = raw.strip_prefix("container:") {
-                let reference = rest.trim_end_matches(":ro").trim_end_matches(":rw");
-                if !external.contains_key(reference) {
-                    let output = runner.capture_before(
-                        Command::new("docker").args([
-                            "container",
-                            "inspect",
-                            "--format",
-                            "{{json .Id}}\n{{json .Mounts}}",
-                            reference,
-                        ]),
-                        deadline,
-                    )?;
-                    let lines = output
-                        .text()?
-                        .lines()
-                        .map(serde_json::from_str)
-                        .collect::<std::result::Result<Vec<Value>, _>>()?;
-                    ensure!(lines.len() == 2, "Invalid captured external provider");
-                    let id = lines[0].as_str().context("Invalid provider ID")?;
-                    ensure!(
-                        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
-                        "Invalid immutable provider ID"
-                    );
-                    external.insert(reference.to_owned(), json!({"id":id,"mounts":lines[1]}));
-                    external_ids.insert(reference.into(), id.into());
-                }
+            if let Some((reference, _)) = external_provider(raw)
+                && !external.contains_key(reference)
+            {
+                let output = runner.capture_before(
+                    Command::new("docker").args([
+                        "container",
+                        "inspect",
+                        "--format",
+                        "{{json .Id}}\n{{json .Mounts}}",
+                        reference,
+                    ]),
+                    deadline,
+                )?;
+                let lines = output
+                    .text()?
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<std::result::Result<Vec<Value>, _>>()?;
+                ensure!(lines.len() == 2, "Invalid captured external provider");
+                let id = lines[0].as_str().context("Invalid provider ID")?;
+                ensure!(
+                    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "Invalid immutable provider ID"
+                );
+                external.insert(reference.to_owned(), json!({"id":id,"mounts":lines[1]}));
+                external_ids.insert(reference.into(), id.into());
             }
         }
         let helper = InspectionHelper {
             name: format!("devkit-inspect-{}-{}", nonce, helpers.len()),
             token: nonce.clone(),
-            role: if active.contains(name) {
-                "runtime-image"
-            } else {
-                "build-context-image"
-            }
-            .into(),
+            role: "runtime-image".into(),
             observed: None,
         };
-        let mut service = json!({"image":references.get(name).context("Missing original effective image reference")?,"container_name":helper.name,
-            "labels":{TOKEN:nonce,ROLE:helper.role,OWNER:ledger.owner.key},"entrypoint":["/devkit-inspection-never-start"],"network_mode":"none","read_only":true,"cap_drop":["ALL"],"restart":"no","scale":1});
-        for key in ["build", "platform", "pull_policy"] {
-            if let Some(v) = original.get(key) {
-                service[key] = v.clone();
-            }
+        let mut service = json!({"image":reference,"container_name":helper.name,
+            "labels":{TOKEN:nonce,ROLE:helper.role,OWNER:ledger.owner.key},"entrypoint":["/devkit-inspection-never-start"],"network_mode":"none","read_only":true,"cap_drop":["ALL"],"restart":"no","scale":1,"pull_policy":"never"});
+        if let Some(platform) = original.get("platform") {
+            service["platform"] = platform.clone();
         }
         services.insert(name.clone(), service);
         helpers.insert(name.clone(), helper);
     }
-    let mut projection = json!({"services":services});
+    let mut acquisition = json!({"services":acquisition});
     if let Some(secrets) = model.get("secrets") {
-        projection["secrets"] = secrets.clone();
+        acquisition["secrets"] = secrets.clone();
     }
+    let command = || {
+        let mut command = Command::new("docker");
+        command
+            .current_dir(root)
+            .args([
+                "compose",
+                "--project-name",
+                &format!("devkit-inspection-{nonce}"),
+                "--project-directory",
+            ])
+            .arg(root)
+            .args(["--file", "-", "create"]);
+        command
+    };
+    // Compose prepares images before convergence. All acquisition services
+    // have zero replicas, no service mounts, and no project networks or volumes.
+    escape_compose(&mut acquisition);
+    let acquisition_started = Instant::now();
+    runner
+        .run_with_input(
+            command().args(["--pull", "missing"]),
+            OutputMode::TeeStderr(65536),
+            &json_bytes(&acquisition)?,
+        )?
+        .success("Image-only Compose acquisition")?;
+    deadline += acquisition_started.elapsed();
+
+    let mut projection = json!({"services":services});
     escape_compose(&mut projection);
     let bytes = json_bytes(&projection)?;
     ports.possible_actors = true;
@@ -717,66 +759,31 @@ pub fn prepare(
     );
     ledger.save(root)?;
     super::epoch::anchor(root)?;
-    let mut command = Command::new("docker");
-    command
-        .current_dir(root)
-        .args([
-            "compose",
-            "--project-name",
-            &format!("devkit-inspection-{}", nonce),
-            "--project-directory",
-        ])
-        .arg(root)
-        .args(["--file", "-", "create", "--pull", "missing"]);
-    for name in active {
-        command.arg(name);
-    }
     let mut reaped = false;
-    let acquisition_started = Instant::now();
     let result = runner.run_tracked(
-        &mut command,
+        command().args(["--no-build", "--pull", "never"]),
         OutputMode::TeeStderr(65536),
         Some(&bytes),
         &mut reaped,
     );
-    // Image pull/build time is acquisition work, outside the shared metadata budget.
-    deadline += acquisition_started.elapsed();
     let intent = ledger.inspections.get_mut(&nonce).unwrap();
     intent.creation_finished = reaped;
     intent.creation_uncertain = !matches!(result.as_ref(), Ok(output) if output.code == 0);
     ledger.save(root)?;
     let proof = (|| -> Result<Proof> {
-        result?.success("Image-only Compose acquisition")?;
+        result?.success("Stopped image inspector creation")?;
         let total_queries = Cell::new(0);
         let mut images = BTreeMap::new();
         let mut namespaces = BTreeMap::new();
         let mut image_mounts = BTreeMap::new();
-        for name in &all {
+        for name in runtime_images {
             let helper = &ledger.inspections[&nonce].helpers[name];
             let snapshot = runner.inspection_snapshot(
                 &owned(helper),
                 &labels(&ledger.owner, helper),
                 deadline,
             )?;
-            let Some(snapshot) = snapshot else {
-                ensure!(
-                    !active.contains(name),
-                    "Missing planned runtime image inspector"
-                );
-                continue;
-            };
-            if !active.contains(name) {
-                ledger
-                    .inspections
-                    .get_mut(&nonce)
-                    .unwrap()
-                    .helpers
-                    .get_mut(name)
-                    .unwrap()
-                    .observed = Some(snapshot);
-                ledger.save(root)?;
-                continue;
-            }
+            let snapshot = snapshot.context("Missing planned runtime image inspector")?;
             let mounts = snapshot
                 .anonymous_volumes
                 .keys()
@@ -806,15 +813,9 @@ pub fn prepare(
                     && info[2].as_str().is_some_and(|s| !s.is_empty()),
                 "Unproved immutable image platform"
             );
-            if let Some(platform) = model["services"][name]["platform"].as_str() {
-                let parts: Vec<_> = platform.split('/').collect();
-                ensure!(
-                    parts.len() >= 2
-                        && Some(parts[0]) == info[1].as_str()
-                        && Some(parts[1]) == info[2].as_str(),
-                    "Inspected image differs from requested platform"
-                );
-            }
+            // Compose and the daemon select the requested platform when they
+            // create this exact helper. The launch keeps that same platform
+            // declaration and the resulting immutable image ID.
             let expected: BTreeSet<_> = info[3]
                 .as_object()
                 .into_iter()
@@ -864,7 +865,7 @@ pub fn prepare(
         let mut slots = BTreeMap::new();
         for name in frontends {
             let mut mounts = model_mounts(model, name, &mut BTreeSet::new(), &external, false)?;
-            for provider in dependency_closure(model, &BTreeSet::from([name.clone()]), false)? {
+            for provider in mount_dependencies(model, &BTreeSet::from([name.clone()]))? {
                 mounts.extend(image_mounts[&provider].clone());
             }
             mounts.sort_by_key(|m| !m.implicit);
@@ -998,6 +999,7 @@ pub fn prepare(
 
 pub fn verify_launch(
     model: &Value,
+    requested: &Value,
     ports: &super::ports::Ports,
     active: &BTreeSet<String>,
     proof: &Proof,
@@ -1005,19 +1007,30 @@ pub fn verify_launch(
     for service in active {
         let actual = &model["services"][service];
         if let Some(image) = proof.images.get(service) {
+            let expected = &requested["services"][service];
             ensure!(
                 actual["image"] == *image
+                    && actual.get("platform") == expected.get("platform")
                     && actual.get("build").is_none_or(Value::is_null)
                     && actual["pull_policy"] == "never",
                 "Launch model escaped inspected image authority for {service}"
             );
+            if let Some(providers) = proof.pinned_providers(expected)? {
+                ensure!(
+                    actual["volumes_from"] == json!(providers),
+                    "Launch model escaped inspected volume-provider authority for {service}"
+                );
+            }
         }
     }
-    if let Some(deployment) = ports
-        .desired_deployment
-        .as_ref()
-        .and_then(|id| ports.deployments.get(id))
-    {
+    for service in active {
+        let Some(deployment) = ports
+            .service_desired
+            .get(service)
+            .and_then(|id| ports.deployments.get(id))
+        else {
+            continue;
+        };
         for file in &deployment.files {
             file.validate(&ports.owner.root, &ports.owner)?;
             let service = &model["services"][&file.service];

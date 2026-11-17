@@ -134,15 +134,6 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             ("HOME".to_string(), json!("/tmp/devkit-home")),
             ("NPM_CONFIG_UPDATE_NOTIFIER".to_string(), json!("false")),
         ]);
-        if modern
-            && matches!(
-                c.tooling_profile,
-                ToolingProfile::Node | ToolingProfile::Rust
-            )
-        {
-            env.insert("HOST".into(), json!("0.0.0.0"));
-            env.insert("PORT".into(), json!("8080"));
-        }
         if let Some(api) = &d.api {
             let server = state
                 .components
@@ -236,6 +227,16 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             ]
         };
         let mut service = json!({"image":if rust{"${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"}else if desktop{"${DEVKIT_DESKTOP_IMAGE:-devkit-unprepared-desktop}"}else{"${DEVKIT_NODE_IMAGE:?}"},"init":true,"user":"${DEVKIT_UID:?}:${DEVKIT_GID:?}","working_dir":format!("/workspace/{path}"),"command":command,"environment":env,"volumes":volumes});
+        if modern
+            && matches!(
+                c.tooling_profile,
+                ToolingProfile::Node | ToolingProfile::Rust
+            )
+        {
+            // Project Compose follows this projection. Its env files and explicit
+            // environment take precedence over the starter defaults.
+            service["env_file"] = json!([".devkit/runtime/api.env"]);
+        }
         if modern && let Some(api) = &d.api {
             let backend = &state.components[api];
             let name = backend

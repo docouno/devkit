@@ -64,7 +64,11 @@ impl Renderer {
                 raw.len() <= 65536,
                 "DEVKIT_PREVIEW_URL_TEMPLATE exceeds byte budget"
             );
-            value.render(65535, "service")?;
+            let example = value.substitute(raw, 1, "x")?;
+            let authority = url_authority(raw)?;
+            if !authority.contains("{port}") && !authority.contains("{service}") {
+                url_host(&example)?;
+            }
         }
         Ok(value)
     }
@@ -73,8 +77,13 @@ impl Renderer {
             return Ok(None);
         };
         ensure!(port > 0, "Preview URL requires a published port");
+        let url = self.substitute(raw, port, service)?;
+        let host = url_host(&url)?;
+        Ok(Some(RenderedUrl { url, host }))
+    }
+    fn substitute(&self, raw: &str, port: u16, service: &str) -> Result<String> {
         let mut result = String::new();
-        let mut rest = raw.as_str();
+        let mut rest = raw;
         while let Some(at) = rest.find('{') {
             ensure!(!rest[..at].contains('}'), "Invalid preview URL braces");
             result.push_str(&rest[..at]);
@@ -92,8 +101,7 @@ impl Renderer {
         }
         ensure!(!rest.contains('}'), "Invalid preview URL braces");
         result.push_str(rest);
-        let host = url_host(&result)?;
-        Ok(Some(RenderedUrl { url: result, host }))
+        Ok(result)
     }
 }
 
@@ -150,7 +158,7 @@ pub fn canonical_host(raw: &str) -> Result<String> {
     );
     Ok(host.to_owned())
 }
-pub fn url_host(url: &str) -> Result<String> {
+fn url_authority(url: &str) -> Result<&str> {
     ensure!(
         url.len() <= 65536 && !url.chars().any(|c| c.is_control() || c.is_whitespace()),
         "Invalid preview URL characters or size"
@@ -167,6 +175,10 @@ pub fn url_host(url: &str) -> Result<String> {
         !authority.contains('@') && !authority.is_empty(),
         "Preview URL must have a host and no userinfo"
     );
+    Ok(authority)
+}
+pub fn url_host(url: &str) -> Result<String> {
+    let authority = url_authority(url)?;
     let host;
     let port;
     if let Some(ipv6) = authority.strip_prefix('[') {
@@ -307,6 +319,7 @@ pub struct HostFile {
 }
 
 pub const DEPLOYMENT_LABEL: &str = "io.docouno.devkit.stand-deployment";
+pub const HOST_ENV_KEYS: [&str; 2] = ["DEVKIT_ALLOWED_HOSTS", "VITE_ALLOWED_HOSTS"];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Deployment {
@@ -315,6 +328,8 @@ pub struct Deployment {
     pub files: Vec<HostFile>,
     pub images: std::collections::BTreeMap<String, String>,
     pub external: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub forwarded_hosts: std::collections::BTreeMap<String, Option<String>>,
 }
 pub fn publish_deployment(
     ports: &mut super::ports::Ports,
@@ -322,45 +337,94 @@ pub fn publish_deployment(
     active: &BTreeSet<String>,
     renderer: &Renderer,
     proof: &super::inspection::Proof,
+    model: &serde_json::Value,
 ) -> Result<()> {
-    let mut files = Vec::new();
-    if renderer.template.is_some() {
-        for service in frontends {
-            let (document, primary) = HostsDocument::render(service, &ports.groups, renderer)?;
-            if document.hosts.is_empty() {
-                continue;
-            }
-            let file = HostFile::publish(
-                &ports.owner.root,
-                &ports.owner,
-                proof
-                    .slots
-                    .get(service)
-                    .context("Missing safe preview slot")?,
-                &document,
-                primary,
-            )?;
-            if !ports.preview_files.contains(&file) {
-                ports.preview_files.push(file.clone());
-            }
-            files.push(file);
-        }
-    }
-    let deployment = Deployment {
-        renderer: renderer.clone(),
-        groups: ports.groups.clone(),
-        files,
-        images: proof.images.clone(),
-        external: proof.external.clone(),
-    };
-    let id = digest(json_bytes(&deployment)?);
-    ports.deployments.insert(id.clone(), deployment);
     for service in active {
-        ports.service_desired.insert(service.clone(), id.clone());
+        let frontend = frontends.contains(service);
+        let groups: Vec<_> = ports
+            .groups
+            .iter()
+            .filter(|group| group.binding.service == *service)
+            .cloned()
+            .collect();
+        let mut files = Vec::new();
+        if frontend && renderer.template.is_some() {
+            let (document, primary) = HostsDocument::render(service, &groups, renderer)?;
+            if !document.hosts.is_empty() {
+                let file = HostFile::publish(
+                    &ports.owner.root,
+                    &ports.owner,
+                    proof
+                        .slots
+                        .get(service)
+                        .context("Missing safe preview slot")?,
+                    &document,
+                    primary,
+                )?;
+                if !ports.preview_files.contains(&file) {
+                    ports.preview_files.push(file.clone());
+                }
+                files.push(file);
+            }
+        }
+        let own = BTreeSet::from([service.clone()]);
+        let inputs = if files.is_empty() {
+            own
+        } else {
+            super::inspection::mount_dependencies(model, &own)?
+        };
+        let images = inputs
+            .iter()
+            .filter_map(|name| proof.images.get(name).map(|id| (name.clone(), id.clone())))
+            .collect();
+        let external = inputs
+            .iter()
+            .flat_map(|name| {
+                model["services"][name]["volumes_from"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|value| super::inspection::external_provider(value.as_str()?))
+            .filter_map(|(name, _)| {
+                proof
+                    .external
+                    .get(name)
+                    .map(|id| (name.to_owned(), id.clone()))
+            })
+            .collect();
+        let forwarded_hosts = if frontend {
+            HOST_ENV_KEYS
+                .into_iter()
+                .filter(|key| model["services"][service]["environment"].get(key).is_none())
+                .map(|key| (key.to_owned(), forwarded_host(key)))
+                .collect()
+        } else {
+            Default::default()
+        };
+        let deployment = Deployment {
+            renderer: if frontend {
+                renderer.clone()
+            } else {
+                Renderer::new(None, "")?
+            },
+            groups,
+            files,
+            images,
+            external,
+            forwarded_hosts,
+        };
+        let id = digest(json_bytes(&deployment)?);
+        ports.deployments.insert(id.clone(), deployment);
+        ports.service_desired.insert(service.clone(), id);
     }
-    ports.desired_deployment = Some(id);
-    ports.preview_renderer = Some(renderer.clone());
+    ports.desired_deployment = None;
+    ports.preview_renderer = None;
     Ok(())
+}
+
+fn forwarded_host(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(digest)
 }
 pub fn directory(root: &Path, owner: &Owner) -> Result<PathBuf> {
     ensure!(
@@ -537,6 +601,16 @@ pub fn enrich_status(
     };
     let rows = super::ledger::observe(project, runner)?;
     let renderer = Renderer::from_env(&super::branch_name(root, runner)?)?;
+    enrich_observed(&ports, &rows, &renderer, services)
+}
+
+pub fn enrich_observed(
+    ports: &super::ports::Ports,
+    rows: &[super::ledger::Container],
+    renderer: &Renderer,
+    services: &mut [crate::doctor::ComposeServiceStatus],
+) -> Result<()> {
+    let root = &ports.owner.root;
     for service in services {
         let Some(row) = rows.iter().find(|r| {
             !service.id.is_empty()
@@ -604,8 +678,30 @@ pub fn enrich_status(
                     "Applied image differs from inspected image"
                 );
             }
+            let applied_renderer = if row.preview_env.contains_key("DEVKIT_SERVICE") {
+                &deployment.renderer
+            } else {
+                ports
+                    .service_preview_renderer
+                    .get(&row.service)
+                    .unwrap_or(&deployment.renderer)
+            };
             status.pending_restart = status.desired_deployment.as_deref() != Some(&row.deployment)
-                || deployment.renderer != renderer;
+                || applied_renderer != renderer
+                || deployment
+                    .forwarded_hosts
+                    .iter()
+                    .any(|(key, value)| forwarded_host(key) != *value);
+            for (key, expected) in &deployment.forwarded_hosts {
+                if let Some(expected) = expected {
+                    ensure!(
+                        row.preview_env
+                            .get(key)
+                            .is_some_and(|value| digest(value) == *expected),
+                        "Applied host allowlist differs from recorded deployment"
+                    );
+                }
+            }
             if row.preview_env.contains_key("DEVKIT_SERVICE") {
                 ensure!(
                     row.preview_env
@@ -654,9 +750,7 @@ pub fn enrich_status(
                             && endpoint.published >= g.first
                             && endpoint.published <= g.last
                     })
-                    && let Some(url) = deployment
-                        .renderer
-                        .render(endpoint.published, &row.service)?
+                    && let Some(url) = applied_renderer.render(endpoint.published, &row.service)?
                 {
                     endpoint.preview_url = Some(url.url.clone());
                     status.preview_urls.push(url.url);
@@ -734,10 +828,15 @@ pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
         .iter()
         .map(|group| {
             let renderer = ports
-                .service_desired
+                .service_preview_renderer
                 .get(&group.binding.service)
-                .and_then(|id| ports.deployments.get(id))
-                .map(|d| &d.renderer);
+                .or_else(|| {
+                    ports
+                        .service_desired
+                        .get(&group.binding.service)
+                        .and_then(|id| ports.deployments.get(id))
+                        .map(|d| &d.renderer)
+                });
             let single = group.first == group.last && group.binding.protocol == "tcp";
             Ok(Reservation {
                 service: group.binding.service.clone(),

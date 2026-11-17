@@ -170,7 +170,7 @@ Leases live in the shared user cache (`port-leases.json`), with checkout identit
 - `make down` stops the current Compose stack and preserves leases, metadata and data volumes.
 - `make down cleanup=1` verifies stand ownership, removes owned remnants, and releases leases and unused metadata. It preserves service volumes.
 - A never-started fresh checkout can clean up before setup without Docker or an engine download. An existing state directory requires verified launch/epoch provenance; absence of a marker alone is insufficient.
-- A failed daemon or unfinished creator leaves a recovery intent. Retry after resolving the diagnostic; Devkit does not adopt unknown legacy containers or report an unproved cleanup as successful.
+- A daemon create with an unknown outcome leaves a recovery intent until Devkit can verify what it created. Fixing a preview image pull or build error allows another `up` without clearing leases or state.
 
 Set `DEVKIT_PREVIEW_URL_TEMPLATE` to an absolute HTTP(S) URL. `{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
 
@@ -180,7 +180,7 @@ Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/dev
 
 Host metadata uses browser URL canonicalization. For example, `127.1` becomes `127.0.0.1` and `::ffff:127.0.0.1` becomes `::ffff:7f00:1`. Invalid numeric/IDNA hosts and aliases of wildcard addresses fail before launch. The rendered URL retains its path and query; its resolved hostname must belong to the canonical file set.
 
-Custom images/builds are acquired through Compose and inspected in stopped image-only containers before any user-backed service starts. Image symlink ancestry, mount aliases, inherited volumes, configs, secrets, devices and retained namespaces must leave a provable literal slot. Keep one slot outside project/volume namespaces; an opaque layout fails with a bounded diagnostic. Actual launch pins inspected image IDs and external volume-provider IDs, retaining declared platforms. Inspectors never run image commands, receive service mounts or remove service volumes. Their anonymous inspection volumes are cleaned separately.
+Compose acquires frontend images and images of their recursive `volumes_from` providers, including build contexts. Devkit then inspects those images in stopped containers before mounting the preview file. Ordinary startup dependencies use the normal Compose launch path. Image symlinks, inherited mounts and retained volumes must leave a provable literal slot. A nested destination inside an opaque volume can alias a path outside that volume. Keep preview destinations provable by avoiding those nested mounts or using a bind with verifiable ancestry. The launch pins inspected image IDs and external volume-provider IDs and retains declared platforms. Inspectors have no service mounts and their own anonymous volumes are cleaned separately.
 
 Docker does not inherit a provider's tmpfs or devices through `volumes_from`. A provider's deeper tmpfs therefore cannot protect the receiver from an inherited source bind. A receiver's own writable tmpfs remains supported.
 

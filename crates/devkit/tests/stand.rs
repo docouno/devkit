@@ -329,6 +329,16 @@ fn preview_renderer_covers_tcp_replicas_and_rejects_ambiguous_authorities() {
     .unwrap();
     assert_eq!(renderer.branch_slug, "feature-some-work");
     assert_eq!(dns_slug(&"a".repeat(100)).len(), 63);
+    let long = Renderer::new(
+        Some(format!(
+            "https://{}-{{service}}.example.test",
+            "a".repeat(57)
+        )),
+        "main",
+    )
+    .unwrap();
+    assert!(long.render(11000, "main").unwrap().is_some());
+    assert!(long.render(11000, "service").is_err());
     for raw in [
         "https://*.example.test",
         "https://user@example.test",
@@ -401,6 +411,7 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
     let cache = tempfile::tempdir().unwrap();
     let mut ports = Ports::open(root.path(), cache.path()).unwrap();
     let renderer = Renderer::new(Some("https://{port}.example.test".into()), "main").unwrap();
+    let model = json!({"services":{"web":{},"api":{}}});
     let proof = Proof {
         slots: std::collections::BTreeMap::from([("web".into(), SLOTS[0].into())]),
         images: Default::default(),
@@ -420,6 +431,7 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
                     &BTreeSet::from(["web".into()]),
                     &renderer,
                     &proof,
+                    &model,
                 )
             },
         )
@@ -433,6 +445,7 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
         &BTreeSet::from(["web".into()]),
         &renderer,
         &proof,
+        &model,
     )
     .unwrap();
     assert_eq!(fs::read(&file.source).unwrap(), bytes);
@@ -443,6 +456,7 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
         &BTreeSet::from(["api".into()]),
         &renderer,
         &proof,
+        &model,
     )
     .unwrap();
     assert_eq!(ports.service_desired["web"], web_desired);
@@ -491,6 +505,7 @@ fn selected_service_with_no_bindings_retires_its_previous_ports_without_touching
             Allocation {
                 declarations: &[],
                 selected: &BTreeSet::from(["web".into()]),
+                stopped: &BTreeSet::new(),
                 primary: Some("web"),
                 seed: "same-seed",
             },

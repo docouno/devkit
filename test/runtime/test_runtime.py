@@ -697,11 +697,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("DEVKIT_PREVIEW_HOSTS=stale.invalid.test", actual["Config"]["Env"])
         mount = next(m for m in actual["Mounts"] if m["Destination"] == file["slot"])
         self.assertFalse(mount["RW"])
-        self.assertEqual(actual["Image"], receipt["deployments"][receipt["desiredDeployment"]]["images"]["main"])
+        self.assertEqual(actual["Image"], receipt["deployments"][receipt["serviceDesired"]["main"]]["images"]["main"])
         status = run(str(ENGINE), "status", str(self.root), "--json", env=environment)
         status = json.loads(status.stdout)["result"]["services"][0]
         self.assertTrue(status["metadataVerified"])
         self.assertFalse(status["pendingRestart"])
+        ignored = dict(environment, DEVKIT_ALLOWED_HOSTS="new-host.example.test")
+        forwarded = dict(environment, VITE_ALLOWED_HOSTS="extra-new.example.test")
+        for selected, pending in [(ignored, False), (forwarded, True)]:
+            status = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=selected).stdout)["result"]["services"][0]
+            self.assertEqual(status["pendingRestart"], pending)
         changed = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://new-{port}.example.test")
         status = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=changed).stdout)["result"]["services"][0]
         self.assertTrue(status["pendingRestart"])
@@ -710,7 +715,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / ".devkit/state/stand.active").read_text())["inspections"], {})
         self.make("up", "app=main", env=environment)
         repeated = json.loads((self.root / ".devkit/state/ports.json").read_text())
-        self.assertEqual(repeated["deployments"][repeated["desiredDeployment"]]["files"][0], file)
+        self.assertEqual(repeated["deployments"][repeated["serviceDesired"]["main"]]["files"][0], file)
         self.make("down", env=environment)
         self.assertTrue(Path(file["source"]).exists())
         self.make("down", "cleanup=1", env=environment)
@@ -737,7 +742,7 @@ class RuntimeTests(unittest.TestCase):
         self.make("up", "app=main", env=environment)
         receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
         self.assertEqual(receipt["previewFiles"][0]["slot"], "/devkit/preview-hosts.json")
-        applied = receipt["deployments"][receipt["desiredDeployment"]]
+        applied = receipt["deployments"][receipt["serviceDesired"]["main"]]
         self.assertEqual(set(applied["images"]), {"main", "provider", "nested"})
         for name in applied["images"]:
             self.assertEqual(container(project + "-" + name + "-1")["Image"], applied["images"][name])
@@ -752,7 +757,7 @@ class RuntimeTests(unittest.TestCase):
         (self.root / "compose.yaml").write_text(json.dumps(spec))
         self.make("up", "app=main", env=environment)
         receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
-        applied = receipt["deployments"][receipt["desiredDeployment"]]
+        applied = receipt["deployments"][receipt["serviceDesired"]["main"]]
         self.assertEqual(applied["files"][0]["slot"], "/run/devkit/preview-hosts.json")
         self.make("down", "cleanup=1", env=environment)
         run("docker", "image", "rm", tag)
@@ -1177,9 +1182,52 @@ class RuntimeTests(unittest.TestCase):
             port = actual["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"]
             with urllib.request.urlopen("http://127.0.0.1:" + port, timeout=3) as response:
                 self.assertEqual(response.read(), b"bound")
+            self.make("down")
+            (self.root / "user.env").write_text("PORT=8081\n")
+            spec["services"]["main"].update({"env_file": ["user.env"], "ports": ["127.0.0.1::8081"]})
+            (self.root / "compose.yaml").write_text(json.dumps(spec))
+            self.make("up", "app=main")
+            actual = container(project + "-main-1")
+            self.assertIn("HOST=0.0.0.0", actual["Config"]["Env"])
+            self.assertIn("PORT=8081", actual["Config"]["Env"])
+            port = actual["NetworkSettings"]["Ports"]["8081/tcp"][0]["HostPort"]
+            with urllib.request.urlopen("http://127.0.0.1:" + port, timeout=3) as response:
+                self.assertEqual(response.read(), b"bound")
             self.make("down", "cleanup=1")
         finally:
             run("docker", "image", "rm", tag, check=False)
+
+    def test_preview_acquisition_failure_can_retry_and_ignores_backend_namespace(self):
+        frontend, project = self.preview_fixture()
+        tag = "devkit-preview-acquisition-" + self.token
+        self.images.append(tag)
+        frontend.update({"image": tag, "build": {"context": "."}, "depends_on": ["helper"]})
+        spec = json.loads((self.root / "compose.yaml").read_text())
+        spec["services"].update({"main": frontend, "helper": {
+            "image": IMAGE, "platform": "linux/x86_64", "labels": {LABEL: self.token},
+            "command": ["node", "-e", "setInterval(() => {}, 1000)"],
+        }})
+        self.resources.append(project + "-helper-1")
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        dockerfile = self.root / "Dockerfile"
+        dockerfile.write_text("FROM " + IMAGE + "\nINVALID_DOCKERFILE_INSTRUCTION\n")
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        failed = self.make("up", "app=main", env=environment, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Image-only Compose acquisition", failed.stderr)
+        self.assertFalse((self.root / ".devkit/state/stand.active").exists())
+        self.assertIsNone(container(project + "-main-1"))
+        dockerfile.write_text("FROM " + IMAGE + "\nLABEL " + LABEL + "=" + self.token + "\n")
+        self.make("up", "app=main", env=environment)
+        receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
+        self.assertEqual(set(receipt["deployments"][receipt["serviceDesired"]["main"]]["images"]), {"main"})
+        helper = container(project + "-helper-1")
+        self.assertTrue(helper["State"]["Running"])
+        changed = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://new-{port}.example.test")
+        self.make("up", "app=main", env=changed)
+        self.assertEqual(container(project + "-helper-1")["Id"], helper["Id"])
+        self.make("down", "cleanup=1", env=environment)
 
     def test_preview_image_symlinks_fail_before_actual_launch_or_claims(self):
         service, project = self.preview_fixture()
@@ -1379,6 +1427,56 @@ exec "$RACE_REAL_DOCKER" "$@"
         pins.write_bytes(original)
         self.make("down", "cleanup=1", env=environment)
         self.assertFalse(trace.exists())
+
+    def test_selected_service_keeps_its_container_and_can_change_a_stopped_port_target(self):
+        write_fixture(self.root, apps=("main", "other"))
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        self.resources.extend(f"{project}-{name}-1" for name in ("main", "other"))
+        self.projects.append((project, self.root, "unused-" + self.token))
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            host_port = listener.getsockname()[1]
+
+        def service(target, publish):
+            return {
+                "image": IMAGE, "labels": {LABEL: self.token},
+                "command": ["node", "-e", f"require('node:http').createServer((q,s)=>s.end('{target}')).listen({target}, '0.0.0.0')"],
+                "ports": [f"127.0.0.1:{publish}:{target}"],
+            }
+
+        compose = self.root / "compose.yaml"
+        spec = {"services": {"main": service(3000, host_port), "other": service(3100, "")},
+                "networks": {"default": {"labels": {LABEL: self.token}}}}
+        compose.write_text(json.dumps(spec))
+        self.make("setup")
+        self.make("up", "app=main")
+        original = container(f"{project}-main-1")["Id"]
+        manifest = self.root / ".devkit/manifest.json"
+        links = manifest.stat().st_nlink
+        self.make("up", "app=other")
+        self.make("up", "app=main")
+        self.assertEqual(container(f"{project}-main-1")["Id"], original)
+        self.assertEqual(manifest.stat().st_nlink, links)
+        spec["services"]["main"] = service(3001, host_port)
+        compose.write_text(json.dumps(spec))
+        self.assertNotEqual(self.make("up", "app=main", check=False).returncode, 0)
+        self.assertEqual(container(f"{project}-main-1")["Id"], original)
+        self.make("down")
+        self.make("up", "app=main")
+        def reaches_new_target():
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{host_port}", timeout=2) as response:
+                    return response.read() == b"3001"
+            except OSError:
+                return False
+
+        wait_until(reaches_new_target)
+        self.make("down")
+        spec["services"]["main"]["scale"] = 0
+        compose.write_text(json.dumps(spec))
+        self.make("up", "app=main")
+        self.assertIsNone(container(f"{project}-main-1"))
+        self.make("down", "cleanup=1")
 
     def test_native_setup_gates_fix_purity_stale_lock_and_secret_boundary(self):
         write_fixture(self.root)

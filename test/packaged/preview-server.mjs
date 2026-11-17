@@ -6,6 +6,7 @@ import net from 'node:net';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import assert from 'node:assert/strict';
 const require = createRequire('/workspace/apps/web/package.json');
 const viteEntry = require.resolve('vite');
 const { createServer } = await import(pathToFileURL(viteEntry));
@@ -24,9 +25,12 @@ let revision = 1,
   base = '/',
   backendRequests = 0,
   hmrAttempts = 0,
-  pingAttempts = 0;
+  pingAttempts = 0,
+  staleStatus,
+  rotatedToken = false;
+const style = (value) => `h1{color:rgb(${(value % 250) + 1}, 2, 3)}`;
 fs.writeFileSync(root + '/main.js', content(revision));
-fs.writeFileSync(root + '/style.css', 'h1{color:rgb(1, 2, 3)}');
+fs.writeFileSync(root + '/style.css', style(revision));
 // The fixture needs only short echo/control frames. Keep it independent of
 // unpublished Vite internals and packages outside the released consumer graph.
 function acceptSocket(q, s) {
@@ -108,6 +112,8 @@ const handler = async (q, s) => {
     await vite.close();
     hmrAttempts = 0;
     pingAttempts = 0;
+    staleStatus = undefined;
+    rotatedToken = false;
     await start();
     s.end('ready');
     return;
@@ -121,12 +127,14 @@ const handler = async (q, s) => {
   if (url.pathname === '/__edit') {
     revision++;
     fs.writeFileSync(root + '/main.js', content(revision));
-    fs.writeFileSync(root + '/style.css', 'h1{color:rgb(4, 5, 6)}');
+    fs.writeFileSync(root + '/style.css', style(revision));
     s.end(String(revision));
     return;
   }
   if (url.pathname === '/__trace') {
-    s.end(JSON.stringify({ hmrAttempts, pingAttempts, backendRequests }));
+    s.end(
+      JSON.stringify({ hmrAttempts, pingAttempts, backendRequests, staleStatus, rotatedToken }),
+    );
     return;
   }
   const upstream = http.request(
@@ -142,10 +150,24 @@ const handler = async (q, s) => {
   });
   q.pipe(upstream);
 };
-function upgrade(q, s, h) {
+async function upgrade(q, s, h) {
   const protocol = q.headers['sec-websocket-protocol'];
+  const stale = protocol === 'vite-hmr' && drop === 'stale';
   if (protocol === 'vite-hmr') {
     hmrAttempts++;
+    if (stale) {
+      // The browser has already loaded the client from A. Forward its original
+      // upgrade to B, where Vite itself rejects the old token.
+      assert.equal(
+        new URL(q.url, 'http://test').searchParams.get('token'),
+        vite.config.webSocketToken,
+      );
+      const oldToken = vite.config.webSocketToken;
+      drop = 'none';
+      await vite.close();
+      await start();
+      rotatedToken = oldToken !== vite.config.webSocketToken;
+    }
     if (drop === 'once') {
       drop = 'none';
       s.destroy();
@@ -174,6 +196,11 @@ function upgrade(q, s, h) {
     upstream.pipe(s);
     s.pipe(upstream);
   });
+  if (stale) {
+    upstream.once('data', (data) => {
+      staleStatus = Number(data.toString().split(' ', 2)[1]);
+    });
+  }
   s.on('close', () => upstream.destroy());
   upstream.on('error', () => s.destroy());
 }
@@ -190,7 +217,12 @@ for (const [server, port] of [
     443,
   ],
 ]) {
-  server.on('upgrade', upgrade);
+  server.on('upgrade', (request, socket, head) => {
+    upgrade(request, socket, head).catch((error) => {
+      console.error(error);
+      socket.destroy();
+    });
+  });
   await new Promise((done) => server.listen(port, '0.0.0.0', done));
 }
 fs.writeFileSync(

@@ -951,6 +951,10 @@ class Verification:
             if component.get("development"):
                 component["development"]["verificationExtension"] = {"development": "preserve"}
             directory = root / path
+            vite_config = directory / "vite.config.mjs"
+            if vite_config.is_file():
+                vite_config.write_text(vite_config.read_text() + "\n// Consumer-owned migration marker.\n")
+                preserve[vite_config] = vite_config.read_bytes()
             rust_source = directory / "src/lib.rs"
             if component["toolchain"] == "rust" and rust_source.is_file():
                 text = rust_source.read_text()

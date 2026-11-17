@@ -156,18 +156,21 @@ pub struct Ports {
     pub possible_actors: bool,
     #[serde(default)]
     pub preview_files: Vec<super::preview::HostFile>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_renderer: Option<super::preview::Renderer>,
     #[serde(default)]
     pub deployments: std::collections::BTreeMap<String, super::preview::Deployment>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_deployment: Option<String>,
     #[serde(default)]
     pub service_desired: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub service_preview_renderer: std::collections::BTreeMap<String, super::preview::Renderer>,
 }
 pub struct Allocation<'a> {
     pub declarations: &'a [Binding],
     pub selected: &'a BTreeSet<String>,
+    pub stopped: &'a BTreeSet<String>,
     pub primary: Option<&'a str>,
     pub seed: &'a str,
 }
@@ -210,6 +213,7 @@ impl Ports {
             deployments: std::collections::BTreeMap::new(),
             desired_deployment: None,
             service_desired: std::collections::BTreeMap::new(),
+            service_preview_renderer: std::collections::BTreeMap::new(),
         };
         value.save()?;
         Ok(value)
@@ -252,6 +256,7 @@ impl Ports {
             Allocation {
                 declarations,
                 selected: &selected,
+                stopped: &BTreeSet::new(),
                 primary,
                 seed,
             },
@@ -270,6 +275,7 @@ impl Ports {
         let Allocation {
             declarations,
             selected,
+            stopped,
             primary,
             seed,
         } = plan;
@@ -295,11 +301,12 @@ impl Ports {
         let mut ordered: Vec<_> = declarations.iter().collect();
         ordered.sort_by_key(|b| (Some(b.service.as_str()) != primary, &b.service, b.slot));
         for binding in ordered {
+            let key = binding.key();
             let previous = self
                 .groups
                 .iter()
                 .chain(&self.retained)
-                .find(|g| g.automatic && g.binding.key() == binding.key());
+                .find(|g| g.automatic && g.binding.key() == key);
             let count = binding.replicas as u32;
             let automatic = binding.explicit.is_none();
             let make = |first: u16, last: u16| Group {
@@ -321,10 +328,12 @@ impl Ports {
             let free = |g: &Group| -> Result<bool> {
                 for claim in &registry.claims {
                     // A previous incarnation is never ours, even at the same path.
-                    if (claim.owner.key != self.owner.key
-                        || claim.group.binding.key() != binding.key())
-                        && g.conflicts(&claim.group)?
-                    {
+                    let replace_own = claim.owner.key == self.owner.key
+                        && (claim.group.binding.key() == key
+                            || (!automatic
+                                && stopped.contains(&binding.service)
+                                && claim.group.binding.service == binding.service));
+                    if !replace_own && g.conflicts(&claim.group)? {
                         return Ok(false);
                     }
                 }
@@ -354,8 +363,8 @@ impl Ports {
                 );
                 group
             } else {
-                let old = previous
-                    .filter(|p| !retry.contains(&binding.key()) || (p.first..=p.last).any(&owned));
+                let old =
+                    previous.filter(|p| !retry.contains(&key) || (p.first..=p.last).any(&owned));
                 let old = old
                     .filter(|p| (p.first as u32 + count - 1) <= 65535)
                     .map(|p| make(p.first, (p.first as u32 + count - 1) as u16));
@@ -373,7 +382,7 @@ impl Ports {
                         if Some(binding.service.as_str()) == primary && binding.slot == 0 {
                             seed.to_owned()
                         } else {
-                            format!("{seed}:{}:{}", self.owner.key, binding.key())
+                            format!("{seed}:{}:{key}", self.owner.key)
                         },
                     );
                     let start = if Some(binding.service.as_str()) == primary && binding.slot == 0 {
@@ -391,8 +400,7 @@ impl Ports {
                             continue;
                         }
                         let group = make(first as u16, (first + count - 1) as u16);
-                        if retry.contains(&binding.key())
-                            && previous.is_some_and(|p| p.first == group.first)
+                        if retry.contains(&key) && previous.is_some_and(|p| p.first == group.first)
                         {
                             continue;
                         }
@@ -550,6 +558,15 @@ fn interval(value: &str) -> Result<Option<(u16, u16)>> {
     ensure!(a > 0 && a <= b, "Invalid published port range");
     Ok(Some((a, b)))
 }
+pub fn replica_count(service: &Value) -> Result<u16> {
+    let count = service
+        .get("scale")
+        .or_else(|| service.pointer("/deploy/replicas"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    u16::try_from(count).context("Stand replicas must be 0..65535")
+}
+
 pub fn declarations(model: &Value, active: &BTreeSet<String>) -> Result<Vec<Binding>> {
     let services = object(
         model
@@ -560,15 +577,10 @@ pub fn declarations(model: &Value, active: &BTreeSet<String>) -> Result<Vec<Bind
     let mut result = Vec::new();
     for name in active {
         let service = &services[name];
-        let scale = service
-            .get("scale")
-            .or_else(|| service.pointer("/deploy/replicas"))
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        ensure!(
-            (1..=65535).contains(&scale),
-            "Stand replicas must be 1..65535"
-        );
+        let scale = replica_count(service)?;
+        if scale == 0 {
+            continue;
+        }
         let Some(ports) = service.get("ports") else {
             continue;
         };
@@ -616,7 +628,7 @@ pub fn declarations(model: &Value, active: &BTreeSet<String>) -> Result<Vec<Bind
                     .get("app_protocol")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                replicas: scale as u16,
+                replicas: scale,
                 explicit: interval(&raw)?,
             };
             binding.ip()?;
@@ -699,7 +711,11 @@ impl Registry {
     }
     fn collect_stale(&mut self) -> Result<()> {
         let mut stale = BTreeSet::new();
+        let mut checked = BTreeSet::new();
         for claim in &self.claims {
+            if !checked.insert(&claim.owner.key) {
+                continue;
+            }
             match fs::symlink_metadata(&claim.owner.root) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     stale.insert(claim.owner.key.clone());

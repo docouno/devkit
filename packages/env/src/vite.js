@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { within } from './paths.js';
-import { previewServerPatch, hostAllowed } from './preview.js';
+import { configureApiProxy, configurePreviewHosts, hostPolicy } from './preview.js';
 import { hmrRecovery } from './hmr.js';
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -178,9 +178,7 @@ function collectWorkspaceSourceMap(startDir) {
 export function devkitWorkspaceSource(projectDir) {
   let activeSourceMap = new Map();
   let active = false;
-  let allowedHosts = [];
   let resolvedConfig;
-  const currentHosts = () => resolvedConfig?.server.allowedHosts ?? allowedHosts;
   const recovery = hmrRecovery();
 
   return {
@@ -199,10 +197,8 @@ export function devkitWorkspaceSource(projectDir) {
       const { projectRoot, sourceMap, allowedDirs, excludedDeps } =
         collectWorkspaceSourceMap(appRoot);
       activeSourceMap = sourceMap;
-      const server = previewServerPatch(userConfig?.server, currentHosts);
-      allowedHosts = server.allowedHosts;
       if (!projectRoot || excludedDeps.size === 0) {
-        return { server };
+        return undefined;
       }
       const existingAllow = Array.isArray(userConfig?.server?.fs?.allow)
         ? userConfig.server.fs.allow
@@ -212,7 +208,6 @@ export function devkitWorkspaceSource(projectDir) {
         : [];
       return {
         server: {
-          ...server,
           fs: {
             allow: [...new Set([...existingAllow, projectRoot, appRoot, ...allowedDirs])],
           },
@@ -225,20 +220,33 @@ export function devkitWorkspaceSource(projectDir) {
     configResolved(config) {
       resolvedConfig = config;
       recovery.configure(config, active);
-    },
-    configureServer(server) {
-      if (!active) {
-        return;
+      if (active) {
+        configurePreviewHosts(config.server);
       }
-      resolvedConfig = server.config;
-      server.middlewares.use((request, response, next) => {
-        if (hostAllowed(request.headers.host, currentHosts())) {
-          next();
+    },
+    configureServer: {
+      order: 'post',
+      handler(server) {
+        if (!active) {
           return;
         }
-        response.statusCode = 403;
-        response.end('Blocked request: host is not allowed.');
-      });
+        resolvedConfig = server.config;
+        const options = server.config.server;
+        const allowsHost = hostPolicy(options.allowedHosts ?? []);
+        configureApiProxy(options, allowsHost);
+        // Vite's native HTTP guard already uses the resolved allowlist. It skips
+        // HTTPS listeners, so apply the same policy there before serving requests.
+        if (options.https && options.allowedHosts !== true) {
+          server.middlewares.use((request, response, next) => {
+            if (allowsHost(request.headers.host)) {
+              next();
+              return;
+            }
+            response.statusCode = 403;
+            response.end('Blocked request: host is not allowed.');
+          });
+        }
+      },
     },
     transform(code, id) {
       if (resolvedConfig) {

@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 const pnpmRoot = fileURLToPath(new URL('../../../node_modules/.pnpm', import.meta.url));
 import test from 'node:test';
 import { devkitWorkspaceSource } from '../src/vite.js';
-import { exactHost, previewHosts, hostAllowed } from '../src/preview.js';
+import { exactHost, previewHosts, hostPolicy } from '../src/preview.js';
 import { hmrRecovery } from '../src/hmr.js';
 
 test('producer and consumer share browser-equivalent canonical host vectors', () => {
@@ -56,19 +56,20 @@ test('serve preview works without a project or packages, merges hosts and guards
     },
     () => {
       const plugin = devkitWorkspaceSource('/no-project');
-      const patch = plugin.config(
-        { server: { allowedHosts: ['owned.example.test'] } },
-        { command: 'serve', mode: 'custom' },
-      );
-      assert.deepEqual(patch.server.allowedHosts, [
+      plugin.config({}, { command: 'serve', mode: 'custom' });
+      const config = { server: { allowedHosts: ['owned.example.test'] } };
+      plugin.configResolved(config);
+      plugin.configureServer.handler({ config });
+      assert.deepEqual(config.server.allowedHosts, [
         'owned.example.test',
         'review.example.test',
         '.team.example.test',
       ]);
-      assert.equal(hostAllowed('review.example.test:443', patch.server.allowedHosts), true);
-      assert.equal(hostAllowed('evil.example.test', patch.server.allowedHosts), false);
-      assert.equal(hostAllowed('sub.team.example.test', patch.server.allowedHosts), true);
-      const api = patch.server.proxy['/api'];
+      const allowsHost = hostPolicy(config.server.allowedHosts);
+      assert.equal(allowsHost('review.example.test:443'), true);
+      assert.equal(allowsHost('evil.example.test'), false);
+      assert.equal(allowsHost('sub.team.example.test'), true);
+      const api = config.server.proxy['/api'];
       assert.equal(api.ws, true);
       assert.equal(api.changeOrigin, true);
       let forwarded = 0;
@@ -94,10 +95,9 @@ test('serve preview works without a project or packages, merges hosts and guards
       assert.equal(forwarded, 1);
       const custom = { target: 'http://custom:8080', ws: false, configure() {} };
       const original = { '/api': custom, '/other': { target: 'http://other' } };
-      const preserved = plugin.config(
-        { server: { proxy: original, allowedHosts: true } },
-        { command: 'serve' },
-      );
+      const preserved = { server: { proxy: original, allowedHosts: true } };
+      plugin.configResolved(preserved);
+      plugin.configureServer.handler({ config: preserved });
       assert.equal(preserved.server.proxy['/api'], custom);
       assert.equal(preserved.server.proxy['/other'], original['/other']);
       assert.equal(preserved.server.allowedHosts, true);
@@ -230,26 +230,28 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
   }
 });
 
-test('final resolved hosts and routing govern HTTP and automatic websocket behavior', () => {
+test('final resolved hosts and routing govern HTTPS and automatic websocket behavior', () => {
   environment({ DEVKIT_API_TARGET: 'http://api:8080' }, () => {
     const plugin = devkitWorkspaceSource('/no-project');
-    const patch = plugin.config(
+    plugin.config(
       { server: { allowedHosts: ['early.test'] } },
       { command: 'serve', mode: 'development' },
     );
-    plugin.configResolved({
+    const config = {
       server: {
         allowedHosts: ['early.test', 'added.test'],
         ws: { host: 'custom.test', clientPort: 12345 },
       },
-    });
+    };
+    plugin.configResolved(config);
+    plugin.configureServer.handler({ config });
     let forwarded = 0;
     const proxy = {
       ws() {
         forwarded++;
       },
     };
-    patch.server.proxy['/api'].configure(proxy);
+    config.server.proxy['/api'].configure(proxy);
     proxy.ws({ headers: { host: 'added.test' } }, {});
     assert.equal(forwarded, 1);
     let denied = '';
@@ -265,8 +267,8 @@ test('final resolved hosts and routing govern HTTP and automatic websocket behav
     assert.equal(forwarded, 1);
     assert.equal(plugin.transform('', '/vite/dist/client/client.mjs'), null);
     let middleware;
-    plugin.configureServer({
-      config: { server: { allowedHosts: ['later.test'], ws: {} } },
+    plugin.configureServer.handler({
+      config: { server: { https: {}, allowedHosts: ['Later.test'], ws: {} } },
       middlewares: {
         use(handler) {
           middleware = handler;
@@ -274,9 +276,44 @@ test('final resolved hosts and routing govern HTTP and automatic websocket behav
       },
     });
     let passed = false;
-    middleware({ headers: { host: 'later.test' } }, {}, () => {
+    middleware({ headers: { host: 'Later.test' } }, {}, () => {
       passed = true;
     });
     assert.equal(passed, true);
   });
+});
+
+test('a later Vite config hook owns its custom proxy options', async () => {
+  const entry = fs.readdirSync(pnpmRoot).find((name) => name.startsWith('vite@'));
+  const { createServer } = await import(
+    pathToFileURL(path.join(pnpmRoot, entry, 'node_modules/vite/dist/node/index.js')).href
+  );
+  const headers = { 'x-custom': 'yes' };
+  let options;
+  const proxy = {
+    target: 'http://127.0.0.1:8080',
+    headers,
+    configure(_instance, received) {
+      options = received;
+    },
+  };
+  const server = await createServer({
+    configFile: false,
+    server: { middlewareMode: true, watch: null, proxy: { '/api': 'http://api:8080' } },
+    plugins: [
+      devkitWorkspaceSource('/no-project'),
+      {
+        name: 'consumer-proxy',
+        config: () => ({ server: { proxy: { '/api': proxy } } }),
+      },
+    ],
+  });
+  try {
+    assert.equal(options, server.config.server.proxy['/api']);
+    assert.equal(options.headers, headers);
+    assert.equal(options.ws, undefined);
+    assert.equal(options.changeOrigin, undefined);
+  } finally {
+    await server.close();
+  }
 });

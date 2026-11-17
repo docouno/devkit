@@ -157,21 +157,6 @@ try {
   });
   assert.match(denied, /403/u);
   assert.equal(JSON.parse((await request('/__trace')).body).backendRequests, 0);
-  const echo = await new Promise((done, reject) => {
-    const ws = new WebSocket('ws://preview.test:18112/api/echo');
-    const timer = setTimeout(() => {
-      ws.close();
-      reject(Error('Echo timeout'));
-    }, 3000);
-    ws.onopen = () => ws.send('genuine');
-    ws.onmessage = (event) => {
-      clearTimeout(timer);
-      ws.close();
-      done(event.data);
-    };
-    ws.onerror = reject;
-  });
-  assert.equal(echo, 'genuine');
   for (const origin of ['http://127.0.0.1:18113', 'https://preview.test']) {
     for (const drop of [
       'none',
@@ -189,22 +174,18 @@ try {
       await delay(50);
       await request(
         '/__control?drop=' +
-          (['stale', 'base'].includes(drop)
-            ? 'once'
-            : ['corrupt', 'unavailable'].includes(drop)
-              ? 'always'
-              : drop) +
+          (drop === 'base' ? 'once' : ['corrupt', 'unavailable'].includes(drop) ? 'always' : drop) +
           (drop === 'base' ? '&base=/base/' : ''),
       );
       loads = 0;
       connected = 0;
       stoppedErrors = 0;
       let injection;
-      if (['stale', 'corrupt', 'unavailable'].includes(drop)) {
+      if (['corrupt', 'unavailable'].includes(drop)) {
         const source =
           drop === 'unavailable'
             ? `Object.defineProperty(window,'sessionStorage',{get(){throw new Error('test storage unavailable')}});`
-            : `try { const key='devkit:hmr-recovery:'+(location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+location.port+'/';if(!sessionStorage.getItem(key))sessionStorage.setItem(key,${drop === 'corrupt' ? JSON.stringify('{invalid') : JSON.stringify(JSON.stringify({ version: 1, token: 'older-server-token', spent: true }))}); } catch {}`;
+            : `sessionStorage.setItem('devkit:hmr-recovery:'+(location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+location.port+'/', '{invalid');`;
         injection = (await send('Page.addScriptToEvaluateOnNewDocument', { source })).identifier;
       }
       await send('Page.navigate', { url: origin + (drop === 'base' ? '/base/' : '') });
@@ -218,13 +199,40 @@ try {
       const successful = ['none', 'once', 'stale', 'base'].includes(drop);
       if (successful) {
         assert.ok(connected > 0, `No actual connected frame: ${origin} ${drop}`);
+        if (drop === 'stale') {
+          const trace = JSON.parse((await request('/__trace')).body);
+          assert.ok(
+            trace.rotatedToken && trace.staleStatus === 400,
+            'Vite did not reject the original token after restart',
+          );
+          assert.ok(
+            loads >= 2 && trace.hmrAttempts >= 2,
+            'Browser never retried with the new client',
+          );
+        }
+        const api = await evaluate(`(async () => {
+          const response = await fetch('/api/health');
+          return [response.status, await response.text()];
+        })()`);
+        assert.deepEqual(api, [200, 'api']);
+        const echo = await evaluate(`new Promise((resolve, reject) => {
+          const url = new URL('/api/echo', location.href);
+          url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const socket = new WebSocket(url);
+          const timer = setTimeout(() => { socket.close(); reject(new Error('API WS echo timeout')); }, 3000);
+          socket.onopen = () => socket.send('genuine');
+          socket.onmessage = (event) => { clearTimeout(timer); socket.close(); resolve(event.data); };
+          socket.onerror = () => { clearTimeout(timer); reject(new Error('API WS error')); };
+        })`);
+        assert.equal(echo, 'genuine');
+        const color = "getComputedStyle(document.querySelector('h1')).color";
+        const previousColor = await evaluate(color);
         const revision = (await request('/__edit')).body;
         await delay(650);
         assert.equal(await evaluate("document.querySelector('h1')?.textContent"), 'v' + revision);
-        assert.equal(
-          await evaluate("getComputedStyle(document.querySelector('h1')).color"),
-          'rgb(4, 5, 6)',
-        );
+        const nextColor = await evaluate(color);
+        assert.notEqual(nextColor, previousColor);
+        assert.equal(nextColor, `rgb(${(Number(revision) % 250) + 1}, 2, 3)`);
         assert.equal(loads, before, 'Hot JS/CSS edit navigated the page');
         assert.equal(
           await evaluate(
@@ -255,6 +263,7 @@ try {
         stoppedErrors,
         worker,
         hotUpdateWithoutNavigation: successful,
+        browserApiHttpAndWs: successful,
       });
       console.log(JSON.stringify(results.at(-1)));
       // Navigation does not imply a fresh session: clear only between independent cases.

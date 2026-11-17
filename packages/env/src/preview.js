@@ -177,53 +177,56 @@ export function previewHosts(environment = process.env) {
   );
   return [...new Set(hosts)];
 }
-export function hostAllowed(authority, allowed) {
+export function hostPolicy(allowed) {
   if (allowed === true) {
-    return true;
+    return () => true;
   }
-  if (typeof authority !== 'string' || authority.includes(',') || /[\s/@\\?#]/u.test(authority)) {
-    return false;
-  }
-  let host;
-  try {
-    const url = new URL(`http://${authority}`);
-    if (url.username || url.password || url.pathname !== '/') {
+  const exact = new Set(allowed);
+  const suffixes = allowed.filter((host) => host.startsWith('.'));
+  return (authority) => {
+    if (typeof authority !== 'string' || /[,\s/@\\?#]/u.test(authority)) {
       return false;
     }
-    host = exactHost(url.hostname);
-  } catch {
-    return false;
-  }
-  if (isIP(host) || host === 'localhost' || host.endsWith('.localhost')) {
-    return true;
-  }
-  return allowed.some(
-    (entry) =>
-      entry === host ||
-      (entry.startsWith('.') && (host === entry.slice(1) || host.endsWith(entry))),
-  );
+    let host;
+    try {
+      const url = new URL(`http://${authority}`);
+      if (url.username || url.password || url.pathname !== '/') {
+        return false;
+      }
+      // Hostnames in explicit Vite configuration retain Vite's literal matching.
+      host = authority.startsWith('[') ? url.hostname.slice(1, -1) : authority.split(':', 1)[0];
+    } catch {
+      return false;
+    }
+    return (
+      Boolean(isIP(host)) ||
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      exact.has(host) ||
+      suffixes.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))
+    );
+  };
 }
-export function previewServerPatch(userServer = {}, resolvedHosts) {
-  const configured = userServer.allowedHosts;
+export function configurePreviewHosts(server) {
   const hosts = previewHosts();
-  const allowedHosts =
-    configured === true
-      ? true
-      : [...new Set([...(Array.isArray(configured) ? configured : []), ...hosts])];
-  const original = userServer.proxy;
-  const proxy = original && typeof original === 'object' ? { ...original } : {};
-  const api = proxy['/api'];
+  if (server.allowedHosts !== true && hosts.length > 0) {
+    server.allowedHosts = [...new Set([...(server.allowedHosts ?? []), ...hosts])];
+  }
+}
+export function configureApiProxy(server, allowsHost) {
+  const api = server.proxy?.['/api'];
   const target =
     typeof api === 'string' ? api : api === undefined ? process.env.DEVKIT_API_TARGET : undefined;
   if (target) {
-    proxy['/api'] = {
+    server.proxy ??= {};
+    server.proxy['/api'] = {
       target,
       changeOrigin: true,
       ws: true,
       configure(instance) {
         const forward = instance.ws;
         instance.ws = function guardedUpgrade(request, socket, ...rest) {
-          if (!hostAllowed(request.headers.host, resolvedHosts ? resolvedHosts() : allowedHosts)) {
+          if (!allowsHost(request.headers.host)) {
             socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
             return undefined;
           }
@@ -232,5 +235,4 @@ export function previewServerPatch(userServer = {}, resolvedHosts) {
       },
     };
   }
-  return { allowedHosts, ...(Object.keys(proxy).length ? { proxy } : {}) };
 }

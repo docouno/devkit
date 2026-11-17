@@ -9,7 +9,6 @@ export DEVKIT_CLEANUP := $(or $(cleanup),0)
 export DEVKIT_SYNC_RECONCILE := $(or $(reconcile),0)
 export DEVKIT_SYNC_PREVIEW := $(or $(preview),0)
 export DEVKIT_PACKAGE_AGGREGATE := 0
-export DEVKIT_DEV_AGGREGATE := 0
 export DEVKIT_TARGET_COMPONENT :=
 export DEVKIT_EXPECTED_MANIFEST := $(word 1,$(shell sha256sum .devkit/manifest.json 2>/dev/null))
 
@@ -43,7 +42,6 @@ build: $(call devkit_targets,build)
 setup check fix test build:
 	@exec sh $(devkit_loader) snapshot
 
-dev up: export DEVKIT_DEV_AGGREGATE := $(devkit_dev_aggregate)
 dev up: devkit-dev-selection $(addprefix dev-,$(devkit_selected_apps))
 .PHONY: devkit-dev-selection
 devkit-dev-selection:
