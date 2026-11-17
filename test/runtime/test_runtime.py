@@ -20,6 +20,7 @@ import tarfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -99,7 +100,7 @@ def wait_until(predicate, timeout=8):
 class DelayedInspectionCreate:
     """Fault injection: daemon completion can outlive a cancelled CLI request."""
 
-    def __init__(self, path):
+    def __init__(self, path, stalled_query=None, project=None, external=None):
         self.path = path
         host = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
         if not host.startswith("unix://"):
@@ -109,6 +110,10 @@ class DelayedInspectionCreate:
         self.release = threading.Event()
         self.completed = threading.Event()
         self.record = {}
+        self.stalled_query = stalled_query
+        self.project = project
+        self.external = external
+        self.image_read = False
         fixture = self
 
         class Connection(http.client.HTTPConnection):
@@ -147,12 +152,27 @@ class DelayedInspectionCreate:
                         chunks.append(self.rfile.read(size))
                         self.rfile.read(2)
                     body = b"".join(chunks)
-                delayed = (self.command == "POST"
+                parsed = urllib.parse.urlsplit(self.path)
+                create = (self.command == "POST"
                            and self.path.split("?", 1)[0].endswith("/containers/create")
                            and b'"io.docouno.devkit.inspection"' in (body or b""))
-                if delayed:
+                image = self.command == "GET" and "/images/sha256:" in parsed.path and parsed.path.endswith("/json")
+                if fixture.stalled_query == "image":
+                    delayed = image
+                elif fixture.stalled_query == "external":
+                    delayed = self.command == "GET" and parsed.path.endswith("/containers/" + fixture.external + "/json")
+                elif fixture.stalled_query == "retained":
+                    filters = urllib.parse.parse_qs(parsed.query).get("filters", [""])[0]
+                    delayed = (self.command == "GET" and parsed.path.endswith("/containers/json")
+                               and fixture.image_read and "com.docker.compose.project=" + fixture.project in filters)
+                else:
+                    delayed = create
+                delayed = delayed and not fixture.accepted.is_set()
+                if create:
                     payload = json.loads(body)
                     fixture.record.update(labels=payload["Labels"])
+                if delayed:
+                    fixture.record.update(path=self.path)
                     fixture.accepted.set()
                     if not fixture.release.wait(20):
                         raise AssertionError("Delayed create was never released")
@@ -165,8 +185,12 @@ class DelayedInspectionCreate:
                 if len(data) > 2 * 1024 * 1024:
                     raise AssertionError("Oversized fixture response")
                 connection.close()
+                if image:
+                    fixture.image_read = True
                 if delayed:
-                    fixture.record.update(status=response.status, reply=json.loads(data))
+                    fixture.record.update(status=response.status)
+                    if create:
+                        fixture.record.update(reply=json.loads(data))
                     fixture.completed.set()
                 try:
                     self.send_response(response.status)
@@ -891,6 +915,93 @@ class RuntimeTests(unittest.TestCase):
                                 self.assertEqual(actual["Config"]["Labels"][key], value)
                         self.assertEqual(actual["State"]["Pid"], 0)
                         run("docker", "rm", "--force", "--volumes", actual["Id"])
+
+    def test_stand_status_and_cleanup_follow_history_after_library_only_delivery(self):
+        _, project = self.preview_fixture()
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        self.make("up", "app=main", env=environment)
+        original = container(project + "-main-1")
+        self.assertTrue(original["State"]["Running"])
+        # Model delivery of a different accepted Git tree, preserving ignored state.
+        (self.root / "packages").mkdir()
+        (self.root / "apps/main").rename(self.root / "packages/main")
+        (self.root / "compose.yaml").unlink()
+        accept_runtime(self.root, native=True, package_profiles={"packages/main": "ts-library"})
+        status = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=environment).stdout)["result"]
+        self.assertEqual(len(status["services"]), 1)
+        self.assertEqual(status["services"][0]["service"], "main")
+        self.assertEqual(status["services"][0]["state"], "running")
+        human = self.make("status", env=environment).stdout
+        self.assertIn("Service main", human)
+        self.assertNotIn("(reserved)", human)
+        active = self.root / ".devkit/state/stand.active"
+        saved = active.read_bytes()
+        ledger = json.loads(saved)
+        ledger.update(launchPending=True, launchFinished=False)
+        active.write_text(json.dumps(ledger))
+        refused = self.make("down", "cleanup=1", env=environment, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("creator has no terminal receipt", refused.stderr)
+        self.assertTrue(container(original["Id"])["State"]["Running"])
+        self.assertTrue(json.loads((self.root / ".devkit/state/ports.json").read_text())["possibleActors"])
+        active.write_bytes(saved)
+        self.make("down", "cleanup=1", env=environment)
+        self.assertIsNone(container(original["Id"]))
+        self.assertFalse((self.root / ".devkit/state/ports.json").exists())
+
+    def test_image_external_and_retained_metadata_reads_obey_deadlines(self):
+        service, project = self.preview_fixture()
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        external = self.owned_name()
+        run("docker", "create", "--name", external, "--label", f"{LABEL}={self.token}", IMAGE, "true")
+        for query in ("image", "retained", "external"):
+            with self.subTest(query=query):
+                current = json.loads(json.dumps(service))
+                if query == "external":
+                    current["volumes_from"] = ["container:" + external + ":ro"]
+                (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": current}, "networks": {"default": {"labels": {LABEL: self.token}}}}))
+                proxy = DelayedInspectionCreate(self.base / "metadata.sock", stalled_query=query, project=project, external=external)
+                proc = None
+                try:
+                    with proxy:
+                        selected = dict(environment, DOCKER_HOST="unix://" + str(proxy.path))
+                        proc = subprocess.Popen([str(ENGINE), "task", "dev", "--root", str(self.root), "--app", "main"],
+                                                env=selected, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                        self.assertTrue(proxy.accepted.wait(20), "The selective daemon metadata query was never reached")
+                        started = time.monotonic()
+                        stdout, stderr = proc.communicate(timeout=8)
+                        self.assertLess(time.monotonic() - started, 7)
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn("deadline", stderr)
+                        self.assertIsNone(container(project + "-main-1"), stdout + stderr)
+                        self.assertFalse(proxy.completed.is_set(), "The response was released before the native deadline")
+                    self.make("down", "cleanup=1", env=environment)
+                    owner = proxy.record.get("labels", {}).get("io.docouno.devkit.inspection-owner")
+                    if owner:
+                        self.assertEqual(run("docker", "ps", "--all", "--filter",
+                                             "label=io.docouno.devkit.inspection-owner=" + owner,
+                                             "--format", "{{.ID}}").stdout.strip(), "")
+                    self.assertIsNotNone(container(external), "Foreign provider was removed by metadata recovery")
+                finally:
+                    proxy.release.set()
+                    if proc is not None and proc.poll() is None:
+                        os.kill(proc.pid, signal.SIGTERM)
+                        proc.communicate(timeout=15)
+                    active = self.root / ".devkit/state/stand.active"
+                    if active.exists():
+                        ledger = json.loads(active.read_text())
+                        for intent in ledger["inspections"].values():
+                            for helper in intent["helpers"].values():
+                                actual = container(helper["name"])
+                                if actual is not None:
+                                    labels = actual["Config"]["Labels"]
+                                    self.assertEqual(labels["io.docouno.devkit.inspection"], helper["token"])
+                                    self.assertEqual(labels["io.docouno.devkit.inspection-role"], helper["role"])
+                                    self.assertEqual(labels["io.docouno.devkit.inspection-owner"], ledger["owner"]["key"])
+                                    self.assertEqual(actual["State"]["Pid"], 0)
+                                    run("docker", "rm", "--force", "--volumes", actual["Id"])
 
     def test_managed_api_defaults_override_image_bind_environment(self):
         write_fixture(self.root)

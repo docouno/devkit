@@ -261,6 +261,21 @@ impl ProcessRunner {
     pub fn capture(&self, command: &mut Command) -> Result<ProcessOutput> {
         self.checked(command, OutputMode::Capture(16 * 1024 * 1024))
     }
+    pub fn capture_before(
+        &self,
+        command: &mut Command,
+        deadline: Instant,
+    ) -> Result<ProcessOutput> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .context("Metadata query deadline exceeded")?;
+        self.checked_with_timeout(
+            command,
+            OutputMode::Capture(16 * 1024 * 1024),
+            remaining.min(Duration::from_secs(3)),
+        )
+    }
     fn run_inner(
         &self,
         command: &mut Command,

@@ -198,4 +198,6 @@ For multi-app aggregate `make up`/`make dev`, an empty `DISPLAY` with `headless=
 
 Keep ignored stand state while services or inspection creators may exist. A missing launch ledger cannot prove that cleanup is safe: an independent actor receipt preserves that uncertainty. Restore recorded state before automated cleanup when history was removed; ordinary `make down` remains available to stop the Compose project.
 
+Changing to a tree with only libraries does not erase an earlier stand. Status still shows its containers, and `make down cleanup=1` verifies and removes owned remnants before releasing leases.
+
 A failed or interrupted acquisition may complete a Docker create after the client exits. Cleanup observes late helpers and retains incomplete creator outcomes with a bounded diagnostic. Rerun cleanup after pending daemon work completes; keep the recorded state while the outcome remains unknown.

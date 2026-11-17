@@ -2191,20 +2191,6 @@ fn run_service(
     } else {
         None
     };
-    if selected.is_none()
-        && !ctx
-            .admission
-            .state
-            .components
-            .values()
-            .any(|c| c.role == Role::App)
-        && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none()
-    {
-        assert_compose_inventory(&ctx.admission.root, &inventory)?;
-        ctx.admission.recheck()?;
-        drop(lock);
-        return Ok(());
-    }
     let mut command = ctx.compose()?;
     // Existing recorded derived image IDs allow interpolation; never inspect or
     // acquire tool images for service status/logs/down.
@@ -3077,34 +3063,23 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
     ctx.prerequisite_service()?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service_to_component = app_service_component_map(&ctx.admission.state);
-    let has_apps = ctx
-        .admission
-        .state
-        .components
-        .values()
-        .any(|c| c.role == Role::App);
-    let mut services =
-        if !has_apps && identity(&safe_path(&ctx.admission.root, "compose.yaml")?)?.is_none() {
-            Vec::new()
-        } else {
-            for kind in ["rust", "desktop"] {
-                let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-                if identity(&p)?.is_some() {
-                    let image = fs::read_to_string(p)?.trim().to_owned();
-                    if image
-                        .strip_prefix("sha256:")
-                        .is_some_and(|h| SHA256_RE.is_match(h))
-                    {
-                        ctx.set_image(kind, image);
-                    }
-                }
+    for kind in ["rust", "desktop"] {
+        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
+        if identity(&p)?.is_some() {
+            let image = fs::read_to_string(p)?.trim().to_owned();
+            if image
+                .strip_prefix("sha256:")
+                .is_some_and(|h| SHA256_RE.is_match(h))
+            {
+                ctx.set_image(kind, image);
             }
-            let mut command = ctx.compose()?;
-            ctx.env(&mut command);
-            command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
-            let out = ctx.runner.capture(&mut command)?;
-            crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?
-        };
+        }
+    }
+    let mut command = ctx.compose()?;
+    ctx.env(&mut command);
+    command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
+    let out = ctx.runner.capture(&mut command)?;
+    let mut services = crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?;
     crate::stand::preview::enrich_status(&ctx.admission.root, &ctx.project, runner, &mut services)?;
     let stand_ports = crate::stand::preview::reservations(&ctx.admission.root)?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;

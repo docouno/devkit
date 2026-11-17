@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     process::Command,
+    time::Instant,
 };
 
 pub const OWNER_LABEL: &str = "io.docouno.devkit.stand-owner";
@@ -127,6 +128,24 @@ pub struct Container {
 }
 
 pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
+    inspect_before(id, runner, None)
+}
+fn capture(
+    command: &mut Command,
+    runner: &ProcessRunner,
+    deadline: Option<Instant>,
+) -> Result<crate::processes::ProcessOutput> {
+    if let Some(deadline) = deadline {
+        runner.capture_before(command, deadline)
+    } else {
+        runner.capture(command)
+    }
+}
+fn inspect_before(
+    id: &str,
+    runner: &ProcessRunner,
+    deadline: Option<Instant>,
+) -> Result<Container> {
     ensure!(
         id.len() >= 12 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid container ID"
@@ -147,8 +166,8 @@ pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
             "\n{{{{$v := \"\"}}}}{{{{range .Config.Env}}}}{{{{if eq (index (split . \"=\") 0) \"{key}\"}}}}{{{{$v = .}}}}{{{{end}}}}{{{{end}}}}{{{{json $v}}}}"
         );
     }
-    let output = runner.capture(Command::new("docker").args(["container", "inspect", "--format",
-        &format!("{{{{json .Id}}}}\n{{{{json (index .Config.Labels \"{OWNER_LABEL}\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.project\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.service\")}}}}\n{{{{json .State.Running}}}}\n{{{{json .Image}}}}\n{{{{json .NetworkSettings.Ports}}}}\n{{{{json .Mounts}}}}\n{{{{json .HostConfig.PortBindings}}}}\n{format}"), id]))?;
+    let output = capture(Command::new("docker").args(["container", "inspect", "--format",
+        &format!("{{{{json .Id}}}}\n{{{{json (index .Config.Labels \"{OWNER_LABEL}\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.project\")}}}}\n{{{{json (index .Config.Labels \"com.docker.compose.service\")}}}}\n{{{{json .State.Running}}}}\n{{{{json .Image}}}}\n{{{{json .NetworkSettings.Ports}}}}\n{{{{json .Mounts}}}}\n{{{{json .HostConfig.PortBindings}}}}\n{format}"), id]), runner, deadline)?;
     let lines = output
         .text()?
         .lines()
@@ -173,21 +192,39 @@ pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
     Ok(row)
 }
 pub fn observe(project: &str, runner: &ProcessRunner) -> Result<Vec<Container>> {
-    let out = runner.capture(Command::new("docker").args([
-        "ps",
-        "--all",
-        "--quiet",
-        "--no-trunc",
-        "--filter",
-        &format!("label=com.docker.compose.project={project}"),
-    ]))?;
+    observe_before(project, runner, None)
+}
+pub fn observe_until(
+    project: &str,
+    runner: &ProcessRunner,
+    deadline: Instant,
+) -> Result<Vec<Container>> {
+    observe_before(project, runner, Some(deadline))
+}
+fn observe_before(
+    project: &str,
+    runner: &ProcessRunner,
+    deadline: Option<Instant>,
+) -> Result<Vec<Container>> {
+    let out = capture(
+        Command::new("docker").args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+        ]),
+        runner,
+        deadline,
+    )?;
     let mut rows = Vec::new();
     for id in out.text()?.split_whitespace() {
         ensure!(
             rows.len() < 1024,
             "Stand observation exceeds container budget"
         );
-        let row = inspect(id, runner)?;
+        let row = inspect_before(id, runner, deadline)?;
         ensure!(
             row.project == project,
             "Container project changed during observation"

@@ -630,6 +630,7 @@ pub fn prepare(
     let root_path = ports.owner.root.clone();
     let root = root_path.as_path();
     recover(root, ledger, runner)?;
+    let mut deadline = Instant::now() + Duration::from_secs(30);
     let all = closure(model, active)?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let mut helpers = BTreeMap::new();
@@ -647,13 +648,16 @@ pub fn prepare(
             if let Some(rest) = raw.strip_prefix("container:") {
                 let reference = rest.trim_end_matches(":ro").trim_end_matches(":rw");
                 if !external.contains_key(reference) {
-                    let output = runner.capture(Command::new("docker").args([
-                        "container",
-                        "inspect",
-                        "--format",
-                        "{{json .Id}}\n{{json .Mounts}}",
-                        reference,
-                    ]))?;
+                    let output = runner.capture_before(
+                        Command::new("docker").args([
+                            "container",
+                            "inspect",
+                            "--format",
+                            "{{json .Id}}\n{{json .Mounts}}",
+                            reference,
+                        ]),
+                        deadline,
+                    )?;
                     let lines = output
                         .text()?
                         .lines()
@@ -728,19 +732,21 @@ pub fn prepare(
         command.arg(name);
     }
     let mut reaped = false;
+    let acquisition_started = Instant::now();
     let result = runner.run_tracked(
         &mut command,
         OutputMode::TeeStderr(65536),
         Some(&bytes),
         &mut reaped,
     );
+    // Image pull/build time is acquisition work, outside the shared metadata budget.
+    deadline += acquisition_started.elapsed();
     let intent = ledger.inspections.get_mut(&nonce).unwrap();
     intent.creation_finished = reaped;
     intent.creation_uncertain = !matches!(result.as_ref(), Ok(output) if output.code == 0);
     ledger.save(root)?;
     let proof = (|| -> Result<Proof> {
         result?.success("Image-only Compose acquisition")?;
-        let deadline = Instant::now() + Duration::from_secs(30);
         let total_queries = Cell::new(0);
         let mut images = BTreeMap::new();
         let mut namespaces = BTreeMap::new();
@@ -781,13 +787,13 @@ pub fn prepare(
                     implicit: true,
                 })
                 .collect::<Vec<_>>();
-            let output = runner.capture(Command::new("docker").args([
+            let output = runner.capture_before(Command::new("docker").args([
                 "image",
                 "inspect",
                 "--format",
                 "{{json .Id}}\n{{json .Os}}\n{{json .Architecture}}\n{{json (index .Config \"Volumes\")}}",
                 &snapshot.image,
-            ]))?;
+            ]), deadline)?;
             let info = output
                 .text()?
                 .lines()
@@ -842,11 +848,12 @@ pub fn prepare(
             ledger.save(root)?;
         }
         // Retained anonymous mounts are hazards even when a fresh inspector's copy is empty.
-        let retained = super::ledger::observe(
+        let retained = super::ledger::observe_until(
             model["name"]
                 .as_str()
                 .context("Missing Compose project name")?,
             runner,
+            deadline,
         )?;
         super::ledger::verify_owners(&retained, &ledger.owner)?;
         let previous = super::ports::Ports::read(root)?.context("Missing stand lease intent")?;
