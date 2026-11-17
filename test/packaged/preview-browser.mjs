@@ -8,7 +8,9 @@ const address = process.env.PROBE_PROXY_ADDRESS;
 fs.mkdirSync(process.env.HOME, { recursive: true });
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 const traces = [],
-  results = [];
+  results = [],
+  diagnostics = [];
+let currentCase;
 const request = (route, host) =>
   new Promise((done, reject) => {
     const q = http.get(
@@ -96,6 +98,13 @@ try {
     }
     if (message.method === 'Page.loadEventFired') loads++;
     if (
+      ['Network.webSocketCreated', 'Runtime.consoleAPICalled', 'Runtime.exceptionThrown'].includes(
+        message.method,
+      ) &&
+      diagnostics.length < 1000
+    )
+      diagnostics.push({ method: message.method, params: message.params });
+    if (
       message.method === 'Network.webSocketFrameReceived' &&
       message.params.response.payloadData.includes('"type":"connected"')
     )
@@ -175,6 +184,7 @@ try {
       'corrupt',
       'unavailable',
     ]) {
+      currentCase = { origin, drop };
       await send('Page.navigate', { url: 'about:blank' });
       await delay(50);
       await request(
@@ -246,6 +256,7 @@ try {
         worker,
         hotUpdateWithoutNavigation: successful,
       });
+      console.log(JSON.stringify(results.at(-1)));
       // Navigation does not imply a fresh session: clear only between independent cases.
       if (drop !== 'unavailable') await evaluate('sessionStorage.clear()');
       if (injection)
@@ -257,6 +268,14 @@ try {
   console.log(JSON.stringify(results));
 } catch (error) {
   console.error(error);
+  fs.writeFileSync(
+    '/evidence/result.json',
+    JSON.stringify(
+      { passed: false, error: String(error), currentCase, results, diagnostics },
+      null,
+      2,
+    ),
+  );
   process.exitCode = 1;
 } finally {
   socket?.close();

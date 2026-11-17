@@ -620,6 +620,14 @@ class Verification:
         self.containers.extend([server, browser])
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
         image = (root / ".devkit/state/desktop-image").read_text().strip()
+        certificate = f"devkit-packaged-{self.token}-preview-certificate"
+        self.containers.append(certificate)
+        self.run("preview-test-certificate", ["docker", "run", "--rm", "--pull", "never", "--name", certificate,
+                 "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
+                 "--network", "none", "--read-only", "--cpus", "1", "--memory", "128m", "--pids-limit", "64",
+                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--volume", f"{output}:/evidence:z",
+                 (root / ".devkit/state/rust-image").read_text().strip(), "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                 "-nodes", "-days", "1", "-subj", "/CN=preview.test", "-keyout", "/evidence/preview-key.pem", "-out", "/evidence/preview-cert.pem"])
         common = ["--detach", "--pull", "never", "--label", f"{OWNERSHIP}={self.token}",
                   "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:rw,exec,mode=1777,size=512m",
                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
@@ -630,6 +638,8 @@ class Verification:
         deadline = time.monotonic() + 20
         while not (output / "server-ready.json").is_file() and time.monotonic() < deadline:
             time.sleep(0.1)
+        if not (output / "server-ready.json").is_file():
+            self.run("preview-server-logs", ["docker", "logs", server])
         require((output / "server-ready.json").is_file(), "Preview Vite server did not become ready")
         captured = self.inspect("container", server)
         address = captured["NetworkSettings"]["Networks"]["bridge"]["IPAddress"]

@@ -191,6 +191,8 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
     }
     shim.configure({ server: { hmr: { path: '/custom', timeout: 123, overlay: false } } }, true);
     assert.ok(shim.transform(source, client, warn));
+    shim.configure({ server: { ws: { path: '/custom', timeout: 123 } } }, true);
+    assert.ok(shim.transform(source, client, warn));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

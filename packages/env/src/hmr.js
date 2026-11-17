@@ -14,15 +14,14 @@ export function hmrRecovery() {
     configure(config, serve) {
       const server = config?.server;
       const hmr = server?.hmr;
+      const changesRouting = (options) =>
+        options &&
+        typeof options === 'object' &&
+        ['host', 'protocol', 'port', 'clientPort', 'server'].some(
+          (key) => options[key] !== undefined,
+        );
       const custom =
-        hmr === false ||
-        server?.ws === false ||
-        (server?.ws && Object.keys(server.ws).length > 0) ||
-        (hmr &&
-          typeof hmr === 'object' &&
-          ['host', 'protocol', 'port', 'clientPort', 'server'].some(
-            (key) => hmr[key] !== undefined,
-          ));
+        hmr === false || server?.ws === false || changesRouting(server?.ws) || changesRouting(hmr);
       enabled = serve && !custom;
     },
     transform(code, id, warn) {

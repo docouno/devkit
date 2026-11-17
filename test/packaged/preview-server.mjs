@@ -5,12 +5,11 @@ import https from 'node:https';
 import net from 'node:net';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 const require = createRequire('/workspace/apps/web/package.json');
 const viteEntry = require.resolve('vite');
 const { createServer } = await import(pathToFileURL(viteEntry));
 const { devkitWorkspaceSource } = await import(pathToFileURL(require.resolve('@docouno/env/vite')));
-const { WebSocketServer } = await import(pathToFileURL(createRequire(viteEntry).resolve('ws')));
 const root = '/tmp/devkit-preview-app';
 fs.mkdirSync(root, { recursive: true });
 fs.writeFileSync(
@@ -28,15 +27,53 @@ let revision = 1,
   pingAttempts = 0;
 fs.writeFileSync(root + '/main.js', content(revision));
 fs.writeFileSync(root + '/style.css', 'h1{color:rgb(1, 2, 3)}');
-const echo = new WebSocketServer({ noServer: true });
-const rejected = new WebSocketServer({ noServer: true });
+// The fixture needs only short echo/control frames. Keep it independent of
+// unpublished Vite internals and packages outside the released consumer graph.
+function acceptSocket(q, s) {
+  s.on('error', () => s.destroy());
+  const accept = createHash('sha1')
+    .update(q.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+    .digest('base64');
+  s.write(
+    'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' +
+      accept +
+      (q.headers['sec-websocket-protocol']
+        ? '\r\nSec-WebSocket-Protocol: ' + q.headers['sec-websocket-protocol']
+        : '') +
+      '\r\n\r\n',
+  );
+}
+function echoSocket(q, s, head) {
+  acceptSocket(q, s);
+  let buffered = Buffer.alloc(0);
+  const consume = (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length > 1024) return s.destroy();
+    while (buffered.length >= 2) {
+      const length = buffered[1] & 127;
+      if (!(buffered[1] & 128) || length > 125) return s.destroy();
+      if (buffered.length < 6 + length) return;
+      const opcode = buffered[0] & 15;
+      const payload = Buffer.from(buffered.subarray(6, 6 + length));
+      for (let i = 0; i < length; i++) payload[i] ^= buffered[2 + (i % 4)];
+      buffered = buffered.subarray(6 + length);
+      if (opcode === 8) return s.end(Buffer.from([0x88, 0]));
+      if ([1, 2, 9].includes(opcode))
+        s.write(
+          Buffer.concat([Buffer.from([0x80 | (opcode === 9 ? 10 : opcode), length]), payload]),
+        );
+    }
+  };
+  s.on('data', consume);
+  if (head.length) consume(head);
+}
 const backend = http.createServer((q, s) => {
   backendRequests++;
   s.end('api');
 });
 backend.on('upgrade', (q, s, h) => {
   backendRequests++;
-  echo.handleUpgrade(q, s, h, (ws) => ws.on('message', (data) => ws.send(data)));
+  echoSocket(q, s, h);
 });
 await new Promise((done) => backend.listen(9090, '0.0.0.0', done));
 process.env.DEVKIT_PREVIEW_URL = 'https://preview.test';
@@ -123,9 +160,8 @@ function upgrade(q, s, h) {
         s.destroy();
         return;
       }
-      rejected.handleUpgrade(q, s, h, (ws) =>
-        setTimeout(() => ws.close(1011, 'upstream unavailable'), 30),
-      );
+      acceptSocket(q, s);
+      setTimeout(() => s.end(Buffer.from([0x88, 2, 3, 243])), 30);
       return;
     }
   }
@@ -141,32 +177,13 @@ function upgrade(q, s, h) {
   s.on('close', () => upstream.destroy());
   upstream.on('error', () => s.destroy());
 }
-execFileSync(
-  'openssl',
-  [
-    'req',
-    '-x509',
-    '-newkey',
-    'rsa:2048',
-    '-nodes',
-    '-days',
-    '1',
-    '-subj',
-    '/CN=preview.test',
-    '-keyout',
-    '/tmp/preview-key.pem',
-    '-out',
-    '/tmp/preview-cert.pem',
-  ],
-  { stdio: 'ignore' },
-);
 for (const [server, port] of [
   [http.createServer(handler), 18112],
   [
     https.createServer(
       {
-        key: fs.readFileSync('/tmp/preview-key.pem'),
-        cert: fs.readFileSync('/tmp/preview-cert.pem'),
+        key: fs.readFileSync('/evidence/preview-key.pem'),
+        cert: fs.readFileSync('/evidence/preview-cert.pem'),
       },
       handler,
     ),
