@@ -57,7 +57,7 @@ test('serve preview works without a project or packages, merges hosts and guards
     () => {
       const plugin = devkitWorkspaceSource('/no-project');
       plugin.config({}, { command: 'serve', mode: 'custom' });
-      const config = { server: { allowedHosts: ['owned.example.test'] } };
+      const config = { command: 'serve', server: { allowedHosts: ['owned.example.test'] } };
       plugin.configResolved(config);
       plugin.configureServer({ config });
       assert.deepEqual(config.server.allowedHosts, [
@@ -95,7 +95,7 @@ test('serve preview works without a project or packages, merges hosts and guards
       assert.equal(forwarded, 1);
       const custom = { target: 'http://custom:8080', ws: false, configure() {} };
       const original = { '/api': custom, '/other': { target: 'http://other' } };
-      const preserved = { server: { proxy: original, allowedHosts: true } };
+      const preserved = { command: 'serve', server: { proxy: original, allowedHosts: true } };
       plugin.configResolved(preserved);
       plugin.configureServer({ config: preserved });
       assert.equal(preserved.server.proxy['/api'], custom);
@@ -238,6 +238,7 @@ test('final resolved hosts and routing govern HTTPS and automatic websocket beha
       { command: 'serve', mode: 'development' },
     );
     const config = {
+      command: 'serve',
       server: {
         allowedHosts: ['early.test', 'added.test'],
         ws: { host: 'custom.test', clientPort: 12345 },
@@ -267,8 +268,13 @@ test('final resolved hosts and routing govern HTTPS and automatic websocket beha
     assert.equal(forwarded, 1);
     assert.equal(plugin.transform('', '/vite/dist/client/client.mjs'), null);
     let middleware;
+    const httpsConfig = {
+      command: 'serve',
+      server: { https: {}, allowedHosts: ['Later.test'], ws: {} },
+    };
+    plugin.configResolved(httpsConfig);
     plugin.configureServer({
-      config: { server: { https: {}, allowedHosts: ['Later.test'], ws: {} } },
+      config: httpsConfig,
       middlewares: {
         use(handler) {
           middleware = handler;
@@ -283,11 +289,15 @@ test('final resolved hosts and routing govern HTTPS and automatic websocket beha
   });
 });
 
-test('a later Vite config hook owns its custom proxy options', async () => {
+function loadVite() {
   const entry = fs.readdirSync(pnpmRoot).find((name) => name.startsWith('vite@'));
-  const { createServer } = await import(
+  return import(
     pathToFileURL(path.join(pnpmRoot, entry, 'node_modules/vite/dist/node/index.js')).href
   );
+}
+
+test('a later Vite config hook owns its custom proxy options', async () => {
+  const { createServer } = await loadVite();
   const inlineProxy = Object.freeze({ '/api': 'http://api:8080' });
   const inline = { middlewareMode: true, watch: null, proxy: inlineProxy };
   const initial = await createServer({
@@ -328,5 +338,32 @@ test('a later Vite config hook owns its custom proxy options', async () => {
     assert.equal(options.changeOrigin, undefined);
   } finally {
     await server.close();
+  }
+});
+
+test('shared Vite plugin keeps each server HMR routing policy', async () => {
+  const { createServer } = await loadVite();
+  const plugin = devkitWorkspaceSource('/no-project');
+  const config = { configFile: false, plugins: [plugin] };
+  const server = { host: '127.0.0.1', port: 0, watch: null };
+  const custom = await createServer({
+    ...config,
+    server: { ...server, ws: { clientPort: 9999 } },
+  });
+  try {
+    await custom.listen();
+    const normal = await createServer({ ...config, server });
+    try {
+      await normal.listen();
+      assert.doesNotMatch(
+        (await custom.transformRequest('/@vite/client')).code,
+        /devkit:hmr-recovery:/u,
+      );
+      assert.match((await normal.transformRequest('/@vite/client')).code, /devkit:hmr-recovery:/u);
+    } finally {
+      await normal.close();
+    }
+  } finally {
+    await custom.close();
   }
 });

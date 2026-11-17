@@ -2219,7 +2219,16 @@ fn run_service(
         && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
     {
         ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
-        crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
+        if !ledger.inspections.is_empty() {
+            let mut ports = crate::stand::ports::Ports::read(&ctx.admission.root)?
+                .context("Missing preflight ownership receipt")?;
+            crate::stand::inspection::recover(
+                &ctx.admission.root,
+                &mut ledger,
+                &mut ports,
+                ctx.runner,
+            )?;
+        }
     }
     if request.command == "down" && request.cleanup {
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
@@ -2720,7 +2729,7 @@ fn run_development(
             &resource_services,
         )
     };
-    let mut resources = resource_overlay(&budget)?;
+    let resources = resource_overlay(&budget)?;
     let mut inspected_model = std::borrow::Cow::Borrowed(&model);
     if renderer.template.is_some()
         && !carrier_frontends.is_empty()
@@ -2742,7 +2751,7 @@ fn run_development(
     }
     let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
     ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
-    crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
+    crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, &mut ports, ctx.runner)?;
     let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
     let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
     let stopped = |rows: &[crate::stand::ledger::Container]| {
@@ -2821,95 +2830,131 @@ fn run_development(
             external: BTreeMap::new(),
         }
     };
-    let result = (|| -> Result<()> {
+    let write_resources = |spec: Option<&Value>| -> Result<Option<tempfile::NamedTempFile>> {
+        let Some(spec) = spec else {
+            return Ok(None);
+        };
+        let mut file = tempfile::Builder::new()
+            .prefix("compose-resources-")
+            .suffix(".json")
+            .tempfile_in(&state_dir)?;
+        file.write_all(&json_bytes(spec)?)?;
+        Ok(Some(file))
+    };
+    let launch_command =
+        |resource_file: Option<&tempfile::NamedTempFile>, stand: &Path| -> Result<Command> {
+            let mut command = ctx.compose()?;
+            for overlay in &overlays {
+                command.arg("--file").arg(overlay.path());
+            }
+            if let Some(resource_file) = resource_file {
+                command.arg("--file").arg(resource_file.path());
+            }
+            command.arg("--file").arg(stand);
+            Ok(command)
+        };
+    let validate_mounts = |ports: &crate::stand::ports::Ports,
+                           resource_file: Option<&tempfile::NamedTempFile>,
+                           stand: &Path|
+     -> Result<()> {
+        if !proof.images.is_empty() {
+            let mut command = launch_command(resource_file, stand)?;
+            command.args([
+                "--profile",
+                "*",
+                "config",
+                "--no-env-resolution",
+                "--format",
+                "json",
+            ]);
+            // This query may hold the shared lease lock until the candidate
+            // passes. Bound it just like the other preview metadata queries.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let output = ctx.runner.capture_before(&mut command, deadline)?;
+            crate::stand::inspection::verify_launch(
+                &crate::stand::preview::compose_model(&output.stdout)?,
+                &inspected_model,
+                ports,
+                &active_services,
+                &proof,
+            )?;
+        }
+        Ok(())
+    };
+    let allocate = |ports: &mut crate::stand::ports::Ports,
+                    rows: &[crate::stand::ledger::Container],
+                    active_ports: &crate::stand::ports::ActivePorts,
+                    conflicts: &BTreeSet<String>,
+                    resource_file: Option<&tempfile::NamedTempFile>|
+     -> Result<PathBuf> {
+        let mut overlay = Vec::new();
         ports.allocate_plan(
             crate::stand::ports::Allocation {
                 declarations: &declarations,
                 selected: &active_services,
-                stopped: &stopped(&rows),
+                stopped: &stopped(rows),
                 primary,
                 seed: &branch,
             },
-            &active_ports,
-            &BTreeSet::new(),
-            |ports| {
+            active_ports,
+            conflicts,
+            |candidate| {
                 crate::stand::preview::publish_deployment(
-                    ports,
+                    candidate,
                     &frontends,
                     &active_services,
                     &renderer,
                     &proof,
                     &model,
-                )
+                )?;
+                overlay = crate::stand::deployment_overlay(
+                    candidate,
+                    &active_services,
+                    &frontends,
+                    &model,
+                    &proof,
+                )?;
+                if !proof.images.is_empty() {
+                    let mut file = tempfile::Builder::new()
+                        .prefix("compose.stand.")
+                        .suffix(".yaml")
+                        .tempfile_in(&state_dir)?;
+                    file.write_all(&overlay)?;
+                    validate_mounts(candidate, resource_file, file.path())?;
+                    assert_compose_inventory(&ctx.admission.root, &inventory)?;
+                }
+                Ok(())
             },
         )?;
-        let stand_overlay = crate::stand::save_overlay(
-            &ctx.admission.root,
-            &crate::stand::deployment_overlay(
-                &ports,
-                &active_services,
-                &frontends,
-                &model,
-                &proof,
-            )?,
+        crate::stand::save_overlay(&ctx.admission.root, &overlay)
+    };
+    let result = (|| -> Result<()> {
+        let mut resource_file = write_resources(resources.as_ref())?;
+        let mut stand_overlay = allocate(
+            &mut ports,
+            &rows,
+            &active_ports,
+            &BTreeSet::new(),
+            resource_file.as_ref(),
         )?;
-        ledger = crate::stand::ledger::Ledger::intent(
-            &ctx.admission.root,
-            &ports.owner,
-            &active_services,
-        )?;
-        ports.possible_actors = true;
-        ports.save()?;
-        crate::stand::epoch::anchor(&ctx.admission.root)?;
         let mut bind_attempts = 1;
         let mut cgroup_retried = false;
         loop {
-            let mut res_overlay_file = None;
-            if let Some(res_spec) = &resources {
-                let mut file = tempfile::Builder::new()
-                    .prefix("compose-resources-")
-                    .suffix(".json")
-                    .tempfile_in(&state_dir)?;
-                file.write_all(&json_bytes(res_spec)?)?;
-                res_overlay_file = Some(file);
-            }
-            let mut command = ctx.compose()?;
-            for f in &overlays {
-                command.arg("--file").arg(f.path());
-            }
-            if let Some(f) = &res_overlay_file {
-                command.arg("--file").arg(f.path());
-            }
-            command.arg("--file").arg(&stand_overlay);
-            if !proof.images.is_empty() {
-                let mut normalized = ctx.compose()?;
-                for f in &overlays {
-                    normalized.arg("--file").arg(f.path());
-                }
-                if let Some(f) = &res_overlay_file {
-                    normalized.arg("--file").arg(f.path());
-                }
-                normalized.arg("--file").arg(&stand_overlay).args([
-                    "--profile",
-                    "*",
-                    "config",
-                    "--no-env-resolution",
-                    "--format",
-                    "json",
-                ]);
-                let output = ctx.runner.capture(&mut normalized)?;
-                crate::stand::inspection::verify_launch(
-                    &crate::stand::preview::compose_model(&output.stdout)?,
-                    &inspected_model,
-                    &ports,
-                    &active_services,
-                    &proof,
-                )?;
-            }
+            let mut command = launch_command(resource_file.as_ref(), &stand_overlay)?;
             command.args(["up", "-d", "--wait", &service]);
             full.recheck()?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+            ledger = crate::stand::ledger::Ledger::intent(
+                &ctx.admission.root,
+                &ports.owner,
+                &active_services,
+            )?;
+            if !ports.possible_actors {
+                ports.possible_actors = true;
+                ports.save()?;
+            }
+            crate::stand::epoch::anchor(&ctx.admission.root)?;
             ledger.begin_launch(&ctx.admission.root, &model, &active_services, &before)?;
             let mut reaped = false;
             let up_result = ctx.runner.run_tracked(
@@ -2937,7 +2982,8 @@ fn run_development(
                     "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
                 );
                 budget.disable_cgroup_limits();
-                resources = resource_overlay(&budget)?;
+                resource_file = write_resources(resource_overlay(&budget)?.as_ref())?;
+                validate_mounts(&ports, resource_file.as_ref(), &stand_overlay)?;
                 cgroup_retried = true;
                 *ctx.budget.borrow_mut() = Some(budget.clone());
                 continue;
@@ -2946,36 +2992,12 @@ fn run_development(
             if bind_attempts < 3 && !conflicts.is_empty() {
                 let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
                 let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
-                ports.allocate_plan(
-                    crate::stand::ports::Allocation {
-                        declarations: &declarations,
-                        selected: &active_services,
-                        stopped: &stopped(&rows),
-                        primary,
-                        seed: &branch,
-                    },
+                stand_overlay = allocate(
+                    &mut ports,
+                    &rows,
                     &active_ports,
                     &conflicts,
-                    |ports| {
-                        crate::stand::preview::publish_deployment(
-                            ports,
-                            &frontends,
-                            &active_services,
-                            &renderer,
-                            &proof,
-                            &model,
-                        )
-                    },
-                )?;
-                crate::stand::save_overlay(
-                    &ctx.admission.root,
-                    &crate::stand::deployment_overlay(
-                        &ports,
-                        &active_services,
-                        &frontends,
-                        &model,
-                        &proof,
-                    )?,
+                    resource_file.as_ref(),
                 )?;
                 bind_attempts += 1;
                 continue;
@@ -3030,7 +3052,12 @@ fn run_development(
     let cleanup = ledger
         .recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)
         .and_then(|()| {
-            crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)
+            crate::stand::inspection::recover(
+                &ctx.admission.root,
+                &mut ledger,
+                &mut ports,
+                ctx.runner,
+            )
         });
     if result.is_ok() {
         cleanup?;

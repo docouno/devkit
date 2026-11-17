@@ -38,7 +38,16 @@ fn labels(owner: &Owner, helper: &InspectionHelper) -> BTreeMap<String, String> 
     ])
 }
 /// A missing planned name proves nothing while its creator may still be alive.
-pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Result<()> {
+pub fn recover(
+    root: &Path,
+    ledger: &mut Ledger,
+    ports: &mut super::ports::Ports,
+    runner: &ProcessRunner,
+) -> Result<()> {
+    ensure!(
+        ports.owner == ledger.owner,
+        "Preflight ownership changed during recovery"
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     for key in ledger.inspections.keys().cloned().collect::<Vec<_>>() {
         if !ledger.inspections[&key].prepared {
@@ -107,12 +116,6 @@ pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Resu
         }
         ledger.inspections.remove(&key);
         if ledger.completed_empty() {
-            let mut ports =
-                super::ports::Ports::read(root)?.context("Missing preflight ownership receipt")?;
-            ensure!(
-                ports.owner == ledger.owner,
-                "Preflight ownership changed during recovery"
-            );
             ports.possible_actors = false;
             ports.save()?;
         }
@@ -643,7 +646,6 @@ pub fn prepare(
 ) -> Result<Proof> {
     let root_path = ports.owner.root.clone();
     let root = root_path.as_path();
-    recover(root, ledger, runner)?;
     let mut deadline = Instant::now() + Duration::from_secs(30);
     let nonce = uuid::Uuid::new_v4().to_string();
     let mut helpers = BTreeMap::new();
@@ -994,7 +996,7 @@ pub fn prepare(
     })();
     // Keep the stopped helpers until the caller finishes the actual create phase.
     if proof.is_err() {
-        let cleanup = recover(root, ledger, runner);
+        let cleanup = recover(root, ledger, ports, runner);
         if let Err(error) = cleanup {
             eprintln!("devkit: image inspection recovery retained: {error:#}");
         }

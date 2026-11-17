@@ -630,6 +630,8 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
             json!(""),
             json!(""),
             json!(""),
+            json!(""),
+            json!(""),
             json!("1"),
         ];
         fs::write(
@@ -674,7 +676,7 @@ if [ "$1" = "compose" ]; then
       printf '{{"services":{{"web":{{}}}}}}\n'
       exit 0
       ;;
-    *" up -d --wait --pull missing web "*)
+    *" up -d --wait web "*)
       overlay=""
       prev=""
       for arg in "$@"; do

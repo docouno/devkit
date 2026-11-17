@@ -431,10 +431,11 @@ impl Ports {
             group.validate()?;
             next.push(group);
         }
+        let mut candidate = self.clone();
         // Keep the complete prior union until a scoped observation retires it.
         for group in &self.groups {
-            if !self.retained.contains(group) {
-                self.retained.push(group.clone());
+            if !candidate.retained.contains(group) {
+                candidate.retained.push(group.clone());
             }
         }
         next.extend(
@@ -443,8 +444,9 @@ impl Ports {
                 .filter(|g| !selected.contains(&g.binding.service))
                 .cloned(),
         );
-        self.groups = next;
-        before_claims(self)?;
+        candidate.groups = next;
+        before_claims(&mut candidate)?;
+        *self = candidate;
         self.allocation_intent = true;
         self.save()?;
         registry.claims.retain(|c| c.owner.key != self.owner.key);

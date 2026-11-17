@@ -417,6 +417,21 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
         images: Default::default(),
         external: Default::default(),
     };
+    let rejected = ports.allocate_with(
+        &bindings(2),
+        Some("web"),
+        "seed",
+        &Default::default(),
+        &Default::default(),
+        |candidate| {
+            assert_eq!(candidate.groups.len(), 1);
+            anyhow::bail!("final mount model changed")
+        },
+    );
+    assert!(rejected.is_err());
+    assert!(ports.groups.is_empty());
+    assert!(Ports::read(root.path()).unwrap().unwrap().groups.is_empty());
+    assert!(!cache.path().join("port-leases.json").exists());
     ports
         .allocate_with(
             &bindings(2),

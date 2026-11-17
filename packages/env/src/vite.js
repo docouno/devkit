@@ -177,19 +177,16 @@ function collectWorkspaceSourceMap(startDir) {
 
 export function devkitWorkspaceSource(projectDir) {
   let activeSourceMap = new Map();
-  let active = false;
-  let resolvedConfig;
-  const recovery = hmrRecovery();
+  let fallbackConfig;
+  const recoveries = new WeakMap();
 
   return {
     name: 'devkit:workspace-source',
     enforce: 'pre',
     apply: 'serve',
     config(userConfig, env) {
-      active = env?.command === 'serve' && !process.env.VITEST;
-      resolvedConfig = undefined;
-      recovery.configure(userConfig, active);
-      if (!active) {
+      fallbackConfig = undefined;
+      if (env?.command !== 'serve' || process.env.VITEST) {
         activeSourceMap = new Map();
         return undefined;
       }
@@ -218,17 +215,19 @@ export function devkitWorkspaceSource(projectDir) {
       };
     },
     configResolved(config) {
-      resolvedConfig = config;
-      recovery.configure(config, active);
-      if (active) {
-        configurePreviewHosts(config.server);
-      }
-    },
-    configureServer(server) {
-      if (!active) {
+      if (config.command !== 'serve' || process.env.VITEST) {
         return;
       }
-      resolvedConfig = server.config;
+      fallbackConfig = config;
+      const recovery = hmrRecovery();
+      recovery.configure(config, true);
+      recoveries.set(config, recovery);
+      configurePreviewHosts(config.server);
+    },
+    configureServer(server) {
+      if (!recoveries.has(server.config)) {
+        return;
+      }
       const options = server.config.server;
       const allowsHost = hostPolicy(options.allowedHosts ?? []);
       configureApiProxy(options, allowsHost);
@@ -246,10 +245,8 @@ export function devkitWorkspaceSource(projectDir) {
       }
     },
     transform(code, id) {
-      if (resolvedConfig) {
-        recovery.configure(resolvedConfig, active);
-      }
-      return recovery.transform(code, id, (message) => this.warn(message));
+      const config = this.environment?.getTopLevelConfig?.() ?? fallbackConfig;
+      return recoveries.get(config)?.transform(code, id, (message) => this.warn(message)) ?? null;
     },
     resolveId(source) {
       if (activeSourceMap.size === 0 || typeof source !== 'string') {
