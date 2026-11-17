@@ -180,6 +180,8 @@ Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/dev
 
 Custom images/builds are acquired through Compose and inspected in stopped image-only containers before any user-backed service starts. Image symlink ancestry, mount aliases, inherited volumes, configs, secrets, devices and retained namespaces must leave a provable literal slot. Keep one slot outside project/volume namespaces; an opaque layout fails with a bounded diagnostic. Actual launch pins inspected image IDs and external volume-provider IDs, retaining declared platforms. Inspectors never run image commands, receive service mounts or remove service volumes. Their anonymous inspection volumes are cleaned separately.
 
+Docker does not inherit a provider's tmpfs or devices through `volumes_from`. A provider's deeper tmpfs therefore cannot protect the receiver from an inherited source bind. A receiver's own writable tmpfs remains supported.
+
 ## Connecting a frontend to an API
 
 ```sh
@@ -195,3 +197,5 @@ New Node/Rust API starters accept `HOST` and decimal `PORT` (`0..65535`, includi
 For multi-app aggregate `make up`/`make dev`, an empty `DISPLAY` with `headless=0` skips Electron before desktop prerequisites and prints a warning. Explicit `app=desktop`, direct `make dev-desktop` and single-app Electron projects still require a display or `headless=1`. Headless mode uses Xvfb; normal X11 validation remains active when a display is supplied.
 
 Keep ignored stand state while services or inspection creators may exist. A missing launch ledger cannot prove that cleanup is safe: an independent actor receipt preserves that uncertainty. Restore recorded state before automated cleanup when history was removed; ordinary `make down` remains available to stop the Compose project.
+
+A failed or interrupted acquisition may complete a Docker create after the client exits. Cleanup observes late helpers and retains incomplete creator outcomes with a bounded diagnostic. Rerun cleanup after pending daemon work completes; keep the recorded state while the outcome remains unknown.

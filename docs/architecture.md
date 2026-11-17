@@ -80,6 +80,10 @@ Tracked Make/Compose projections describe components and port intent. A checkout
 
 Stand observations are scoped to the Compose project and verify exact ownership before removal or socket reuse. Ordinary down retains leases. Cleanup releases only after owned containers and inspection helpers are proven absent, without deleting service volumes. Unknown/unfinished creators keep recovery state. An independent receipt records possible actors before creation, so a missing ledger cannot be treated as empty history. Desired deployments and container-labelled applied deployments retain immutable host files until their last reference disappears.
 
+Inspection acquisition records client completion separately from uncertain daemon outcomes. Interrupted or failed acquisition observes the complete planned helper set for late creates; a missing required outcome retains its intent and actor receipt. Observed helpers and anonymous volumes are removed by verified immutable identity before that history can become empty.
+
 Preview host authority comes from registered frontend profiles and final normalized TCP bindings. A bounded image-only acquisition phase follows runtime volume providers and build-context dependencies, then proves a literal metadata slot against pinned image ancestry and all mount providers. The launch overlay disables build/pull for inspected images, pins external provider IDs, and is normalized again before up. Status validates observed image, reserved environment, read-only bind and file digest against the applied deployment.
+
+The namespace model distinguishes a receiver's own mounts from Docker mountpoints inherited through `volumes_from`. Provider tmpfs and devices are not inherited and cannot mask a source-backed ancestor for the receiver. A receiver's own deeper writable tmpfs can still provide a safe literal metadata slot.
 
 `development.api` is a service relationship, not an import edge. Modern projections add required startup ordering; the development Make DAG includes both frontend and connected API library builds while preserving native library dependency ordering. Historical `0.4.x` projection bytes remain compatible.

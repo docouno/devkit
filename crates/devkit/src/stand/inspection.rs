@@ -46,46 +46,64 @@ pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Resu
             ledger.inspections[&key].creation_finished,
             "Image inspection creator has no terminal receipt; preserving recovery intent {key}"
         );
-        for service in ledger.inspections[&key]
-            .helpers
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            let helper = ledger.inspections[&key].helpers[&service].clone();
-            let observed = runner.inspection_snapshot(
-                &owned(&helper),
-                &labels(&ledger.owner, &helper),
-                deadline,
-            )?;
-            if let Some(snapshot) = &observed {
-                if let Some(previous) = &helper.observed {
-                    ensure!(
-                        snapshot.id == previous.id
-                            && snapshot.image == previous.image
-                            && snapshot.anonymous_volumes == previous.anonymous_volumes,
-                        "Image inspection identity changed"
-                    );
-                }
-                ledger
-                    .inspections
-                    .get_mut(&key)
-                    .unwrap()
-                    .helpers
-                    .get_mut(&service)
-                    .unwrap()
-                    .observed = Some(snapshot.clone());
-                ledger.save(root)?;
-            }
-            if let Some(snapshot) = observed.as_ref().or(helper.observed.as_ref()) {
-                runner.remove_inspection(
+        // Reaping the client does not acknowledge an in-flight daemon create.
+        // Observe the whole planned set over the existing late-create window.
+        let attempts = if ledger.inspections[&key].creation_uncertain {
+            10
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
+            for service in ledger.inspections[&key]
+                .helpers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let helper = ledger.inspections[&key].helpers[&service].clone();
+                let observed = runner.inspection_snapshot(
                     &owned(&helper),
                     &labels(&ledger.owner, &helper),
-                    snapshot,
                     deadline,
                 )?;
+                if let Some(snapshot) = &observed {
+                    if let Some(previous) = &helper.observed {
+                        ensure!(
+                            snapshot.id == previous.id
+                                && snapshot.image == previous.image
+                                && snapshot.anonymous_volumes == previous.anonymous_volumes,
+                            "Image inspection identity changed"
+                        );
+                    }
+                    ledger
+                        .inspections
+                        .get_mut(&key)
+                        .unwrap()
+                        .helpers
+                        .get_mut(&service)
+                        .unwrap()
+                        .observed = Some(snapshot.clone());
+                    ledger.save(root)?;
+                }
+                if let Some(snapshot) = observed.as_ref().or(helper.observed.as_ref()) {
+                    runner.remove_inspection(
+                        &owned(&helper),
+                        &labels(&ledger.owner, &helper),
+                        snapshot,
+                        deadline,
+                    )?;
+                }
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
+        ensure!(
+            ledger.inspections[&key].helpers.values().all(|helper| {
+                helper.role == "build-context-image" || helper.observed.is_some()
+            }),
+            "Image inspection has incomplete daemon outcomes; preserving recovery intent {key}"
+        );
         ledger.inspections.remove(&key);
         ledger.save(root)?;
     }
@@ -384,6 +402,7 @@ fn model_mounts(
     name: &str,
     seen: &mut BTreeSet<String>,
     external: &BTreeMap<String, Value>,
+    from_provider: bool,
 ) -> Result<Vec<Mount>> {
     ensure!(
         seen.insert(name.into()) && seen.len() <= 128,
@@ -393,9 +412,15 @@ fn model_mounts(
     ensure!(service.is_object(), "Missing volumes_from provider {name}");
     let mut result = Vec::new();
     for mount in service["volumes"].as_array().into_iter().flatten() {
+        if from_provider && mount["type"] == "tmpfs" {
+            continue;
+        }
         result.push(target_mount(mount)?);
     }
     for key in ["configs", "secrets", "devices"] {
+        if from_provider && key == "devices" {
+            continue;
+        }
         for mount in service[key].as_array().into_iter().flatten() {
             let target = if let Some(raw) = mount.as_str() {
                 if key == "devices" {
@@ -430,7 +455,14 @@ fn model_mounts(
             });
         }
     }
-    for raw in service["tmpfs"].as_array().into_iter().flatten() {
+    // volumes_from inherits Docker mountpoints, not a provider's tmpfs/devices.
+    // The receiver's own tmpfs remains part of its effective namespace.
+    for raw in service["tmpfs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|_| !from_provider)
+    {
         let raw = raw.as_str().context("Unproved tmpfs destination")?;
         let (target, options) = raw.split_once(':').unwrap_or((raw, ""));
         result.push(Mount {
@@ -454,6 +486,7 @@ fn model_mounts(
                 .as_array()
                 .context("Invalid provider mounts")?
                 .iter()
+                .filter(|v| v["Type"] != "tmpfs")
                 .map(|v| {
                     Ok(Mount {
                         target: v["Destination"]
@@ -476,7 +509,7 @@ fn model_mounts(
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            model_mounts(model, reference, seen, external)?
+            model_mounts(model, reference, seen, external, true)?
         };
         if ro {
             for mount in &mut inherited {
@@ -675,6 +708,7 @@ pub fn prepare(
             external: external_ids.clone(),
             helpers,
             creation_finished: false,
+            creation_uncertain: false,
         },
     );
     ledger.save(root)?;
@@ -700,11 +734,9 @@ pub fn prepare(
         Some(&bytes),
         &mut reaped,
     );
-    ledger
-        .inspections
-        .get_mut(&nonce)
-        .unwrap()
-        .creation_finished = reaped;
+    let intent = ledger.inspections.get_mut(&nonce).unwrap();
+    intent.creation_finished = reaped;
+    intent.creation_uncertain = !matches!(result.as_ref(), Ok(output) if output.code == 0);
     ledger.save(root)?;
     let proof = (|| -> Result<Proof> {
         result?.success("Image-only Compose acquisition")?;
@@ -824,7 +856,7 @@ pub fn prepare(
         );
         let mut slots = BTreeMap::new();
         for name in frontends {
-            let mut mounts = model_mounts(model, name, &mut BTreeSet::new(), &external)?;
+            let mut mounts = model_mounts(model, name, &mut BTreeSet::new(), &external, false)?;
             for provider in dependency_closure(model, &BTreeSet::from([name.clone()]), false)? {
                 mounts.extend(image_mounts[&provider].clone());
             }

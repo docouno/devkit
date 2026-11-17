@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+import http.server
 import io
 import json
 import os
@@ -10,9 +12,12 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
+import socketserver
 import subprocess
 import tempfile
 import tarfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -89,6 +94,112 @@ def wait_until(predicate, timeout=8):
             return
         time.sleep(0.05)
     raise AssertionError("bounded readiness condition not met")
+
+
+class DelayedInspectionCreate:
+    """Fault injection: daemon completion can outlive a cancelled CLI request."""
+
+    def __init__(self, path):
+        self.path = path
+        host = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+        if not host.startswith("unix://"):
+            raise AssertionError("The delayed-create fixture requires a local Unix Docker socket")
+        self.socket = host.removeprefix("unix://")
+        self.accepted = threading.Event()
+        self.release = threading.Event()
+        self.completed = threading.Event()
+        self.record = {}
+        fixture = self
+
+        class Connection(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(20)
+                self.sock.connect(fixture.socket)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                self.forward()
+
+            do_POST = do_HEAD = do_DELETE = do_GET
+
+            def forward(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 1024 * 1024:
+                    raise AssertionError("Oversized fixture request")
+                body = self.rfile.read(length) if length else None
+                if self.headers.get("Transfer-Encoding") == "chunked":
+                    chunks = []
+                    total = 0
+                    while True:
+                        size = int(self.rfile.readline().split(b";")[0], 16)
+                        if not size:
+                            self.rfile.readline()
+                            break
+                        total += size
+                        if total > 1024 * 1024:
+                            raise AssertionError("Oversized chunked fixture request")
+                        chunks.append(self.rfile.read(size))
+                        self.rfile.read(2)
+                    body = b"".join(chunks)
+                delayed = (self.command == "POST"
+                           and self.path.split("?", 1)[0].endswith("/containers/create")
+                           and b'"io.docouno.devkit.inspection"' in (body or b""))
+                if delayed:
+                    payload = json.loads(body)
+                    fixture.record.update(labels=payload["Labels"])
+                    fixture.accepted.set()
+                    if not fixture.release.wait(20):
+                        raise AssertionError("Delayed create was never released")
+                connection = Connection("localhost")
+                headers = {key: value for key, value in self.headers.items()
+                           if key.lower() not in ("host", "connection", "transfer-encoding", "content-length")}
+                connection.request(self.command, self.path, body=body, headers=headers)
+                response = connection.getresponse()
+                data = response.read(2 * 1024 * 1024 + 1)
+                if len(data) > 2 * 1024 * 1024:
+                    raise AssertionError("Oversized fixture response")
+                connection.close()
+                if delayed:
+                    fixture.record.update(status=response.status, reply=json.loads(data))
+                    fixture.completed.set()
+                try:
+                    self.send_response(response.status)
+                    for key, value in response.getheaders():
+                        if key.lower() not in ("transfer-encoding", "content-length", "connection"):
+                            self.send_header(key, value)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+        self.server = Server(str(path), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.release.set()
+        try:
+            if self.accepted.is_set() and not self.completed.wait(20):
+                raise AssertionError("A delayed daemon request is still running")
+        finally:
+            self.server.shutdown()
+            self.server.server_close()
+            self.thread.join(timeout=5)
+            self.path.unlink(missing_ok=True)
 
 
 def fixture_tool(root, script):
@@ -620,6 +731,166 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(applied["files"][0]["slot"], "/run/devkit/preview-hosts.json")
         self.make("down", "cleanup=1", env=environment)
         run("docker", "image", "rm", tag)
+
+    def test_preview_inherits_mountpoints_without_provider_tmpfs_or_devices(self):
+        service, project = self.preview_fixture()
+        labels = {LABEL: self.token}
+        source = self.base / "provider source"
+        (source / "devkit").mkdir(parents=True)
+        (source / "devkit/marker").write_text("preserve source and metadata\n")
+
+        def snapshot():
+            result = {}
+            for path in [source, *sorted(source.rglob("*"))]:
+                stat = path.lstat()
+                result[str(path.relative_to(source))] = (
+                    stat.st_mode, stat.st_uid, stat.st_gid, stat.st_size,
+                    stat.st_mtime_ns, stat.st_ctime_ns,
+                    path.read_bytes() if path.is_file() else None,
+                )
+            return result
+
+        before = snapshot()
+        service["volumes_from"] = ["middle:rw"]
+        service["depends_on"] = {"middle": {"condition": "service_completed_successfully"}}
+        provider = {"image": IMAGE, "command": ["true"], "labels": labels,
+                    "volumes": [{"type": "bind", "source": str(source), "target": "/run"}],
+                    "devices": ["/dev/null:/devkit"]}
+        middle = {"image": IMAGE, "command": ["true"], "labels": labels,
+                  "volumes_from": ["provider:rw"],
+                  "depends_on": {"provider": {"condition": "service_completed_successfully"}}}
+        self.resources.extend([project + "-provider-1", project + "-middle-1"])
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        for form in ("service", "volume"):
+            with self.subTest(form=form):
+                current = json.loads(json.dumps(provider))
+                if form == "service":
+                    current["tmpfs"] = ["/run/devkit:rw"]
+                else:
+                    current["volumes"].append({"type": "tmpfs", "target": "/run/devkit"})
+                spec = {"services": {"main": service, "middle": middle, "provider": current},
+                        "networks": {"default": {"labels": labels}}}
+                (self.root / "compose.yaml").write_text(json.dumps(spec))
+                self.make("setup", env=environment)
+                launched = self.make("up", "app=main", env=environment, check=False)
+                receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
+                self.assertEqual(receipt["previewFiles"][0]["slot"], "/devkit/preview-hosts.json")
+                actual = container(project + "-main-1")
+                if launched.returncode:
+                    # Some Engine mount representations reject volume-syntax
+                    # tmpfs inheritance. Compare with Docker itself; the proof
+                    # must still choose the fallback and preserve the source.
+                    self.assertEqual(form, "volume", launched.stderr)
+                    self.assertIn("no such volume", launched.stderr)
+                    control = self.owned_name()
+                    native = run("docker", "create", "--name", control, "--label", f"{LABEL}={self.token}",
+                                 "--volumes-from", project + "-provider-1", IMAGE, "true", check=False)
+                    self.assertNotEqual(native.returncode, 0)
+                    self.assertIn("no such volume", native.stderr)
+                    self.assertIsNone(actual)
+                else:
+                    self.assertIsNotNone(actual)
+                    self.assertFalse(actual["HostConfig"].get("Tmpfs"))
+                    self.assertFalse(actual["HostConfig"].get("Devices"))
+                self.assertEqual(snapshot(), before)
+                self.make("down", "cleanup=1", env=environment)
+                self.assertEqual(snapshot(), before)
+
+    def test_preview_cancellation_tracks_delayed_daemon_create_and_anonymous_volumes(self):
+        service, project = self.preview_fixture()
+        tag = "devkit-inspection-delay-" + self.token
+        self.images.append(tag)
+        (self.root / "Dockerfile").write_text(
+            "FROM " + IMAGE + "\nVOLUME /inspection-data\nLABEL " + LABEL + "=" + self.token + "\n")
+        run("docker", "build", "--tag", tag, str(self.root), timeout=60)
+        service["image"] = tag
+        spec = json.loads((self.root / "compose.yaml").read_text())
+        spec["services"]["main"] = service
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}.example.test")
+        self.make("setup", env=environment)
+        for delayed_beyond_window in (False, True):
+            with self.subTest(retained=delayed_beyond_window):
+                proxy = DelayedInspectionCreate(self.base / "daemon.sock")
+                proc = None
+                helper_name = None
+                try:
+                    with proxy:
+                        selected = dict(environment, DOCKER_HOST="unix://" + str(proxy.path))
+                        proc = subprocess.Popen(
+                            [str(ENGINE), "task", "dev", "--root", str(self.root), "--app", "main"],
+                            env=selected, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True,
+                        )
+                        self.assertTrue(proxy.accepted.wait(20), "The real helper create request never reached the daemon barrier")
+                        active = self.root / ".devkit/state/stand.active"
+                        ledger = json.loads(active.read_text())
+                        intent = next(iter(ledger["inspections"].values()))
+                        helper_name = intent["helpers"]["main"]["name"]
+                        if not delayed_beyond_window:
+                            threading.Timer(.15, proxy.release.set).start()
+                        os.kill(proc.pid, signal.SIGTERM)
+                        stdout, stderr = proc.communicate(timeout=15)
+                        self.assertEqual(proc.returncode, 143, stdout + stderr)
+                        if delayed_beyond_window:
+                            # A still-accepted request is unknown, not an empty stand.
+                            ledger = json.loads(active.read_text())
+                            self.assertTrue(ledger["inspections"])
+                            self.assertTrue(json.loads((self.root / ".devkit/state/ports.json").read_text())["possibleActors"])
+                            refused = self.make("down", "cleanup=1", env=environment, check=False)
+                            self.assertNotEqual(refused.returncode, 0)
+                            self.assertIn("incomplete daemon outcomes", refused.stderr)
+                            self.assertTrue(json.loads(active.read_text())["inspections"])
+                            proxy.release.set()
+                            self.assertTrue(proxy.completed.wait(10))
+                            actual = container(helper_name)
+                            self.assertIsNotNone(actual)
+                            self.assertEqual(actual["State"]["Pid"], 0)
+                            self.assertEqual(actual["Config"]["Labels"]["io.docouno.devkit.inspection"], proxy.record["labels"]["io.docouno.devkit.inspection"])
+                            volumes = [mount["Name"] for mount in actual["Mounts"] if mount["Type"] == "volume"]
+                            self.assertTrue(volumes)
+                            self.make("down", "cleanup=1", env=environment)
+                            self.assertIsNone(container(helper_name))
+                            for volume in volumes:
+                                self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
+                        else:
+                            self.assertTrue(proxy.completed.wait(10))
+                            self.assertIsNone(container(helper_name), "Late helper survived controlled cancellation")
+                            self.assertEqual(json.loads(active.read_text())["inspections"], {})
+                            self.assertFalse(json.loads((self.root / ".devkit/state/ports.json").read_text())["possibleActors"])
+                            denied = self.base / "cancel-cleanup-bin"
+                            denied.mkdir()
+                            trace = self.base / "cancel-cleanup-docker"
+                            (denied / "docker").write_text('#!/bin/sh\nprintf docker >> "$CLEANUP_DOCKER_TRACE"\nexit 97\n')
+                            (denied / "docker").chmod(0o755)
+                            no_docker = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
+                            self.make("down", "cleanup=1", env=no_docker)
+                            self.assertFalse(trace.exists())
+                finally:
+                    proxy.release.set()
+                    if proc is not None and proc.poll() is None:
+                        os.kill(proc.pid, signal.SIGTERM)
+                        proc.communicate(timeout=15)
+                    helpers = {helper_name: proxy.record["labels"]} if helper_name else {}
+                    active = self.root / ".devkit/state/stand.active"
+                    if active.exists():
+                        ledger = json.loads(active.read_text())
+                        for intent in ledger["inspections"].values():
+                            for helper in intent["helpers"].values():
+                                helpers[helper["name"]] = {
+                                    "io.docouno.devkit.inspection": helper["token"],
+                                    "io.docouno.devkit.inspection-role": helper["role"],
+                                    "io.docouno.devkit.inspection-owner": ledger["owner"]["key"],
+                                }
+                    for name, expected in helpers.items():
+                        actual = container(name)
+                        if actual is None:
+                            continue
+                        for key, value in expected.items():
+                            if key.startswith("io.docouno.devkit.inspection"):
+                                self.assertEqual(actual["Config"]["Labels"][key], value)
+                        self.assertEqual(actual["State"]["Pid"], 0)
+                        run("docker", "rm", "--force", "--volumes", actual["Id"])
 
     def test_managed_api_defaults_override_image_bind_environment(self):
         write_fixture(self.root)

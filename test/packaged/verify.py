@@ -1210,7 +1210,8 @@ class Verification:
 
 def main():
     def interrupted(signum, _frame):
-        raise InterruptedError(f"Packaged verification interrupted by signal {signum}")
+        # selectors retries InterruptedError as EINTR; cancellation must unwind.
+        raise KeyboardInterrupt(f"Packaged verification interrupted by signal {signum}")
 
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)

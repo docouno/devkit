@@ -43,6 +43,8 @@ pub struct InspectionIntent {
     pub external: BTreeMap<String, String>,
     pub helpers: BTreeMap<String, InspectionHelper>,
     pub creation_finished: bool,
+    #[serde(default)]
+    pub creation_uncertain: bool,
 }
 impl Ledger {
     pub fn completed_empty(&self) -> bool {
