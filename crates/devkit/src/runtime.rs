@@ -44,6 +44,7 @@ pub struct RuntimeRequest {
     pub package: Option<String>,
     pub expected_manifest: Option<String>,
     pub headless: bool,
+    pub cleanup: bool,
     pub package_aggregate: bool,
     pub follow: bool,
     pub tail: u64,
@@ -59,6 +60,7 @@ impl RuntimeRequest {
             package: None,
             expected_manifest: None,
             headless: false,
+            cleanup: false,
             package_aggregate: false,
             follow: false,
             tail: 100,
@@ -441,14 +443,11 @@ impl<'a> PreparedContext<'a> {
         verify_pin: bool,
         cache_dir: Option<&Path>,
     ) -> Result<Self> {
-        let engine = fs::canonicalize(std::env::current_exe()?)?;
-        ensure!(
-            identity(&engine)?.is_some(),
-            "Current native engine is not a regular executable"
-        );
-        if verify_pin {
-            crate::delivery::verify_engine(&engine, &admission.pins.engine)?;
-        }
+        let engine = if verify_pin {
+            crate::delivery::verify_current_engine(&admission.pins.engine)?
+        } else {
+            crate::delivery::current_engine_path()?
+        };
         let project = crate::doctor::compose_project_name(&admission.root);
         Ok(Self {
             admission,
@@ -1692,6 +1691,9 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     } else {
         CheckoutLock::acquire_exclusive(&request.root, &lock_op, Some(runner))?
     };
+    if request.command == "down" && request.cleanup && cleanup_without_stand(&request, &pre_root)? {
+        return Ok(());
+    }
     let service = ["status", "logs", "down"].contains(&request.command.as_str());
     let tool = if service {
         ToolAdmission::capture_service(&request)?
@@ -1779,6 +1781,17 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         return Ok(());
     }
     if service {
+        if request.command == "down"
+            && request.cleanup
+            && crate::stand::epoch::trusted(&ctx.admission.root)?
+            && crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_none()
+        {
+            if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
+                ports.release()?;
+            }
+            crate::stand::clear_overlay(&ctx.admission.root)?;
+            return Ok(());
+        }
         ctx.prerequisite_service()?;
         run_service(&request, target.as_deref(), &mut ctx, lock)?;
         return Ok(());
@@ -1997,6 +2010,55 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     drop(lock);
     Ok(())
 }
+/// This path consumes the accepted manifest, engine pin and stand receipts only.
+/// Project/Compose/SDK inputs are irrelevant when no launch can need stopping.
+fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> {
+    if request.component.is_some()
+        || request.app.is_some()
+        || request.package.is_some()
+        || !crate::stand::epoch::trusted(root)?
+        || crate::stand::ledger::Ledger::read(root)?.is_some()
+    {
+        return Ok(false);
+    }
+    let manifest =
+        identity(&safe_path(root, MANIFEST_PATH)?)?.context("Missing accepted manifest")?;
+    if let Some(expected) = &request.expected_manifest {
+        ensure!(
+            expected == &manifest.sha256,
+            "accepted toolkit changed during this Make invocation; rerun the command"
+        );
+    }
+    let state = read_accepted_header(root)?;
+    let pin_path = safe_path(root, ".devkit/runtime/toolchains.env")?;
+    let (bytes, actual) = read_regular_file(&pin_path, 65536, "accepted engine pins")?
+        .context("Missing accepted engine pins")?;
+    ensure!(
+        state
+            .managed
+            .get(".devkit/runtime/toolchains.env")
+            .is_some_and(|id| actual.matches_git_tracked(id)),
+        "Managed engine pins changed"
+    );
+    let pins = ToolPins::parse(&bytes)?;
+    ensure!(
+        pins.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
+        "Accepted engine version differs from its build"
+    );
+    crate::delivery::verify_current_engine(&pins.engine)?;
+    let ports = crate::stand::ports::Ports::read(root)?;
+    runtime_pending(root)?;
+    ensure!(
+        identity(&safe_path(root, MANIFEST_PATH)?)?.as_ref() == Some(&manifest)
+            && crate::stand::epoch::trusted(root)?,
+        "Accepted runtime changed during cleanup"
+    );
+    crate::stand::clear_overlay(root)?;
+    if let Some(ports) = ports {
+        ports.release()?;
+    }
+    Ok(true)
+}
 pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     ensure!(!request.argv.is_empty(), "exec requires ARGV after --");
     ensure!(
@@ -2152,6 +2214,17 @@ fn run_service(
         }
     }
     ctx.env(&mut command);
+    let stand_rows = if request.command == "down" && request.cleanup {
+        let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+        if !rows.is_empty() {
+            let ports = crate::stand::ports::Ports::read(&ctx.admission.root)?
+                .context("Stand origin is unknown; inspect containers and run make down explicitly before cleanup")?;
+            crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
+        }
+        Some(rows)
+    } else {
+        None
+    };
     match request.command.as_str() {
         "down" => {
             command.args(["--profile", "*", "down"]);
@@ -2187,6 +2260,33 @@ fn run_service(
         return Ok(());
     }
     ctx.runner.checked(&mut command, OutputMode::Inherit)?;
+    if request.command == "down" {
+        let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+        if request.cleanup {
+            if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
+                crate::stand::ledger::remove_owned(&rows, &ctx.project, &ports.owner, ctx.runner)?;
+                ports.release()?;
+            } else {
+                ensure!(rows.is_empty(), "Unknown stand remnants remain");
+            }
+            let _ = stand_rows;
+        }
+        if rows.is_empty() || request.cleanup {
+            if exists(&safe_path(
+                &ctx.admission.root,
+                crate::stand::ledger::ACTIVE,
+            )?)? {
+                remove_file(&safe_path(
+                    &ctx.admission.root,
+                    crate::stand::ledger::ACTIVE,
+                )?)?;
+            }
+            crate::stand::epoch::anchor(&ctx.admission.root)?;
+        }
+        if request.cleanup {
+            crate::stand::clear_overlay(&ctx.admission.root)?;
+        }
+    }
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     ctx.admission.recheck()?;
     drop(lock);
@@ -2394,7 +2494,48 @@ fn run_development(
         .borrow()
         .clone()
         .context("Missing host resource budget; prerequisite not checked")?;
-    for attempt in 0..2 {
+    let declarations = crate::stand::ports::declarations(&model, &active_services)?;
+    let mut ports = crate::stand::ports::Ports::open(&ctx.admission.root, &ctx.cache_root()?)?;
+    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+    let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
+    for name in &active_services {
+        if let Some(label) = model
+            .pointer("/services")
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.get("labels"))
+            .and_then(|v| v.get(crate::stand::ledger::OWNER_LABEL))
+        {
+            ensure!(
+                label.as_str() == Some(ports.owner.key.as_str()),
+                "Reserved stand owner label conflicts on {name}"
+            );
+        }
+    }
+    let primary = full
+        .state
+        .components
+        .iter()
+        .filter(|(_, c)| c.tooling_profile == ToolingProfile::Web)
+        .map(|(p, c)| service_name(p, c))
+        .find(|s| active_services.contains(*s));
+    let branch = crate::stand::branch_name(&ctx.admission.root, ctx.runner)?;
+    ports.allocate(
+        &declarations,
+        primary,
+        &branch,
+        &active_ports,
+        &BTreeSet::new(),
+    )?;
+    let stand_overlay = crate::stand::save_overlay(
+        &ctx.admission.root,
+        &crate::stand::port_overlay(&ports, &active_services)?,
+    )?;
+    let mut ledger =
+        crate::stand::ledger::Ledger::intent(&ctx.admission.root, &ports.owner, &active_services)?;
+    crate::stand::epoch::anchor(&ctx.admission.root)?;
+    let mut bind_attempts = 1;
+    let mut cgroup_retried = false;
+    loop {
         let mut res_overlay_file = None;
         if let Some(res_spec) = crate::resources::build_compose_resource_overlay(
             &budget,
@@ -2417,6 +2558,7 @@ fn run_development(
         if let Some(f) = &res_overlay_file {
             command.arg("--file").arg(f.path());
         }
+        command.arg("--file").arg(&stand_overlay);
         command.args(["up", "-d", "--wait", "--pull", "missing", &service]);
         full.recheck()?;
         assert_compose_inventory(&ctx.admission.root, &inventory)?;
@@ -2426,7 +2568,7 @@ fn run_development(
         if up_output.code == 0 {
             break;
         }
-        if attempt == 0
+        if !cgroup_retried
             && crate::resources::is_compose_cgroup_delegation_failure(
                 up_output.code,
                 &up_output.stderr,
@@ -2436,12 +2578,28 @@ fn run_development(
                 "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
             );
             budget.disable_cgroup_limits();
+            cgroup_retried = true;
             *ctx.budget.borrow_mut() = Some(budget.clone());
+            continue;
+        }
+        let conflicts = crate::stand::ports::bind_conflicts(&up_output.stderr, &ports.groups)?;
+        if bind_attempts < 3 && !conflicts.is_empty() {
+            let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+            let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
+            ports.allocate(&declarations, primary, &branch, &active_ports, &conflicts)?;
+            crate::stand::save_overlay(
+                &ctx.admission.root,
+                &crate::stand::port_overlay(&ports, &active_services)?,
+            )?;
+            bind_attempts += 1;
             continue;
         }
         up_output.stderr.clear();
         up_output.success("docker")?;
     }
+    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+    ledger.observed(&ctx.admission.root, &rows)?;
+    ports.reconcile(&rows)?;
     let service_to_component = app_service_component_map(&full.state);
     let mut ps_cmd = ctx.compose()?;
     ps_cmd.args(["--profile", "*", "ps", "--format", "json"]);

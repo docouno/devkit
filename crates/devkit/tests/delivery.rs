@@ -134,3 +134,37 @@ fn source_execution_permission_and_canonical_cache_mode_are_distinct() {
     }
     assert_eq!(file_digest(&path).unwrap(), pin.sha256);
 }
+#[test]
+fn current_executable_authority_detects_replacement_after_verification() {
+    use devkit::delivery::current_engine_digest;
+    use std::os::unix::fs::PermissionsExt;
+    const WORKER: &str = "DEVKIT_TEST_CURRENT_EXECUTABLE_WORKER";
+    if std::env::var(WORKER).as_deref() == Ok("1") {
+        let first = current_engine_digest().unwrap();
+        assert_eq!(first, current_engine_digest().unwrap());
+        let current = std::env::current_exe().unwrap();
+        let replacement = current.with_extension("replacement");
+        std::fs::write(&replacement, b"changed executable path").unwrap();
+        std::fs::rename(replacement, current).unwrap();
+        assert!(current_engine_digest().is_err());
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let executable = temporary.path().join("delivery-test");
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "current_executable_authority_detects_replacement_after_verification",
+            "--nocapture",
+        ])
+        .env(WORKER, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

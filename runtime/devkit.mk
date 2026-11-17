@@ -5,6 +5,7 @@ export DEVKIT_PACKAGE := $(package)
 export DEVKIT_FOLLOW := $(follow)
 export DEVKIT_TAIL := $(tail)
 export DEVKIT_HEADLESS := $(or $(headless),0)
+export DEVKIT_CLEANUP := $(or $(cleanup),0)
 export DEVKIT_SYNC_RECONCILE := $(or $(reconcile),0)
 export DEVKIT_SYNC_PREVIEW := $(or $(preview),0)
 export DEVKIT_PACKAGE_AGGREGATE := 0

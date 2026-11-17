@@ -4,6 +4,24 @@ use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
 fn main() -> Result<()> {
     let root = PathBuf::from(std::env::args_os().nth(1).expect("fixture root"));
+    if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--port-lease")) {
+        let _lock = devkit::state::CheckoutLock::acquire(&root)?;
+        let cache = devkit::cache::cache_root(None)?;
+        let mut ports = devkit::stand::ports::Ports::open(&root, &cache)?;
+        let declarations = devkit::stand::ports::declarations(
+            &json!({"services":{"api":{"ports":[{"target":8080,"published":"0","host_ip":"127.0.0.1"}]}}}),
+            &std::collections::BTreeSet::from(["api".into()]),
+        )?;
+        ports.allocate(
+            &declarations,
+            None,
+            "fixture",
+            &Default::default(),
+            &Default::default(),
+        )?;
+        println!("{}", serde_json::to_string(&ports)?);
+        return Ok(());
+    }
     if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--compose-inventory")) {
         let inventory = devkit::compose::admit_compose_inventory(
             &root,

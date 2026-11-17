@@ -617,6 +617,9 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit 0
 fi
+if [ "$1" = "ps" ]; then
+  exit 0
+fi
 if [ "$1" = "compose" ]; then
   case " $* " in
     *" config --no-env-resolution --format json "*)

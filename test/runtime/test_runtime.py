@@ -486,6 +486,175 @@ class RuntimeTests(unittest.TestCase):
         self.resources.append(name)
         return name
 
+    def test_actual_bind_race_retries_only_the_automatic_endpoint(self):
+        write_fixture(self.root)
+        labels = {LABEL: self.token}
+        (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": {
+            "image": "${DEVKIT_NODE_IMAGE:?}", "command": ["node", "-e",
+                "require('node:http').createServer((q,s)=>s.end('ok')).listen(3000,'0.0.0.0')"],
+            "ports": [{"target": 3000, "published": "0", "host_ip": "127.0.0.1"}],
+            "labels": labels}}, "networks": {"default": {"labels": labels}}}))
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        service = project + "-main-1"
+        helper = self.owned_name()
+        self.resources.append(service)
+        self.projects.append((project, self.root, "unused-" + self.token))
+        wrapper = self.base / "race-bin"
+        wrapper.mkdir()
+        executable = wrapper / "docker"
+        executable.write_text(r"""#!/bin/sh
+set -eu
+if [ "$1" = compose ] && [ ! -f "$RACE_MARKER" ]; then
+  start=0
+  previous=
+  for arg in "$@"; do
+    [ "$arg" != up ] || start=1
+    if [ "$previous" = --file ]; then
+      case "$arg" in *compose.stand.yaml) RACE_OVERLAY=$arg; export RACE_OVERLAY ;; esac
+    fi
+    previous=$arg
+  done
+  if [ "$start" = 1 ]; then
+    python3 - <<'PYRACE'
+import json, os, subprocess
+from pathlib import Path
+rows = Path(os.environ['RACE_OVERLAY']).read_text().splitlines()
+ports = json.loads(next(row.split('ports: !override ', 1)[1] for row in rows if 'ports: !override ' in row))
+port = int(ports[0]['published'])
+subprocess.run([os.environ['RACE_REAL_DOCKER'], 'run', '--detach', '--pull', 'never', '--init',
+    '--name', os.environ['RACE_NAME'], '--label', os.environ['RACE_LABEL'],
+    '--cpus', '0.25', '--memory', '128m', '--pids-limit', '64', '--network', 'bridge',
+    '--publish', '127.0.0.1:' + str(port) + ':9000', os.environ['RACE_IMAGE'],
+    'node', '-e', "require('node:http').createServer((q,s)=>s.end('occupied')).listen(9000,'0.0.0.0')"],
+    check=True, stdout=subprocess.DEVNULL)
+Path(os.environ['RACE_MARKER']).write_text(str(port))
+PYRACE
+  fi
+fi
+exec "$RACE_REAL_DOCKER" "$@"
+""")
+        executable.chmod(0o755)
+        marker = self.base / "race-created"
+        environment = dict(env(), PATH=str(wrapper) + os.pathsep + os.environ["PATH"],
+            RACE_REAL_DOCKER=shutil.which("docker"), RACE_MARKER=str(marker), RACE_NAME=helper,
+            RACE_LABEL=LABEL + "=" + self.token, RACE_IMAGE=IMAGE)
+        self.make("setup", env=environment)
+        result = self.make("up", env=environment)
+        occupied = int(marker.read_text())
+        actual = int(container(service)["NetworkSettings"]["Ports"]["3000/tcp"][0]["HostPort"])
+        self.assertNotEqual(actual, occupied)
+        self.assertIn("stand port changed", result.stderr)
+        self.assertTrue(container(helper)["State"]["Running"])
+        self.make("up", env=environment)
+        self.assertEqual(int(container(service)["NetworkSettings"]["Ports"]["3000/tcp"][0]["HostPort"]), actual)
+        self.make("down", "cleanup=1")
+        self.assertTrue(container(helper)["State"]["Running"])
+
+    def test_sticky_replica_ports_across_real_sibling_worktrees_and_cleanup(self):
+        import socket
+        write_fixture(self.root)
+        labels = {LABEL: self.token}
+        (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": {
+            "image": "${DEVKIT_NODE_IMAGE:?}", "command": ["node", "-e",
+                "require('node:http').createServer((q,s)=>s.end('ok')).listen(3000,'0.0.0.0')"],
+            "deploy": {"replicas": 2}, "ports": [{"target": 3000, "published": "0", "host_ip": "127.0.0.1"}],
+            "labels": labels}}, "networks": {"default": {"labels": labels}}}))
+        (self.root / ".gitignore").write_text("**/node_modules/\n**/dist/\n.devkit/state/\n")
+        run("git", "-C", str(self.root), "init", "--initial-branch=main")
+        run("git", "-C", str(self.root), "add", ".")
+        run("git", "-C", str(self.root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+            "commit", "-m", "chore(test): seed stand fixture")
+        peer = self.base / "sibling"
+        run("git", "-C", str(self.root), "worktree", "add", "-b", "peer", str(peer))
+        roots = (self.root, peer)
+        names = []
+        for root in roots:
+            project = "devkit-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+            replicas = [project + "-main-" + str(i) for i in (1, 2)]
+            names.append(replicas)
+            self.resources.extend(replicas)
+            self.projects.append((project, root, "unused-" + self.token))
+            run("make", "--no-print-directory", "-C", str(root), "setup")
+        processes = [subprocess.Popen(["make", "--no-print-directory", "-C", str(root), "up"],
+            env=env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) for root in roots]
+        try:
+            for proc in processes:
+                out, err = proc.communicate(timeout=35)
+                self.assertEqual(proc.returncode, 0, out + err)
+        finally:
+            for proc in processes:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.communicate(timeout=12)
+        def publications(replicas):
+            return {int(container(name)["NetworkSettings"]["Ports"]["3000/tcp"][0]["HostPort"]) for name in replicas}
+        original = [publications(replicas) for replicas in names]
+        self.assertEqual([len(ports) for ports in original], [2, 2])
+        self.assertTrue(original[0].isdisjoint(original[1]))
+        for root in roots:
+            run("make", "--no-print-directory", "-C", str(root), "down")
+            run("make", "--no-print-directory", "-C", str(root), "up")
+        self.assertEqual([publications(replicas) for replicas in names], original)
+        self.make("down")
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", min(original[0])))
+            occupied.listen()
+            changed = self.make("up")
+            self.assertIn("stand port changed", changed.stderr)
+            self.assertNotEqual(publications(names[0]), original[0])
+        self.make("down", "cleanup=1")
+        self.assertEqual(publications(names[1]), original[1])
+        peer_owner = json.loads((peer / ".devkit/state/ports.json").read_text())["owner"]["key"]
+        claims = json.loads((CACHE_OVERRIDE / "port-leases.json").read_text())["claims"]
+        self.assertTrue(claims)
+        self.assertTrue(all(claim["owner"]["key"] == peer_owner for claim in claims))
+        for root in roots:
+            self.assertEqual(run("git", "-C", str(root), "status", "--porcelain").stdout, "")
+        run("make", "--no-print-directory", "-C", str(peer), "down", "cleanup=1")
+
+    def test_cleanup_fresh_and_leased_never_invokes_docker_before_setup(self):
+        write_rust_fixture(self.root)
+        trace_bin = self.base / "trace-bin"
+        trace_bin.mkdir()
+        trace = self.base / "docker-trace"
+        for tool in ("docker", "curl"):
+            executable = trace_bin / tool
+            executable.write_text('#!/bin/sh\nprintf called >> "$CLEANUP_TRACE"\nexit 91\n')
+            executable.chmod(0o755)
+        environment = dict(env(), PATH=str(trace_bin) + os.pathsep + os.environ["PATH"], CLEANUP_TRACE=str(trace))
+        missing = dict(environment, DEVKIT_ENGINE_PATH=str(self.base / "missing-engine"))
+        for _ in range(3):
+            self.make("down", "cleanup=1", env=missing)
+        self.assertFalse((self.root / ".devkit/state").exists())
+        self.assertFalse(trace.exists())
+        lease = json.loads(run(str(FIXTURE), str(self.root), "--port-lease", env=environment).stdout)
+        registry = Path(lease["cacheRoot"]) / "port-leases.json"
+        self.assertTrue(json.loads(registry.read_text())["claims"])
+        self.make("down", "cleanup=1", env=environment)
+        self.assertEqual(json.loads(registry.read_text())["claims"], [])
+        self.assertFalse((self.root / ".devkit/state/ports.json").exists())
+        self.make("down", "cleanup=1", env=environment)
+        self.assertFalse(trace.exists())
+        self.assertTrue((self.root / ".devkit/state/task.lock").is_file())
+        # A known unused lease does not consume Compose or SDK inputs.
+        run(str(FIXTURE), str(self.root), "--port-lease", env=environment)
+        projection = self.root / ".devkit/compose.apps.yaml"
+        original = projection.read_bytes()
+        projection.write_text("invalid unused projection")
+        self.make("down", "cleanup=1", env=environment)
+        projection.write_bytes(original)
+        # Engine pin admission still precedes every release.
+        run(str(FIXTURE), str(self.root), "--port-lease", env=environment)
+        pins = self.root / ".devkit/runtime/toolchains.env"
+        original = pins.read_bytes()
+        pins.write_bytes(original + b"# changed pins\n")
+        refused = self.make("down", "cleanup=1", env=environment, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertTrue(json.loads(registry.read_text())["claims"])
+        pins.write_bytes(original)
+        self.make("down", "cleanup=1", env=environment)
+        self.assertFalse(trace.exists())
+
     def test_native_setup_gates_fix_purity_stale_lock_and_secret_boundary(self):
         write_fixture(self.root)
         source = self.root / "apps/main/untracked.txt"
@@ -1424,6 +1593,10 @@ wait
         self.assertEqual(container(b[1])["Id"], before)
         self.assertTrue(container(b[1])["State"]["Running"])
         self.assertEqual(run("docker", "volume", "inspect", a[2]).returncode, 0)
+        conflict = run("make", "--no-print-directory", "-C", str(a[0]), "up", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("ownership conflict", conflict.stderr)
+        run("docker", "rm", "--force", orphan)
         run("make", "--no-print-directory", "-C", str(a[0]), "up")
         self.assertEqual(run("docker", "exec", a[1], "node", "-e",
                              "process.stdout.write(require('node:fs').readFileSync('/state/value','utf8'))").stdout, a[3])

@@ -13,10 +13,11 @@ use std::{
     io::{Read, Seek, SeekFrom},
     os::unix::{
         ffi::OsStrExt,
-        fs::{OpenOptionsExt, PermissionsExt},
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,7 +43,6 @@ impl EnginePin {
 }
 
 pub fn file_digest(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
     let path = project_root(path)?;
     ensure!(
         fs::symlink_metadata(&path)?.is_file(),
@@ -50,6 +50,11 @@ pub fn file_digest(path: &Path) -> Result<String> {
         path.display()
     );
     let mut file = fs::File::open(path)?;
+    hash_reader(&mut file)
+}
+fn hash_reader(file: &mut fs::File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -74,7 +79,6 @@ pub fn verify_static_elf_file(
     expected_sha256: &str,
     require_mode_0755: bool,
 ) -> Result<()> {
-    use sha2::{Digest, Sha256};
     ensure!(
         SHA256_RE.is_match(expected_sha256),
         "Invalid executable SHA256"
@@ -90,6 +94,14 @@ pub fn verify_static_elf_file(
         !require_mode_0755 || metadata.permissions().mode() & 0o7777 == 0o755,
         "Cached executable mode differs from canonical 0755"
     );
+    executable_access(&path)?;
+    ensure!(
+        hash_reader(&mut file)? == expected_sha256,
+        "Native engine checksum differs from accepted pin"
+    );
+    verify_elf_reader(&mut file)
+}
+fn executable_access(path: &Path) -> Result<()> {
     let encoded = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: one live C path; faccessat evaluates the current effective user's
     // execution permission, including ACLs. A 0700 npm installation is valid.
@@ -104,19 +116,10 @@ pub fn verify_static_elf_file(
         } == 0,
         "Native engine is not executable by the current user"
     );
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    ensure!(
-        format!("{:x}", hash.finalize()) == expected_sha256,
-        "Native engine checksum differs from accepted pin"
-    );
+    Ok(())
+}
+fn verify_elf_reader(file: &mut fs::File) -> Result<()> {
+    let metadata = file.metadata()?;
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = [0_u8; 64];
     file.read_exact(&mut bytes)
@@ -166,6 +169,84 @@ pub fn verify_static_elf_file(
         }
     }
     Ok(())
+}
+
+// This authority lives only in the executing process. The descriptor pins the
+// inode and every reuse checks its physical identity and timestamps, the path,
+// and /proc/self/exe. No environment flag or persistent stat cache grants trust.
+#[derive(Debug, PartialEq, Eq)]
+struct ExecutableStamp(u64, u64, u64, i64, i64, i64, i64);
+fn executable_stamp(m: &fs::Metadata) -> ExecutableStamp {
+    ExecutableStamp(
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )
+}
+struct CurrentExecutable {
+    file: fs::File,
+    path: PathBuf,
+    stamp: ExecutableStamp,
+    sha256: String,
+}
+static CURRENT_EXECUTABLE: Mutex<Option<CurrentExecutable>> = Mutex::new(None);
+fn with_current<T>(read: impl FnOnce(&CurrentExecutable) -> Result<T>) -> Result<T> {
+    let mut cached = CURRENT_EXECUTABLE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Current executable verification failed"))?;
+    if cached.is_none() {
+        let path = fs::canonicalize(std::env::current_exe()?)?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file(),
+            "Current engine is not a regular executable"
+        );
+        let stamp = executable_stamp(&metadata);
+        let sha256 = hash_reader(&mut file)?;
+        verify_elf_reader(&mut file)?;
+        *cached = Some(CurrentExecutable {
+            file,
+            path,
+            stamp,
+            sha256,
+        });
+    }
+    let current = cached.as_ref().expect("verified executable");
+    let path = fs::symlink_metadata(&current.path)?;
+    let executing = fs::metadata("/proc/self/exe")?;
+    ensure!(
+        path.is_file()
+            && executable_stamp(&path) == current.stamp
+            && executable_stamp(&current.file.metadata()?) == current.stamp
+            && (executing.dev(), executing.ino()) == (path.dev(), path.ino()),
+        "Current native engine changed during operation"
+    );
+    executable_access(&current.path)?;
+    read(current)
+}
+pub fn current_engine_digest() -> Result<String> {
+    with_current(|current| Ok(current.sha256.clone()))
+}
+pub fn current_engine_path() -> Result<PathBuf> {
+    with_current(|current| Ok(current.path.clone()))
+}
+pub fn verify_current_engine(pin: &EnginePin) -> Result<PathBuf> {
+    pin.validate()?;
+    with_current(|current| {
+        ensure!(
+            current.sha256 == pin.sha256,
+            "Native engine checksum differs from accepted pin"
+        );
+        Ok(current.path.clone())
+    })
 }
 
 /// Engine-cache files are published with one canonical mode. Unlike a source

@@ -215,6 +215,7 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
         identity(&safe_path(root, PENDING_PATH)?)? == pending,
         "Update journal changed during recovery"
     );
+    crate::stand::epoch::recovery_transfer(root, &json_bytes(&tx)?)?;
     for file in tx.files.iter().rev() {
         let p = safe_path(root, &file.path)?;
         let actual = identity(&p)?;
@@ -247,7 +248,9 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
             remove_empty_dir_durable(&p)?;
         }
     }
+    crate::stand::epoch::finish_transfer(root, &json_bytes(&tx)?)?;
     remove_file(&safe_path(root, PENDING_PATH)?)?;
+    crate::stand::epoch::clear_transfer(root)?;
     remove_tree_durable(&safe_path(root, &tx.stage)?)?;
     Ok(true)
 }
@@ -388,8 +391,10 @@ impl PreparedTransaction {
         // Also bind already-existing ancestry up to the admitted checkout.
         // It may have been created by an older engine without directory fsync.
         sync_stage_ancestry(root, &self.journal.stage)?;
+        let epoch_transfer = crate::stand::epoch::prepare_transfer(root)?;
         write_json(&safe_path(root, PENDING_PATH)?, &self.journal)?;
         let result = (|| {
+            crate::stand::epoch::begin_transfer(root, &json_bytes(&self.journal)?, epoch_transfer)?;
             for (i, file) in self.journal.files.iter().enumerate() {
                 let p = safe_path(root, &file.path)?;
                 ensure!(
@@ -411,7 +416,9 @@ impl PreparedTransaction {
                     h.after_write(i + 1, &file.path)?;
                 }
             }
+            crate::stand::epoch::finish_transfer(root, &json_bytes(&self.journal)?)?;
             remove_file(&safe_path(root, PENDING_PATH)?)?;
+            crate::stand::epoch::clear_transfer(root)?;
             Ok(())
         })();
         if let Err(error) = result {

@@ -1,5 +1,6 @@
 #!/bin/sh
 # Initial transfer and delegation only; all project operations run in the ELF.
+# devkit-stand-protocol-v1
 set -eu
 mode=@@DEVKIT_MODE@@
 version=@@DEVKIT_VERSION@@
@@ -7,8 +8,20 @@ expected=@@DEVKIT_ENGINE_SHA256@@
 target=@@DEVKIT_ENGINE_TARGET@@
 asset=devkit-x86_64-unknown-linux-musl
 fail() { printf 'devkit: %s\n' "$*" >&2; exit 1; }
-[ "$(uname -s):$(uname -m)" = Linux:x86_64 ] || fail 'this release requires Linux x86_64'
+[ "$(uname -sm)" = 'Linux x86_64' ] || fail 'this release requires Linux x86_64'
 command=${1:-help}
+root=
+loader_directory=${0%/*}
+[ "$loader_directory" != "$0" ] || loader_directory=.
+if [ "$mode" = project ] && [ "$command" = down ]; then
+  case "${DEVKIT_CLEANUP:-0}" in 0|1) ;; *) fail 'cleanup must be 0 or 1' ;; esac
+  root=$(CDPATH= cd -- "$loader_directory/../.." && pwd -P)
+  if [ "${DEVKIT_CLEANUP:-0}" = 1 ] && [ -d "$root/.devkit" ] && [ -r "$root/.devkit" ] && [ -x "$root/.devkit" ] && [ ! -L "$root/.devkit" ] \
+    && [ ! -e "$root/.devkit/update-pending.json" ] && [ ! -L "$root/.devkit/update-pending.json" ] \
+    && [ ! -e "$root/.devkit/state" ] && [ ! -L "$root/.devkit/state" ]; then
+    exit 0
+  fi
+fi
 if [ "$mode" = project ] && [ "$command" = help ]; then
   printf '%s\n' \
     'make setup | check | fix | test | build   [app=NAME | package=NAME]' \
@@ -25,13 +38,14 @@ if [ "$mode" = project ] && [ "$command" = help ]; then
     'sh .devkit/runtime/devkit.sh cli ...      (run pinned devkit CLI without global install)'
   exit 0
 fi
-cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
-case "$cache" in /*) ;; *) fail 'the cache directory must be absolute' ;; esac
-cache=$(realpath -ms -- "$cache")
-[ "$(realpath -m -- "$cache")" = "$cache" ] || fail 'the cache path contains a symbolic link'
-engine=$cache/engines/$target/$version/$expected/devkit
 if [ -n "${DEVKIT_ENGINE_PATH:-}" ]; then
   engine=$DEVKIT_ENGINE_PATH
+else
+  cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
+  case "$cache" in /*) ;; *) fail 'the cache directory must be absolute' ;; esac
+  cache=$(realpath -ms -- "$cache")
+  [ "$(realpath -m -- "$cache")" = "$cache" ] || fail 'the cache path contains a symbolic link'
+  engine=$cache/engines/$target/$version/$expected/devkit
 fi
 valid_engine() {
   [ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || return 1
@@ -103,7 +117,7 @@ if [ "$mode" = bootstrap ]; then
   export DEVKIT_BOOTSTRAP_INTERACTIVE
   exec "$engine" "$@"
 fi
-root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+[ -n "$root" ] || root=$(CDPATH= cd -- "$loader_directory/../.." && pwd -P)
 if [ "$command" = cli ]; then
   shift
   [ "$#" -gt 0 ] || set -- --help

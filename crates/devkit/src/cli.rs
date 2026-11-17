@@ -409,37 +409,6 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
     crate::lifecycle_cli::run(command, &globals, runner)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AcceptedManifestHeader {
-    schema_version: u32,
-    version: String,
-    release_identity: String,
-    managed: BTreeMap<String, crate::model::FileIdentity>,
-}
-
-fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
-    let path = safe_path(root, state::MANIFEST_PATH)?;
-    state::check_manifest_regular_bounded(&path)?;
-    let before = identity(&path)?.context("Missing project manifest")?;
-    let bytes = fs::read(&path)?;
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
-        "Project manifest changed during admission"
-    );
-    let header: AcceptedManifestHeader = serde_json::from_slice(&bytes)?;
-    ensure!(
-        header.schema_version == 2,
-        "Unsupported project schemaVersion; only published schema2 is supported"
-    );
-    version(&header.version)?;
-    ensure!(
-        SHA256_RE.is_match(&header.release_identity),
-        "Invalid project release identity/generation"
-    );
-    Ok(header)
-}
-
 fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
     let switches = ["--preview", "--reconcile-lock"];
     let mut target = None;
@@ -540,7 +509,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         (project_root(&root)?, None)
     };
     state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
-    let header = read_accepted_header(&root)?;
+    let header = state::read_accepted_header(&root)?;
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
     ensure!(
@@ -557,7 +526,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     );
     let pin = pins.engine;
     let current = fs::canonicalize(std::env::current_exe()?)?;
-    if delivery::file_digest(&current)? == pin.sha256 {
+    if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(
             pin.version == env!("CARGO_PKG_VERSION"),
             "Accepted engine version differs from its build"

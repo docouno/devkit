@@ -220,7 +220,15 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             map.extend(serde_json::from_value::<serde_json::Map<String,Value>>(json!({"read_only":true,"tmpfs":["/tmp:mode=1777"],"shm_size":"256m","cap_drop":["ALL"],"security_opt":["no-new-privileges:true","seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"]}))?);
         } else {
             service["ports"] = json!([format!(
-                "127.0.0.1::{}",
+                "127.0.0.1:{}:{}",
+                if modern {
+                    format!(
+                        "${{DEVKIT_PORT_{}:-0}}",
+                        name.to_uppercase().replace('-', "_")
+                    )
+                } else {
+                    String::new()
+                },
                 if c.tooling_profile == ToolingProfile::Web {
                     "5173"
                 } else {
