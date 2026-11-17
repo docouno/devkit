@@ -53,6 +53,8 @@ pub struct InspectionIntent {
     #[serde(default)]
     pub external: BTreeMap<String, String>,
     pub helpers: BTreeMap<String, InspectionHelper>,
+    #[serde(default)]
+    pub prepared: bool,
     pub creation_finished: bool,
     #[serde(default)]
     pub creation_uncertain: bool,
@@ -63,16 +65,30 @@ impl Ledger {
             || (self.launch_finished && self.launch.as_ref().is_some_and(|l| l.daemon_finished))
     }
     pub fn completed_empty(&self) -> bool {
+        self.empty_or_prepared() && self.inspections.is_empty()
+    }
+    pub fn empty_or_prepared(&self) -> bool {
         self.services.is_empty()
             && self.containers.is_empty()
             && !self.launch_pending
             && self.launch_finished
-            && self.inspections.is_empty()
+            && self.inspections.values().all(|intent| intent.prepared)
     }
     pub fn read(root: &Path) -> Result<Option<Self>> {
         let value = read_bounded::<Self>(&safe_path(root, ACTIVE)?, 4 * 1024 * 1024)?;
         if let Some(value) = &value {
             ensure!(value.schema_version == 1, "Unsupported stand ledger schema");
+            for intent in value.inspections.values().filter(|intent| intent.prepared) {
+                ensure!(
+                    !intent.creation_finished
+                        && !intent.creation_uncertain
+                        && intent
+                            .helpers
+                            .values()
+                            .all(|helper| helper.observed.is_none()),
+                    "Prepared image inspection contains a creator outcome"
+                );
+            }
             if let Some(launch) = &value.launch {
                 ensure!(value.launch_pending, "Creator plan has no launch intent");
                 let id = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
@@ -383,6 +399,7 @@ pub fn active_ports(rows: &[Container], owner: &Owner) -> Result<super::ports::A
             continue;
         };
         for (target, bindings) in ports {
+            let configured = row.configured_ports.get(target).and_then(Value::as_array);
             let (target, protocol) = target
                 .split_once('/')
                 .context("Invalid observed port protocol")?;
@@ -402,6 +419,24 @@ pub fn active_ports(rows: &[Container], owner: &Owner) -> Result<super::ports::A
                     host.to_canonical().to_string(),
                     target.parse()?,
                 ));
+                // A bridge default can narrow an implicit bind to a specific host.
+                // Only reuse that port when this same container was configured
+                // for an implicit host and the observed port belongs to its range.
+                for declared in configured.into_iter().flatten() {
+                    if declared["HostIp"].as_str() == Some("")
+                        && let Some(raw) = declared["HostPort"].as_str()
+                        && let Some((first, last)) = super::ports::interval(raw)?
+                        && (first..=last).contains(&port)
+                    {
+                        result.insert((
+                            row.service.clone(),
+                            port,
+                            protocol.to_owned(),
+                            String::new(),
+                            target.parse()?,
+                        ));
+                    }
+                }
             }
         }
     }

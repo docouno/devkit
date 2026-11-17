@@ -315,7 +315,11 @@ impl Ports {
                 last,
                 automatic,
             };
-            let host = binding.ip()?.to_canonical().to_string();
+            let host = if binding.host_ip.is_empty() {
+                String::new()
+            } else {
+                binding.ip()?.to_canonical().to_string()
+            };
             let owned = |port| {
                 active.contains(&(
                     binding.service.clone(),
@@ -548,7 +552,7 @@ pub fn port_range(raw: Option<&str>) -> Result<(u16, u16)> {
     );
     Ok((a, b))
 }
-fn interval(value: &str) -> Result<Option<(u16, u16)>> {
+pub(super) fn interval(value: &str) -> Result<Option<(u16, u16)>> {
     if value.is_empty() || value == "0" {
         return Ok(None);
     }

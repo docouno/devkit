@@ -76,6 +76,9 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             &env_string("DEVKIT_CLEANUP").unwrap_or_else(|| "0".into()),
             "cleanup",
         )?;
+        if let Some(group) = env_string("DEVKIT_DEV_GROUP") {
+            request.dev_group = group.split_whitespace().map(str::to_owned).collect();
+        }
         request.package_aggregate = boolean(
             &env_string("DEVKIT_PACKAGE_AGGREGATE").unwrap_or_else(|| "0".into()),
             "package_aggregate",

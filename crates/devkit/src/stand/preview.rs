@@ -66,6 +66,10 @@ impl Renderer {
             );
             let example = value.substitute(raw, 1, "x")?;
             let authority = url_authority(raw)?;
+            ensure!(
+                !authority.contains('*'),
+                "A preview host cannot be a wildcard"
+            );
             if !authority.contains("{port}") && !authority.contains("{service}") {
                 url_host(&example)?;
             }
@@ -330,6 +334,8 @@ pub struct Deployment {
     pub external: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub forwarded_hosts: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<bool>,
 }
 pub fn publish_deployment(
     ports: &mut super::ports::Ports,
@@ -348,9 +354,24 @@ pub fn publish_deployment(
             .cloned()
             .collect();
         let mut files = Vec::new();
-        if frontend && renderer.template.is_some() {
-            let (document, primary) = HostsDocument::render(service, &groups, renderer)?;
-            if !document.hosts.is_empty() {
+        if renderer.template.is_some() {
+            let (document, primary) = if frontend {
+                let (document, primary) = HostsDocument::render(service, &groups, renderer)?;
+                (Some(document), primary)
+            } else {
+                for group in groups
+                    .iter()
+                    .filter(|group| group.binding.protocol == "tcp")
+                {
+                    for port in group.first..=group.last {
+                        renderer
+                            .render(port, service)
+                            .with_context(|| format!("Invalid preview URL for {service}"))?;
+                    }
+                }
+                (None, None)
+            };
+            if let Some(document) = document.filter(|document| !document.hosts.is_empty()) {
                 let file = HostFile::publish(
                     &ports.owner.root,
                     &ports.owner,
@@ -413,6 +434,7 @@ pub fn publish_deployment(
             images,
             external,
             forwarded_hosts,
+            frontend: Some(frontend),
         };
         let id = digest(json_bytes(&deployment)?);
         ports.deployments.insert(id.clone(), deployment);
@@ -678,7 +700,10 @@ pub fn enrich_observed(
                     "Applied image differs from inspected image"
                 );
             }
-            let applied_renderer = if row.preview_env.contains_key("DEVKIT_SERVICE") {
+            let frontend = deployment
+                .frontend
+                .unwrap_or_else(|| row.preview_env.contains_key("DEVKIT_SERVICE"));
+            let applied_renderer = if frontend {
                 &deployment.renderer
             } else {
                 ports
@@ -702,7 +727,7 @@ pub fn enrich_observed(
                     );
                 }
             }
-            if row.preview_env.contains_key("DEVKIT_SERVICE") {
+            if frontend {
                 ensure!(
                     row.preview_env
                         .get("DEVKIT_PREVIEW_HOSTS")

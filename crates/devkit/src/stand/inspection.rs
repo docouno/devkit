@@ -41,68 +41,70 @@ fn labels(owner: &Owner, helper: &InspectionHelper) -> BTreeMap<String, String> 
 pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     for key in ledger.inspections.keys().cloned().collect::<Vec<_>>() {
-        ensure!(
-            ledger.inspections[&key].creation_finished,
-            "Image inspection creator has no terminal receipt; preserving recovery intent {key}"
-        );
-        // Reaping the client does not acknowledge an in-flight daemon create.
-        // Observe the whole planned set over the existing late-create window.
-        let attempts = if ledger.inspections[&key].creation_uncertain {
-            10
-        } else {
-            1
-        };
-        for attempt in 0..attempts {
-            for service in ledger.inspections[&key]
-                .helpers
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                let helper = ledger.inspections[&key].helpers[&service].clone();
-                let observed = runner.inspection_snapshot(
-                    &owned(&helper),
-                    &labels(&ledger.owner, &helper),
-                    deadline,
-                )?;
-                if let Some(snapshot) = &observed {
-                    if let Some(previous) = &helper.observed {
-                        ensure!(
-                            snapshot.id == previous.id
-                                && snapshot.image == previous.image
-                                && snapshot.anonymous_volumes == previous.anonymous_volumes,
-                            "Image inspection identity changed"
-                        );
-                    }
-                    ledger
-                        .inspections
-                        .get_mut(&key)
-                        .unwrap()
-                        .helpers
-                        .get_mut(&service)
-                        .unwrap()
-                        .observed = Some(snapshot.clone());
-                    ledger.save(root)?;
-                }
-                if let Some(snapshot) = observed.as_ref().or(helper.observed.as_ref()) {
-                    runner.remove_inspection(
+        if !ledger.inspections[&key].prepared {
+            ensure!(
+                ledger.inspections[&key].creation_finished,
+                "Image inspection creator has no terminal receipt; preserving recovery intent {key}"
+            );
+            // Reaping the client does not acknowledge an in-flight daemon create.
+            // Observe the whole planned set over the existing late-create window.
+            let attempts = if ledger.inspections[&key].creation_uncertain {
+                10
+            } else {
+                1
+            };
+            for attempt in 0..attempts {
+                for service in ledger.inspections[&key]
+                    .helpers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    let helper = ledger.inspections[&key].helpers[&service].clone();
+                    let observed = runner.inspection_snapshot(
                         &owned(&helper),
                         &labels(&ledger.owner, &helper),
-                        snapshot,
                         deadline,
                     )?;
+                    if let Some(snapshot) = &observed {
+                        if let Some(previous) = &helper.observed {
+                            ensure!(
+                                snapshot.id == previous.id
+                                    && snapshot.image == previous.image
+                                    && snapshot.anonymous_volumes == previous.anonymous_volumes,
+                                "Image inspection identity changed"
+                            );
+                        }
+                        ledger
+                            .inspections
+                            .get_mut(&key)
+                            .unwrap()
+                            .helpers
+                            .get_mut(&service)
+                            .unwrap()
+                            .observed = Some(snapshot.clone());
+                        ledger.save(root)?;
+                    }
+                    if let Some(snapshot) = observed.as_ref().or(helper.observed.as_ref()) {
+                        runner.remove_inspection(
+                            &owned(&helper),
+                            &labels(&ledger.owner, &helper),
+                            snapshot,
+                            deadline,
+                        )?;
+                    }
+                }
+                if attempt + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            if attempt + 1 < attempts {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            ensure!(
+                ledger.inspections[&key].helpers.values().all(|helper| {
+                    helper.role == "build-context-image" || helper.observed.is_some()
+                }),
+                "Image inspection has incomplete daemon outcomes; preserving recovery intent {key}"
+            );
         }
-        ensure!(
-            ledger.inspections[&key].helpers.values().all(|helper| {
-                helper.role == "build-context-image" || helper.observed.is_some()
-            }),
-            "Image inspection has incomplete daemon outcomes; preserving recovery intent {key}"
-        );
         ledger.inspections.remove(&key);
         if ledger.completed_empty() {
             let mut ports =
@@ -743,8 +745,6 @@ pub fn prepare(
     let mut projection = json!({"services":services});
     escape_compose(&mut projection);
     let bytes = json_bytes(&projection)?;
-    ports.possible_actors = true;
-    ports.save()?;
     ledger.inspections.insert(
         nonce.clone(),
         InspectionIntent {
@@ -753,12 +753,17 @@ pub fn prepare(
             references: references.clone(),
             external: external_ids.clone(),
             helpers,
+            prepared: true,
             creation_finished: false,
             creation_uncertain: false,
         },
     );
     ledger.save(root)?;
+    ports.possible_actors = true;
+    ports.save()?;
     super::epoch::anchor(root)?;
+    ledger.inspections.get_mut(&nonce).unwrap().prepared = false;
+    ledger.save(root)?;
     let mut reaped = false;
     let result = runner.run_tracked(
         command().args(["--no-build", "--pull", "never"]),
@@ -1021,6 +1026,25 @@ pub fn verify_launch(
                     "Launch model escaped inspected volume-provider authority for {service}"
                 );
             }
+            let proved_volumes = expected["volumes"].as_array().into_iter().flatten();
+            let actual_volumes =
+                actual["volumes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|mount| {
+                        proof
+                            .slots
+                            .get(service)
+                            .is_none_or(|slot| mount["target"].as_str() != Some(slot.as_str()))
+                    });
+            ensure!(
+                actual_volumes.eq(proved_volumes)
+                    && ["tmpfs", "configs", "secrets", "devices"]
+                        .iter()
+                        .all(|key| actual.get(key) == expected.get(key)),
+                "Launch mount namespace differs from inspected model for {service}"
+            );
         }
     }
     for service in active {

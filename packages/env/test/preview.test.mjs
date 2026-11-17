@@ -59,7 +59,7 @@ test('serve preview works without a project or packages, merges hosts and guards
       plugin.config({}, { command: 'serve', mode: 'custom' });
       const config = { server: { allowedHosts: ['owned.example.test'] } };
       plugin.configResolved(config);
-      plugin.configureServer.handler({ config });
+      plugin.configureServer({ config });
       assert.deepEqual(config.server.allowedHosts, [
         'owned.example.test',
         'review.example.test',
@@ -97,7 +97,7 @@ test('serve preview works without a project or packages, merges hosts and guards
       const original = { '/api': custom, '/other': { target: 'http://other' } };
       const preserved = { server: { proxy: original, allowedHosts: true } };
       plugin.configResolved(preserved);
-      plugin.configureServer.handler({ config: preserved });
+      plugin.configureServer({ config: preserved });
       assert.equal(preserved.server.proxy['/api'], custom);
       assert.equal(preserved.server.proxy['/other'], original['/other']);
       assert.equal(preserved.server.allowedHosts, true);
@@ -244,7 +244,7 @@ test('final resolved hosts and routing govern HTTPS and automatic websocket beha
       },
     };
     plugin.configResolved(config);
-    plugin.configureServer.handler({ config });
+    plugin.configureServer({ config });
     let forwarded = 0;
     const proxy = {
       ws() {
@@ -267,7 +267,7 @@ test('final resolved hosts and routing govern HTTPS and automatic websocket beha
     assert.equal(forwarded, 1);
     assert.equal(plugin.transform('', '/vite/dist/client/client.mjs'), null);
     let middleware;
-    plugin.configureServer.handler({
+    plugin.configureServer({
       config: { server: { https: {}, allowedHosts: ['Later.test'], ws: {} } },
       middlewares: {
         use(handler) {
@@ -288,6 +288,19 @@ test('a later Vite config hook owns its custom proxy options', async () => {
   const { createServer } = await import(
     pathToFileURL(path.join(pnpmRoot, entry, 'node_modules/vite/dist/node/index.js')).href
   );
+  const inlineProxy = Object.freeze({ '/api': 'http://api:8080' });
+  const inline = { middlewareMode: true, watch: null, proxy: inlineProxy };
+  const initial = await createServer({
+    configFile: false,
+    server: inline,
+    plugins: [devkitWorkspaceSource('/no-project')],
+  });
+  try {
+    assert.equal(initial.config.server.proxy['/api'].ws, true);
+    assert.equal(inline.proxy['/api'], 'http://api:8080');
+  } finally {
+    await initial.close();
+  }
   const headers = { 'x-custom': 'yes' };
   let options;
   const proxy = {
@@ -299,7 +312,7 @@ test('a later Vite config hook owns its custom proxy options', async () => {
   };
   const server = await createServer({
     configFile: false,
-    server: { middlewareMode: true, watch: null, proxy: { '/api': 'http://api:8080' } },
+    server: inline,
     plugins: [
       devkitWorkspaceSource('/no-project'),
       {

@@ -224,29 +224,26 @@ export function devkitWorkspaceSource(projectDir) {
         configurePreviewHosts(config.server);
       }
     },
-    configureServer: {
-      order: 'post',
-      handler(server) {
-        if (!active) {
-          return;
-        }
-        resolvedConfig = server.config;
-        const options = server.config.server;
-        const allowsHost = hostPolicy(options.allowedHosts ?? []);
-        configureApiProxy(options, allowsHost);
-        // Vite's native HTTP guard already uses the resolved allowlist. It skips
-        // HTTPS listeners, so apply the same policy there before serving requests.
-        if (options.https && options.allowedHosts !== true) {
-          server.middlewares.use((request, response, next) => {
-            if (allowsHost(request.headers.host)) {
-              next();
-              return;
-            }
-            response.statusCode = 403;
-            response.end('Blocked request: host is not allowed.');
-          });
-        }
-      },
+    configureServer(server) {
+      if (!active) {
+        return;
+      }
+      resolvedConfig = server.config;
+      const options = server.config.server;
+      const allowsHost = hostPolicy(options.allowedHosts ?? []);
+      configureApiProxy(options, allowsHost);
+      // Vite's native HTTP guard already uses the resolved allowlist. It skips
+      // HTTPS listeners, so apply the same policy there before serving requests.
+      if (options.https && options.allowedHosts !== true) {
+        server.middlewares.use((request, response, next) => {
+          if (allowsHost(request.headers.host)) {
+            next();
+            return;
+          }
+          response.statusCode = 403;
+          response.end('Blocked request: host is not allowed.');
+        });
+      }
     },
     transform(code, id) {
       if (resolvedConfig) {

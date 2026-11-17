@@ -3458,15 +3458,20 @@ fn fullstack_preset_and_api_add_are_transactional_and_separate_from_library_depe
         json!({"condition":"service_started","required":true})
     );
     assert_eq!(
-        projection["services"]["api"]["environment"]["HOST"],
-        "0.0.0.0"
+        projection["services"]["api"]["env_file"],
+        json!([".devkit/runtime/api.env"])
     );
-    assert_eq!(projection["services"]["api"]["environment"]["PORT"], "8080");
     assert!(
-        projection["services"]["web"]["environment"]
+        projection["services"]["api"]["environment"]
             .get("HOST")
             .is_none()
     );
+    assert!(
+        projection["services"]["api"]["environment"]
+            .get("PORT")
+            .is_none()
+    );
+    assert!(projection["services"]["web"].get("env_file").is_none());
     let mut historical = state.clone();
     historical.version = "0.4.1".into();
     assert!(

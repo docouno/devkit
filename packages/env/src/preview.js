@@ -218,8 +218,7 @@ export function configureApiProxy(server, allowsHost) {
   const target =
     typeof api === 'string' ? api : api === undefined ? process.env.DEVKIT_API_TARGET : undefined;
   if (target) {
-    server.proxy ??= {};
-    server.proxy['/api'] = {
+    const route = {
       target,
       changeOrigin: true,
       ws: true,
@@ -234,5 +233,6 @@ export function configureApiProxy(server, allowsHost) {
         };
       },
     };
+    server.proxy = { ...server.proxy, '/api': route };
   }
 }

@@ -1205,7 +1205,8 @@ class RuntimeTests(unittest.TestCase):
         spec = json.loads((self.root / "compose.yaml").read_text())
         spec["services"].update({"main": frontend, "helper": {
             "image": IMAGE, "platform": "linux/x86_64", "labels": {LABEL: self.token},
-            "command": ["node", "-e", "setInterval(() => {}, 1000)"],
+            "command": ["node", "-e", "require('node:http').createServer((q,s)=>s.end('helper')).listen(3001,'0.0.0.0')"],
+            "ports": ["127.0.0.1::3001"], "environment": {"DEVKIT_SERVICE": "helper"},
         }})
         self.resources.append(project + "-helper-1")
         (self.root / "compose.yaml").write_text(json.dumps(spec))
@@ -1219,7 +1220,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse((self.root / ".devkit/state/stand.active").exists())
         self.assertIsNone(container(project + "-main-1"))
         dockerfile.write_text("FROM " + IMAGE + "\nLABEL " + LABEL + "=" + self.token + "\n")
-        self.make("up", "app=main", env=environment)
+        invalid = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://" + "a" * 57 + "-{service}.example.test")
+        refused = self.make("up", "app=main", env=invalid, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Invalid preview URL for helper", refused.stderr)
+        self.assertIsNone(container(project + "-helper-1"))
+        launched = self.make("up", "app=main", env=environment)
+        self.assertIn("Preview helper: https://", launched.stdout)
         receipt = json.loads((self.root / ".devkit/state/ports.json").read_text())
         self.assertEqual(set(receipt["deployments"][receipt["serviceDesired"]["main"]]["images"]), {"main"})
         helper = container(project + "-helper-1")
@@ -1227,6 +1234,10 @@ class RuntimeTests(unittest.TestCase):
         changed = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://new-{port}.example.test")
         self.make("up", "app=main", env=changed)
         self.assertEqual(container(project + "-helper-1")["Id"], helper["Id"])
+        status = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=changed).stdout)["result"]
+        backend = next(service for service in status["services"] if service["service"] == "helper")
+        self.assertFalse(backend["pendingRestart"])
+        self.assertTrue(backend["previewUrls"][0].startswith("https://new-"))
         self.make("down", "cleanup=1", env=environment)
 
     def test_preview_image_symlinks_fail_before_actual_launch_or_claims(self):
@@ -1403,7 +1414,17 @@ exec "$RACE_REAL_DOCKER" "$@"
         lease = json.loads(run(str(FIXTURE), str(self.root), "--port-lease", env=environment).stdout)
         registry = Path(lease["cacheRoot"]) / "port-leases.json"
         self.assertTrue(json.loads(registry.read_text())["claims"])
+        active = self.root / ".devkit/state/stand.active"
+        receipt = self.root / ".devkit/state/ports.json"
+        lease["possibleActors"] = True
+        receipt.write_text(json.dumps(lease))
+        active.write_text(json.dumps({"schemaVersion": 1, "owner": lease["owner"], "services": [],
+            "containers": [], "launchPending": False, "launchFinished": True,
+            "inspections": {"prepare": {"nonce": "prepare", "modelSha256": "0" * 64,
+                "references": {}, "external": {}, "helpers": {}, "prepared": True,
+                "creationFinished": False, "creationUncertain": False}}}))
         self.make("down", "cleanup=1", env=environment)
+        self.assertFalse(active.exists())
         self.assertEqual(json.loads(registry.read_text())["claims"], [])
         self.assertFalse((self.root / ".devkit/state/ports.json").exists())
         self.make("down", "cleanup=1", env=environment)
@@ -1446,7 +1467,9 @@ exec "$RACE_REAL_DOCKER" "$@"
 
         compose = self.root / "compose.yaml"
         spec = {"services": {"main": service(3000, host_port), "other": service(3100, "")},
-                "networks": {"default": {"labels": {LABEL: self.token}}}}
+                "networks": {"default": {"labels": {LABEL: self.token}, "driver_opts": {
+                    "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"}}}}
+        spec["services"]["other"]["ports"] = [{"target": 3100}]
         compose.write_text(json.dumps(spec))
         self.make("setup")
         self.make("up", "app=main")
@@ -1454,6 +1477,10 @@ exec "$RACE_REAL_DOCKER" "$@"
         manifest = self.root / ".devkit/manifest.json"
         links = manifest.stat().st_nlink
         self.make("up", "app=other")
+        implicit = container(f"{project}-other-1")
+        self.assertEqual(implicit["NetworkSettings"]["Ports"]["3100/tcp"][0]["HostIp"], "127.0.0.1")
+        self.make("up", "app=other")
+        self.assertEqual(container(f"{project}-other-1")["Id"], implicit["Id"])
         self.make("up", "app=main")
         self.assertEqual(container(f"{project}-main-1")["Id"], original)
         self.assertEqual(manifest.stat().st_nlink, links)
@@ -1476,6 +1503,14 @@ exec "$RACE_REAL_DOCKER" "$@"
         compose.write_text(json.dumps(spec))
         self.make("up", "app=main")
         self.assertIsNone(container(f"{project}-main-1"))
+        self.make("down", "cleanup=1")
+        del spec["services"]["main"]["scale"]
+        spec["services"]["other"]["depends_on"] = ["main"]
+        compose.write_text(json.dumps(spec))
+        self.make("up")
+        before = container(f"{project}-main-1")["Id"]
+        self.make("up")
+        self.assertEqual(container(f"{project}-main-1")["Id"], before)
         self.make("down", "cleanup=1")
 
     def test_native_setup_gates_fix_purity_stale_lock_and_secret_boundary(self):

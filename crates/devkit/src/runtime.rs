@@ -46,6 +46,7 @@ pub struct RuntimeRequest {
     pub headless: bool,
     pub cleanup: bool,
     pub package_aggregate: bool,
+    pub dev_group: Vec<String>,
     pub follow: bool,
     pub tail: u64,
     pub cache_dir: Option<PathBuf>,
@@ -62,6 +63,7 @@ impl RuntimeRequest {
             headless: false,
             cleanup: false,
             package_aggregate: false,
+            dev_group: Vec::new(),
             follow: false,
             tail: 100,
             cache_dir: None,
@@ -2010,9 +2012,10 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         return Ok(false);
     }
     let ledger = crate::stand::ledger::Ledger::read(root)?;
-    if ledger.as_ref().is_some_and(|l| !l.completed_empty()) {
+    if ledger.as_ref().is_some_and(|l| !l.empty_or_prepared()) {
         return Ok(false);
     }
+    let unarmed = ledger.as_ref().is_some_and(|l| !l.inspections.is_empty());
     let manifest =
         identity(&safe_path(root, MANIFEST_PATH)?)?.context("Missing accepted manifest")?;
     if let Some(expected) = &request.expected_manifest {
@@ -2038,7 +2041,7 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         "Accepted engine version differs from its build"
     );
     crate::delivery::verify_current_engine(&pins.engine)?;
-    let ports = crate::stand::ports::Ports::read(root)?;
+    let mut ports = crate::stand::ports::Ports::read(root)?;
     if let Some(ledger) = &ledger {
         ensure!(
             ports.as_ref().is_some_and(|p| p.owner == ledger.owner),
@@ -2046,7 +2049,7 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         );
     }
     ensure!(
-        ports.as_ref().is_none_or(|p| !p.possible_actors),
+        unarmed || ports.as_ref().is_none_or(|p| !p.possible_actors),
         "Stand actor history is missing or inconsistent; preserving leases until ownership recovery"
     );
     runtime_pending(root)?;
@@ -2056,6 +2059,13 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         "Accepted runtime changed during cleanup"
     );
     crate::stand::clear_overlay(root)?;
+    if unarmed
+        && let Some(ports) = &mut ports
+        && ports.possible_actors
+    {
+        ports.possible_actors = false;
+        ports.save()?;
+    }
     if ledger.is_some() {
         remove_file(&safe_path(root, crate::stand::ledger::ACTIVE)?)?;
     }
@@ -2684,6 +2694,46 @@ fn run_development(
         .collect();
     preview_forwarding_presence(ctx, &mut model, &frontends)?;
     let renderer = crate::stand::preview::Renderer::from_env(&branch)?;
+    // Make starts the selected applications individually. Use the same budget
+    // group for every prerequisite of an aggregate invocation.
+    let mut resource_services = active_services.clone();
+    if request.dev_group.len() > 1 {
+        for app in &request.dev_group {
+            let path = format!("apps/{app}");
+            let component = full
+                .state
+                .components
+                .get(&path)
+                .context("Unregistered development group application")?;
+            resource_services.extend(active_compose_services(
+                &model,
+                service_name(&path, component),
+            )?);
+        }
+    }
+    let resource_overlay = |budget: &crate::resources::HostResourceBudget| {
+        crate::resources::build_compose_resource_overlay(
+            budget,
+            &full.state,
+            &ctx.admission.pins.rust_version,
+            &model,
+            &resource_services,
+        )
+    };
+    let mut resources = resource_overlay(&budget)?;
+    let mut inspected_model = std::borrow::Cow::Borrowed(&model);
+    if renderer.template.is_some()
+        && !carrier_frontends.is_empty()
+        && let Some(services) = resources
+            .as_ref()
+            .and_then(|resource| resource["services"].as_object())
+    {
+        for (name, settings) in services {
+            if let Some(tmpfs) = settings.get("tmpfs") {
+                inspected_model.to_mut()["services"][name]["tmpfs"] = tmpfs.clone();
+            }
+        }
+    }
     if ports.possible_actors {
         ensure!(
             crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_some(),
@@ -2757,7 +2807,7 @@ fn run_development(
         }
         crate::stand::inspection::prepare(
             &mut ports,
-            &model,
+            &inspected_model,
             &mount_inputs,
             &carrier_frontends,
             &references,
@@ -2803,32 +2853,24 @@ fn run_development(
                 &proof,
             )?,
         )?;
-        ports.possible_actors = true;
-        ports.save()?;
         ledger = crate::stand::ledger::Ledger::intent(
             &ctx.admission.root,
             &ports.owner,
             &active_services,
         )?;
-        ledger.launch_finished = true;
-        ledger.save(&ctx.admission.root)?;
+        ports.possible_actors = true;
+        ports.save()?;
         crate::stand::epoch::anchor(&ctx.admission.root)?;
         let mut bind_attempts = 1;
         let mut cgroup_retried = false;
         loop {
             let mut res_overlay_file = None;
-            if let Some(res_spec) = crate::resources::build_compose_resource_overlay(
-                &budget,
-                &full.state,
-                &ctx.admission.pins.rust_version,
-                &model,
-                &active_services,
-            )? {
+            if let Some(res_spec) = &resources {
                 let mut file = tempfile::Builder::new()
                     .prefix("compose-resources-")
                     .suffix(".json")
                     .tempfile_in(&state_dir)?;
-                file.write_all(&json_bytes(&res_spec)?)?;
+                file.write_all(&json_bytes(res_spec)?)?;
                 res_overlay_file = Some(file);
             }
             let mut command = ctx.compose()?;
@@ -2858,7 +2900,7 @@ fn run_development(
                 let output = ctx.runner.capture(&mut normalized)?;
                 crate::stand::inspection::verify_launch(
                     &crate::stand::preview::compose_model(&output.stdout)?,
-                    &model,
+                    &inspected_model,
                     &ports,
                     &active_services,
                     &proof,
@@ -2895,6 +2937,7 @@ fn run_development(
                     "devkit: warning: Docker daemon lacks cgroup resource delegation; retrying Compose without container cgroup limits"
                 );
                 budget.disable_cgroup_limits();
+                resources = resource_overlay(&budget)?;
                 cgroup_retried = true;
                 *ctx.budget.borrow_mut() = Some(budget.clone());
                 continue;
