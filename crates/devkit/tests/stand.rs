@@ -427,3 +427,63 @@ fn preview_file_publication_precedes_claims_and_is_immutable() {
     ports.release().unwrap();
     assert!(!file.source.exists());
 }
+
+#[test]
+fn compose_wire_decoding_is_paired_with_single_serialization_escape() {
+    use devkit::stand::preview::*;
+    let encoded = json!({"services":{"web":{"environment":{"URL":"https://host.test/?q=$$literal"},"build":{"context":"/tmp/$$dir","args":{"VALUE":"$${VARIABLE}"}},"command":["echo","$$$$literal"]}}});
+    let semantic = compose_model(&serde_json::to_vec(&encoded).unwrap()).unwrap();
+    assert_eq!(
+        semantic["services"]["web"]["environment"]["URL"],
+        "https://host.test/?q=$literal"
+    );
+    assert_eq!(semantic["services"]["web"]["build"]["context"], "/tmp/$dir");
+    let mut roundtrip = semantic;
+    escape_compose(&mut roundtrip);
+    assert_eq!(roundtrip, encoded);
+}
+
+#[test]
+fn selected_service_with_no_bindings_retires_its_previous_ports_without_touching_other_services() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut ports = Ports::open(root.path(), cache.path()).unwrap();
+    let mut all = bindings(1);
+    let mut api = all[0].clone();
+    api.service = "api".into();
+    all.push(api);
+    allocate(&mut ports, &all);
+    let old = ports
+        .groups
+        .iter()
+        .find(|g| g.binding.service == "web")
+        .unwrap()
+        .clone();
+    ports
+        .allocate_plan(
+            Allocation {
+                declarations: &[],
+                selected: &BTreeSet::from(["web".into()]),
+                primary: Some("web"),
+                seed: "same-seed",
+            },
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(ports.groups.len(), 1);
+    assert_eq!(ports.groups[0].binding.service, "api");
+    assert!(ports.retained.contains(&old));
+    ports.reconcile(&[]).unwrap();
+    assert!(ports.retained.is_empty());
+    let registry: serde_json::Value = read_json(&cache.path().join("port-leases.json")).unwrap();
+    assert!(
+        registry["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|claim| claim["group"]["binding"]["service"] == "api")
+    );
+    assert!(!ports.possible_actors);
+}

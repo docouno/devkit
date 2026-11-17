@@ -302,6 +302,9 @@ pub fn publish_deployment(
     if renderer.template.is_some() {
         for service in frontends {
             let (document, primary) = HostsDocument::render(service, &ports.groups, renderer)?;
+            if document.hosts.is_empty() {
+                continue;
+            }
             let file = HostFile::publish(
                 &ports.owner.root,
                 &ports.owner,
@@ -451,6 +454,22 @@ pub fn collect_files(root: &Path, owner: &Owner, retained: &BTreeSet<PathBuf>) -
     Ok(())
 }
 
+/// Compose config JSON escapes every literal dollar for re-use as a Compose
+/// file. Keep a semantic model internally and encode only on serialization.
+pub fn decode_compose(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => *s = s.replace("$$", "$"),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(decode_compose),
+        serde_json::Value::Object(values) => values.values_mut().for_each(decode_compose),
+        _ => {}
+    }
+}
+pub fn compose_model(bytes: &[u8]) -> Result<serde_json::Value> {
+    let mut model = serde_json::from_slice(bytes)?;
+    decode_compose(&mut model);
+    Ok(model)
+}
+
 /// Normalized Compose values must not undergo a second interpolation pass.
 pub fn escape_compose(value: &mut serde_json::Value) {
     match value {
@@ -561,8 +580,15 @@ pub fn enrich_status(
                 );
             }
             status.pending_restart = status.desired_deployment.as_deref() != Some(&row.deployment)
-                || (row.preview_env.contains_key("DEVKIT_SERVICE")
-                    && deployment.renderer != renderer);
+                || deployment.renderer != renderer;
+            if row.preview_env.contains_key("DEVKIT_SERVICE") {
+                ensure!(
+                    row.preview_env
+                        .get("DEVKIT_PREVIEW_HOSTS")
+                        .is_none_or(String::is_empty),
+                    "Applied stand retained a stale CSV host carrier"
+                );
+            }
             if let Some(file) = deployment.files.iter().find(|f| f.service == row.service) {
                 file.validate(root, &ports.owner)?;
                 ensure!(
@@ -593,22 +619,22 @@ pub fn enrich_status(
                             && m["RW"] == false)),
                     "Applied preview bind differs from recorded deployment"
                 );
-                for endpoint in &mut status.endpoints {
-                    if endpoint.protocol == "tcp"
-                        && deployment.groups.iter().any(|g| {
-                            g.binding.service == row.service
-                                && g.binding.target == endpoint.target
-                                && g.binding.protocol == endpoint.protocol
-                                && endpoint.published >= g.first
-                                && endpoint.published <= g.last
-                        })
-                        && let Some(url) = deployment
-                            .renderer
-                            .render(endpoint.published, &row.service)?
-                    {
-                        endpoint.preview_url = Some(url.url.clone());
-                        status.preview_urls.push(url.url);
-                    }
+            }
+            for endpoint in &mut status.endpoints {
+                if endpoint.protocol == "tcp"
+                    && deployment.groups.iter().any(|g| {
+                        g.binding.service == row.service
+                            && g.binding.target == endpoint.target
+                            && g.binding.protocol == endpoint.protocol
+                            && endpoint.published >= g.first
+                            && endpoint.published <= g.last
+                    })
+                    && let Some(url) = deployment
+                        .renderer
+                        .render(endpoint.published, &row.service)?
+                {
+                    endpoint.preview_url = Some(url.url.clone());
+                    status.preview_urls.push(url.url);
                 }
             }
             status.preview_urls.sort();
@@ -657,4 +683,95 @@ pub fn prune(ports: &mut super::ports::Ports, rows: &[super::ledger::Container])
             .map(|f| f.source.clone())
             .collect(),
     )
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reservation {
+    pub service: String,
+    pub target: u16,
+    pub protocol: String,
+    pub host_ip: String,
+    pub first: u16,
+    pub last: u16,
+    pub replicas: u16,
+    pub automatic: bool,
+    pub state: &'static str,
+    pub local_url: Option<String>,
+    pub preview_url: Option<String>,
+}
+pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
+    let Some(ports) = super::ports::Ports::read(root)? else {
+        return Ok(Vec::new());
+    };
+    ports
+        .groups
+        .iter()
+        .map(|group| {
+            let renderer = ports
+                .service_desired
+                .get(&group.binding.service)
+                .and_then(|id| ports.deployments.get(id))
+                .map(|d| &d.renderer);
+            let single = group.first == group.last && group.binding.protocol == "tcp";
+            Ok(Reservation {
+                service: group.binding.service.clone(),
+                target: group.binding.target,
+                protocol: group.binding.protocol.clone(),
+                host_ip: group.binding.host_ip.clone(),
+                first: group.first,
+                last: group.last,
+                replicas: group.binding.replicas,
+                automatic: group.automatic,
+                state: "reserved",
+                local_url: single.then(|| local_url(&group.binding.host_ip, group.first)),
+                preview_url: if single {
+                    renderer
+                        .map(|r| r.render(group.first, &group.binding.service))
+                        .transpose()?
+                        .flatten()
+                        .map(|u| u.url)
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
+}
+pub fn reservation_lines(
+    reservations: &[Reservation],
+    services: &[crate::doctor::ComposeServiceStatus],
+) -> Vec<String> {
+    reservations
+        .iter()
+        .filter(|r| {
+            !services
+                .iter()
+                .any(|s| s.service == r.service && s.state == "running")
+        })
+        .map(|r| {
+            let ports = if r.first == r.last {
+                r.first.to_string()
+            } else {
+                format!("{}-{}", r.first, r.last)
+            };
+            let mut line = format!(
+                "Leased {}: {}:{ports}/{} (reserved)",
+                r.service,
+                if r.host_ip.is_empty() {
+                    "*"
+                } else {
+                    &r.host_ip
+                },
+                r.protocol
+            );
+            if let Some(url) = &r.local_url {
+                line += &format!(" {url}");
+            }
+            if let Some(url) = &r.preview_url {
+                line += &format!(" {url}");
+            }
+            line
+        })
+        .collect()
 }

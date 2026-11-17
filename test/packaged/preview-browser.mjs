@@ -82,7 +82,8 @@ try {
   let sequence = 0;
   const pending = new Map();
   let loads = 0,
-    connected = 0;
+    connected = 0,
+    stoppedErrors = 0;
   const errors = [];
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
@@ -99,6 +100,14 @@ try {
       message.params.response.payloadData.includes('"type":"connected"')
     )
       connected++;
+    if (
+      message.method === 'Runtime.consoleAPICalled' &&
+      message.params.args?.some(
+        (arg) =>
+          typeof arg.value === 'string' && arg.value.startsWith('[devkit] HMR recovery stopped'),
+      )
+    )
+      stoppedErrors++;
     if (message.method === 'Runtime.exceptionThrown')
       errors.push(message.params.exceptionDetails.text);
   });
@@ -163,23 +172,30 @@ try {
       'openclose',
       'reject-then-openclose',
       'base',
+      'corrupt',
+      'unavailable',
     ]) {
       await send('Page.navigate', { url: 'about:blank' });
       await delay(50);
       await request(
         '/__control?drop=' +
-          (['stale', 'base'].includes(drop) ? 'once' : drop) +
+          (['stale', 'base'].includes(drop)
+            ? 'once'
+            : ['corrupt', 'unavailable'].includes(drop)
+              ? 'always'
+              : drop) +
           (drop === 'base' ? '&base=/base/' : ''),
       );
       loads = 0;
       connected = 0;
+      stoppedErrors = 0;
       let injection;
-      if (drop === 'stale') {
-        injection = (
-          await send('Page.addScriptToEvaluateOnNewDocument', {
-            source: `try { const key='devkit:hmr-recovery:'+(location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+location.port+'/';if(!sessionStorage.getItem(key))sessionStorage.setItem(key,JSON.stringify({version:1,token:'older-server-token',spent:true})); } catch {}`,
-          })
-        ).identifier;
+      if (['stale', 'corrupt', 'unavailable'].includes(drop)) {
+        const source =
+          drop === 'unavailable'
+            ? `Object.defineProperty(window,'sessionStorage',{get(){throw new Error('test storage unavailable')}});`
+            : `try { const key='devkit:hmr-recovery:'+(location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+location.port+'/';if(!sessionStorage.getItem(key))sessionStorage.setItem(key,${drop === 'corrupt' ? JSON.stringify('{invalid') : JSON.stringify(JSON.stringify({ version: 1, token: 'older-server-token', spent: true }))}); } catch {}`;
+        injection = (await send('Page.addScriptToEvaluateOnNewDocument', { source })).identifier;
       }
       await send('Page.navigate', { url: origin + (drop === 'base' ? '/base/' : '') });
       await delay(1700);
@@ -210,10 +226,28 @@ try {
         await delay(600);
         assert.equal(loads, before, 'Permanent denial caused an unbounded reload loop');
         assert.ok(loads <= 2, 'More than one automatic reload per token');
+        assert.equal(stoppedErrors, 1, 'Recovery must stop with one actionable error');
+        if (['corrupt', 'unavailable'].includes(drop))
+          assert.equal(loads, 1, 'Unusable storage must not trigger reload');
       }
-      results.push({ origin, drop, loads, connected, hotUpdateWithoutNavigation: successful });
+      let worker;
+      if (drop === 'none') {
+        worker = await evaluate(
+          `new Promise((resolve,reject)=>{const worker=new Worker(new URL('worker.js',location.href),{type:'module'});const timeout=setTimeout(()=>{worker.terminate();reject(new Error('Worker timeout'));},4000);worker.onmessage=event=>{clearTimeout(timeout);worker.terminate();resolve(event.data)};worker.onerror=event=>{clearTimeout(timeout);worker.terminate();reject(new Error(event.message))};})`,
+        );
+        assert.deepEqual(worker, { worker: true, nativeSocket: true });
+      }
+      results.push({
+        origin,
+        drop,
+        loads,
+        connected,
+        stoppedErrors,
+        worker,
+        hotUpdateWithoutNavigation: successful,
+      });
       // Navigation does not imply a fresh session: clear only between independent cases.
-      await evaluate('sessionStorage.clear()');
+      if (drop !== 'unavailable') await evaluate('sessionStorage.clear()');
       if (injection)
         await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: injection });
     }

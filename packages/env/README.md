@@ -66,9 +66,9 @@ devkit-verify
 devkit-verify --pack
 ```
 
-During serve, the plugin also merges exact preview hosts from Devkit's read-only metadata file, even when no local packages or project manifest exist. Manual launches can use a concrete `DEVKIT_PREVIEW_URL`, comma-separated `DEVKIT_ALLOWED_HOSTS`/`VITE_ALLOWED_HOSTS` (explicit leading-dot suffixes allowed), or a bounded exact `DEVKIT_PREVIEW_HOSTS` list. Wildcards and URLs in host lists fail validation. Explicit `server.allowedHosts: true` remains the user's opt-in.
+During serve, the plugin also merges exact preview hosts from Devkit's read-only metadata file, even when no local packages or project manifest exist. Manual launches can use a concrete `DEVKIT_PREVIEW_URL`, comma-separated `DEVKIT_ALLOWED_HOSTS`/`VITE_ALLOWED_HOSTS` (explicit leading-dot suffixes allowed), or a bounded exact `DEVKIT_PREVIEW_HOSTS` list when no FILE carrier is present. Wildcards and URLs in host lists fail validation. Explicit `server.allowedHosts: true` remains the user's opt-in.
 
-String `/api` proxy targets and an absent `/api` with `DEVKIT_API_TARGET` gain `changeOrigin: true` and `ws: true`. The automatic proxy rejects hostile WebSocket Host headers before forwarding. User proxy objects and other routes retain their functions/options. Build and Vitest runs do not read preview files or install server/client patches.
+String `/api` proxy targets and an absent `/api` with `DEVKIT_API_TARGET` gain `changeOrigin: true` and `ws: true`. The automatic proxy rejects hostile WebSocket Host headers before forwarding. The automatic guards use Vite's resolved allowlist, including configured origins and additional hosts. User proxy objects and other routes retain their functions/options. Build and Vitest runs do not read preview files or install server/client patches.
 
 Default browser HMR routing on tested Vite 8.3.5/8.3.8 clients receives a guarded first-handshake recovery wrapper. It waits for an actual `connected` payload, uses one shared recovery attempt and at most one automatic reload per server token, and clears the budget after connection. Ordinary connected-session restart behavior stays native. Explicit custom HMR routing and workers retain the native transport; unknown versions/fragments produce one actionable warning.
 

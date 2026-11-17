@@ -1783,17 +1783,6 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         return Ok(());
     }
     if service {
-        if request.command == "down"
-            && request.cleanup
-            && crate::stand::epoch::trusted(&ctx.admission.root)?
-            && crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_none()
-        {
-            if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
-                ports.release()?;
-            }
-            crate::stand::clear_overlay(&ctx.admission.root)?;
-            return Ok(());
-        }
         ctx.prerequisite_service()?;
         run_service(&request, target.as_deref(), &mut ctx, lock)?;
         return Ok(());
@@ -2019,8 +2008,11 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
         || request.app.is_some()
         || request.package.is_some()
         || !crate::stand::epoch::trusted(root)?
-        || crate::stand::ledger::Ledger::read(root)?.is_some()
     {
+        return Ok(false);
+    }
+    let ledger = crate::stand::ledger::Ledger::read(root)?;
+    if ledger.as_ref().is_some_and(|l| !l.completed_empty()) {
         return Ok(false);
     }
     let manifest =
@@ -2049,6 +2041,16 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
     );
     crate::delivery::verify_current_engine(&pins.engine)?;
     let ports = crate::stand::ports::Ports::read(root)?;
+    if let Some(ledger) = &ledger {
+        ensure!(
+            ports.as_ref().is_some_and(|p| p.owner == ledger.owner),
+            "Completed stand history has no matching ownership receipt"
+        );
+    }
+    ensure!(
+        ports.as_ref().is_none_or(|p| !p.possible_actors),
+        "Stand actor history is missing or inconsistent; preserving leases until ownership recovery"
+    );
     runtime_pending(root)?;
     ensure!(
         identity(&safe_path(root, MANIFEST_PATH)?)?.as_ref() == Some(&manifest)
@@ -2058,6 +2060,9 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
     crate::stand::clear_overlay(root)?;
     if let Some(ports) = ports {
         ports.release()?;
+    }
+    if ledger.is_some() {
+        remove_file(&safe_path(root, crate::stand::ledger::ACTIVE)?)?;
     }
     Ok(true)
 }
@@ -2282,6 +2287,10 @@ fn run_service(
             ctx.runner,
             &mut services,
         )?;
+        let reservation_lines = crate::stand::preview::reservation_lines(
+            &crate::stand::preview::reservations(&ctx.admission.root)?,
+            &services,
+        );
         for service in services {
             println!(
                 "Service {} ({}): {}",
@@ -2297,6 +2306,9 @@ fn run_service(
                 println!("  Preview unverified: {diagnostic}");
             }
         }
+        for line in reservation_lines {
+            println!("{line}");
+        }
     } else {
         ctx.runner.checked(&mut command, OutputMode::Inherit)?;
     }
@@ -2310,6 +2322,18 @@ fn run_service(
                 ensure!(rows.is_empty(), "Unknown stand remnants remain");
             }
             let _ = stand_rows;
+        }
+        if !request.cleanup
+            && rows.is_empty()
+            && let Some(ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
+            && let Some(mut ports) = crate::stand::ports::Ports::read(&ctx.admission.root)?
+        {
+            ensure!(
+                ledger.owner == ports.owner && ledger.inspections.is_empty(),
+                "Unfinished stand inspections remain"
+            );
+            ports.possible_actors = false;
+            ports.save()?;
         }
         if !request.cleanup
             && rows.is_empty()
@@ -2464,7 +2488,7 @@ fn preview_forwarding_presence(
             &json_bytes(&spec)?,
         )?
         .success("Selected frontend environment query")?;
-    let resolved: Value = serde_json::from_slice(&output.stdout)?;
+    let resolved: Value = crate::stand::preview::compose_model(&output.stdout)?;
     for name in frontends {
         for key in keys {
             if resolved["services"][name]["environment"].get(key).is_some() {
@@ -2503,7 +2527,7 @@ fn run_development(
         "--format",
         "json",
     ]))?;
-    let model: Value = serde_json::from_slice(&output.stdout)?;
+    let model: Value = crate::stand::preview::compose_model(&output.stdout)?;
     let active_services = active_compose_services(&model, &service)?;
     let reached = development_components(&full.state, &model, &service)?;
     ensure!(
@@ -2629,7 +2653,7 @@ fn run_development(
         "--format",
         "json",
     ]))?;
-    let mut model: Value = serde_json::from_slice(&output.stdout)?;
+    let mut model: Value = crate::stand::preview::compose_model(&output.stdout)?;
     let mut budget = ctx
         .budget
         .borrow()
@@ -2671,22 +2695,32 @@ fn run_development(
             )
         })
         .map(|(p, c)| service_name(p, c).to_owned())
+        .filter(|name| active_services.contains(name))
+        .collect();
+    let carrier_frontends: BTreeSet<_> = frontends
+        .iter()
         .filter(|name| {
-            active_services.contains(name)
-                && declarations
-                    .iter()
-                    .any(|b| b.service == *name && b.protocol == "tcp")
+            declarations
+                .iter()
+                .any(|b| b.service == **name && b.protocol == "tcp")
         })
+        .cloned()
         .collect();
     preview_forwarding_presence(ctx, &mut model, &frontends)?;
     let renderer = crate::stand::preview::Renderer::from_env(&branch)?;
+    if ports.possible_actors {
+        ensure!(
+            crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_some(),
+            "Stand launch history is missing; preserving leases"
+        );
+    }
     let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
     ensure!(
         !ledger.launch_pending || ledger.launch_finished,
         "Unfinished stand creator; preserving its launch intent"
     );
     crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, ctx.runner)?;
-    let proof = if renderer.template.is_some() && !frontends.is_empty() {
+    let proof = if renderer.template.is_some() && !carrier_frontends.is_empty() {
         let mut references = BTreeMap::new();
         for name in crate::stand::inspection::closure(&model, &active_services)? {
             let image = if let Some(image) = model["services"][&name]["image"].as_str() {
@@ -2734,10 +2768,10 @@ fn run_development(
             references.insert(name, image);
         }
         crate::stand::inspection::prepare(
-            &ctx.admission.root,
+            &mut ports,
             &model,
             &active_services,
-            &frontends,
+            &carrier_frontends,
             &references,
             &mut ledger,
             ctx.runner,
@@ -2750,10 +2784,13 @@ fn run_development(
         }
     };
     let result = (|| -> Result<()> {
-        ports.allocate_with(
-            &declarations,
-            primary,
-            &branch,
+        ports.allocate_plan(
+            crate::stand::ports::Allocation {
+                declarations: &declarations,
+                selected: &active_services,
+                primary,
+                seed: &branch,
+            },
             &active_ports,
             &BTreeSet::new(),
             |ports| {
@@ -2776,6 +2813,8 @@ fn run_development(
                 &proof,
             )?,
         )?;
+        ports.possible_actors = true;
+        ports.save()?;
         ledger = crate::stand::ledger::Ledger::intent(
             &ctx.admission.root,
             &ports.owner,
@@ -2828,7 +2867,7 @@ fn run_development(
                 ]);
                 let output = ctx.runner.capture(&mut normalized)?;
                 crate::stand::inspection::verify_launch(
-                    &serde_json::from_slice(&output.stdout)?,
+                    &crate::stand::preview::compose_model(&output.stdout)?,
                     &ports,
                     &active_services,
                     &proof,
@@ -2883,10 +2922,13 @@ fn run_development(
             if bind_attempts < 3 && !conflicts.is_empty() {
                 let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
                 let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
-                ports.allocate_with(
-                    &declarations,
-                    primary,
-                    &branch,
+                ports.allocate_plan(
+                    crate::stand::ports::Allocation {
+                        declarations: &declarations,
+                        selected: &active_services,
+                        primary,
+                        seed: &branch,
+                    },
                     &active_ports,
                     &conflicts,
                     |ports| {
@@ -2919,32 +2961,24 @@ fn run_development(
         ledger.observed(&ctx.admission.root, &rows)?;
         ports.reconcile(&rows)?;
         crate::stand::preview::prune(&mut ports, &rows)?;
-        for file in ports
-            .desired_deployment
-            .as_ref()
-            .and_then(|id| ports.deployments.get(id))
-            .into_iter()
-            .flat_map(|d| &d.files)
-        {
-            for group in ports
-                .groups
-                .iter()
-                .filter(|g| g.binding.service == file.service && g.binding.protocol == "tcp")
-            {
-                for port in group.first..=group.last {
-                    if let Some(url) = renderer.render(port, &file.service)? {
-                        println!("Preview {}: {}", file.service, url.url);
-                    }
-                }
-            }
-        }
         let service_to_component = app_service_component_map(&full.state);
         let mut ps_cmd = ctx.compose()?;
         ps_cmd.args(["--profile", "*", "ps", "--format", "json"]);
         let ps_out = ctx.runner.capture(&mut ps_cmd)?;
-        for entry in crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)? {
+        let mut entries =
+            crate::doctor::parse_compose_ps_json(&ps_out.stdout, &service_to_component)?;
+        crate::stand::preview::enrich_status(
+            &ctx.admission.root,
+            &ctx.project,
+            ctx.runner,
+            &mut entries,
+        )?;
+        for entry in entries {
             if !active_services.contains(&entry.service) || entry.state != "running" {
                 continue;
+            }
+            for url in &entry.preview.preview_urls {
+                println!("Preview {}: {url}", entry.service);
             }
             for url in &entry.urls {
                 if let Some(comp) = &entry.component {
@@ -3072,6 +3106,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
             crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?
         };
     crate::stand::preview::enrich_status(&ctx.admission.root, &ctx.project, runner, &mut services)?;
+    let stand_ports = crate::stand::preview::reservations(&ctx.admission.root)?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
     ctx.admission.recheck()?;
@@ -3112,10 +3147,15 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
             ));
         }
     }
+    lines.extend(crate::stand::preview::reservation_lines(
+        &stand_ports,
+        &services,
+    ));
     let result = json!({
         "root": ctx.admission.root,
         "composeProject": ctx.project,
         "services": services,
+        "standPorts": stand_ports,
         "receipts": receipts,
     });
     Ok((result, lines.join("\n")))
@@ -3167,7 +3207,7 @@ impl ComposeNormalizer for DockerComposeNormalizer {
             "json",
         ]);
         let output = self.runner.capture(&mut command)?;
-        Ok(serde_json::from_slice(&output.stdout)?)
+        crate::stand::preview::compose_model(&output.stdout)
     }
 }
 

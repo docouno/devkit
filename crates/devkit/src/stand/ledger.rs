@@ -45,6 +45,13 @@ pub struct InspectionIntent {
     pub creation_finished: bool,
 }
 impl Ledger {
+    pub fn completed_empty(&self) -> bool {
+        self.services.is_empty()
+            && self.containers.is_empty()
+            && !self.launch_pending
+            && self.launch_finished
+            && self.inspections.is_empty()
+    }
     pub fn read(root: &Path) -> Result<Option<Self>> {
         let value = read_bounded::<Self>(&safe_path(root, ACTIVE)?, 4 * 1024 * 1024)?;
         if let Some(value) = &value {
@@ -129,6 +136,7 @@ pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
     for key in [
         "DEVKIT_PREVIEW_HOSTS_FILE",
         "DEVKIT_PREVIEW_HOSTS_SHA256",
+        "DEVKIT_PREVIEW_HOSTS",
         "DEVKIT_PREVIEW_URL",
         "DEVKIT_SERVICE",
         "DEVKIT_BRANCH",
@@ -144,7 +152,7 @@ pub fn inspect(id: &str, runner: &ProcessRunner) -> Result<Container> {
         .lines()
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<Value>, _>>()?;
-    ensure!(lines.len() == 15, "Invalid bounded stand observation");
+    ensure!(lines.len() == 16, "Invalid bounded stand observation");
     let mut preview_env = BTreeMap::new();
     for line in &lines[10..] {
         if let Some((key, value)) = line.as_str().and_then(|s| s.split_once('=')) {

@@ -146,6 +146,7 @@ test('literal metadata carrier verifies digest, schema, nofollow file and bounde
       DEVKIT_SERVICE: 'web',
     };
     assert.deepEqual(previewHosts(env), ['a.test', 'b.test']);
+    assert.deepEqual(previewHosts({ ...env, DEVKIT_PREVIEW_HOSTS: '*' }), ['a.test', 'b.test']);
     assert.throws(() => previewHosts({ ...env, DEVKIT_SERVICE: 'other' }));
     assert.throws(() => previewHosts({ ...env, DEVKIT_PREVIEW_HOSTS_SHA256: '0'.repeat(64) }));
     fs.unlinkSync(source);
@@ -193,4 +194,55 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('final resolved hosts and routing govern HTTP and automatic websocket behavior', () => {
+  environment({ DEVKIT_API_TARGET: 'http://api:8080' }, () => {
+    const plugin = devkitWorkspaceSource('/no-project');
+    const patch = plugin.config(
+      { server: { allowedHosts: ['early.test'] } },
+      { command: 'serve', mode: 'development' },
+    );
+    plugin.configResolved({
+      server: {
+        allowedHosts: ['early.test', 'added.test'],
+        ws: { host: 'custom.test', clientPort: 12345 },
+      },
+    });
+    let forwarded = 0;
+    const proxy = {
+      ws() {
+        forwarded++;
+      },
+    };
+    patch.server.proxy['/api'].configure(proxy);
+    proxy.ws({ headers: { host: 'added.test' } }, {});
+    assert.equal(forwarded, 1);
+    let denied = '';
+    proxy.ws(
+      { headers: { host: 'hostile.test' } },
+      {
+        end(value) {
+          denied = value;
+        },
+      },
+    );
+    assert.match(denied, /403/u);
+    assert.equal(forwarded, 1);
+    assert.equal(plugin.transform('', '/vite/dist/client/client.mjs'), null);
+    let middleware;
+    plugin.configureServer({
+      config: { server: { allowedHosts: ['later.test'], ws: {} } },
+      middlewares: {
+        use(handler) {
+          middleware = handler;
+        },
+      },
+    });
+    let passed = false;
+    middleware({ headers: { host: 'later.test' } }, {}, () => {
+      passed = true;
+    });
+    assert.equal(passed, true);
+  });
 });

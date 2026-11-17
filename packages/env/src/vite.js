@@ -179,6 +179,8 @@ export function devkitWorkspaceSource(projectDir) {
   let activeSourceMap = new Map();
   let active = false;
   let allowedHosts = [];
+  let resolvedConfig;
+  const currentHosts = () => resolvedConfig?.server.allowedHosts ?? allowedHosts;
   const recovery = hmrRecovery();
 
   return {
@@ -187,6 +189,7 @@ export function devkitWorkspaceSource(projectDir) {
     apply: 'serve',
     config(userConfig, env) {
       active = env?.command === 'serve' && !process.env.VITEST;
+      resolvedConfig = undefined;
       recovery.configure(userConfig, active);
       if (!active) {
         activeSourceMap = new Map();
@@ -196,7 +199,7 @@ export function devkitWorkspaceSource(projectDir) {
       const { projectRoot, sourceMap, allowedDirs, excludedDeps } =
         collectWorkspaceSourceMap(appRoot);
       activeSourceMap = sourceMap;
-      const server = previewServerPatch(userConfig?.server);
+      const server = previewServerPatch(userConfig?.server, currentHosts);
       allowedHosts = server.allowedHosts;
       if (!projectRoot || excludedDeps.size === 0) {
         return { server };
@@ -219,12 +222,17 @@ export function devkitWorkspaceSource(projectDir) {
         },
       };
     },
+    configResolved(config) {
+      resolvedConfig = config;
+      recovery.configure(config, active);
+    },
     configureServer(server) {
       if (!active) {
         return;
       }
+      resolvedConfig = server.config;
       server.middlewares.use((request, response, next) => {
-        if (hostAllowed(request.headers.host, allowedHosts)) {
+        if (hostAllowed(request.headers.host, currentHosts())) {
           next();
           return;
         }
@@ -233,6 +241,9 @@ export function devkitWorkspaceSource(projectDir) {
       });
     },
     transform(code, id) {
+      if (resolvedConfig) {
+        recovery.configure(resolvedConfig, active);
+      }
       return recovery.transform(code, id, (message) => this.warn(message));
     },
     resolveId(source) {

@@ -643,7 +643,7 @@ class Verification:
         self.run("preview-browser-logs", ["docker", "logs", browser])
         require(result == "0" and (output / "result.json").is_file(), "Preview browser transport failed")
         evidence = json.loads((output / "result.json").read_text())
-        require(evidence["passed"] and len(evidence["results"]) == 14, "Incomplete preview browser matrix")
+        require(evidence["passed"] and len(evidence["results"]) == 18, "Incomplete preview browser matrix")
         self.results.append({"label": "preview-first-handshake-and-host-guard", "passed": True, "result": evidence})
         for name in (browser, server):
             self.run("preview-stop-" + name.rsplit("-", 1)[-1], ["docker", "rm", "--force", name])
@@ -654,11 +654,29 @@ class Verification:
         # helper joins only this service's network namespace.
         (root / "compose.yaml").write_text('services:\n  desktop:\n    environment:\n      REMOTE_DEBUGGING_PORT: "9222"\n')
         self.make(node, "dev", label="node-development-start")
-        self.make(root, "dev", "headless=1", label="fullstack-development-start")
+        preview_template = "https://{port}-{service}.preview.example.test"
+        args = ["dev", "headless=1"] + (["DEVKIT_PREVIEW_URL_TEMPLATE=" + preview_template] if pnpm_project(root) else [])
+        self.make(root, *args, label="fullstack-development-start")
         web, api, desktop = (self.service(root, name) for name in ("web", "api", "desktop"))
         main = self.service(node, "main")
         self.http(self.port(api, 8080), "/health", {"status": "ok"})
         self.http(self.port(web, 5173), "/api/greeting?name=shared", {"message": "Hello, shared!"})
+        if pnpm_project(root):
+            actual = self.inspect("container", web)
+            env = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
+            require(env.get("DEVKIT_PREVIEW_HOSTS_FILE") in ("/run/devkit/preview-hosts.json", "/devkit/preview-hosts.json"), "Managed Vite did not receive FILE carrier")
+            require(env.get("DEVKIT_PREVIEW_HOSTS", "") == "", "Managed Vite retained CSV carrier")
+            host = f"{self.port(web, 5173)}-web.preview.example.test"
+            for authority, expected_status in [(host, 200), ("unrelated.preview.example.test", 403)]:
+                connection = http.client.HTTPConnection("127.0.0.1", self.port(web, 5173), timeout=3)
+                try:
+                    connection.request("GET", "/", headers={"Host": authority})
+                    response = connection.getresponse()
+                    response.read()
+                    require(response.status == expected_status, "Managed FILE-to-Vite host policy mismatch")
+                finally:
+                    connection.close()
+            self.results.append({"label": "managed-file-to-vite-host-policy", "passed": True, "file": env["DEVKIT_PREVIEW_HOSTS_FILE"]})
         self.http(self.port(main, 8080), "/health", {"status": "ok"})
         initial = "A small app, ready to change."
         marker = "Packaged harness shared UI"

@@ -3457,6 +3457,16 @@ fn fullstack_preset_and_api_add_are_transactional_and_separate_from_library_depe
         projection["services"]["web"]["depends_on"]["api"],
         json!({"condition":"service_started","required":true})
     );
+    assert_eq!(
+        projection["services"]["api"]["environment"]["HOST"],
+        "0.0.0.0"
+    );
+    assert_eq!(projection["services"]["api"]["environment"]["PORT"], "8080");
+    assert!(
+        projection["services"]["web"]["environment"]
+            .get("HOST")
+            .is_none()
+    );
     let mut historical = state.clone();
     historical.version = "0.4.1".into();
     assert!(

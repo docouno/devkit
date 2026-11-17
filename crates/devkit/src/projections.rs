@@ -134,6 +134,15 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             ("HOME".to_string(), json!("/tmp/devkit-home")),
             ("NPM_CONFIG_UPDATE_NOTIFIER".to_string(), json!("false")),
         ]);
+        if modern
+            && matches!(
+                c.tooling_profile,
+                ToolingProfile::Node | ToolingProfile::Rust
+            )
+        {
+            env.insert("HOST".into(), json!("0.0.0.0"));
+            env.insert("PORT".into(), json!("8080"));
+        }
         if let Some(api) = &d.api {
             let server = state
                 .components

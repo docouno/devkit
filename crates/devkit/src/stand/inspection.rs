@@ -40,6 +40,7 @@ fn labels(owner: &Owner, helper: &InspectionHelper) -> BTreeMap<String, String> 
 /// A missing planned name proves nothing while its creator may still be alive.
 pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let had_inspections = !ledger.inspections.is_empty();
     for key in ledger.inspections.keys().cloned().collect::<Vec<_>>() {
         ensure!(
             ledger.inspections[&key].creation_finished,
@@ -87,6 +88,16 @@ pub fn recover(root: &Path, ledger: &mut Ledger, runner: &ProcessRunner) -> Resu
         }
         ledger.inspections.remove(&key);
         ledger.save(root)?;
+    }
+    if had_inspections && ledger.completed_empty() {
+        let mut ports =
+            super::ports::Ports::read(root)?.context("Missing preflight ownership receipt")?;
+        ensure!(
+            ports.owner == ledger.owner,
+            "Preflight ownership changed during recovery"
+        );
+        ports.possible_actors = false;
+        ports.save()?;
     }
     Ok(())
 }
@@ -575,7 +586,7 @@ fn dependency_closure(
 }
 
 pub fn prepare(
-    root: &Path,
+    ports: &mut super::ports::Ports,
     model: &Value,
     active: &BTreeSet<String>,
     frontends: &BTreeSet<String>,
@@ -583,6 +594,8 @@ pub fn prepare(
     ledger: &mut Ledger,
     runner: &ProcessRunner,
 ) -> Result<Proof> {
+    let root_path = ports.owner.root.clone();
+    let root = root_path.as_path();
     recover(root, ledger, runner)?;
     let all = closure(model, active)?;
     let nonce = uuid::Uuid::new_v4().to_string();
@@ -651,6 +664,8 @@ pub fn prepare(
     }
     escape_compose(&mut projection);
     let bytes = json_bytes(&projection)?;
+    ports.possible_actors = true;
+    ports.save()?;
     ledger.inspections.insert(
         nonce.clone(),
         InspectionIntent {
@@ -674,8 +689,8 @@ pub fn prepare(
             "--project-directory",
         ])
         .arg(root)
-        .args(["--file", "-", "create", "--build", "--pull", "missing"]);
-    for name in &all {
+        .args(["--file", "-", "create", "--pull", "missing"]);
+    for name in active {
         command.arg(name);
     }
     let mut reaped = false;
@@ -700,9 +715,30 @@ pub fn prepare(
         let mut image_mounts = BTreeMap::new();
         for name in &all {
             let helper = &ledger.inspections[&nonce].helpers[name];
-            let snapshot = runner
-                .inspection_snapshot(&owned(helper), &labels(&ledger.owner, helper), deadline)?
-                .context("Missing planned image inspector")?;
+            let snapshot = runner.inspection_snapshot(
+                &owned(helper),
+                &labels(&ledger.owner, helper),
+                deadline,
+            )?;
+            let Some(snapshot) = snapshot else {
+                ensure!(
+                    !active.contains(name),
+                    "Missing planned runtime image inspector"
+                );
+                continue;
+            };
+            if !active.contains(name) {
+                ledger
+                    .inspections
+                    .get_mut(&nonce)
+                    .unwrap()
+                    .helpers
+                    .get_mut(name)
+                    .unwrap()
+                    .observed = Some(snapshot);
+                ledger.save(root)?;
+                continue;
+            }
             let mounts = snapshot
                 .anonymous_volumes
                 .keys()
@@ -947,7 +983,8 @@ pub fn verify_launch(
             file.validate(&ports.owner.root, &ports.owner)?;
             let service = &model["services"][&file.service];
             ensure!(
-                service["environment"]["DEVKIT_PREVIEW_HOSTS_FILE"] == file.slot
+                service["environment"]["DEVKIT_PREVIEW_HOSTS"] == ""
+                    && service["environment"]["DEVKIT_PREVIEW_HOSTS_FILE"] == file.slot
                     && service["environment"]["DEVKIT_PREVIEW_HOSTS_SHA256"] == file.sha256
                     && service["environment"]["DEVKIT_PREVIEW_URL"].as_str()
                         == file.primary_url.as_deref(),

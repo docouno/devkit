@@ -122,7 +122,7 @@ pub fn deployment_overlay(
                 .as_ref()
                 .and_then(|id| ports.deployments.get(id));
             let file = deployment.and_then(|d| d.files.iter().find(|f| f.service == *service));
-            let mut env = json!({"DEVKIT_PREVIEW_HOSTS_FILE":null,"DEVKIT_PREVIEW_HOSTS_SHA256":null,"DEVKIT_PREVIEW_URL":null,"DEVKIT_SERVICE":service,"DEVKIT_BRANCH":ports.preview_renderer.as_ref().map(|r|&r.branch_slug)});
+            let mut env = json!({"DEVKIT_PREVIEW_HOSTS_FILE":"","DEVKIT_PREVIEW_HOSTS_SHA256":"","DEVKIT_PREVIEW_URL":"","DEVKIT_PREVIEW_HOSTS":"","DEVKIT_SERVICE":service,"DEVKIT_BRANCH":ports.preview_renderer.as_ref().map(|r|&r.branch_slug)});
             if let Some(file) = file {
                 env["DEVKIT_PREVIEW_HOSTS_FILE"] = json!(file.slot);
                 env["DEVKIT_PREVIEW_HOSTS_SHA256"] = json!(file.sha256);

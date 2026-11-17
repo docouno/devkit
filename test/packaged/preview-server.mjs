@@ -41,6 +41,10 @@ backend.on('upgrade', (q, s, h) => {
 await new Promise((done) => backend.listen(9090, '0.0.0.0', done));
 process.env.DEVKIT_PREVIEW_URL = 'https://preview.test';
 async function start() {
+  fs.writeFileSync(
+    root + '/worker.js',
+    `import '${base}@vite/client';postMessage({worker:typeof document==='undefined',nativeSocket:WebSocket.toString().includes('[native code]')});`,
+  );
   vite = await createServer({
     configFile: false,
     root,

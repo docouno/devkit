@@ -156,7 +156,7 @@ export function previewHosts(environment = process.env) {
     hosts.push(host);
   }
   hosts.push(
-    ...csv(environment.DEVKIT_PREVIEW_HOSTS, false),
+    ...(!file ? csv(environment.DEVKIT_PREVIEW_HOSTS, false) : []),
     ...csv(environment.DEVKIT_ALLOWED_HOSTS, true),
     ...csv(environment.VITE_ALLOWED_HOSTS, true),
   );
@@ -188,7 +188,7 @@ export function hostAllowed(authority, allowed) {
       (entry.startsWith('.') && (host === entry.slice(1) || host.endsWith(entry))),
   );
 }
-export function previewServerPatch(userServer = {}) {
+export function previewServerPatch(userServer = {}, resolvedHosts) {
   const configured = userServer.allowedHosts;
   const hosts = previewHosts();
   const allowedHosts =
@@ -208,7 +208,7 @@ export function previewServerPatch(userServer = {}) {
       configure(instance) {
         const forward = instance.ws;
         instance.ws = function guardedUpgrade(request, socket, ...rest) {
-          if (!hostAllowed(request.headers.host, allowedHosts)) {
+          if (!hostAllowed(request.headers.host, resolvedHosts ? resolvedHosts() : allowedHosts)) {
             socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
             return undefined;
           }

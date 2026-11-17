@@ -153,6 +153,7 @@ pub struct Ports {
     pub groups: Vec<Group>,
     pub retained: Vec<Group>,
     pub allocation_intent: bool,
+    pub possible_actors: bool,
     #[serde(default)]
     pub preview_files: Vec<super::preview::HostFile>,
     #[serde(default)]
@@ -163,6 +164,12 @@ pub struct Ports {
     pub desired_deployment: Option<String>,
     #[serde(default)]
     pub service_desired: std::collections::BTreeMap<String, String>,
+}
+pub struct Allocation<'a> {
+    pub declarations: &'a [Binding],
+    pub selected: &'a BTreeSet<String>,
+    pub primary: Option<&'a str>,
+    pub seed: &'a str,
 }
 impl Ports {
     pub fn read(root: &Path) -> Result<Option<Self>> {
@@ -197,6 +204,7 @@ impl Ports {
             groups: Vec::new(),
             retained: Vec::new(),
             allocation_intent: false,
+            possible_actors: false,
             preview_files: Vec::new(),
             preview_renderer: None,
             deployments: std::collections::BTreeMap::new(),
@@ -239,6 +247,36 @@ impl Ports {
         retry: &BTreeSet<String>,
         before_claims: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        let selected = declarations.iter().map(|b| b.service.clone()).collect();
+        self.allocate_plan(
+            Allocation {
+                declarations,
+                selected: &selected,
+                primary,
+                seed,
+            },
+            active,
+            retry,
+            before_claims,
+        )
+    }
+    pub fn allocate_plan(
+        &mut self,
+        plan: Allocation<'_>,
+        active: &ActivePorts,
+        retry: &BTreeSet<String>,
+        before_claims: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let Allocation {
+            declarations,
+            selected,
+            primary,
+            seed,
+        } = plan;
+        ensure!(
+            declarations.iter().all(|b| selected.contains(&b.service)),
+            "Published binding lies outside selected services"
+        );
         ensure!(declarations.len() <= 65535, "Too many published bindings");
         for binding in declarations {
             Group {
@@ -387,11 +425,10 @@ impl Ports {
                 self.retained.push(group.clone());
             }
         }
-        let selected: BTreeSet<_> = declarations.iter().map(|b| b.service.as_str()).collect();
         next.extend(
             self.groups
                 .iter()
-                .filter(|g| !selected.contains(g.binding.service.as_str()))
+                .filter(|g| !selected.contains(&g.binding.service))
                 .cloned(),
         );
         self.groups = next;

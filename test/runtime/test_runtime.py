@@ -453,6 +453,7 @@ class RuntimeTests(unittest.TestCase):
         self.resources = []
         self.tokens = {}
         self.projects = []
+        self.images = []
 
     def tearDown(self):
         global CACHE_OVERRIDE
@@ -476,6 +477,16 @@ class RuntimeTests(unittest.TestCase):
                         errors.append(f"unexpected {kind} ownership: {name}")
                     else:
                         run("docker", kind, "rm", name)
+        for tag in self.images:
+            found = run("docker", "image", "inspect", tag, check=False)
+            if found.returncode == 0:
+                image = json.loads(found.stdout)[0]
+                if image["Config"].get("Labels", {}).get(LABEL) != self.token:
+                    errors.append("unexpected image ownership: " + tag)
+                else:
+                    removed = run("docker", "image", "rm", image["Id"], check=False)
+                    if removed.returncode:
+                        errors.append("could not remove owned image: " + tag)
         self.temp.cleanup()
         self.assertEqual(errors, [])
 
@@ -530,6 +541,7 @@ class RuntimeTests(unittest.TestCase):
         (self.root / "preview.env").write_text("DEVKIT_ALLOWED_HOSTS=from-file.example.test\n")
         spec = json.loads((self.root / "compose.yaml").read_text())
         spec["services"]["main"]["env_file"] = [str(self.root / "preview.env")]
+        spec["services"]["main"]["environment"] = {"DEVKIT_PREVIEW_HOSTS": "stale.invalid.test"}
         (self.root / "compose.yaml").write_text(json.dumps(spec))
         environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}-{service}-{branch}.example.test/path?q=$literal", DEVKIT_ALLOWED_HOSTS="from-host.example.test", VITE_ALLOWED_HOSTS="extra.example.test")
         self.make("setup", env=environment)
@@ -545,6 +557,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("DEVKIT_ALLOWED_HOSTS=from-file.example.test", actual["Config"]["Env"])
         self.assertIn("VITE_ALLOWED_HOSTS=extra.example.test", actual["Config"]["Env"])
         self.assertNotIn("DEVKIT_ALLOWED_HOSTS=from-host.example.test", actual["Config"]["Env"])
+        self.assertIn("DEVKIT_PREVIEW_HOSTS=", actual["Config"]["Env"])
+        self.assertNotIn("DEVKIT_PREVIEW_HOSTS=stale.invalid.test", actual["Config"]["Env"])
         mount = next(m for m in actual["Mounts"] if m["Destination"] == file["slot"])
         self.assertFalse(mount["RW"])
         self.assertEqual(actual["Image"], receipt["deployments"][receipt["desiredDeployment"]]["images"]["main"])
@@ -569,6 +583,11 @@ class RuntimeTests(unittest.TestCase):
     def test_preview_fallback_masks_only_proved_rw_tmpfs_and_pins_recursive_provider_images(self):
         service, project = self.preview_fixture()
         labels = {LABEL: self.token}
+        tag = "devkit-preview-cache-" + self.token
+        self.images.append(tag)
+        (self.root / "Dockerfile").write_text("FROM " + IMAGE + "\nLABEL " + LABEL + "=" + self.token + "\n")
+        service["image"] = tag
+        service["build"] = {"context": str(self.root)}
         spec = json.loads((self.root / "compose.yaml").read_text())
         service["volumes_from"] = ["provider:ro"]
         spec["services"]["main"] = service
@@ -586,6 +605,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(set(applied["images"]), {"main", "provider", "nested"})
         for name in applied["images"]:
             self.assertEqual(container(project + "-" + name + "-1")["Image"], applied["images"][name])
+        (self.root / "Dockerfile").write_text("FROM " + IMAGE + "\nRUN exit 73\n")
         self.make("up", "app=main", env=environment)
         self.make("down", env=environment)
         # A deeper writable tmpfs masks the unsafe outer source ancestry.
@@ -599,6 +619,38 @@ class RuntimeTests(unittest.TestCase):
         applied = receipt["deployments"][receipt["desiredDeployment"]]
         self.assertEqual(applied["files"][0]["slot"], "/run/devkit/preview-hosts.json")
         self.make("down", "cleanup=1", env=environment)
+        run("docker", "image", "rm", tag)
+
+    def test_managed_api_defaults_override_image_bind_environment(self):
+        write_fixture(self.root)
+        state_path = self.root / ".devkit/manifest.json"
+        state = json.loads(state_path.read_text())
+        state["components"]["apps/main"]["development"]["owner"] = "managed"
+        state_path.write_text(json.dumps(state))
+        accept_runtime(self.root)
+        tag = "devkit-api-bind-" + self.token
+        self.images.append(tag)
+        dockerfile = self.root / "Dockerfile"
+        dockerfile.write_text("FROM " + IMAGE + "\nENV HOST=127.0.0.1 PORT=9000\nLABEL " + LABEL + "=" + self.token + "\n")
+        run("docker", "build", "--tag", tag, str(self.root), timeout=60)
+        labels = {LABEL: self.token}
+        spec = {"services": {"main": {"image": tag, "labels": labels, "command": ["node", "-e", "require('node:http').createServer((q,s)=>s.end('bound')).listen(Number(process.env.PORT),process.env.HOST)"]}}, "networks": {"default": {"labels": labels}}}
+        (self.root / "compose.yaml").write_text(json.dumps(spec))
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        self.resources.append(project + "-main-1")
+        self.projects.append((project, self.root, "unused-" + self.token))
+        try:
+            self.make("setup")
+            self.make("up", "app=main")
+            actual = container(project + "-main-1")
+            self.assertIn("HOST=0.0.0.0", actual["Config"]["Env"])
+            self.assertIn("PORT=8080", actual["Config"]["Env"])
+            port = actual["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"]
+            with urllib.request.urlopen("http://127.0.0.1:" + port, timeout=3) as response:
+                self.assertEqual(response.read(), b"bound")
+            self.make("down", "cleanup=1")
+        finally:
+            run("docker", "image", "rm", tag, check=False)
 
     def test_preview_image_symlinks_fail_before_actual_launch_or_claims(self):
         service, project = self.preview_fixture()
@@ -619,7 +671,14 @@ class RuntimeTests(unittest.TestCase):
             if registry.exists():
                 self.assertEqual(json.loads(registry.read_text())["claims"], [])
             self.assertEqual(json.loads((self.root / ".devkit/state/stand.active").read_text())["inspections"], {})
-            self.make("down", "cleanup=1", env=environment)
+            denied = self.base / "docker-denied"
+            denied.mkdir()
+            trace = self.base / "unexpected-preflight-cleanup-docker"
+            (denied / "docker").write_text("#!/bin/sh\nprintf docker >> \"$CLEANUP_DOCKER_TRACE\"\nexit 97\n")
+            (denied / "docker").chmod(0o755)
+            unavailable = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
+            self.make("down", "cleanup=1", env=unavailable)
+            self.assertFalse(trace.exists(), "completed empty preflight still required Docker")
         finally:
             run("docker", "image", "rm", service["image"], check=False)
 
@@ -2191,22 +2250,32 @@ if (priv.value !== 'from-private-gitlab-registry') {
             "networks": {"default": {"labels": labels}},
         }))
 
-        self.make("setup")
+        environment = dict(env(), DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}-{service}.preview.example.test")
+        self.make("setup", env=environment)
         logs_proc = None
         try:
-            up_out = self.make("up").stdout
+            up_out = self.make("up", env=environment).stdout
             match = re.search(r"Service main \(apps/main\): (http://127\.0\.0\.1:\d+)", up_out)
             self.assertIsNotNone(match, f"expected Service URL in make up output: {up_out}")
             url = match.group(1)
             wait_until(lambda: urllib.request.urlopen(url, timeout=2).read() == b"DEV_PORT_OK", timeout=10)
 
-            status_res = run(str(ENGINE), "status", str(self.root), "--json")
+            published = int(url.rsplit(":", 1)[1])
+            preview = f"https://{published}-main.preview.example.test"
+            self.assertIn(preview, up_out)
+            status_res = run(str(ENGINE), "status", str(self.root), "--json", env=environment)
             status_json = json.loads(status_res.stdout)["result"]
             self.assertEqual(status_json["composeProject"], project)
             self.assertEqual(len(status_json["services"]), 1)
             self.assertEqual(status_json["services"][0]["service"], "main")
             self.assertEqual(status_json["services"][0]["component"], "apps/main")
             self.assertIn(url, status_json["services"][0]["urls"])
+            self.assertIn(preview, status_json["services"][0]["previewUrls"])
+            changed = dict(environment, DEVKIT_PREVIEW_URL_TEMPLATE="https://changed-{port}-{service}.preview.example.test")
+            pending = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=changed).stdout)["result"]["services"][0]
+            self.assertTrue(pending["pendingRestart"])
+            self.assertIn(preview, pending["previewUrls"])
+            self.assertIn("Preview settings pending restart", self.make("status", env=changed).stdout)
 
             # Running make setup while dev services are running refuses cleanly without removing node-workspace.lock.
             blocked_setup = self.make("setup", check=False)
@@ -2225,6 +2294,40 @@ if (priv.value !== 'from-private-gitlab-registry') {
             self.assertIsNone(logs_proc.poll(), "logs follow=1 exited prematurely")
             check_out = self.make("check").stdout
             self.assertIn("GATE main check", check_out)
+            os.killpg(logs_proc.pid, signal.SIGTERM)
+            logs_proc.communicate(timeout=10)
+            ledger = self.root / ".devkit/state/stand.active"
+            recorded = ledger.read_bytes()
+            ledger.unlink()
+            denied = self.base / "lost-ledger-bin"
+            denied.mkdir()
+            trace = self.base / "lost-ledger-docker"
+            (denied / "docker").write_text("#!/bin/sh\nprintf docker >> \"$CLEANUP_DOCKER_TRACE\"\nexit 97\n")
+            (denied / "docker").chmod(0o755)
+            lost = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
+            try:
+                refused = self.make("down", "cleanup=1", env=lost, check=False)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("actor history", refused.stderr)
+                self.assertFalse(trace.exists())
+                self.assertTrue((self.root / ".devkit/state/ports.json").exists())
+            finally:
+                ledger.write_bytes(recorded)
+            self.assertTrue(container(svc_container)["State"]["Running"])
+            self.make("down", env=environment)
+            stopped = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=environment).stdout)["result"]
+            self.assertEqual(stopped["services"], [])
+            self.assertEqual(stopped["standPorts"][0]["first"], published)
+            self.assertEqual(stopped["standPorts"][0]["state"], "reserved")
+            self.assertIn("Leased main:", self.make("status", env=environment).stdout)
+            self.make("up", env=environment)
+            (self.root / "compose.yaml").write_text("services:\n  main:\n    ports: !reset []\n    labels: " + json.dumps(labels) + "\nnetworks:\n  default:\n    labels: " + json.dumps(labels) + "\n")
+            self.make("up", env=environment)
+            actual = container(svc_container)
+            self.assertFalse(any(actual["NetworkSettings"]["Ports"].values()))
+            self.assertEqual(json.loads((self.root / ".devkit/state/ports.json").read_text())["groups"], [])
+            self.make("down", "cleanup=1", env=environment)
+
         finally:
             if logs_proc is not None and logs_proc.poll() is None:
                 os.killpg(logs_proc.pid, signal.SIGTERM)
