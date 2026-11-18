@@ -115,6 +115,8 @@ class DelayedInspectionCreate:
         self.external = external
         self.image_read = False
         self.creator = creator
+        self.armed = threading.Event()
+        self.armed.set()
         fixture = self
 
         class Connection(http.client.HTTPConnection):
@@ -168,7 +170,7 @@ class DelayedInspectionCreate:
                                and fixture.image_read and "com.docker.compose.project=" + fixture.project in filters)
                 else:
                     delayed = create
-                delayed = delayed and not fixture.accepted.is_set()
+                delayed = delayed and fixture.armed.is_set() and not fixture.accepted.is_set()
                 if create and (delayed or "labels" not in fixture.record):
                     payload = json.loads(body)
                     fixture.record.update(labels=payload["Labels"])
@@ -317,6 +319,12 @@ def seal_runtime(root):
                for path in sorted((root / ".devkit/runtime").rglob("*")) if path.is_file()}
     state_path = root / ".devkit/manifest.json"
     state = json.loads(state_path.read_text())
+    release_identity = hashlib.sha256(json.dumps(managed, sort_keys=True).encode()).hexdigest()
+    projection = root / ".devkit/project.mk"
+    rules, token, _ = projection.read_bytes().partition(b"DEVKIT_EXPECTED_PLAN := ")
+    if token:
+        plan = hashlib.sha256(release_identity.encode() + b"\n" + rules).hexdigest().encode()
+        projection.write_bytes(rules + token + plan + b"\n")
     for name in ("project.mk", "compose.apps.yaml", "compose.workspace.json", "tooling-profiles.json"):
         managed[".devkit/" + name] = identity(root / ".devkit" / name)
     for component, info in state["components"].items():
@@ -326,7 +334,7 @@ def seal_runtime(root):
     checksum = root / ".devkit/runtime.sha256"
     checksum.write_text("".join(f"{value['sha256']}  {name}\n" for name, value in sorted(managed.items())))
     managed[str(checksum.relative_to(root))] = identity(checksum)
-    state.update({"releaseIdentity": hashlib.sha256(json.dumps(managed, sort_keys=True).encode()).hexdigest(),
+    state.update({"releaseIdentity": release_identity,
                   "managed": managed})
     state_path.write_text(json.dumps(state) + "\n")
 
@@ -400,6 +408,167 @@ def write_rust_fixture(root):
 
 
 class EngineVersionAdmissionTests(unittest.TestCase):
+    def test_make_preserves_literal_inputs_before_projection_probe(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-make-literal-") as temporary:
+            root = Path(temporary) / "project"
+            write_rust_fixture(root)
+            loader = Path(temporary) / "argv.sh"
+            loader.write_text('#!/bin/sh\nprintf "%s\\n" "$DEVKIT_EXEC_COMMAND"\n')
+            make = ["make", "--no-print-directory", "-C", str(root)]
+            value = "echo '$(warning literal-argument-was-expanded)' '$VAR'"
+            for alias in ("command", "cmd"):
+                output = run(*make, "exec", f"{alias}={value}", f"devkit_loader={loader}")
+                self.assertEqual(output.stdout.strip(), value)
+                self.assertEqual(output.stderr, "")
+
+    def test_make_rejects_projection_replaced_after_parsing(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-make-plan-") as temporary:
+            base = Path(temporary)
+            root, next_root = base / "project", base / "next"
+            write_rust_fixture(root)
+            shutil.copytree(root, next_root)
+            shutil.copytree(next_root / "apps/api", next_root / "apps/extra")
+            accept_runtime(next_root, native=True)
+            shutil.copytree(next_root / "apps/extra", root / "apps/extra")
+            local = root / "Makefile"
+            local.write_text(local.read_text() + "\nsetup-api: replace-projection\n"
+                             "replace-projection:\n\t@cp -a ../next/.devkit/. .devkit/\n")
+            failed = run("make", "--no-print-directory", "-C", str(root), "setup", check=False, timeout=10)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("Accepted Make plan changed during this invocation", failed.stderr)
+
+    def test_early_reservation_on_linked_checkout_requires_no_docker_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-linked-reservation-") as temporary:
+            base = Path(temporary)
+            root = base / "main checkout"
+            linked = base / "review checkout"
+            write_rust_fixture(root)
+            manifest = root / ".devkit/manifest.json"
+            state = json.loads(manifest.read_text())
+            state["components"]["apps/api"]["development"]["owner"] = "managed"
+            manifest.write_text(json.dumps(state))
+            accept_runtime(root)
+            run("git", "-C", str(root), "init", "-b", "main")
+            run("git", "-C", str(root), "add", ".")
+            run("git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-m", "Create test checkout")
+            run("git", "-C", str(root), "worktree", "add", "-b", "review/api", str(linked))
+            environment = dict(env(), DOCKER_HOST=f"unix://{base / 'unavailable.sock'}",
+                               DEVKIT_CACHE_DIR=str(base / "cache"),
+                               DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}-{branch}.example.test")
+            loader = linked / ".devkit/runtime/devkit.sh"
+            for _ in range(2):
+                result = run("sh", str(loader), "cli", "stand", "reserve", ".", "--json",
+                             cwd=linked, env=environment, timeout=4)
+                self.assertTrue(json.loads(result.stdout)["result"]["reserved"])
+                result = run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                             env=environment, timeout=4)
+                info = json.loads(result.stdout)["result"]
+                self.assertEqual(info["worktreeKind"], "linked")
+                self.assertEqual(info["branch"], "review/api")
+                self.assertEqual(info["standState"], "stopped")
+                port = info["standPorts"][0]
+                self.assertEqual(port["localUrl"], f"http://127.0.0.1:{port['first']}")
+                self.assertEqual(port["previewUrl"], f"https://{port['first']}-review-api.example.test")
+            receipt = linked / ".devkit/state/ports.json"
+            saved = receipt.read_bytes()
+            receipt.unlink()
+            try:
+                for action in ("reserve", "remove"):
+                    result = run("sh", str(loader), "cli", "stand", action, ".",
+                                 cwd=linked, env=environment, check=False, timeout=4)
+                    self.assertIn("unexplained claim", result.stderr)
+                    self.assertFalse(receipt.exists())
+            finally:
+                receipt.write_bytes(saved)
+            self.assertFalse((linked / ".devkit/state/stand.active").exists())
+            for kind in ("state", "cache"):
+                (linked / ".devkit" / kind).rename(base / ("saved-" + kind))
+            for cleanup in ([], ["cleanup=1"]):
+                result = run("make", "--no-print-directory", "-C", str(linked), "down", *cleanup,
+                             env=environment, check=False, timeout=4)
+                self.assertIn("Stand ownership history was lost", result.stderr)
+            self.assertFalse((linked / ".devkit/state").exists())
+
+    def test_make_metadata_ignores_nonregular_projection_and_manifest(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory(prefix="devkit-worktree-info-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            write_rust_fixture(root)
+            run("git", "init", "-b", "main", str(root))
+            make = ["make", "--no-print-directory", "-C", str(root)]
+            initial = json.loads(run(*make, "info", "json=1", timeout=4).stdout)
+            self.assertEqual(initial["command"], "info")
+            self.assertEqual(initial["result"]["branch"], "main")
+            self.assertEqual(initial["result"]["worktreeKind"], "main")
+            self.assertEqual(initial["result"]["apps"], ["api"])
+            self.assertEqual(initial["result"]["standState"], "stopped")
+            self.assertEqual(initial["result"]["readiness"], "setup-required")
+            self.assertEqual(initial, json.loads(run(*make, "status", "json=1", timeout=4).stdout))
+            state = root / ".devkit/state"
+            self.assertFalse(state.exists())
+            run(*make, "recover", timeout=4)
+            self.assertFalse(state.exists())
+            state.mkdir()
+            with (state / "task.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+                started = time.monotonic()
+                busy = json.loads(run(*make, "info", "json=1", timeout=4).stdout)["result"]
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(busy["lock"]["state"], "busy")
+                self.assertEqual(busy["standState"], "unknown")
+            for name in ("manifest.json", "project.mk", "tooling-profiles.json"):
+                path = root / ".devkit" / name
+                original = path.read_bytes()
+                path.unlink()
+                os.mkfifo(path)
+                try:
+                    self.assertIn("make exec", run(*make, "help", timeout=3).stdout)
+                    run(*make, "info", "json=1", timeout=3)
+                    run(*make, "recover", timeout=3)
+                    if name != "tooling-profiles.json":
+                        failed = run(*make, "check", check=False, timeout=3)
+                        self.assertIn("cannot read accepted Make projection", failed.stderr)
+                finally:
+                    path.unlink()
+                    path.write_bytes(original)
+            import resource
+            cargo = root / "apps/api/Cargo.toml"
+            with cargo.open("r+b") as manifest:
+                manifest.truncate(256 * 1024 * 1024)
+            result = run(*make, "info", "json=1", timeout=3, preexec_fn=lambda: resource.setrlimit(
+                resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024)))
+            self.assertEqual(json.loads(result.stdout)["result"]["readiness"], "unknown")
+
+    def test_make_info_bounds_local_dependency_artifacts(self):
+        import resource
+
+        with tempfile.TemporaryDirectory(prefix="devkit-info-dependency-") as temporary:
+            root = Path(temporary) / "checkout"
+            write_rust_fixture(root)
+            app = root / "apps/web"
+            app.mkdir()
+            (app / "package.json").write_text(json.dumps({"name": "web", "version": "1.0.0", "private": True,
+                "scripts": {name: "true" for name in ("check", "fix", "test", "build", "dev")}}))
+            (root / "package.json").write_text(json.dumps({"name": "fixture", "version": "1.0.0", "private": True}))
+            (root / "pnpm-lock.yaml").write_text(json.dumps({"lockfileVersion": "9.0", "importers": {".": {}, "apps/web": {}}}))
+            (root / "pnpm-workspace.yaml").write_text(json.dumps({"packages": ["apps/web"], "nodeLinker": "isolated",
+                "packageImportMethod": "hardlink", "verifyDepsBeforeRun": False,
+                "patchedDependencies": {"example@1.0.0": "example.patch"}}))
+            patch = root / "example.patch"
+            patch.write_text("diff --git a/package.json b/package.json\n")
+            accept_runtime(root)
+            described = run(str(ENGINE), "describe", str(root), "--json")
+            self.assertIn("example.patch", json.loads(described.stdout)["result"]["inputs"]["files"])
+            with patch.open("r+b") as source:
+                source.truncate(256 * 1024 * 1024)
+            limit = 128 * 1024 * 1024
+            info = run("make", "--no-print-directory", "-C", str(root), "info", "json=1", timeout=3,
+                       preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_AS, (limit, limit)))
+            self.assertEqual(json.loads(info.stdout)["result"]["readiness"], "unknown")
+
     def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:
             base = Path(temporary)
@@ -633,6 +802,91 @@ class RuntimeTests(unittest.TestCase):
         name = "devkit-runtime-test-" + self.token + "-" + str(len(self.resources))
         self.resources.append(name)
         return name
+
+    def test_stand_remove_releases_owned_resources_and_preserves_external_data(self):
+        write_fixture(self.root)
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        name = project + "-main-1"
+        self.resources.append(name)
+        labels = {LABEL: self.token}
+        external = "devkit-external-" + self.token
+        run("docker", "volume", "create", "--label", f"{LABEL}={self.token}", external)
+        provider = self.owned_name()
+        run("docker", "create", "--name", provider, "--label", f"{LABEL}={self.token}", "--volume", "/borrowed", IMAGE, "true")
+        borrowed = container(provider)["Mounts"][0]["Name"]
+        spec = {"services": {"main": {"image": "${DEVKIT_NODE_IMAGE:?}", "labels": labels,
+                        "command": ["node", "-e", "setTimeout(()=>{},120000)"],
+                        "ports": ["127.0.0.1:0:3000"], "volumes_from": ["container:" + provider],
+                        "volumes": ["state:/state", "external:/external", "protect:/protect", "/anonymous"]}},
+                "volumes": {"state": {"labels": labels}, "external": {"external": True, "name": external},
+                            "protect": {"labels": labels}},
+                "networks": {"default": {"labels": labels}}}
+        compose = self.root / "compose.yaml"
+        compose.write_text(json.dumps(spec))
+        loader = self.root / ".devkit/runtime/devkit.sh"
+        history = self.root / ".devkit/state/stand.history.json"
+        ports = self.root / ".devkit/state/ports.json"
+        actors = self.root / ".devkit/state/stand.active"
+        protected = None
+        try:
+            self.make("setup", timeout=240)
+            self.make("up", timeout=120)
+            mounted = {m["Destination"]: m["Name"] for m in container(name)["Mounts"] if m["Type"] == "volume"}
+            owned = mounted["/state"]
+            anonymous = mounted["/anonymous"]
+            protected = mounted["/protect"]
+            self.assertEqual(mounted["/external"], external)
+            self.assertEqual(mounted["/borrowed"], borrowed)
+            self.make("down", "cleanup=1", timeout=90)
+            self.assertEqual(run("docker", "volume", "inspect", owned).returncode, 0)
+            self.assertEqual(json.loads(self.make("info", "json=1").stdout)["result"]["standState"], "stopped")
+            self.make("up", timeout=120)
+            self.assertIn(owned, [m.get("Name") for m in container(name)["Mounts"]])
+            spec["services"]["main"]["ports"] = []
+            compose.write_text(json.dumps(spec))
+            self.make("up", timeout=120)
+            before = {path: path.read_bytes() for path in (ports, actors) if path.exists()}
+            self.assertEqual(json.loads(before[ports])["groups"], [])
+            for path in before:
+                path.unlink()
+            try:
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("lack an ownership receipt", refused.stderr)
+                observed = json.loads(self.make("info", "json=1").stdout)["result"]
+                self.assertEqual(observed["standState"], "unknown")
+                self.assertTrue(container(name)["State"]["Running"])
+            finally:
+                for path, data in before.items():
+                    path.write_bytes(data)
+            # Protect another persisted volume even after its last service mount disappears.
+            spec["services"]["main"]["volumes"].remove("external:/external")
+            spec["services"]["main"]["volumes"].remove("protect:/protect")
+            spec["volumes"]["protect"] = {"external": {"name": protected}}
+            compose.write_text(json.dumps(spec))
+            run("docker", "rm", provider)
+            other_context = dict(env(), DOCKER_CONTEXT="default")
+            failed = run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root,
+                         env=other_context, check=False, timeout=30)
+            self.assertIn("original Docker context", failed.stderr)
+            self.assertTrue(container(name)["State"]["Running"])
+            for _ in range(2):
+                run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root, timeout=90)
+            self.assertIsNone(container(name))
+            self.assertFalse((self.root / ".devkit/state/ports.json").exists())
+            for volume in (owned, anonymous):
+                self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
+            self.assertIn(external, run("docker", "volume", "inspect", external).stdout)
+            self.assertIn(borrowed, run("docker", "volume", "inspect", borrowed).stdout)
+            self.assertIn(protected, run("docker", "volume", "inspect", protected).stdout)
+            self.assertTrue(json.loads(history.read_text())["cleaned"])
+            refused = self.make("up", check=False)
+            self.assertIn("Stand is retired", refused.stderr)
+        finally:
+            run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root, timeout=90, check=False)
+            run("docker", "rm", provider, check=False)
+            run("docker", "volume", "rm", external, borrowed, *([protected] if protected else []), check=False)
 
     def test_make_aggregate_without_display_skips_desktop_before_its_library_prerequisites(self):
         # Exercise the real public Make DAG with a controlled task boundary;
@@ -916,7 +1170,7 @@ class RuntimeTests(unittest.TestCase):
                             ledger = json.loads(active.read_text())
                             self.assertTrue(ledger["inspections"])
                             self.assertTrue(json.loads((self.root / ".devkit/state/ports.json").read_text())["possibleActors"])
-                            refused = self.make("down", "cleanup=1", env=environment, check=False)
+                            refused = self.make("down", "cleanup=1", env=selected, check=False)
                             self.assertNotEqual(refused.returncode, 0)
                             self.assertIn("incomplete daemon outcomes", refused.stderr)
                             self.assertTrue(json.loads(active.read_text())["inspections"])
@@ -928,7 +1182,7 @@ class RuntimeTests(unittest.TestCase):
                             self.assertEqual(actual["Config"]["Labels"]["io.docouno.devkit.inspection"], proxy.record["labels"]["io.docouno.devkit.inspection"])
                             volumes = [mount["Name"] for mount in actual["Mounts"] if mount["Type"] == "volume"]
                             self.assertTrue(volumes)
-                            self.make("down", "cleanup=1", env=environment)
+                            self.make("down", "cleanup=1", env=selected)
                             self.assertIsNone(container(helper_name))
                             for volume in volumes:
                                 self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
@@ -944,6 +1198,8 @@ class RuntimeTests(unittest.TestCase):
                             (denied / "docker").chmod(0o755)
                             no_docker = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
                             self.make("down", "cleanup=1", env=no_docker)
+                            observed = json.loads(self.make("info", "json=1", env=no_docker).stdout)["result"]
+                            self.assertEqual(observed["standState"], "stopped")
                             self.assertFalse(trace.exists())
                 finally:
                     proxy.release.set()
@@ -987,9 +1243,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(status["services"]), 1)
         self.assertEqual(status["services"][0]["service"], "main")
         self.assertEqual(status["services"][0]["state"], "running")
-        human = self.make("status", env=environment).stdout
-        self.assertIn("Service main", human)
-        self.assertNotIn("(reserved)", human)
+        unverified = json.loads(self.make("status", "json=1", env=environment).stdout)["result"]
+        self.assertEqual(unverified["standState"], "unknown")
+        self.assertFalse(unverified["standPorts"])
         active = self.root / ".devkit/state/stand.active"
         saved = active.read_bytes()
         ledger = json.loads(saved)
@@ -1020,15 +1276,17 @@ class RuntimeTests(unittest.TestCase):
                 replicas = 1 if preview else 2
                 service["deploy"]["replicas"] = replicas
                 (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": service}}))
-                if preview:
-                    self.make("up", "app=main", env=environment)
-                    before_ids = {container(project + "-main-1")["Id"]}
-                    selected["DEVKIT_PREVIEW_URL_TEMPLATE"] = "https://{port}.example.test"
                 proxy = DelayedInspectionCreate(self.base / "main.sock", creator="main")
                 proc = None
                 try:
                     with proxy:
                         fault = dict(selected, DOCKER_HOST="unix://" + str(proxy.path))
+                        if preview:
+                            proxy.armed.clear()
+                            self.make("up", "app=main", env=fault)
+                            proxy.armed.set()
+                            before_ids = {container(project + "-main-1")["Id"]}
+                            fault["DEVKIT_PREVIEW_URL_TEMPLATE"] = "https://{port}.example.test"
                         proc = subprocess.Popen([str(ENGINE), "task", "dev", "--root", str(self.root), "--app", "main"],
                                                 env=fault, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                         self.assertTrue(proxy.accepted.wait(20), "Main create never reached the daemon barrier")
@@ -1055,7 +1313,16 @@ class RuntimeTests(unittest.TestCase):
                             self.assertFalse(ledger["launch"]["daemonFinished"])
                             self.assertTrue(json.loads(ports.read_text())["possibleActors"])
                             before = ports.read_bytes()
-                            refused = self.make("down", "cleanup=1", env=selected, check=False)
+                            saved_actors = active.read_bytes()
+                            active.unlink()
+                            try:
+                                refused = self.make("down", env=fault, check=False)
+                                self.assertNotEqual(refused.returncode, 0)
+                                self.assertIn("Stand actor history is missing", refused.stderr)
+                                self.assertFalse(proxy.completed.is_set())
+                            finally:
+                                active.write_bytes(saved_actors)
+                            refused = self.make("down", "cleanup=1", env=fault, check=False)
                             self.assertNotEqual(refused.returncode, 0)
                             self.assertIn("incomplete daemon outcomes", refused.stderr)
                             self.assertEqual(ports.read_bytes(), before)
@@ -1069,7 +1336,7 @@ class RuntimeTests(unittest.TestCase):
                             self.assertTrue(ledger["launch"]["daemonFinished"])
                         self.assertEqual(proxy.record["status"], 201)
                         self.assertIsNotNone(container(proxy.record["reply"]["Id"]))
-                    self.make("down", "cleanup=1", env=selected)
+                        self.make("down", "cleanup=1", env=fault)
                     self.assertIsNone(container(held))
                     if peer:
                         self.assertIsNone(container(peer))
@@ -1139,7 +1406,8 @@ class RuntimeTests(unittest.TestCase):
                         self.assertIn("deadline", stderr)
                         self.assertIsNone(container(project + "-main-1"), stdout + stderr)
                         self.assertFalse(proxy.completed.is_set(), "The response was released before the native deadline")
-                    self.make("down", "cleanup=1", env=environment)
+                        proxy.release.set()
+                        self.make("down", "cleanup=1", env=selected)
                     owner = proxy.record.get("labels", {}).get("io.docouno.devkit.inspection-owner")
                     if owner:
                         self.assertEqual(run("docker", "ps", "--all", "--filter",
@@ -1927,7 +2195,7 @@ build: simulate-update
         self.make("up", "app=web")
         self.assertTrue(container(names["web"])["State"]["Running"])
         self.assertIsNone(container(names["api"]), "unrelated unprepared app was started")
-        self.assertIn(names["web"], self.make("status").stdout)
+        self.assertIn("Service web: running", self.make("status").stdout)
         self.assertIn("PROFILE_READY", self.make("logs", "app=web").stdout)
         self.assertIn("PROFILE_READY", self.make("logs").stdout)
         self.make("down")
@@ -2177,7 +2445,9 @@ build: simulate-update
         state["components"]["apps/extra"] = {**state["components"]["apps/main"],
             "development": {"owner": "project", "kind": "compose", "service": "extra"}}
         manifest.write_text(json.dumps(state))
-        self.assertIn("workspace membership differs", self.make("check", check=False).stderr)
+        self.assertIn("Accepted Make plan changed", self.make("check", check=False).stderr)
+        described = run(str(ENGINE), "describe", "--root", str(self.root), check=False)
+        self.assertIn("workspace membership differs", described.stderr)
         makefile = self.root / "Makefile"
         makefile.write_text(makefile.read_text() + "\nowner-hook:\n\t@true\n")
         accepted_makefile = makefile.read_bytes()
@@ -2193,7 +2463,9 @@ build: simulate-update
         seal_runtime(self.root)
         rejected = self.make("check", check=False)
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Make registration projection is stale", rejected.stderr)
+        self.assertIn("Accepted Make plan changed", rejected.stderr)
+        described = run(str(ENGINE), "describe", "--root", str(self.root), check=False)
+        self.assertIn("Make registration projection is stale", described.stderr)
 
     def test_metadata_is_native_and_requires_no_docker_or_dependencies(self):
         write_fixture(self.root)
@@ -2202,7 +2474,7 @@ build: simulate-update
         result = run(str(ENGINE), "describe", "--root", str(self.root), env=e)
         self.assertEqual(json.loads(result.stdout)["version"], VERSION)
         self.assertFalse((self.root / "node_modules").exists())
-        self.assertFalse((self.root / ".devkit/cache").exists())
+        self.assertFalse(list((self.root / ".devkit/cache").glob("*")))
 
     def guard(self, name, argv):
         return subprocess.Popen([str(ENGINE), "internal", "guard", name, self.token, "--", *argv],
@@ -2299,7 +2571,7 @@ build: simulate-update
         for command in ("status", "logs", "down"):
             self.make(command)
         self.assertFalse((self.root / "node_modules").exists())
-        self.assertFalse((self.root / ".devkit/cache").exists())
+        self.assertFalse(list((self.root / ".devkit/cache").glob("*")))
 
     def test_guard_preserves_native_failure(self):
         name = self.owned_name()
@@ -2809,7 +3081,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
 
         # Cold-safe make help works and documents flags and diagnostic commands.
         help_out = self.make("help").stdout
-        for token in ("headless=1", "follow=1", "tail=100", "make sync", "devkit status", "devkit doctor", "devkit exec", "devkit.sh cli"):
+        for token in ("headless=1", "follow=1", "tail=100", "make sync", "make info", "make doctor", "make exec", "Registered apps: main", "Registered packages: lib"):
             self.assertIn(token, help_out)
 
         # Offline CLI invocation with cold engine cache refuses network download cleanly.
@@ -3005,14 +3277,27 @@ if (priv.value !== 'from-private-gitlab-registry') {
             (denied / "docker").chmod(0o755)
             lost = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
             try:
-                refused = self.make("down", "cleanup=1", env=lost, check=False)
-                self.assertNotEqual(refused.returncode, 0)
-                self.assertIn("actor history", refused.stderr)
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, env=lost, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("actor history", refused.stderr)
                 self.assertFalse(trace.exists())
                 self.assertTrue((self.root / ".devkit/state/ports.json").exists())
             finally:
                 ledger.write_bytes(recorded)
             self.assertTrue(container(svc_container)["State"]["Running"])
+            different_owner = json.loads(recorded)
+            different_owner["owner"]["key"] = "0" * 64
+            ledger.write_text(json.dumps(different_owner))
+            try:
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, env=lost, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("Stand actor history differs from lease ownership", refused.stderr)
+                    self.assertFalse(trace.exists())
+                self.assertTrue(container(svc_container)["State"]["Running"])
+            finally:
+                ledger.write_bytes(recorded)
             self.make("down", env=environment)
             stopped = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=environment).stdout)["result"]
             self.assertEqual(stopped["services"], [])

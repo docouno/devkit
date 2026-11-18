@@ -25,6 +25,7 @@ pub mod desktop;
 pub mod distribution;
 pub mod doctor;
 pub mod download;
+mod info;
 mod lifecycle_cli;
 pub mod notices;
 pub mod processes;

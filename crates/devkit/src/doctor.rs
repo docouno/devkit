@@ -112,7 +112,8 @@ fn recorded_derived_image_ready(root: &Path, kind: &str, recipe: &str, pin: &str
     let Ok(recipe_path) = safe_path(root, &format!(".devkit/runtime/{recipe}")) else {
         return false;
     };
-    let Ok(Some(recipe_id)) = identity(&recipe_path) else {
+    let Ok(Some((_, recipe_id))) = read_regular_file(&recipe_path, 1024 * 1024, "tool recipe")
+    else {
         return false;
     };
     if recipe_id.sha256 != pin {
@@ -121,15 +122,12 @@ fn recorded_derived_image_ready(root: &Path, kind: &str, recipe: &str, pin: &str
     let Ok(state_path) = safe_path(root, &format!(".devkit/state/{kind}-image")) else {
         return false;
     };
-    let Ok(Some(_)) = identity(&state_path) else {
+    let Ok(Some((recorded, _))) = read_regular_file(&state_path, 4096, "image receipt") else {
         return false;
     };
-    let Ok(recorded) = fs::read_to_string(&state_path) else {
-        return false;
-    };
-    recorded
-        .trim()
-        .strip_prefix("sha256:")
+    std::str::from_utf8(&recorded)
+        .ok()
+        .and_then(|text| text.trim().strip_prefix("sha256:"))
         .is_some_and(|h| SHA256_RE.is_match(h))
 }
 
@@ -140,10 +138,15 @@ pub fn local_receipts(
     project_state: &ProjectState,
     node_inputs_digest: Option<&str>,
 ) -> Result<Value> {
-    let pins = safe_path(root, ".devkit/runtime/toolchains.env")
-        .ok()
-        .and_then(|p| fs::read(p).ok())
-        .and_then(|b| ToolPins::parse(&b).ok());
+    let pins_path = ".devkit/runtime/toolchains.env";
+    let pins = safe_path(root, pins_path).ok().and_then(|path| {
+        let (bytes, id) = read_regular_file(&path, 65536, "toolchain pins").ok()??;
+        project_state
+            .managed
+            .get(pins_path)
+            .filter(|pin| id.matches_git_tracked(pin))?;
+        ToolPins::parse(&bytes).ok()
+    });
 
     let computed_node_digest = match node_inputs_digest {
         Some(d) => Some(d.to_owned()),
@@ -156,9 +159,8 @@ pub fn local_receipts(
         let lock_ok = safe_path(root, ".devkit/state/node-workspace.lock")
             .ok()
             .and_then(|p| {
-                let id = identity(&p).ok()??;
-                let _ = id;
-                fs::read_to_string(p).ok()
+                let (bytes, _) = read_regular_file(&p, 4096, "Node workspace receipt").ok()??;
+                String::from_utf8(bytes).ok()
             })
             .is_some_and(|s| s.trim() == expected);
         let nm_ok = safe_path(root, "node_modules")

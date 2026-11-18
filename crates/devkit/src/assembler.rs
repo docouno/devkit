@@ -123,11 +123,25 @@ fn ignored(name: &str) -> bool {
             "dist",
             "release",
             ".artifacts",
+            ".worktrees",
             ".tmp",
             ".git",
         ]
         .contains(&part)
     })
+}
+
+fn assert_shippable_path(path: &str) -> Result<()> {
+    ensure!(
+        !path.split('/').any(|part| {
+            part == ".worktrees"
+                || ["AGENTS.md", "CLAUDE.md", "GEMINI.md"]
+                    .iter()
+                    .any(|name| part.eq_ignore_ascii_case(name))
+        }),
+        "Forbidden path in release payload: {path}"
+    );
+    Ok(())
 }
 
 fn selected_sources(
@@ -170,6 +184,9 @@ fn npm_sources(root: &Path) -> Result<BTreeMap<String, FileIdentity>> {
         );
     }
     selected_sources(root, "packages/env", &mut files)?;
+    for path in files.keys() {
+        assert_shippable_path(path)?;
+    }
     ensure!(
         !files.keys().any(|p| p.rsplit('/').next() == Some(".npmrc")),
         "Package .npmrc is not an accepted npm preparation input"
@@ -1093,6 +1110,9 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &environment_package,
         "package",
     )?;
+    for path in file_map(&environment_package)?.keys() {
+        assert_shippable_path(path)?;
+    }
     let environment_manifest: Value = read_json(&safe_path(&environment_package, "package.json")?)?;
     ensure!(
         environment_manifest["name"] == "@docouno/env"
@@ -1190,14 +1210,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":["linux"],"cpu":["x64"],"bin":{"devkit":"devkit"},"files":["devkit","runtime","templates","npm","notices","docs","release.json","README.md","LICENSE"],"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
     )?;
     for (name, file) in file_map(&payload)? {
-        ensure!(
-            !name.split('/').any(|p| {
-                p.eq_ignore_ascii_case("AGENTS.md")
-                    || p.eq_ignore_ascii_case("CLAUDE.md")
-                    || p.eq_ignore_ascii_case("GEMINI.md")
-            }),
-            "Private agent instructions are forbidden in the release payload"
-        );
+        assert_shippable_path(&name)?;
         let mode = if file.mode & 0o111 != 0 { 0o755 } else { 0o644 };
         if file.mode != mode {
             let path = safe_path(&payload, &name)?;

@@ -3038,11 +3038,11 @@ fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() 
 }
 
 #[test]
-fn project_make_stays_byte_identical_without_packageable_libraries() {
+fn project_make_preserves_rules_and_pins_the_plan_without_packageable_libraries() {
     let f = TempDir::new().unwrap();
     let release = fixture_release(f.path(), "0.5.0");
     let target = f.path().join("fullstack-web");
-    init_project(
+    let state = init_project(
         &release,
         &target,
         &InitOptions {
@@ -3054,7 +3054,12 @@ fn project_make_stays_byte_identical_without_packageable_libraries() {
         &FixtureResolver,
     )
     .unwrap();
-    let legacy_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    let project_mk = fs::read_to_string(target.join(".devkit/project.mk")).unwrap();
+    let (legacy_mk, token) = project_mk.split_once("DEVKIT_EXPECTED_PLAN := ").unwrap();
+    assert_eq!(
+        token.trim_end(),
+        digest(format!("{}\n{legacy_mk}", state.release_identity))
+    );
     assert!(
         !legacy_mk.contains("DEVKIT_PACKAGEABLE_PACKAGES"),
         "non-packageable profile set must not emit DEVKIT_PACKAGEABLE_PACKAGES:\n{legacy_mk}"

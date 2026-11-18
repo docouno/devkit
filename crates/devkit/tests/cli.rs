@@ -139,6 +139,7 @@ fn pending(root: &Path, missing: bool) -> (Vec<u8>, String) {
         Vec::new(),
     )
     .unwrap();
+    write_atomic(&root.join(".devkit/state/task.lock"), b"", 0o644).unwrap();
     write_json(&root.join(PENDING_PATH), &tx.journal).unwrap();
     if missing {
         fs::remove_file(root.join(MANIFEST_PATH)).unwrap();

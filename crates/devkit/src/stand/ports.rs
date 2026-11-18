@@ -167,6 +167,8 @@ pub struct Ports {
     pub service_desired: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub service_preview_renderer: std::collections::BTreeMap<String, super::preview::Renderer>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub early_plans: std::collections::BTreeMap<String, String>,
 }
 pub struct Allocation<'a> {
     pub declarations: &'a [Binding],
@@ -176,6 +178,49 @@ pub struct Allocation<'a> {
     pub seed: &'a str,
 }
 impl Ports {
+    pub(crate) fn verified_snapshot(root: &Path) -> Result<Option<Self>> {
+        let Some(ports) = Self::read(root)? else {
+            return Ok(None);
+        };
+        let receipt = safe_path(root, RECEIPT)?;
+        let registry_path = safe_path(&ports.cache_root, "port-leases.json")?;
+        let Some((lease_bytes, _, receipt_stamp)) =
+            read_regular_snapshot(&receipt, MAX_BYTES, "port receipt")?
+        else {
+            return Ok(None);
+        };
+        let observed: Self = serde_json::from_slice(&lease_bytes)?;
+        ensure!(
+            json_bytes(&observed)? == json_bytes(&ports)?,
+            "Port receipt changed while reading"
+        );
+        let Some((registry_bytes, _, registry_stamp)) =
+            read_regular_snapshot(&registry_path, MAX_BYTES, "port registry")?
+        else {
+            return Ok(None);
+        };
+        let registry: Registry = serde_json::from_slice(&registry_bytes)?;
+        ensure!(
+            registry.schema_version == 1,
+            "Unsupported port lease schema"
+        );
+        if ports.allocation_intent
+            || !super::epoch::trusted(root)?
+            || !ports.groups.iter().chain(&ports.retained).all(|group| {
+                registry
+                    .claims
+                    .iter()
+                    .any(|claim| claim.owner == ports.owner && claim.group == *group)
+            })
+            || !receipt_stamp.matches(&receipt)?
+            || !registry_stamp.matches(&registry_path)?
+            || Physical::at(root)? != ports.owner.physical
+        {
+            return Ok(None);
+        }
+        Ok(Some(ports))
+    }
+
     pub fn read(root: &Path) -> Result<Option<Self>> {
         let Some(value): Option<Self> = read_bounded(&safe_path(root, RECEIPT)?, MAX_BYTES)? else {
             return Ok(None);
@@ -193,6 +238,7 @@ impl Ports {
         Ok(Some(value))
     }
     pub fn open(root: &Path, cache_root: &Path) -> Result<Self> {
+        Self::verify_checkout_claims(root, cache_root)?;
         if let Some(value) = Self::read(root)? {
             ensure!(
                 value.cache_root == cache_root,
@@ -215,9 +261,27 @@ impl Ports {
             desired_deployment: None,
             service_desired: std::collections::BTreeMap::new(),
             service_preview_renderer: std::collections::BTreeMap::new(),
+            early_plans: std::collections::BTreeMap::new(),
         };
         value.save()?;
         Ok(value)
+    }
+
+    pub(crate) fn verify_checkout_claims(root: &Path, cache: &Path) -> Result<()> {
+        let local = Self::read(root)?;
+        let physical = Physical::at(root)?;
+        let registry = Registry::read(cache)?;
+        ensure!(
+            registry.claims.iter().all(|claim| {
+                claim.owner.root != root
+                    || claim.owner.physical != physical
+                    || local
+                        .as_ref()
+                        .is_some_and(|ports| ports.owner == claim.owner)
+            }),
+            "Port registry contains an unexplained claim for this checkout; restore the lease receipt"
+        );
+        Ok(())
     }
     pub fn save(&self) -> Result<()> {
         ensure!(
@@ -271,7 +335,19 @@ impl Ports {
         plan: Allocation<'_>,
         active: &ActivePorts,
         retry: &BTreeSet<String>,
+        before_claims: impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.allocate_plan_until(plan, active, retry, before_claims, None, || Ok(()))
+    }
+
+    pub(crate) fn allocate_plan_until(
+        &mut self,
+        plan: Allocation<'_>,
+        active: &ActivePorts,
+        retry: &BTreeSet<String>,
         mut before_claims: impl FnMut(&mut Self) -> Result<()>,
+        deadline: Option<Instant>,
+        recheck: impl Fn() -> Result<()>,
     ) -> Result<()> {
         ensure!(
             plan.declarations
@@ -296,14 +372,23 @@ impl Ports {
         let mut ordered: Vec<_> = plan.declarations.iter().collect();
         ordered.sort_by_key(|b| (Some(b.service.as_str()) != plan.primary, &b.service, b.slot));
         let propose = |ports: &Self, registry: &Registry| {
-            ports.propose(&plan, &ordered, active, retry, range, registry)
+            ensure!(
+                !registry
+                    .claims
+                    .iter()
+                    .any(|c| c.owner.physical == ports.owner.physical
+                        && c.owner.root == ports.owner.root
+                        && c.owner != ports.owner),
+                "Port registry contains an unexplained claim for this checkout"
+            );
+            ports.propose(&plan, &ordered, active, retry, range, registry, deadline)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let retry_until = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         loop {
             let next = {
-                let _lock = Registry::lock(&self.cache_root)?;
+                let _lock = Registry::lock_until(&self.cache_root, deadline)?;
                 let mut registry = Registry::read(&self.cache_root)?;
-                registry.collect_stale()?;
+                registry.collect_stale(deadline)?;
                 propose(self, &registry)?
             };
             let mut candidate = self.clone();
@@ -318,16 +403,17 @@ impl Ports {
 
             // Normalization may call Docker. Revalidate after it returns, with
             // the registry locked across publication of the local and global intents.
-            let lock = Registry::lock(&self.cache_root)?;
+            let lock = Registry::lock_until(&self.cache_root, deadline)?;
             let mut registry = Registry::read(&self.cache_root)?;
-            registry.collect_stale()?;
+            registry.collect_stale(deadline)?;
             if propose(self, &registry)? != candidate.groups {
                 ensure!(
-                    Instant::now() < deadline,
+                    Instant::now() < retry_until,
                     "Stand port candidates changed repeatedly before publication"
                 );
                 continue;
             }
+            recheck()?;
             for group in candidate.groups.iter().filter(|g| g.automatic) {
                 if let Some(old) = self.previous_automatic(&group.binding.key())
                     && old.first != group.first
@@ -338,6 +424,7 @@ impl Ports {
                     );
                 }
             }
+            ensure_before(deadline)?;
             *self = candidate;
             self.allocation_intent = true;
             self.save()?;
@@ -368,6 +455,7 @@ impl Ports {
             .find(|g| g.automatic && g.binding.key() == key)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn propose(
         &self,
         plan: &Allocation<'_>,
@@ -376,6 +464,7 @@ impl Ports {
         retry: &BTreeSet<String>,
         range: (u16, u16),
         registry: &Registry,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Group>> {
         let Allocation {
             selected,
@@ -386,6 +475,7 @@ impl Ports {
         } = *plan;
         let mut next = Vec::new();
         for &binding in ordered {
+            ensure_before(deadline)?;
             let key = binding.key();
             let previous = self.previous_automatic(&key);
             let count = binding.replicas as u32;
@@ -412,6 +502,7 @@ impl Ports {
             };
             let free = |g: &Group| -> Result<bool> {
                 for claim in &registry.claims {
+                    ensure_before(deadline)?;
                     // A previous incarnation is never ours, even at the same path.
                     let replace_own = claim.owner.key == self.owner.key
                         && (claim.group.binding.key() == key
@@ -428,6 +519,7 @@ impl Ports {
                     }
                 }
                 for port in g.first..=g.last {
+                    ensure_before(deadline)?;
                     if owned(port) {
                         continue;
                     }
@@ -480,6 +572,7 @@ impl Ports {
                     };
                     let mut selected = None;
                     for offset in 0..candidates {
+                        ensure_before(deadline)?;
                         let first = range.0 as u32 + (start + offset) % candidates;
                         if first + count - 1 > range.1 as u32 {
                             continue;
@@ -717,6 +810,9 @@ struct Registry {
 }
 impl Registry {
     fn lock(root: &Path) -> Result<File> {
+        Self::lock_until(root, None)
+    }
+    fn lock_until(root: &Path, deadline: Option<Instant>) -> Result<File> {
         create_dir_all_durable(root)?;
         let path = safe_path(root, "port-leases.lock")?;
         let file = OpenOptions::new()
@@ -730,7 +826,21 @@ impl Registry {
             file.metadata()?.is_file(),
             "Port registry lock must be regular"
         );
-        file.lock()?;
+        if let Some(at) = deadline {
+            loop {
+                ensure_before(deadline)?;
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(fs::TryLockError::WouldBlock) => std::thread::sleep(
+                        at.saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    ),
+                    Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+                }
+            }
+        } else {
+            file.lock()?;
+        }
         ensure!(
             Physical::at(&path)? == Physical::of(&file.metadata()?),
             "Port registry lock replaced"
@@ -761,10 +871,11 @@ impl Registry {
         );
         write_atomic(&safe_path(root, "port-leases.json")?, &bytes, 0o644)
     }
-    fn collect_stale(&mut self) -> Result<()> {
+    fn collect_stale(&mut self, deadline: Option<Instant>) -> Result<()> {
         let mut stale = BTreeSet::new();
         let mut checked = BTreeSet::new();
         for claim in &self.claims {
+            ensure_before(deadline)?;
             if !checked.insert(&claim.owner.key) {
                 continue;
             }
@@ -788,6 +899,14 @@ impl Registry {
         self.claims.retain(|c| !stale.contains(&c.owner.key));
         Ok(())
     }
+}
+
+fn ensure_before(deadline: Option<Instant>) -> Result<()> {
+    ensure!(
+        deadline.is_none_or(|at| Instant::now() < at),
+        "Stand reservation deadline exceeded"
+    );
+    Ok(())
 }
 
 /// Retry only a daemon bind failure attributed to one automatic declaration.

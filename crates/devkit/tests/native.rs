@@ -391,6 +391,7 @@ fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
     let tx =
         devkit::transaction::PreparedTransaction::prepare(&project, stage, &staged, &paths, vec![])
             .unwrap();
+    write_atomic(&project.join(".devkit/state/task.lock"), b"", 0o644).unwrap();
     let file = tx
         .journal
         .files

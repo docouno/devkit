@@ -6,6 +6,7 @@ import errno
 import fcntl
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,13 +15,16 @@ import shutil
 import signal
 import socketserver
 import ssl
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
 import threading
 import time
 import unittest
+import urllib.request
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
@@ -37,6 +41,35 @@ PROOF = Path(os.environ.get("DEVKIT_DELIVERY_PROOF_DIR",
 COMMANDS = []
 RESULTS = []
 EVIDENCE = []
+
+WT_VERSION = "0.74.0"
+WT_TARGET = "worktrunk-x86_64-unknown-linux-musl"
+WT_ARCHIVE_SHA = "28392033912ab0a9027192d9975284787b29f080b4f2fd6298c89fffecf34c1f"
+WT_ENGINE_SHA = "a950f2f9838f06d169a39c0d91f0c80c72890794a9235203c070050b3cb10d1c"
+
+
+def worktrunk(directory):
+    installed = shutil.which("wt")
+    if installed and digest(installed) == WT_ENGINE_SHA:
+        return installed
+    url = f"https://github.com/max-sixty/worktrunk/releases/download/v{WT_VERSION}/{WT_TARGET}.tar.xz"
+    archive = directory / "worktrunk.tar.xz"
+    limit = 32 * 1024 * 1024
+    with urllib.request.urlopen(url, timeout=30) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit or hashlib.sha256(data).hexdigest() != WT_ARCHIVE_SHA:
+        raise AssertionError("Pinned Worktrunk archive integrity differs")
+    archive.write_bytes(data)
+    with tarfile.open(archive) as source:
+        member = source.getmember(f"{WT_TARGET}/wt")
+        if not member.isfile() or member.size > limit:
+            raise AssertionError("Invalid Worktrunk executable member")
+        executable = directory / "wt"
+        executable.write_bytes(source.extractfile(member).read())
+    if digest(executable) != WT_ENGINE_SHA:
+        raise AssertionError("Pinned Worktrunk executable integrity differs")
+    executable.chmod(0o755)
+    return executable
 
 
 def digest(path):
@@ -375,6 +408,171 @@ class ReleaseFixture:
 
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
+    @unittest.skipUnless(DOCKER_ENABLED and os.environ.get("DEVKIT_BASELINE_SET"), "Requires the real baseline and Docker")
+    def test_legacy_volume_survives_native_update_and_git_delivery(self):
+        baseline = Path(os.environ["DEVKIT_BASELINE_SET"]) / "payload"
+        old_engine = baseline / "devkit"
+        upgraded = None
+        for route in ("native", "git"):
+            target = self.root / ("legacy " + route)
+            token = uuid.uuid4().hex
+            label = "io.docouno.devkit.fixture"
+            env = self.env
+            def run(*args, **kwargs):
+                return execute(args, cwd=kwargs.pop("cwd", target), env=env, timeout=kwargs.pop("timeout", 360), **kwargs)
+            run(old_engine, "init", target, "--app", "api=rust-api", "--name", "legacy-fixture",
+                "--release-root", baseline, "--package-source", "local", "--non-interactive", cwd=self.root)
+            compose = {"services": {"api": {"image": "${DEVKIT_NODE_IMAGE:?}", "user": "0:0",
+                        "command": ["node", "-e", "const fs=require('node:fs');if(!fs.existsSync('/state/value'))fs.writeFileSync('/state/value','seed');setTimeout(()=>{},240000)"],
+                        "volumes": ["store:/state"], "labels": {label: token}}},
+                       "volumes": {"store": {"labels": {label: token}}}, "networks": {"default": {"labels": {label: token}}}}
+            (target / "compose.yaml").write_text(json.dumps(compose))
+            makefile = (target / "Makefile").read_bytes()
+            compose_bytes = (target / "compose.yaml").read_bytes()
+            run("git", "init", "-b", "main")
+            run("git", "config", "user.name", "Fixture")
+            run("git", "config", "user.email", "fixture@example.invalid")
+            run("git", "add", ".")
+            run("git", "commit", "-m", "Create baseline checkout")
+            cid = None
+            volume = None
+            def find_actor():
+                return run("docker", "ps", "--quiet", "--no-trunc", "--filter", f"label={label}={token}").stdout.strip()
+            try:
+                run("make", "setup")
+                run("make", "up")
+                cid = find_actor()
+                observed = json.loads(run("docker", "container", "inspect", cid).stdout)[0]
+                volume = next(m["Name"] for m in observed["Mounts"] if m["Destination"] == "/state")
+                run("docker", "exec", cid, "node", "-e", f"require('node:fs').writeFileSync('/state/value',{json.dumps(token)})")
+                if route == "native":
+                    run("make", "down")
+                    run(ENGINE, "update", ".", "--to", self.version, "--release-root", RELEASE, "--non-interactive")
+                    updated = json.loads((target / ".devkit/manifest.json").read_text())
+                    upgraded = {name: ((target / name).read_bytes(), stat.S_IMODE((target / name).stat().st_mode))
+                                for name in [*updated["managed"], ".devkit/manifest.json"]}
+                else:
+                    run("git", "switch", "-c", "toolchain-update")
+                    old_state = json.loads((target / ".devkit/manifest.json").read_text())
+                    for name in old_state["managed"].keys() - upgraded.keys():
+                        (target / name).unlink()
+                    for name, (data, mode) in upgraded.items():
+                        path = target / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(data)
+                        path.chmod(mode)
+                    run("git", "add", ".")
+                    run("git", "commit", "-m", "Deliver the accepted environment")
+                    run("git", "switch", "main")
+                    run("git", "merge", "--ff-only", "toolchain-update")
+                    run("make", "down")
+                self.assertEqual((target / "Makefile").read_bytes(), makefile)
+                self.assertEqual((target / "compose.yaml").read_bytes(), compose_bytes)
+                run("make", "setup")
+                run("make", "up")
+                cid = find_actor()
+                self.assertEqual(run("docker", "exec", cid, "cat", "/state/value").stdout, token)
+                mounts = json.loads(run("docker", "container", "inspect", cid).stdout)[0]["Mounts"]
+                self.assertEqual(next(m["Name"] for m in mounts if m["Destination"] == "/state"), volume)
+                run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".")
+                self.assertEqual(run("docker", "volume", "inspect", volume).returncode, 0)
+                self.assertEqual(find_actor(), "")
+            finally:
+                run("make", "down", check=False)
+                actor = find_actor()
+                if actor:
+                    run("docker", "rm", "--force", actor, check=False)
+                if volume:
+                    inspected = run("docker", "volume", "inspect", volume, check=False)
+                    if inspected.returncode == 0 and json.loads(inspected.stdout)[0]["Labels"].get(label) == token:
+                        run("docker", "volume", "rm", volume)
+
+    @unittest.skipUnless(DOCKER_ENABLED, "Requires the pinned SDK containers")
+    def test_frozen_readme_make_lifecycle(self):
+        spec = importlib.util.spec_from_file_location("public_readme_flow", REPO / "test/public/readme.py")
+        readme = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(readme)
+        target = self.root / "my-product"
+        self.cli("init", target, "--app", "web=react-web", "--name", "my-product",
+                 "--release-root", RELEASE, "--package-source", "local", "--non-interactive", timeout=240)
+        # The frozen package is supplied by its verified archive before public
+        # publication. Pnpm can enforce registry age for all other packages.
+        package = self.manifest["environment"]
+        workspace = target / "pnpm-workspace.yaml"
+        workspace.write_text(workspace.read_text() + f"\nminimumReleaseAgeExclude:\n  - '{package['name']}@{package['version']}'\n")
+        def make(*args, label):
+            result = execute(["make", *args], cwd=target, env=self.env, timeout=360)
+            EVIDENCE.append({"case": "readme", "step": label})
+            return result.stdout
+        make("help", label="readme-cold-help")
+        make("info", "json=1", label="readme-cold-info")
+        readme.add_readme_components(make, target)
+        readme.update_readme_project(make, self.version)
+        make("setup", label="readme-after-update-setup")
+        make("check", label="readme-after-update-check")
+
+    def test_worktree_guidance_opt_outs_are_independent_and_persist(self):
+        for flag, omitted, retained in (
+            ("--no-agents-md", "AGENTS.md", ".config/wt.toml"),
+            ("--no-worktrunk", ".config/wt.toml", "AGENTS.md"),
+        ):
+            with self.subTest(flag=flag):
+                target = self.root / flag.removeprefix("--")
+                self.cli("init", target, "--app", "api=rust-api", "--name", "project",
+                         "--release-root", RELEASE, "--package-source", "local", "--non-interactive", flag)
+                path = target / retained
+                customized = path.read_bytes() + b"\n# Project customization\n"
+                path.write_bytes(customized)
+                for args in (("sync", target), ("update", target, "--to", self.version)):
+                    self.cli(*args, "--non-interactive")
+                    self.assertFalse((target / omitted).exists())
+                    self.assertEqual(path.read_bytes(), customized)
+
+    @unittest.skipUnless(DOCKER_ENABLED, "Requires the host Compose plugin")
+    def test_generated_worktrunk_hooks_reserve_and_finalize_native_worktrees(self):
+        project = self.create(self.root / "project with spaces")
+        wt = worktrunk(self.root)
+        env = dict(self.env, WORKTRUNK_WORKTREE_PATH="{{ repo_path }}/.worktrees/{{ branch | sanitize }}",
+                   XDG_CONFIG_HOME=str(self.root / "config"), DOCKER_HOST=f"unix://{self.root / 'absent.sock'}",
+                   DEVKIT_ENGINE_PATH=str(self.root / "invalid-parent-engine"),
+                   MAKEFILES=str(self.root / "missing-parent-include"),
+                   DEVKIT_APP="unrelated-app")
+
+        def run(*args, **kwargs):
+            return execute(args, cwd=kwargs.pop("cwd", project), env=kwargs.pop("env", env), **kwargs)
+
+        self.assertIn(WT_VERSION, run(wt, "--version").stdout)
+        self.assertTrue((project / "AGENTS.md").is_file())
+        self.assertTrue((project / ".config/wt.toml").is_file())
+        run("git", "init", "-b", "main")
+        run("git", "add", ".")
+        run("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Create test checkout")
+        run(wt, "switch", "--create", "--base", "main", "--no-cd", "--yes", "review/api")
+        listing = run("git", "worktree", "list", "--porcelain").stdout
+        linked = Path(next(line.removeprefix("worktree ") for line in listing.splitlines()
+                           if line.startswith("worktree ") and "/.worktrees/" in line))
+        self.assertIn("review/api", run(wt, "list").stdout)
+        clean_env = {key: value for key, value in env.items() if key not in ("DEVKIT_ENGINE_PATH", "MAKEFILES", "DEVKIT_APP")}
+        info = json_result(run("make", "info", "json=1", cwd=linked, env=clean_env))["result"]
+        self.assertEqual(info["standState"], "stopped")
+        self.assertEqual(info["branch"], "review/api")
+        self.assertEqual(info["worktreeKind"], "linked")
+        self.assertEqual(len(info["standPorts"]), 1)
+        self.assertFalse((linked / ".devkit/state/stand.active").exists())
+        history = linked / ".devkit/state/stand.history.json"
+        saved = history.read_bytes()
+        history.unlink()
+        try:
+            stopped = run(wt, "remove", "--foreground", "--yes", "review/api", check=False)
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertTrue(linked.is_dir())
+        finally:
+            history.write_bytes(saved)
+        for _ in range(2):
+            run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".", cwd=linked, env=clean_env)
+        run(wt, "remove", "--foreground", "--yes", "review/api")
+        self.assertFalse(linked.exists())
+
     def test_cached_engine_permissions_refuse_before_lifecycle_writes(self):
         self.create()
         accepted = self.manifest["files"]["devkit"]["sha256"]

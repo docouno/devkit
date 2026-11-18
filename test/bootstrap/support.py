@@ -11,6 +11,7 @@ import shutil
 import signal
 import socketserver
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -21,7 +22,7 @@ import uuid
 
 AUTHOR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHOR / 'test/delivery'))
-from test_delivery import HttpsFixture  # noqa: E402
+from test_delivery import HttpsFixture, worktrunk  # noqa: E402
 
 BASELINE_VERSION = '0.4.1'
 BASELINE_INDEX_SHA256 = '0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa'
@@ -164,6 +165,8 @@ class Harness:
         self.base = '/docouno/devkit/releases/download'
         self.engine_route = f'{self.base}/v{self.version}/{self.index["engine"]}'
         self.fixture.routes[self.engine_route] = self.engine.read_bytes()
+        self.fixture.routes[f'{self.base}/v{self.version}/release-index.json'] = (self.build_set / 'release-index.json').read_bytes()
+        self.fixture.routes[f'{self.base}/v{self.version}/{self.index["archive"]}'] = (self.build_set / self.index['archive']).read_bytes()
         self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
         self.old_base = f'{self.base}/v{self.old_version}'
         self.old_index_route = f'{self.old_base}/release-index.json'
@@ -188,9 +191,9 @@ class Harness:
         self.results = []
     def environment(self, name):
         return dict(self.env, DEVKIT_CACHE_DIR=str(self.scratch / ('cache ' + name)))
-    def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None):
+    def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None, cwd=None):
         started = time.monotonic()
-        result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=self.scratch,
+        result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=cwd or self.scratch,
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
             preexec_fn=(lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))) if memory_limit else None)
         output = result.stdout + result.stderr
@@ -211,6 +214,97 @@ class Harness:
         if expected is not None:
             require(not target.exists(), 'Rejected archive wrote the project')
         return result
+    def verify_cold_worktree(self, target):
+        wt = worktrunk(self.scratch)
+        worktrees = self.scratch / 'worktree paths'
+        env = dict(self.environment('cold-worktrunk'),
+                   XDG_CONFIG_HOME=str(self.scratch / 'worktrunk config'),
+                   WORKTRUNK_WORKTREE_PATH=str(worktrees / '{{ branch | sanitize }}'),
+                   DOCKER_HOST=f'unix://{self.scratch / "unavailable-docker.sock"}')
+        def run(name, argv, **kwargs):
+            return self.run(name, argv, env=env, cwd=target, **kwargs)
+        run('worktrunk-git-init', ['git', 'init', '-b', 'main'])
+        run('worktrunk-git-add', ['git', 'add', '.'])
+        run('worktrunk-git-commit', ['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'Create test checkout'])
+        sw = [wt, 'switch', '--create', '--base', 'main', '--no-cd']
+        before = self.fixture.requests.count(self.engine_route)
+        unchecked = subprocess.run([str(v) for v in [*sw, 'unapproved']], env=env, cwd=target,
+                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        require(not (worktrees / 'unapproved/.devkit/state/ports.json').exists(), 'Unapproved Worktrunk hook reserved a port')
+        require(self.fixture.requests.count(self.engine_route) == before, 'Unapproved Worktrunk ran a cold download')
+        require(unchecked.returncode != 0 or (worktrees / 'unapproved').is_dir(), 'Unexpected unapproved Worktrunk outcome')
+        if (worktrees / 'unapproved').is_dir():
+            run('worktrunk-remove-unapproved', [wt, 'remove', '--foreground', '--no-hooks', 'unapproved'])
+        run('worktrunk-create-cold', [*sw, '--yes', 'approved'])
+        require(self.fixture.requests.count(self.engine_route) == before + 1, 'Cold Worktrunk hook did not fetch the exact engine')
+        approved = worktrees / 'approved'
+        info = self.run('worktrunk-cold-lease', ['make', 'info', 'json=1'], env=env, cwd=approved)
+        worktree = json.loads(info.stdout)['result']
+        require(worktree['standState'] == 'stopped' and len(worktree['standPorts']) == 1, 'Cold Worktrunk reservation was not available on return')
+        run('worktrunk-remove-cold', [wt, 'remove', '--foreground', '--yes', 'approved'])
+        require(not approved.exists(), 'Worktrunk did not complete removal')
+    def verify_node_recovery(self):
+        target = self.scratch / 'genuine-node-migration'
+        env = self.environment('genuine-node-migration')
+        sdk_env = {key: value for key, value in env.items() if key not in ('HTTPS_PROXY', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE')}
+        self.run('prime-genuine-node-pnpm', [self.engine, 'internal', 'ensure-pnpm', '--pin-file', self.payload / 'runtime/pnpm.env'], env=sdk_env, timeout=150)
+        self.run('genuine-node-init', [self.engine, 'init', target, '--to', self.old_version,
+                                     '--app', 'web=react-web', '--package-source', 'local', '--non-interactive'], env=env, timeout=360)
+        saved = self.scratch / 'genuine-node-before'
+        shutil.copytree(target, saved)
+        loader = '.devkit/runtime/devkit.sh'
+        projection = '.devkit/runtime/devkit.mk'
+        manifest = '.devkit/manifest.json'
+        self.run('genuine-node-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive'],
+                 cwd=target, env=env, timeout=360)
+        old = json.loads((saved / manifest).read_bytes())
+        new = json.loads((target / manifest).read_bytes())
+        require(old['version'] == self.old_version and new['version'] == self.version, 'Unexpected Node migration fixture pins')
+        paths = sorted(set(old['managed']) | set(new['managed']) | {
+            'package.json', 'apps/web/package.json', 'package-lock.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc'}) + [manifest]
+        def capture(root, path):
+            absolute = root / path
+            if absolute.is_file():
+                return absolute.read_bytes(), stat.S_IMODE(absolute.stat().st_mode)
+            return None
+        before = {path: capture(saved, path) for path in paths}
+        after = {path: capture(target, path) for path in paths}
+        require(before['package-lock.json'] is not None and after['pnpm-lock.yaml'] is not None, 'Fixture did not migrate a genuine npm lock')
+        def install(root, path, recorded):
+            absolute = root / path
+            if recorded is None:
+                absolute.unlink(missing_ok=True)
+                return None
+            data, mode = recorded
+            absolute.parent.mkdir(parents=True, exist_ok=True)
+            absolute.write_bytes(data)
+            absolute.chmod(mode)
+            return {'sha256': digest(data), 'mode': mode}
+        for variant, new_make, new_loader in [('old-old', False, False), ('new-old', True, False), ('new-new', True, True)]:
+            root = self.scratch / ('mixed-node-' + variant)
+            shutil.copytree(target, root)
+            stage = '.devkit/state/update-' + str(uuid.uuid4())
+            journal = {'schemaVersion': 2, 'stage': stage, 'files': [], 'createdDirectories': [], 'createdParents': []}
+            for path in paths:
+                if before[path] == after[path]:
+                    continue
+                i = len(journal['files'])
+                backup = f'{stage}/backup/{i}' if before[path] else None
+                staged = f'{stage}/staged/{i}' if after[path] else None
+                row = {'path': path, 'before': install(root, backup, before[path]) if backup else None,
+                       'after': install(root, staged, after[path]) if staged else None, 'backup': backup, 'staged': staged}
+                journal['files'].append(row)
+            if not new_make:
+                install(root, projection, before[projection])
+            if not new_loader:
+                install(root, loader, before[loader])
+            (root / '.devkit/update-pending.json').write_text(json.dumps(journal))
+            if new_loader:
+                self.run('make-recover-mixed-node-' + variant, ['make', 'recover'], cwd=root, env=env)
+            else:
+                self.boot('bootstrap-recover-mixed-node-' + variant, 'recover', root, env=env)
+            require(all(capture(root, path) == before[path] for path in paths), 'Mixed-state rollback changed original Node files')
+            require(not (root / '.devkit/update-pending.json').exists(), 'Mixed-state rollback left a pending journal')
     def execute(self):
         self.run('download-versioned-loader', ['curl', '--disable', '--fail', '--silent', '--show-error', '--output', self.script,
             f'https://github.com{self.base}/v{self.version}/install.sh'])
@@ -224,6 +318,7 @@ class Harness:
         require(state['version'] == self.version and not (self.scratch / 'injected').exists(), 'Wrong accepted version or shell expansion')
         self.boot('cached-bootstrap-offline-metadata', 'describe', '--root', target, env=dict(env, HTTPS_PROXY='http://127.0.0.1:1'))
         self.boot('recover-local-journal-no-cache', 'recover', target, env=self.environment('empty'))
+        self.verify_cold_worktree(target)
         self.cold_old('genuine-baseline-http-init')
         baseline = self.scratch / 'genuine-baseline-http-init'
         source = baseline / 'apps/api/src/main.rs'
@@ -231,10 +326,19 @@ class Harness:
         (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
         before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml')}
         self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
-        self.run('explicit-baseline-preview', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--preview', '--non-interactive'])
-        self.run('explicit-baseline-native-update', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--non-interactive'])
+        bridge_env = self.environment('genuine-baseline-http-init')
+        old_loader = baseline / '.devkit/runtime/devkit.sh'
+        old_bytes = old_loader.read_bytes()
+        bridge = ['sh', old_loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive']
+        self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
+        require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
+        self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
         require(all(p.read_bytes() == data for p, data in before.items()), 'Migration changed product inputs')
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+        info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
+        require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
+        require(not (baseline / 'AGENTS.md').exists() and not (baseline / '.config/wt.toml').exists(), 'Upgrade created project-owned files')
+        self.verify_node_recovery()
         pre_040 = self.scratch / 'pre-040-checkout'
         (pre_040 / '.devkit').mkdir(parents=True)
         (pre_040 / '.devkit/manifest.json').write_text(json.dumps({

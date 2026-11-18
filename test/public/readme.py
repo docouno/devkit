@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shutil
 import signal
 import subprocess
 import time
@@ -24,6 +25,32 @@ def require(condition, message):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def add_readme_components(make, root):
+    make("add-app", "name=api", "template=rust-api", label="readme-add-api")
+    make("add-package", "name=client", "template=react-client", label="readme-add-client")
+    make("add-app", "name=desktop", "template=electron-react", "use=client", label="readme-add-desktop")
+    worker = root / "apps/worker"
+    shutil.copytree(root / "apps/api", worker, ignore=shutil.ignore_patterns("target"))
+    for name in ("Cargo.toml", "Cargo.lock"):
+        path = worker / name
+        path.write_text(path.read_text().replace('name = "api"', 'name = "worker"'))
+    make("register", "app=worker", "profile=rust", label="readme-register-app")
+    make("register", "app=worker", "profile=rust", label="readme-register-repeat")
+    make("setup", label="readme-added-components-setup")
+    make("exec", "command=node -p process.cwd()", label="readme-root-exec")
+    make("exec", "app=web", "write=1", "network=bridge",
+         "command=pnpm add zod --lockfile-only --ignore-scripts", label="readme-native-dependency-edit")
+    web_package = json.loads((root / "apps/web/package.json").read_text())
+    require("zod" in web_package["dependencies"], "README native dependency edit did not update the web package")
+
+
+def update_readme_project(make, version):
+    make("update", "to=" + version, "preview=1", label="readme-update-preview")
+    make("update", "to=" + version, label="readme-update-apply")
+    recovery = make("recover", label="readme-clean-recover")
+    require("no pending" in recovery.lower(), "Clean recovery did not report its no-pending state")
 
 
 def bare_wizard(npx, environment, directory, log):
@@ -77,7 +104,10 @@ def main():
     readme = (REPO / "README.md").read_text()
     package = "@docouno/devkit@" + index["version"]
     for example in (f"npx {package} init my-product --app web=react-web",
-                    f"npx {package} exec --component apps/web --write --network bridge -- pnpm add zod"):
+                    "make exec app=web write=1 network=bridge command='pnpm add zod --lockfile-only --ignore-scripts'",
+                    "make add-app name=api template=rust-api",
+                    "make add-package name=client template=react-client",
+                    "make add-app name=desktop template=electron-react use=client"):
         require(example in readme, "Principal README commands differ; update the named executable examples")
     spec = importlib.util.spec_from_file_location("readme_packaged_helper", REPO / "test/packaged/verify.py")
     module = importlib.util.module_from_spec(spec)
@@ -110,6 +140,9 @@ def main():
     def cli(label, *arguments, cwd=root):
         return helper.run(label, [*npx, *arguments], cwd=cwd, environment=environment)
 
+    def make(*arguments, label):
+        return helper.make(root, *arguments, label=label)
+
     try:
         bare_wizard(npx, environment, products, helper.receipt / "bare-pty.log")
         cli("readme-init-web", "init", "my-product", "--app", "web=react-web", cwd=products)
@@ -117,6 +150,8 @@ def main():
         state = json.loads((root / ".devkit/manifest.json").read_text())
         require(state["version"] == index["version"] and set(state["components"]) == {"apps/web"}, "README web init accepted a different graph")
         before = module.source_snapshot(root)
+        helper.make(root, "help", label="readme-cold-help")
+        helper.make(root, "info", "json=1", label="readme-cold-info")
         helper.make(root, "setup", label="readme-first-setup")
         helper.make(root, "check", label="readme-first-check")
         require(module.source_snapshot(root) == before, "Initial README setup/check changed product inputs")
@@ -124,14 +159,7 @@ def main():
         web = helper.service(root, "web")
         helper.http(helper.port(web, 5173), "/", '<div id="root">')
         helper.make(root, "down", label="readme-first-down")
-        cli("readme-add-api", "add-app", ".", "--name", "api", "--template", "rust-api")
-        cli("readme-add-client", "add-package", ".", "--name", "client", "--template", "react-client")
-        cli("readme-add-desktop", "add-app", ".", "--name", "desktop", "--template", "electron-react", "--use", "client")
-        helper.make(root, "setup", label="readme-added-components-setup")
-        cli("readme-register-help", "register", "--help")
-        cli("readme-native-dependency-edit", "exec", "--component", "apps/web", "--write", "--network", "bridge", "--", "pnpm", "add", "zod")
-        web_package = json.loads((root / "apps/web/package.json").read_text())
-        require("zod" in web_package["dependencies"], "README native dependency edit did not update the web package")
+        add_readme_components(make, root)
         before = module.source_snapshot(root)
         helper.make(root, "setup", label="readme-after-dependency-setup")
         helper.make(root, "check", label="readme-after-dependency-check")
@@ -151,7 +179,7 @@ def main():
         require("A small app, ready to change." in original, "Named standalone HMR source fixture changed")
         with module.changed_files({source: original.replace("A small app, ready to change.", "README live HMR")}):
             helper.helper_finish(browser, "readme-web-hmr")
-        helper.make(root, "status", label="readme-status")
+        helper.make(root, "info", label="readme-info")
         helper.make(root, "down", label="readme-down")
         preset = products / "fullstack-product"
         cli("readme-preset-init", "init", "fullstack-product", "--preset", "fullstack-desktop", cwd=products)
@@ -161,10 +189,7 @@ def main():
         helper.run("readme-product-git-init", ["git", "init", "--quiet"], cwd=root)
         helper.run("readme-update-branch", ["git", "switch", "-c", "chore/devkit-" + index["version"]], cwd=root)
         before = module.source_snapshot(root)
-        cli("readme-update-preview", "update", ".", "--to", index["version"], "--preview")
-        cli("readme-update-apply", "update", ".", "--to", index["version"])
-        recovery = cli("readme-clean-recover", "recover", ".")
-        require("No pending" in recovery or "no pending" in recovery, "Clean recovery did not report its no-pending state")
+        update_readme_project(make, index["version"])
         helper.make(root, "setup", label="readme-after-update-setup")
         helper.make(root, "check", label="readme-after-update-check")
         require(module.source_snapshot(root) == before, "Same-version README update/recovery changed product inputs")

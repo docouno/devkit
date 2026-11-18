@@ -92,7 +92,27 @@ pub fn render_project_make(state: &ProjectState) -> String {
             );
         }
     }
+    if SemVer::parse(&state.version)
+        .is_ok_and(|version| version >= SemVer::parse("0.5.0").expect("valid version"))
+    {
+        let token = digest(format!("{}\n{result}", state.release_identity).as_bytes());
+        result += &format!("DEVKIT_EXPECTED_PLAN := {token}\n");
+    }
     result
+}
+
+pub(crate) fn verify_make_plan(state: &ProjectState, token: &str) -> Result<()> {
+    let projection = render_project_make(state);
+    ensure!(
+        SHA256_RE.is_match(token)
+            && projection
+                .lines()
+                .last()
+                .and_then(|line| { line.strip_prefix("DEVKIT_EXPECTED_PLAN := ") })
+                == Some(token),
+        "Accepted Make plan changed during this invocation; rerun the command"
+    );
+    Ok(())
 }
 fn volume(source: String, target: String, read_only: bool) -> Value {
     json!({"type":"bind","source":source,"target":target,"read_only":read_only,"bind":{"create_host_path":false,"selinux":"z"}})

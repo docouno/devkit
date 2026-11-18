@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -367,6 +367,49 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         globals.emit("status", result, &human);
         return Ok(());
     }
+    if command == "info" {
+        ensure!(!globals.interactive, "info does not accept --interactive");
+        let options = Options::parse(&globals.args[1..], &["--app"], &[], &[])?;
+        let target = options.target.clone().unwrap_or(std::env::current_dir()?);
+        let (result, human) = crate::info::inspect(&target, options.value("--app")?, runner)?;
+        globals.emit("info", result, &human);
+        return Ok(());
+    }
+    if command == "stand" {
+        ensure!(!globals.interactive, "stand does not accept --interactive");
+        let action = globals
+            .args
+            .get(1)
+            .map(|arg| string(arg))
+            .transpose()?
+            .context("Expected stand reserve or stand remove [TARGET]")?;
+        let root = resolve_metadata_target(&globals.args[2..])?;
+        match action {
+            "reserve" => {
+                let reserved =
+                    crate::runtime::reserve_stand(&root, globals.cache_dir.as_deref(), runner)?;
+                globals.emit(
+                    "stand reserve",
+                    json!({"reserved":reserved}),
+                    if reserved {
+                        "Stand address reserved."
+                    } else {
+                        "No stand reservation needed."
+                    },
+                );
+            }
+            "remove" => {
+                crate::runtime::remove_stand(&root, runner)?;
+                globals.emit(
+                    "stand remove",
+                    json!({"removed":true}),
+                    "Stand cleanup completed.",
+                );
+            }
+            _ => anyhow::bail!("Expected stand reserve or stand remove [TARGET]"),
+        }
+        return Ok(());
+    }
     if command == "describe" {
         ensure!(
             !globals.interactive,
@@ -410,7 +453,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
 }
 
 fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
-    let switches = ["--preview", "--reconcile-lock"];
+    let switches = ["--preview", "--reconcile-lock", "--idempotent"];
     let mut target = None;
     let mut release_root = None;
     let mut index = 0;

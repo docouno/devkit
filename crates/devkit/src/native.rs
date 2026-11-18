@@ -4,8 +4,8 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        SemVer, digest, exists, identity, input_path, is_pnpm_yaml, object, project_root,
-        read_json, relative_name, safe_path, sorted_entries, text,
+        SemVer, digest, exists, input_path, object, project_root, read_regular_file, relative_name,
+        safe_path, sorted_entries, text,
     },
     model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
@@ -279,22 +279,32 @@ pub fn dependency_table(data: &Fields, field: &str) -> Result<Fields> {
     }
 }
 
+const NATIVE_METADATA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
-    let before =
-        identity(path)?.with_context(|| format!("Missing native input: {}", path.display()))?;
-    let bytes = if is_pnpm_yaml(path) {
-        crate::pnpm::read_yaml_file(path)?
-            .context("Missing pnpm YAML input")?
-            .0
+    if crate::files::is_pnpm_yaml(path) {
+        crate::pnpm::read_yaml_file(path)?.context("Missing pnpm YAML input")
     } else {
-        fs::read(path)?
-    };
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(path)? == Some(before.clone()),
-        "Native input changed while reading: {}",
-        path.display()
-    );
-    Ok((bytes, before))
+        read_regular_file(path, NATIVE_METADATA_MAX_BYTES, "native metadata")?
+            .with_context(|| format!("Missing native input: {}", path.display()))
+    }
+}
+
+fn bounded_identity(path: &Path, maximum: u64) -> Result<Option<FileIdentity>> {
+    Ok(read_regular_file(path, maximum, "native metadata")?.map(|(_, id)| id))
+}
+
+fn identity(path: &Path) -> Result<Option<FileIdentity>> {
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("toml" | "json" | "lock")
+    ) || matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".npmrc" | "config")
+    ) {
+        return bounded_identity(path, NATIVE_METADATA_MAX_BYTES);
+    }
+    crate::files::identity(path)
 }
 fn manifest_snapshot(root: &Path, path: &str) -> Result<(Fields, FileIdentity)> {
     let name = if path.is_empty() {
@@ -834,6 +844,7 @@ struct ReadContext<'a> {
     cargo_locks: BTreeMap<String, CargoLockGraph>,
     node_inputs: Option<InputIdentitySet>,
     read_identities: BTreeMap<String, FileIdentity>,
+    dependency_byte_limit: Option<u64>,
 }
 impl<'a> ReadContext<'a> {
     fn new(root: &'a Path, lock_kind: NodeLockKind) -> Self {
@@ -848,6 +859,7 @@ impl<'a> ReadContext<'a> {
             cargo_locks: BTreeMap::new(),
             node_inputs: None,
             read_identities: BTreeMap::new(),
+            dependency_byte_limit: None,
         }
     }
     fn is_pnpm(&self) -> bool {
@@ -1570,6 +1582,7 @@ impl<'a> ReadContext<'a> {
     fn node_closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
         let mut files = BTreeMap::new();
         let mut directories = BTreeSet::new();
+        let mut dependency_bytes = self.dependency_byte_limit;
         let mut queue: VecDeque<String> = node_components(state)
             .into_iter()
             .map(|(p, _)| p.clone())
@@ -1582,10 +1595,17 @@ impl<'a> ReadContext<'a> {
                 record(self.root, &mut files, "pnpm-lock.yaml", true)?;
                 let workspace = crate::pnpm::Workspace::read(self.root)?;
                 for path in workspace.patched_dependencies.values() {
-                    record(self.root, &mut files, path, true)?;
+                    record_dependency(self.root, &mut files, path, &mut dependency_bytes)?;
                 }
                 for value in workspace.overrides.values() {
-                    local_dependency(self.root, "", value, &mut queue, &mut files)?;
+                    local_dependency(
+                        self.root,
+                        "",
+                        value,
+                        &mut queue,
+                        &mut files,
+                        &mut dependency_bytes,
+                    )?;
                 }
                 let root = self.root;
                 let lock = self.pnpm()?;
@@ -1604,7 +1624,14 @@ impl<'a> ReadContext<'a> {
                             queue.push_back(local_path(root, "", path)?);
                         }
                         if let Some(path) = resolution.get("tarball").and_then(Value::as_str) {
-                            local_dependency(root, "", path, &mut queue, &mut files)?;
+                            local_dependency(
+                                root,
+                                "",
+                                path,
+                                &mut queue,
+                                &mut files,
+                                &mut dependency_bytes,
+                            )?;
                         }
                     }
                 }
@@ -1628,7 +1655,14 @@ impl<'a> ReadContext<'a> {
                             )?,
                         )?);
                     } else if let Some(spec) = item.get("resolved").and_then(Value::as_str) {
-                        local_dependency(root, "", spec, &mut queue, &mut files)?;
+                        local_dependency(
+                            root,
+                            "",
+                            spec,
+                            &mut queue,
+                            &mut files,
+                            &mut dependency_bytes,
+                        )?;
                     }
                 }
             }
@@ -1689,6 +1723,7 @@ impl<'a> ReadContext<'a> {
                         text(spec, "dependency spec")?,
                         &mut queue,
                         &mut files,
+                        &mut dependency_bytes,
                     )?;
                 }
             }
@@ -1799,9 +1834,31 @@ fn record(
     required: bool,
 ) -> Result<()> {
     let path = input_path(root, name)?;
-    let value = identity(&path)?;
+    let value = bounded_identity(&path, NATIVE_METADATA_MAX_BYTES)?;
     ensure!(!required || value.is_some(), "Missing native input: {name}");
     files.insert(relative_name(&project_root(root)?, &path)?, value);
+    Ok(())
+}
+fn record_dependency(
+    root: &Path,
+    files: &mut BTreeMap<String, Option<FileIdentity>>,
+    name: &str,
+    budget: &mut Option<u64>,
+) -> Result<()> {
+    let path = input_path(root, name)?;
+    let key = relative_name(&project_root(root)?, &path)?;
+    let observed = if let Some(remaining) = budget {
+        if files.get(&key).is_some_and(Option::is_some) {
+            return Ok(());
+        }
+        let (bytes, identity) = read_regular_file(&path, *remaining, "local dependency input")?
+            .with_context(|| format!("Missing native input: {name}"))?;
+        *remaining -= bytes.len() as u64;
+        identity
+    } else {
+        identity(&path)?.with_context(|| format!("Missing native input: {name}"))?
+    };
+    files.insert(key, Some(observed));
     Ok(())
 }
 fn local_dependency(
@@ -1810,6 +1867,7 @@ fn local_dependency(
     spec: &str,
     queue: &mut VecDeque<String>,
     files: &mut BTreeMap<String, Option<crate::model::FileIdentity>>,
+    budget: &mut Option<u64>,
 ) -> Result<()> {
     let Some(spec) = spec.strip_prefix("file:") else {
         return Ok(());
@@ -1820,7 +1878,7 @@ fn local_dependency(
     if fs::symlink_metadata(&target)?.is_dir() {
         queue.push_back(name);
     } else if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
-        record(root, files, &name, true)?;
+        record_dependency(root, files, &name, budget)?;
     } else {
         bail!("Unsupported local dependency: {name}");
     }
@@ -1908,7 +1966,13 @@ pub fn assert_component_manifests(root: &Path, state: &ProjectState) -> Result<(
     Ok(())
 }
 pub fn assert_tool_profiles(root: &Path, state: &ProjectState) -> Result<()> {
-    let value: Value = read_json(&safe_path(root, ".devkit/tooling-profiles.json")?)?;
+    let (bytes, _) = read_regular_file(
+        &safe_path(root, ".devkit/tooling-profiles.json")?,
+        4 * 1024 * 1024,
+        "tooling profiles",
+    )?
+    .context("Missing tooling profiles")?;
+    let value: Value = serde_json::from_slice(&bytes)?;
     let payload = object(&value, "accepted tooling profiles")?;
     ensure!(
         payload.get("schemaVersion") == Some(&json!(1))
@@ -1951,27 +2015,55 @@ impl NativeAdmission {
     }
 }
 pub fn assert_input_identities(root: &Path, inputs: &InputIdentitySet) -> Result<()> {
+    assert_input_identities_with_limit(root, inputs, None)
+}
+
+fn assert_input_identities_with_limit(
+    root: &Path,
+    inputs: &InputIdentitySet,
+    maximum: Option<u64>,
+) -> Result<()> {
     ensure!(
         inputs.schema_version == 1,
         "Unsupported native input identity schema"
     );
     for (name, expected) in &inputs.files {
+        let path = input_path(root, name)?;
+        let observed = match maximum {
+            Some(maximum) => bounded_identity(&path, maximum)?,
+            None => identity(&path)?,
+        };
         ensure!(
-            &identity(&input_path(root, name)?)? == expected,
+            &observed == expected,
             "Native input changed during admission: {name}"
         );
     }
     Ok(())
 }
+
 pub fn assert_native_components(root: &Path, state: &ProjectState) -> Result<()> {
     admit_native_components(root, state).map(|_| ())
 }
 pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<NativeAdmission> {
+    admit_native_with_dependency_limit(root, state, None)
+}
+pub(crate) fn inspect_native_components(
+    root: &Path,
+    state: &ProjectState,
+) -> Result<NativeAdmission> {
+    admit_native_with_dependency_limit(root, state, Some(NATIVE_METADATA_MAX_BYTES))
+}
+fn admit_native_with_dependency_limit(
+    root: &Path,
+    state: &ProjectState,
+    dependency_byte_limit: Option<u64>,
+) -> Result<NativeAdmission> {
     let structure = NativeStructure::capture(root, state)?;
     structure.assert_registered(state)?;
     assert_tool_profiles(root, state)?;
     let lock_kind = NodeLockKind::for_state(state)?;
     let mut context = ReadContext::new(root, lock_kind);
+    context.dependency_byte_limit = dependency_byte_limit;
     let nodes = node_components(state);
     let pnpm_mode = lock_kind == NodeLockKind::Pnpm;
     if !nodes.is_empty() && pnpm_mode {
@@ -2167,7 +2259,9 @@ pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<Nati
     }
     let inputs = context.closure_with_structure(state, &structure)?;
     let npmrc_policy = parse_and_admit_npmrc(root, &inputs.directories, lock_kind)?;
-    assert_input_identities(root, &inputs)?;
+    // Keep inspection bounded through the final recheck, including files that
+    // changed size after collection.
+    assert_input_identities_with_limit(root, &inputs, dependency_byte_limit)?;
     let node_inputs = context
         .node_inputs
         .take()
@@ -2547,13 +2641,13 @@ pub fn parse_manifest_npmrc_policy(root: &Path, kind: NodeLockKind) -> Result<Np
         reject_pnpm_hooks(root, "")?;
     }
     let path = input_path(root, ".npmrc")?;
-    if identity(&path)?.is_none() {
+    let Some((bytes, _)) = read_regular_file(&path, 1024 * 1024, "npm configuration")? else {
         return Ok(NpmrcPolicy::default());
-    }
+    };
     let mut policy = NpmrcPolicy::default();
     let mut seen_keys = BTreeSet::new();
     let defaults = npmrc_safe_defaults(kind);
-    for raw_line in fs::read_to_string(&path)?.lines() {
+    for raw_line in std::str::from_utf8(&bytes)?.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
@@ -2688,10 +2782,10 @@ pub fn parse_and_admit_npmrc(
             reject_pnpm_hooks(root, directory)?;
         }
         let path = input_path(root, format!("{directory}/.npmrc"))?;
-        if identity(&path)?.is_none() {
+        let Some((bytes, _)) = read_regular_file(&path, 1024 * 1024, "npm configuration")? else {
             continue;
-        }
-        for raw_line in fs::read_to_string(&path)?.lines() {
+        };
+        for raw_line in std::str::from_utf8(&bytes)?.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with(['#', ';']) {
                 continue;
@@ -2789,4 +2883,33 @@ pub fn resolve_ca_cert_path() -> Result<Option<std::path::PathBuf>> {
         )
     })?;
     Ok(Some(canonical))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_recheck_rejects_a_dependency_that_has_grown() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let patch = root.path().join("example.patch");
+        fs::write(&patch, b"original patch")?;
+        let inputs = InputIdentitySet {
+            schema_version: 1,
+            files: BTreeMap::from([("example.patch".into(), identity(&patch)?)]),
+            directories: Vec::new(),
+            digest: String::new(),
+        };
+        assert_input_identities_with_limit(root.path(), &inputs, Some(32))?;
+        fs::write(&patch, [b'x'; 33])?;
+        let error = assert_input_identities_with_limit(root.path(), &inputs, Some(32))
+            .expect_err("the updated input exceeds the inspection limit");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::FileTooLarge)
+        );
+        Ok(())
+    }
 }

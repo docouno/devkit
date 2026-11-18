@@ -272,11 +272,23 @@ impl ProcessRunner {
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
             .context("Metadata query deadline exceeded")?;
-        self.checked_with_timeout(
+        let deadline = Instant::now() + remaining.min(Duration::from_secs(3));
+        let run_until = deadline
+            .checked_sub(Duration::from_millis(60))
+            .context("Metadata query deadline exceeded")?;
+        let timeout = run_until
+            .checked_duration_since(Instant::now())
+            .context("Metadata query deadline exceeded")?;
+        self.run_input_inner(
             command,
             OutputMode::Capture(16 * 1024 * 1024),
-            remaining.min(Duration::from_secs(3)),
-        )
+            false,
+            Some(timeout),
+            None,
+            None,
+            Some(deadline),
+        )?
+        .success(&command.get_program().to_string_lossy())
     }
     /// Reconcile already accepted writes after cancellation, within one deadline.
     pub fn capture_recovery_before(
@@ -302,7 +314,7 @@ impl ProcessRunner {
         cleanup: bool,
         timeout: Option<Duration>,
     ) -> Result<ProcessOutput> {
-        self.run_input_inner(command, mode, cleanup, timeout, None, None)
+        self.run_input_inner(command, mode, cleanup, timeout, None, None, None)
     }
     pub fn run_with_input(
         &self,
@@ -314,7 +326,7 @@ impl ProcessRunner {
             input.len() <= MAX_NATIVE_INPUT,
             "Native stdin exceeds byte budget"
         );
-        self.run_input_inner(command, mode, false, None, Some(input), None)
+        self.run_input_inner(command, mode, false, None, Some(input), None, None)
     }
     pub fn run_tracked(
         &self,
@@ -328,8 +340,9 @@ impl ProcessRunner {
             "Native stdin exceeds byte budget"
         );
         *reaped = false;
-        self.run_input_inner(command, mode, false, None, input, Some(reaped))
+        self.run_input_inner(command, mode, false, None, input, Some(reaped), None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn run_input_inner(
         &self,
         command: &mut Command,
@@ -338,6 +351,7 @@ impl ProcessRunner {
         timeout: Option<Duration>,
         input: Option<&[u8]>,
         mut reaped: Option<&mut bool>,
+        metadata_deadline: Option<Instant>,
     ) -> Result<ProcessOutput> {
         if !cleanup && let Err(error) = self.check_cancelled() {
             if let Some(flag) = reaped.as_deref_mut() {
@@ -433,7 +447,10 @@ impl ProcessRunner {
         };
         // This happens on every path, including wait/read errors. Do not let an
         // early ? bypass termination and reaping of the exact creator PGID.
-        let stopped = creator.finish();
+        let stopped = match metadata_deadline {
+            Some(deadline) => creator.finish_metadata(deadline),
+            None => creator.finish(),
+        };
         if stopped.is_ok()
             && let Some(reaped) = reaped
         {
@@ -1062,6 +1079,25 @@ impl Creator {
             child,
             pid,
             finished: false,
+        }
+    }
+    fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
+        // This process has no daemon-side mutation to reconcile. Stop it
+        // immediately and never enter the mutation grace period on drop.
+        self.finished = true;
+        signal_group(self.pid, libc::SIGKILL);
+        loop {
+            if self.child.try_wait()?.is_some() {
+                reap_available(self.pid)?;
+                if !group_exists(self.pid) {
+                    return Ok(());
+                }
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Metadata query process group was not reaped"
+            );
+            thread::sleep(Duration::from_millis(2));
         }
     }
     fn finish(&mut self) -> Result<()> {

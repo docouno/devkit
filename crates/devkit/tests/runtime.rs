@@ -604,6 +604,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     fs::create_dir_all(&attempt_dir).unwrap();
     let cache = temp.path().join("cache");
     let ports = devkit::stand::ports::Ports::open(&root, &cache).unwrap();
+    ports.save().unwrap();
     let project = devkit::doctor::compose_project_name(&root);
     let container_id = "a".repeat(64);
     // A daemon cgroup error happens after container creation. Preserve that
@@ -652,7 +653,16 @@ if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
   exit 0
 fi
 if [ "$1" = "info" ]; then
+  case "$*" in *'.ID'* ) printf 'fixture-daemon\n'; exit 0 ;; esac
   printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  exit 0
+fi
+if [ "$1" = "context" ]; then
+  case "$2" in
+    show) printf 'default\n' ;;
+    inspect) printf 'tcp://127.0.0.1:2375\n' ;;
+    *) exit 90 ;;
+  esac
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then

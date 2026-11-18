@@ -1,6 +1,7 @@
 //! Host-local stand state. Checkout locks precede the registry lock; Docker is
 //! never called while the registry is locked.
 pub mod epoch;
+pub(crate) mod history;
 pub mod inspection;
 pub mod ledger;
 pub mod preview;
@@ -14,6 +15,14 @@ use std::{
 };
 
 pub fn branch_name(root: &Path, runner: &crate::processes::ProcessRunner) -> Result<String> {
+    branch_name_until(root, runner, None)
+}
+
+pub(crate) fn branch_name_until(
+    root: &Path,
+    runner: &crate::processes::ProcessRunner,
+    deadline: Option<std::time::Instant>,
+) -> Result<String> {
     let fallback = || {
         root.file_name()
             .unwrap_or_default()
@@ -38,15 +47,15 @@ pub fn branch_name(root: &Path, runner: &crate::processes::ProcessRunner) -> Res
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["-c", "core.fsmonitor=false"])
             .args(args);
-        Ok(runner
-            .checked_with_timeout(
+        let output = match deadline {
+            Some(at) => runner.capture_before(&mut command, at)?,
+            None => runner.checked_with_timeout(
                 &mut command,
                 crate::processes::OutputMode::Capture(65536),
                 std::time::Duration::from_secs(3),
-            )?
-            .text()?
-            .trim()
-            .into())
+            )?,
+        };
+        Ok(output.text()?.trim().into())
     };
     let branch = query(&["branch", "--show-current"])?;
     if !branch.is_empty() {

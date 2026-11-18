@@ -38,6 +38,7 @@ pub fn parse_compose(bytes: &[u8]) -> Result<Value> {
 fn capture(root: &Path, snapshot: Option<&Path>) -> Result<ComposeInventory> {
     let root = project_root(root)?;
     let mut files = BTreeMap::new();
+    let mut include_env = std::collections::BTreeSet::new();
     let mut queue: VecDeque<_> = ENTRYPOINTS.iter().map(|p| (p.to_string(), true)).collect();
     while let Some((name, optional)) = queue.pop_front() {
         ensure!(
@@ -49,22 +50,18 @@ fn capture(root: &Path, snapshot: Option<&Path>) -> Result<ComposeInventory> {
         if files.contains_key(&key) {
             continue;
         }
-        let id = identity(&path)?;
-        files.insert(key.clone(), id.clone());
-        let Some(id) = id else {
+        let Some((bytes, id)) = read_regular_file(&path, MAX_YAML_BYTES as u64, "Compose input")?
+        else {
+            files.insert(key.clone(), None);
             ensure!(optional, "Missing Compose input: {key}");
             continue;
         };
-        let bytes = fs::read(&path)?;
-        ensure!(
-            digest(&bytes) == id.sha256 && identity(&path)?.as_ref() == Some(&id),
-            "Compose input changed during admission: {key}"
-        );
+        files.insert(key.clone(), Some(id.clone()));
         let data = parse_compose(&bytes).with_context(|| format!("Invalid Compose YAML: {key}"))?;
         if let Some(snapshot) = snapshot {
             write_atomic(&input_path(snapshot, &key)?, &bytes, id.mode)?;
         }
-        let mut add = |value: &Value| -> Result<()> {
+        let mut add = |value: &Value, include: bool| -> Result<()> {
             let reference = text(value, "Compose local reference")?;
             ensure!(
                 !reference.contains('$')
@@ -74,6 +71,16 @@ fn capture(root: &Path, snapshot: Option<&Path>) -> Result<ComposeInventory> {
             );
             let parent = Path::new(&key).parent().context("Compose parent")?;
             let target = input_path(&root, parent.join(reference))?;
+            if include {
+                let env = input_path(
+                    &root,
+                    target
+                        .parent()
+                        .context("Compose include parent")?
+                        .join(".env"),
+                )?;
+                include_env.insert(relative_name(&root, &env)?);
+            }
             queue.push_back((relative_name(&root, &target)?, false));
             Ok(())
         };
@@ -82,7 +89,7 @@ fn capture(root: &Path, snapshot: Option<&Path>) -> Result<ComposeInventory> {
                 .as_array()
                 .context("Compose include must be a local string array")?
             {
-                add(value)?;
+                add(value, true)?;
             }
         }
         let empty = json!({});
@@ -92,9 +99,23 @@ fn capture(root: &Path, snapshot: Option<&Path>) -> Result<ComposeInventory> {
             if let Some(extension) = s.get("extends")
                 && let Some(file) = object(extension, "Compose extends")?.get("file")
             {
-                add(file)?;
+                add(file, false)?;
             }
         }
+    }
+    for name in include_env {
+        ensure!(
+            !files.contains_key(&name),
+            "Compose model overlaps include environment: {name}"
+        );
+        let path = input_path(&root, &name)?;
+        let value = read_regular_file(&path, MAX_YAML_BYTES as u64, "Compose include environment")?;
+        if let Some(snapshot) = snapshot
+            && let Some((bytes, id)) = &value
+        {
+            write_atomic(&input_path(snapshot, &name)?, bytes, id.mode)?;
+        }
+        files.insert(name, value.map(|(_, id)| id));
     }
     let digest = digest(serde_json::to_vec(&json!([
         "devkit-compose-inputs-v1",

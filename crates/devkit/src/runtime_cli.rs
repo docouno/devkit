@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
+const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
 fn string(arg: &OsStr) -> Result<&str> {
     arg.to_str().context("Expected UTF-8 command option")
 }
@@ -68,6 +68,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         request.app = env_string("DEVKIT_APP");
         request.package = env_string("DEVKIT_PACKAGE");
         request.expected_manifest = env_string("DEVKIT_EXPECTED_MANIFEST");
+        request.expected_plan = env_string("DEVKIT_MAKE_PLAN");
         request.headless = boolean(
             &env_string("DEVKIT_HEADLESS").unwrap_or_else(|| "0".into()),
             "headless",
@@ -157,6 +158,18 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         }
     }
     if command == "exec" {
+        ensure!(
+            [
+                request.app.is_some(),
+                request.package.is_some(),
+                request.component.is_some()
+            ]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+                <= 1,
+            "Choose at most one of app, package, or component for exec"
+        );
         if argv.is_empty()
             && let Some(value) = env_string("DEVKIT_EXEC_COMMAND")
         {
@@ -182,7 +195,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         ensure!(
             [
                 "help", "doctor", "setup", "check", "fix", "test", "build", "package", "dev", "up",
-                "down", "logs", "status"
+                "down", "logs", "info", "status"
             ]
             .contains(&request.command.as_str()),
             "Unknown Make task: {}",

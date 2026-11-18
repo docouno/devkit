@@ -24,7 +24,26 @@ use std::{
 };
 
 const LEGACY_GITIGNORE:&[u8]=b"**/node_modules/\n**/dist/\n**/target/\n**/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
-const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/apps/*/dist/\n/packages/*/dist/\n/apps/*/target/\n/packages/*/target/\n/apps/*/release/\n/packages/*/release/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
+const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/apps/*/dist/\n/packages/*/dist/\n/apps/*/target/\n/packages/*/target/\n/apps/*/release/\n/packages/*/release/\n/.worktrees/\n.devkit/cache/\n.devkit/state/\n.env\n.env.*\n!.env.example\n";
+const PROJECT_AGENTS: &[u8] = b"# Development instructions\n\n\
+- Start with `make help` and `make info`. Use `make setup` to prepare pinned tools and dependencies.\n\
+- Run `make check`, `make test`, and `make build` in the checkout. These gates use offline containers.\n\
+- Change dependencies with `make exec write=1 network=bridge command='pnpm add ...'` in the Node workspace or with an explicit component selector. Use the pinned container tools for Rust too. Run `make sync` and `make setup` after changing dependency inputs.\n\
+- Use `make add-app`, `make add-package`, and `make register` for component registration. Keep accepted `.devkit/` files managed through `make sync`, `make update`, or `make recover`.\n\
+- Keep application and shared code in `apps/` and `packages/`. The root `Makefile` and `compose.yaml` belong to this project. See [.devkit/runtime/GUIDE.md](.devkit/runtime/GUIDE.md) for command details.\n";
+
+const PROJECT_WORKTRUNK: &[u8] =
+    br#"# Worktrunk runs approved project hooks in the target checkout.
+# Enable the optional start with DEVKIT_WT_AUTOSTART=1.
+[pre-start]
+devkit-reserve = "sh .devkit/runtime/devkit.sh worktree-hook reserve"
+
+[post-start]
+devkit-start = "sh .devkit/runtime/devkit.sh worktree-hook start"
+
+[pre-remove]
+devkit-remove = "sh .devkit/runtime/devkit.sh worktree-hook remove"
+"#;
 
 fn project_readme(name: &str, state: &ProjectState) -> String {
     let mut text = format!(
@@ -92,6 +111,8 @@ pub struct InitOptions<'a> {
     pub name: Option<String>,
     pub registry: Option<&'a str>,
     pub hooks: Option<&'a dyn MutationHooks>,
+    pub no_agents_md: bool,
+    pub no_worktrunk: bool,
 }
 #[derive(Default)]
 pub struct UpdateOptions<'a> {
@@ -104,6 +125,7 @@ pub struct UpdateOptions<'a> {
     pub hooks: Option<&'a dyn MutationHooks>,
     pub preview: bool,
     pub reconcile_lock: bool,
+    pub idempotent: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct FileChange {
@@ -1154,6 +1176,18 @@ pub fn init_project(
         0o644,
     )?;
     write_atomic(&stage.path().join(".gitignore"), PROJECT_GITIGNORE, 0o644)?;
+    if SemVer::parse(&state.version)? >= SemVer::parse("0.5.0")? {
+        if !options.no_agents_md {
+            write_atomic(&stage.path().join("AGENTS.md"), PROJECT_AGENTS, 0o644)?;
+        }
+        if !options.no_worktrunk {
+            write_atomic(
+                &stage.path().join(".config/wt.toml"),
+                PROJECT_WORKTRUNK,
+                0o644,
+            )?;
+        }
+    }
     let readme = project_readme(&name, &state);
     write_atomic(&stage.path().join("README.md"), readme.as_bytes(), 0o644)?;
     write_json(&safe_path(stage.path(), MANIFEST_PATH)?, &state)?;
@@ -1307,6 +1341,25 @@ fn assert_legacy_ignore_allows_component(root: &Path, path: &str, name: &str) ->
     }
     Ok(())
 }
+
+fn registration_intent(change: &Change, options: &UpdateOptions<'_>) -> Result<(String, Value)> {
+    let reconcile = options.reconcile_lock;
+    Ok(match change {
+        Change::Add { role, spec } => (
+            component_path(*role, &spec.name)?,
+            json!({"template": template(&spec.template)?.id, "api": options.api, "use": spec.uses, "reconcile": reconcile}),
+        ),
+        Change::Register {
+            role,
+            name,
+            profile,
+        } => (
+            component_path(*role, name)?,
+            json!({"profile": profile, "reconcile": reconcile}),
+        ),
+    })
+}
+
 fn mutate(
     release_root: &Path,
     target: &Path,
@@ -1336,6 +1389,7 @@ fn mutate(
         None => "sync/update",
     };
     let lock = CheckoutLock::acquire_exclusive(target, op_label, options.runner)?;
+    assert_no_pending(&lock.root)?;
     let candidate_state = read_project_state(&lock.root)?;
     if !node_components(&candidate_state).is_empty()
         && SemVer::parse(&candidate_state.version)? < SemVer::parse("0.5.0")?
@@ -1353,6 +1407,37 @@ fn mutate(
     let old = &snapshot.state;
     let mut next = old.clone();
     verify_old_tools(root, &next)?;
+    let intent = change
+        .as_ref()
+        .map(|change| registration_intent(change, options))
+        .transpose()?;
+    if options.idempotent
+        && let Some((path, requested)) = &intent
+        && let Some(component) = old.components.get(path)
+    {
+        ensure!(
+            release.identity == old.release_identity,
+            "Add/register requires the exact accepted release"
+        );
+        let matched = match component.origin.extra.get("registrationIntent") {
+            Some(recorded) => recorded == requested,
+            None => matches!(&change, Some(Change::Register { profile, .. })
+                if *profile == component.tooling_profile && !options.reconcile_lock),
+        };
+        ensure!(
+            matched,
+            "Component {path} already exists with different or unverified registration options; use make sync reconcile=1 to reconcile its lock"
+        );
+        release.recheck()?;
+        snapshot.recheck()?;
+        return Ok(MutationOutcome {
+            state: old.clone(),
+            files: vec![],
+            applied: false,
+            no_op: true,
+            lock_reconciliation: None,
+        });
+    }
     let owned_inventory = match (options.compose_inventory, options.compose_normalizer) {
         (None, Some(normalizer))
             if matches!(
@@ -1597,6 +1682,16 @@ fn mutate(
                     );
                 }
             }
+        }
+        if SemVer::parse(&next.version)? >= SemVer::parse("0.5.0")?
+            && let Some((path, record)) = &intent
+        {
+            next.components
+                .get_mut(path)
+                .context("Missing new registration")?
+                .origin
+                .extra
+                .insert("registrationIntent".into(), record.clone());
         }
         let migrating_product = if !node_components(old).is_empty()
             && SemVer::parse(&old.version)? < SemVer::parse("0.5.0")?

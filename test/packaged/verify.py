@@ -222,8 +222,15 @@ class Verification:
             require(actual[path] == [identity["mode"], identity["sha256"]], f"Release mismatch: {path}")
         require((destination / "runtime/LICENSE").read_bytes() == (destination / "LICENSE").read_bytes(),
                 "Vendored runtime must retain the MIT notice")
+        def check_payload_path(path):
+            for part in Path(path).parts:
+                require(part != ".worktrees" and part.lower() not in ("agents.md", "claude.md", "gemini.md"),
+                        f"Forbidden release payload path: {path}")
         for path in actual:
-            require(Path(path).name not in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"), f"Agent file shipped: {path}")
+            check_payload_path(path)
+        with tarfile.open(destination / manifest["environment"]["archive"]) as env_archive:
+            for entry in env_archive:
+                check_payload_path(entry.name)
         return destination
 
     def run(self, label, argv, *, expected=None, timeout=600, cwd=None, environment=None):
