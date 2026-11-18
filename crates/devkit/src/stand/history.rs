@@ -157,6 +157,8 @@ pub(crate) struct History {
     pub(crate) retired: bool,
     pub(crate) cleaned: bool,
     #[serde(default)]
+    actors_stopped: bool,
+    #[serde(default)]
     lease_cache: Option<PathBuf>,
     #[serde(default)]
     networks: BTreeMap<String, Resource>,
@@ -255,6 +257,7 @@ impl History {
             daemon: None,
             retired: false,
             cleaned: false,
+            actors_stopped: false,
             lease_cache: None,
             networks: BTreeMap::new(),
             volumes: BTreeMap::new(),
@@ -290,6 +293,15 @@ impl History {
         self.daemon.is_some()
     }
 
+    pub(crate) fn may_have_actors(&self) -> bool {
+        self.has_daemon() && !self.actors_stopped && !self.cleaned
+    }
+
+    pub(crate) fn record_stopped(&mut self, root: &Path) -> Result<()> {
+        self.actors_stopped = true;
+        self.save(root)
+    }
+
     pub(crate) fn prove_lease_history(&self, root: &Path) -> Result<()> {
         if let Some(cache) = &self.lease_cache {
             super::ports::Ports::verify_checkout_claims(root, cache)?;
@@ -317,9 +329,14 @@ impl History {
     pub(crate) fn bind_daemon(&mut self, root: &Path, runner: &ProcessRunner) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
         if self.has_daemon() {
-            return self.verify_daemon(runner, deadline);
+            self.verify_daemon(runner, deadline)?;
+            if !self.actors_stopped {
+                return Ok(());
+            }
+        } else {
+            self.daemon = Some(Daemon::current(runner, deadline)?);
         }
-        self.daemon = Some(Daemon::current(runner, deadline)?);
+        self.actors_stopped = false;
         self.save(root)
     }
 

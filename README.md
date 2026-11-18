@@ -103,7 +103,7 @@ Placeholders are `{port}`, `{service}`, `{branch}` and `{slug}` (the last two us
 Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 
 ```sh
-make exec app=web write=1 network=bridge command='pnpm add zod'
+make exec app=web write=1 network=bridge command='pnpm add zod --lockfile-only --ignore-scripts'
 make setup
 make check
 ```

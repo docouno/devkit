@@ -1701,11 +1701,23 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         CheckoutLock::acquire_exclusive(&request.root, &lock_op, Some(runner))?
     };
     if request.command == "down" {
+        use crate::stand::{history::History, ledger::Ledger, ports::Ports};
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        if let Some(history) = crate::stand::history::History::read(&pre_root, runner, deadline)? {
+        let history = History::read(&pre_root, runner, deadline)?;
+        if let Some(history) = &history {
             history.prove_lease_history(&pre_root)?;
+            if history.has_daemon() {
+                ensure!(
+                    !Ports::read(&pre_root)?.is_some_and(|ports| ports.possible_actors)
+                        || Ledger::read(&pre_root)?.is_some(),
+                    "Stand actor history is missing; preserving leases until ownership recovery"
+                );
+            }
         }
-        if request.cleanup && cleanup_without_stand(&request, &pre_root)? {
+        if request.cleanup
+            && !history.as_ref().is_some_and(History::may_have_actors)
+            && cleanup_without_stand(&request, &pre_root)?
+        {
             return Ok(());
         }
     }
@@ -2270,7 +2282,7 @@ fn run_service(
         let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if !rows.is_empty() {
             let ports = crate::stand::ports::Ports::read(&ctx.admission.root)?
-                .context("Stand origin is unknown; inspect containers and run make down explicitly before cleanup")?;
+                .context("Stand containers lack an ownership receipt; restore it before cleanup")?;
             crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
         }
     }
@@ -2412,6 +2424,9 @@ fn run_service(
                 ctx.runner,
                 true,
             )?;
+            if rows.is_empty() || request.cleanup {
+                history.record_stopped(&ctx.admission.root)?;
+            }
         }
         if request.cleanup {
             crate::stand::clear_overlay(&ctx.admission.root)?;

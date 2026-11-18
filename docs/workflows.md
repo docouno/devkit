@@ -72,7 +72,7 @@ Run package-manager mutations inside the pinned container. Use `write=1` to allo
 
 ```sh
 # A Node package
-make exec package=ui write=1 network=bridge command='pnpm add clsx'
+make exec package=ui write=1 network=bridge command='pnpm add clsx --lockfile-only --ignore-scripts'
 
 # A Rust app
 make exec app=api write=1 network=bridge command='cargo update --manifest-path Cargo.toml'

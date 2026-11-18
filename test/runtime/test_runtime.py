@@ -542,6 +542,33 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024)))
             self.assertEqual(json.loads(result.stdout)["result"]["readiness"], "setup-required")
 
+    def test_make_info_bounds_local_dependency_artifacts(self):
+        import resource
+
+        with tempfile.TemporaryDirectory(prefix="devkit-info-dependency-") as temporary:
+            root = Path(temporary) / "checkout"
+            write_rust_fixture(root)
+            app = root / "apps/web"
+            app.mkdir()
+            (app / "package.json").write_text(json.dumps({"name": "web", "version": "1.0.0", "private": True,
+                "scripts": {name: "true" for name in ("check", "fix", "test", "build", "dev")}}))
+            (root / "package.json").write_text(json.dumps({"name": "fixture", "version": "1.0.0", "private": True}))
+            (root / "pnpm-lock.yaml").write_text(json.dumps({"lockfileVersion": "9.0", "importers": {".": {}, "apps/web": {}}}))
+            (root / "pnpm-workspace.yaml").write_text(json.dumps({"packages": ["apps/web"], "nodeLinker": "isolated",
+                "packageImportMethod": "hardlink", "verifyDepsBeforeRun": False,
+                "patchedDependencies": {"example@1.0.0": "example.patch"}}))
+            patch = root / "example.patch"
+            patch.write_text("diff --git a/package.json b/package.json\n")
+            accept_runtime(root)
+            described = run(str(ENGINE), "describe", str(root), "--json")
+            self.assertIn("example.patch", json.loads(described.stdout)["result"]["inputs"]["files"])
+            with patch.open("r+b") as source:
+                source.truncate(256 * 1024 * 1024)
+            limit = 128 * 1024 * 1024
+            info = run("make", "--no-print-directory", "-C", str(root), "info", "json=1", timeout=3,
+                       preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_AS, (limit, limit)))
+            self.assertEqual(json.loads(info.stdout)["result"]["readiness"], "setup-required")
+
     def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:
             base = Path(temporary)
@@ -812,6 +839,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(mounted["/borrowed"], borrowed)
             self.make("down", "cleanup=1", timeout=90)
             self.assertEqual(run("docker", "volume", "inspect", owned).returncode, 0)
+            self.assertEqual(json.loads(self.make("info", "json=1").stdout)["result"]["standState"], "stopped")
             self.make("up", timeout=120)
             self.assertIn(owned, [m.get("Name") for m in container(name)["Mounts"]])
             spec["services"]["main"]["ports"] = []
@@ -822,8 +850,10 @@ class RuntimeTests(unittest.TestCase):
             for path in before:
                 path.unlink()
             try:
-                refused = self.make("down", check=False)
-                self.assertIn("lack an ownership receipt", refused.stderr)
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("lack an ownership receipt", refused.stderr)
                 observed = json.loads(self.make("info", "json=1").stdout)["result"]
                 self.assertEqual(observed["standState"], "unknown")
                 self.assertTrue(container(name)["State"]["Running"])
@@ -1281,6 +1311,15 @@ class RuntimeTests(unittest.TestCase):
                             self.assertFalse(ledger["launch"]["daemonFinished"])
                             self.assertTrue(json.loads(ports.read_text())["possibleActors"])
                             before = ports.read_bytes()
+                            saved_actors = active.read_bytes()
+                            active.unlink()
+                            try:
+                                refused = self.make("down", env=fault, check=False)
+                                self.assertNotEqual(refused.returncode, 0)
+                                self.assertIn("Stand actor history is missing", refused.stderr)
+                                self.assertFalse(proxy.completed.is_set())
+                            finally:
+                                active.write_bytes(saved_actors)
                             refused = self.make("down", "cleanup=1", env=fault, check=False)
                             self.assertNotEqual(refused.returncode, 0)
                             self.assertIn("incomplete daemon outcomes", refused.stderr)
@@ -3233,9 +3272,10 @@ if (priv.value !== 'from-private-gitlab-registry') {
             (denied / "docker").chmod(0o755)
             lost = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
             try:
-                refused = self.make("down", "cleanup=1", env=lost, check=False)
-                self.assertNotEqual(refused.returncode, 0)
-                self.assertIn("actor history", refused.stderr)
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, env=lost, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("actor history", refused.stderr)
                 self.assertFalse(trace.exists())
                 self.assertTrue((self.root / ".devkit/state/ports.json").exists())
             finally:

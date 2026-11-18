@@ -40,7 +40,8 @@ def add_readme_components(make, root):
     make("register", "app=worker", "profile=rust", label="readme-register-repeat")
     make("setup", label="readme-added-components-setup")
     make("exec", "command=node -p process.cwd()", label="readme-root-exec")
-    make("exec", "app=web", "write=1", "network=bridge", "command=pnpm add zod", label="readme-native-dependency-edit")
+    make("exec", "app=web", "write=1", "network=bridge",
+         "command=pnpm add zod --lockfile-only --ignore-scripts", label="readme-native-dependency-edit")
     web_package = json.loads((root / "apps/web/package.json").read_text())
     require("zod" in web_package["dependencies"], "README native dependency edit did not update the web package")
 
@@ -103,7 +104,7 @@ def main():
     readme = (REPO / "README.md").read_text()
     package = "@docouno/devkit@" + index["version"]
     for example in (f"npx {package} init my-product --app web=react-web",
-                    "make exec app=web write=1 network=bridge command='pnpm add zod'",
+                    "make exec app=web write=1 network=bridge command='pnpm add zod --lockfile-only --ignore-scripts'",
                     "make add-app name=api template=rust-api",
                     "make add-package name=client template=react-client",
                     "make add-app name=desktop template=electron-react use=client"):

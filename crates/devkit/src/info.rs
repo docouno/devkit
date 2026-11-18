@@ -134,7 +134,7 @@ fn observe_stand(
     let unconfirmed_history = ports.is_none()
         && resources
             .as_ref()
-            .is_some_and(|history| history.has_daemon() && !history.cleaned);
+            .is_some_and(|history| history.may_have_actors());
     if !unconfirmed_history && history.is_none() && (no_state || (no_services && ports.is_none())) {
         return Ok(("stopped", vec![]));
     }
@@ -318,7 +318,7 @@ pub(crate) fn inspect(
         {
             readiness = if busy {
                 "unknown"
-            } else if let Ok(native) = crate::native::admit_native_components(&root, state) {
+            } else if let Ok(native) = crate::native::inspect_native_components(&root, state) {
                 let receipts =
                     crate::doctor::local_receipts(&root, state, Some(&native.node_inputs.digest))?;
                 let needed = state.components.values().all(|c| match c.toolchain {

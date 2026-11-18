@@ -61,7 +61,7 @@ Scope `setup`, `check`, `fix`, `test`, `build`, and `package` with `app=<name>` 
 ### Add or remove npm dependencies
 
 ```sh
-make exec app=web write=1 network=bridge command='pnpm add zod'
+make exec app=web write=1 network=bridge command='pnpm add zod --lockfile-only --ignore-scripts'
 make setup
 make check
 ```

@@ -838,6 +838,7 @@ struct ReadContext<'a> {
     cargo_locks: BTreeMap<String, CargoLockGraph>,
     node_inputs: Option<InputIdentitySet>,
     read_identities: BTreeMap<String, FileIdentity>,
+    dependency_byte_limit: Option<u64>,
 }
 impl<'a> ReadContext<'a> {
     fn new(root: &'a Path, lock_kind: NodeLockKind) -> Self {
@@ -852,6 +853,7 @@ impl<'a> ReadContext<'a> {
             cargo_locks: BTreeMap::new(),
             node_inputs: None,
             read_identities: BTreeMap::new(),
+            dependency_byte_limit: None,
         }
     }
     fn is_pnpm(&self) -> bool {
@@ -1574,6 +1576,7 @@ impl<'a> ReadContext<'a> {
     fn node_closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
         let mut files = BTreeMap::new();
         let mut directories = BTreeSet::new();
+        let mut dependency_bytes = self.dependency_byte_limit;
         let mut queue: VecDeque<String> = node_components(state)
             .into_iter()
             .map(|(p, _)| p.clone())
@@ -1586,10 +1589,17 @@ impl<'a> ReadContext<'a> {
                 record(self.root, &mut files, "pnpm-lock.yaml", true)?;
                 let workspace = crate::pnpm::Workspace::read(self.root)?;
                 for path in workspace.patched_dependencies.values() {
-                    record(self.root, &mut files, path, true)?;
+                    record_dependency(self.root, &mut files, path, &mut dependency_bytes)?;
                 }
                 for value in workspace.overrides.values() {
-                    local_dependency(self.root, "", value, &mut queue, &mut files)?;
+                    local_dependency(
+                        self.root,
+                        "",
+                        value,
+                        &mut queue,
+                        &mut files,
+                        &mut dependency_bytes,
+                    )?;
                 }
                 let root = self.root;
                 let lock = self.pnpm()?;
@@ -1608,7 +1618,14 @@ impl<'a> ReadContext<'a> {
                             queue.push_back(local_path(root, "", path)?);
                         }
                         if let Some(path) = resolution.get("tarball").and_then(Value::as_str) {
-                            local_dependency(root, "", path, &mut queue, &mut files)?;
+                            local_dependency(
+                                root,
+                                "",
+                                path,
+                                &mut queue,
+                                &mut files,
+                                &mut dependency_bytes,
+                            )?;
                         }
                     }
                 }
@@ -1632,7 +1649,14 @@ impl<'a> ReadContext<'a> {
                             )?,
                         )?);
                     } else if let Some(spec) = item.get("resolved").and_then(Value::as_str) {
-                        local_dependency(root, "", spec, &mut queue, &mut files)?;
+                        local_dependency(
+                            root,
+                            "",
+                            spec,
+                            &mut queue,
+                            &mut files,
+                            &mut dependency_bytes,
+                        )?;
                     }
                 }
             }
@@ -1693,6 +1717,7 @@ impl<'a> ReadContext<'a> {
                         text(spec, "dependency spec")?,
                         &mut queue,
                         &mut files,
+                        &mut dependency_bytes,
                     )?;
                 }
             }
@@ -1808,12 +1833,29 @@ fn record(
     files.insert(relative_name(&project_root(root)?, &path)?, value);
     Ok(())
 }
+fn record_dependency(
+    root: &Path,
+    files: &mut BTreeMap<String, Option<FileIdentity>>,
+    name: &str,
+    budget: &mut Option<u64>,
+) -> Result<()> {
+    let Some(remaining) = budget else {
+        return record(root, files, name, true);
+    };
+    let path = input_path(root, name)?;
+    let (bytes, identity) = read_regular_file(&path, *remaining, "local dependency input")?
+        .with_context(|| format!("Missing native input: {name}"))?;
+    *remaining -= bytes.len() as u64;
+    files.insert(relative_name(&project_root(root)?, &path)?, Some(identity));
+    Ok(())
+}
 fn local_dependency(
     root: &Path,
     base: &str,
     spec: &str,
     queue: &mut VecDeque<String>,
     files: &mut BTreeMap<String, Option<crate::model::FileIdentity>>,
+    budget: &mut Option<u64>,
 ) -> Result<()> {
     let Some(spec) = spec.strip_prefix("file:") else {
         return Ok(());
@@ -1824,7 +1866,7 @@ fn local_dependency(
     if fs::symlink_metadata(&target)?.is_dir() {
         queue.push_back(name);
     } else if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
-        record(root, files, &name, true)?;
+        record_dependency(root, files, &name, budget)?;
     } else {
         bail!("Unsupported local dependency: {name}");
     }
@@ -1977,11 +2019,25 @@ pub fn assert_native_components(root: &Path, state: &ProjectState) -> Result<()>
     admit_native_components(root, state).map(|_| ())
 }
 pub fn admit_native_components(root: &Path, state: &ProjectState) -> Result<NativeAdmission> {
+    admit_native_with_dependency_limit(root, state, None)
+}
+pub(crate) fn inspect_native_components(
+    root: &Path,
+    state: &ProjectState,
+) -> Result<NativeAdmission> {
+    admit_native_with_dependency_limit(root, state, Some(32 * 1024 * 1024))
+}
+fn admit_native_with_dependency_limit(
+    root: &Path,
+    state: &ProjectState,
+    dependency_byte_limit: Option<u64>,
+) -> Result<NativeAdmission> {
     let structure = NativeStructure::capture(root, state)?;
     structure.assert_registered(state)?;
     assert_tool_profiles(root, state)?;
     let lock_kind = NodeLockKind::for_state(state)?;
     let mut context = ReadContext::new(root, lock_kind);
+    context.dependency_byte_limit = dependency_byte_limit;
     let nodes = node_components(state);
     let pnpm_mode = lock_kind == NodeLockKind::Pnpm;
     if !nodes.is_empty() && pnpm_mode {
