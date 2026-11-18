@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
@@ -380,20 +380,22 @@ pub(crate) fn read_regular_snapshot(
         "{label} must be a regular file: {}",
         path.display()
     );
-    ensure!(
-        metadata.len() <= maximum,
-        "{label} exceeds byte budget: {}",
-        path.display()
-    );
+    let too_large = || {
+        io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("{label} exceeds byte budget: {}", path.display()),
+        )
+    };
+    if metadata.len() > maximum {
+        return Err(too_large().into());
+    }
     let mut bytes = Vec::new();
     (&file)
         .take(maximum.checked_add(1).context("Invalid file byte budget")?)
         .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= maximum,
-        "{label} exceeds byte budget: {}",
-        path.display()
-    );
+    if bytes.len() as u64 > maximum {
+        return Err(too_large().into());
+    }
     let identity = FileIdentity {
         sha256: digest(&bytes),
         mode: metadata.permissions().mode() & 0o777,

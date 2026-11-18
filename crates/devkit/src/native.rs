@@ -1843,10 +1843,14 @@ fn record_dependency(
         return record(root, files, name, true);
     };
     let path = input_path(root, name)?;
+    let key = relative_name(&project_root(root)?, &path)?;
+    if files.get(&key).is_some_and(Option::is_some) {
+        return Ok(());
+    }
     let (bytes, identity) = read_regular_file(&path, *remaining, "local dependency input")?
         .with_context(|| format!("Missing native input: {name}"))?;
     *remaining -= bytes.len() as u64;
-    files.insert(relative_name(&project_root(root)?, &path)?, Some(identity));
+    files.insert(key, Some(identity));
     Ok(())
 }
 fn local_dependency(

@@ -540,7 +540,7 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 manifest.truncate(256 * 1024 * 1024)
             result = run(*make, "info", "json=1", timeout=3, preexec_fn=lambda: resource.setrlimit(
                 resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024)))
-            self.assertEqual(json.loads(result.stdout)["result"]["readiness"], "setup-required")
+            self.assertEqual(json.loads(result.stdout)["result"]["readiness"], "unknown")
 
     def test_make_info_bounds_local_dependency_artifacts(self):
         import resource
@@ -567,7 +567,7 @@ class EngineVersionAdmissionTests(unittest.TestCase):
             limit = 128 * 1024 * 1024
             info = run("make", "--no-print-directory", "-C", str(root), "info", "json=1", timeout=3,
                        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_AS, (limit, limit)))
-            self.assertEqual(json.loads(info.stdout)["result"]["readiness"], "setup-required")
+            self.assertEqual(json.loads(info.stdout)["result"]["readiness"], "unknown")
 
     def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:

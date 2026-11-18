@@ -225,6 +225,32 @@ fn observe_stand(
     Ok((known, services))
 }
 
+fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'static str> {
+    let native = match crate::native::inspect_native_components(root, state) {
+        Ok(native) => native,
+        Err(error) => {
+            let exceeds_budget = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge);
+            return Ok(if exceeds_budget {
+                "unknown"
+            } else {
+                "setup-required"
+            });
+        }
+    };
+    let receipts = crate::doctor::local_receipts(root, state, Some(&native.node_inputs.digest))?;
+    let ready = state.components.values().all(|c| match c.toolchain {
+        Toolchain::Rust => receipts["rustImageReady"] == true,
+        Toolchain::Node => {
+            receipts["nodeWorkspaceReady"] == true
+                && (c.tooling_profile != ToolingProfile::Electron
+                    || receipts["desktopImageReady"] == true)
+        }
+    });
+    Ok(if ready { "ready" } else { "setup-required" })
+}
+
 pub(crate) fn inspect(
     root: &Path,
     app: Option<&str>,
@@ -316,23 +342,9 @@ pub(crate) fn inspect(
             && pins_version.as_deref() == Some(&state.version)
             && state.version == env!("CARGO_PKG_VERSION")
         {
-            readiness = if busy {
-                "unknown"
-            } else if let Ok(native) = crate::native::inspect_native_components(&root, state) {
-                let receipts =
-                    crate::doctor::local_receipts(&root, state, Some(&native.node_inputs.digest))?;
-                let needed = state.components.values().all(|c| match c.toolchain {
-                    Toolchain::Rust => receipts["rustImageReady"] == true,
-                    Toolchain::Node => {
-                        receipts["nodeWorkspaceReady"] == true
-                            && (c.tooling_profile != ToolingProfile::Electron
-                                || receipts["desktopImageReady"] == true)
-                    }
-                });
-                if needed { "ready" } else { "setup-required" }
-            } else {
-                "setup-required"
-            };
+            if !busy {
+                readiness = local_readiness(&root, state)?;
+            }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             if let Some(ports) = &ports {
                 reservations = preview::reservations_from(ports, true).unwrap_or_default();
