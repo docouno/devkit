@@ -1703,7 +1703,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     if request.command == "down" {
         use crate::stand::{history::History, ledger::Ledger, ports::Ports};
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let history = History::read(&pre_root, runner, deadline)?;
+        let mut history = History::read(&pre_root, runner, deadline)?;
         if let Some(history) = &history {
             history.prove_lease_history(&pre_root)?;
             if history.has_daemon() {
@@ -1721,10 +1721,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 }
             }
         }
-        if request.cleanup
-            && !history.as_ref().is_some_and(History::may_have_actors)
-            && cleanup_without_stand(&request, &pre_root)?
-        {
+        if request.cleanup && cleanup_without_stand(&request, &pre_root, history.as_mut())? {
             return Ok(());
         }
     }
@@ -2035,7 +2032,11 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
 }
 /// This path consumes the accepted manifest, engine pin and stand receipts only.
 /// Project/Compose/SDK inputs are irrelevant when no launch can need stopping.
-fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> {
+fn cleanup_without_stand(
+    request: &RuntimeRequest,
+    root: &Path,
+    history: Option<&mut crate::stand::history::History>,
+) -> Result<bool> {
     if request.component.is_some()
         || request.app.is_some()
         || request.package.is_some()
@@ -2045,6 +2046,14 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
     }
     let ledger = crate::stand::ledger::Ledger::read(root)?;
     if ledger.as_ref().is_some_and(|l| !l.empty_or_prepared()) {
+        return Ok(false);
+    }
+    // After daemon admission accept an explicit empty ledger paired with its
+    // lease receipt, or the stopped proof recorded by an earlier cleanup.
+    let needs_proof = history
+        .as_ref()
+        .is_some_and(|history| history.may_have_actors());
+    if needs_proof && ledger.is_none() {
         return Ok(false);
     }
     let unarmed = ledger.as_ref().is_some_and(|l| !l.inspections.is_empty());
@@ -2097,6 +2106,9 @@ fn cleanup_without_stand(request: &RuntimeRequest, root: &Path) -> Result<bool> 
     {
         ports.possible_actors = false;
         ports.save()?;
+    }
+    if let Some(history) = history.filter(|_| needs_proof) {
+        history.record_stopped(root)?;
     }
     if ledger.is_some() {
         remove_file(&safe_path(root, crate::stand::ledger::ACTIVE)?)?;
@@ -2882,7 +2894,7 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
         }
     } else {
         ensure!(
-            cleanup_without_stand(&request, &root)?,
+            cleanup_without_stand(&request, &root, None)?,
             "Could not prove the stand is empty; restore its ownership records before removing this checkout"
         );
     }

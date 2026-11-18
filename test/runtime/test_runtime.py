@@ -1198,6 +1198,8 @@ class RuntimeTests(unittest.TestCase):
                             (denied / "docker").chmod(0o755)
                             no_docker = dict(environment, PATH=str(denied) + os.pathsep + environment["PATH"], CLEANUP_DOCKER_TRACE=str(trace))
                             self.make("down", "cleanup=1", env=no_docker)
+                            observed = json.loads(self.make("info", "json=1", env=no_docker).stdout)["result"]
+                            self.assertEqual(observed["standState"], "stopped")
                             self.assertFalse(trace.exists())
                 finally:
                     proxy.release.set()
@@ -1404,7 +1406,8 @@ class RuntimeTests(unittest.TestCase):
                         self.assertIn("deadline", stderr)
                         self.assertIsNone(container(project + "-main-1"), stdout + stderr)
                         self.assertFalse(proxy.completed.is_set(), "The response was released before the native deadline")
-                    self.make("down", "cleanup=1", env=environment)
+                        proxy.release.set()
+                        self.make("down", "cleanup=1", env=selected)
                     owner = proxy.record.get("labels", {}).get("io.docouno.devkit.inspection-owner")
                     if owner:
                         self.assertEqual(run("docker", "ps", "--all", "--filter",
