@@ -464,3 +464,24 @@ pub fn remove_owned(
     );
     Ok(())
 }
+
+pub(crate) fn stop_owned(
+    rows: &[Container],
+    project: &str,
+    owner: &Owner,
+    runner: &ProcessRunner,
+) -> Result<()> {
+    verify_owners(rows, owner)?;
+    for row in rows {
+        let actual = inspect(&row.id, runner)?;
+        ensure!(
+            actual.project == project && actual.owner == owner.key && actual.service == row.service,
+            "Container ownership changed before stop"
+        );
+        if actual.running {
+            runner.capture(Command::new("docker").args(["stop", &row.id]))?;
+        }
+        runner.capture(Command::new("docker").args(["rm", &row.id]))?;
+    }
+    Ok(())
+}

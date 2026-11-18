@@ -6,6 +6,7 @@ import errno
 import fcntl
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import shutil
 import signal
 import socketserver
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -406,6 +408,104 @@ class ReleaseFixture:
 
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
+    @unittest.skipUnless(DOCKER_ENABLED and os.environ.get("DEVKIT_BASELINE_SET"), "Requires the real baseline and Docker")
+    def test_legacy_volume_survives_native_update_and_git_delivery(self):
+        baseline = Path(os.environ["DEVKIT_BASELINE_SET"]) / "payload"
+        old_engine = baseline / "devkit"
+        upgraded = None
+        for route in ("native", "git"):
+            target = self.root / ("legacy " + route)
+            token = uuid.uuid4().hex
+            label = "io.docouno.devkit.fixture"
+            env = self.env
+            def run(*args, **kwargs):
+                return execute(args, cwd=kwargs.pop("cwd", target), env=env, timeout=kwargs.pop("timeout", 360), **kwargs)
+            run(old_engine, "init", target, "--app", "api=rust-api", "--name", "legacy-fixture",
+                "--release-root", baseline, "--package-source", "local", "--non-interactive", cwd=self.root)
+            compose = {"services": {"api": {"image": "${DEVKIT_NODE_IMAGE:?}", "user": "0:0",
+                        "command": ["node", "-e", "const fs=require('node:fs');if(!fs.existsSync('/state/value'))fs.writeFileSync('/state/value','seed');setTimeout(()=>{},240000)"],
+                        "volumes": ["store:/state"], "labels": {label: token}}},
+                       "volumes": {"store": {"labels": {label: token}}}, "networks": {"default": {"labels": {label: token}}}}
+            (target / "compose.yaml").write_text(json.dumps(compose))
+            makefile = (target / "Makefile").read_bytes()
+            compose_bytes = (target / "compose.yaml").read_bytes()
+            run("git", "init", "-b", "main")
+            run("git", "config", "user.name", "Fixture")
+            run("git", "config", "user.email", "fixture@example.invalid")
+            run("git", "add", ".")
+            run("git", "commit", "-m", "Create baseline checkout")
+            cid = None
+            volume = None
+            def find_actor():
+                return run("docker", "ps", "--quiet", "--no-trunc", "--filter", f"label={label}={token}").stdout.strip()
+            try:
+                run("make", "setup")
+                run("make", "up")
+                cid = find_actor()
+                observed = json.loads(run("docker", "container", "inspect", cid).stdout)[0]
+                volume = next(m["Name"] for m in observed["Mounts"] if m["Destination"] == "/state")
+                run("docker", "exec", cid, "node", "-e", f"require('node:fs').writeFileSync('/state/value',{json.dumps(token)})")
+                if route == "native":
+                    run("make", "down")
+                    run(ENGINE, "update", ".", "--to", self.version, "--release-root", RELEASE, "--non-interactive")
+                    updated = json.loads((target / ".devkit/manifest.json").read_text())
+                    upgraded = {name: ((target / name).read_bytes(), stat.S_IMODE((target / name).stat().st_mode))
+                                for name in [*updated["managed"], ".devkit/manifest.json"]}
+                else:
+                    run("git", "switch", "-c", "toolchain-update")
+                    old_state = json.loads((target / ".devkit/manifest.json").read_text())
+                    for name in old_state["managed"].keys() - upgraded.keys():
+                        (target / name).unlink()
+                    for name, (data, mode) in upgraded.items():
+                        path = target / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(data)
+                        path.chmod(mode)
+                    run("git", "add", ".")
+                    run("git", "commit", "-m", "Deliver the accepted environment")
+                    run("git", "switch", "main")
+                    run("git", "merge", "--ff-only", "toolchain-update")
+                    run("make", "down")
+                self.assertEqual((target / "Makefile").read_bytes(), makefile)
+                self.assertEqual((target / "compose.yaml").read_bytes(), compose_bytes)
+                run("make", "setup")
+                run("make", "up")
+                cid = find_actor()
+                self.assertEqual(run("docker", "exec", cid, "cat", "/state/value").stdout, token)
+                mounts = json.loads(run("docker", "container", "inspect", cid).stdout)[0]["Mounts"]
+                self.assertEqual(next(m["Name"] for m in mounts if m["Destination"] == "/state"), volume)
+                run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".")
+                self.assertEqual(run("docker", "volume", "inspect", volume).returncode, 0)
+                self.assertEqual(find_actor(), "")
+            finally:
+                run("make", "down", check=False)
+                actor = find_actor()
+                if actor:
+                    run("docker", "rm", "--force", actor, check=False)
+                if volume:
+                    inspected = run("docker", "volume", "inspect", volume, check=False)
+                    if inspected.returncode == 0 and json.loads(inspected.stdout)[0]["Labels"].get(label) == token:
+                        run("docker", "volume", "rm", volume)
+
+    @unittest.skipUnless(DOCKER_ENABLED, "Requires the pinned SDK containers")
+    def test_frozen_readme_make_lifecycle(self):
+        spec = importlib.util.spec_from_file_location("public_readme_flow", REPO / "test/public/readme.py")
+        readme = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(readme)
+        target = self.root / "my-product"
+        self.cli("init", target, "--app", "web=react-web", "--name", "my-product",
+                 "--release-root", RELEASE, "--package-source", "local", "--non-interactive", timeout=240)
+        def make(*args, label):
+            result = execute(["make", *args], cwd=target, env=self.env, timeout=360)
+            EVIDENCE.append({"case": "readme", "step": label})
+            return result.stdout
+        make("help", label="readme-cold-help")
+        make("info", "json=1", label="readme-cold-info")
+        readme.add_readme_components(make, target)
+        readme.update_readme_project(make, self.version)
+        make("setup", label="readme-after-update-setup")
+        make("check", label="readme-after-update-check")
+
     @unittest.skipUnless(DOCKER_ENABLED, "Requires the host Compose plugin")
     def test_generated_worktrunk_hooks_reserve_and_finalize_native_worktrees(self):
         project = self.create(self.root / "project with spaces")

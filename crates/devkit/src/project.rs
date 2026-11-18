@@ -1347,7 +1347,7 @@ fn registration_intent(change: &Change, options: &UpdateOptions<'_>) -> Result<(
     Ok(match change {
         Change::Add { role, spec } => (
             component_path(*role, &spec.name)?,
-            json!({"template": spec.template, "api": options.api, "use": spec.uses, "reconcile": reconcile}),
+            json!({"template": template(&spec.template)?.id, "api": options.api, "use": spec.uses, "reconcile": reconcile}),
         ),
         Change::Register {
             role,

@@ -406,6 +406,35 @@ def write_rust_fixture(root):
 
 
 class EngineVersionAdmissionTests(unittest.TestCase):
+    def test_make_preserves_literal_inputs_before_projection_probe(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-make-literal-") as temporary:
+            root = Path(temporary) / "project"
+            write_rust_fixture(root)
+            loader = Path(temporary) / "argv.sh"
+            loader.write_text('#!/bin/sh\nprintf "%s\\n" "$DEVKIT_EXEC_COMMAND"\n')
+            make = ["make", "--no-print-directory", "-C", str(root)]
+            value = "echo '$(warning literal-argument-was-expanded)' '$VAR'"
+            for alias in ("command", "cmd"):
+                output = run(*make, "exec", f"{alias}={value}", f"devkit_loader={loader}")
+                self.assertEqual(output.stdout.strip(), value)
+                self.assertEqual(output.stderr, "")
+
+    def test_make_rejects_projection_replaced_after_parsing(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-make-plan-") as temporary:
+            base = Path(temporary)
+            root, next_root = base / "project", base / "next"
+            write_rust_fixture(root)
+            shutil.copytree(root, next_root)
+            shutil.copytree(next_root / "apps/api", next_root / "apps/extra")
+            accept_runtime(next_root, native=True)
+            shutil.copytree(next_root / "apps/extra", root / "apps/extra")
+            local = root / "Makefile"
+            local.write_text(local.read_text() + "\nsetup-api: replace-projection\n"
+                             "replace-projection:\n\t@cp -a ../next/.devkit/. .devkit/\n")
+            failed = run("make", "--no-print-directory", "-C", str(root), "setup", check=False, timeout=10)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("Accepted Make plan changed during this invocation", failed.stderr)
+
     def test_early_reservation_on_linked_checkout_requires_no_docker_daemon(self):
         with tempfile.TemporaryDirectory(prefix="devkit-linked-reservation-") as temporary:
             base = Path(temporary)
@@ -439,6 +468,17 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 port = info["standPorts"][0]
                 self.assertEqual(port["localUrl"], f"http://127.0.0.1:{port['first']}")
                 self.assertEqual(port["previewUrl"], f"https://{port['first']}-review-api.example.test")
+            receipt = linked / ".devkit/state/ports.json"
+            saved = receipt.read_bytes()
+            receipt.unlink()
+            try:
+                for action in ("reserve", "remove"):
+                    result = run("sh", str(loader), "cli", "stand", action, ".",
+                                 cwd=linked, env=environment, check=False, timeout=4)
+                    self.assertIn("unexplained claim", result.stderr)
+                    self.assertFalse(receipt.exists())
+            finally:
+                receipt.write_bytes(saved)
             self.assertFalse((linked / ".devkit/state/stand.active").exists())
 
     def test_make_metadata_ignores_nonregular_projection_and_manifest(self):
@@ -470,7 +510,7 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 2)
                 self.assertEqual(busy["lock"]["state"], "busy")
                 self.assertEqual(busy["standState"], "unknown")
-            for name in ("manifest.json", "project.mk"):
+            for name in ("manifest.json", "project.mk", "tooling-profiles.json"):
                 path = root / ".devkit" / name
                 original = path.read_bytes()
                 path.unlink()
@@ -479,8 +519,9 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                     self.assertIn("make exec", run(*make, "help", timeout=3).stdout)
                     run(*make, "info", "json=1", timeout=3)
                     run(*make, "recover", timeout=3)
-                    failed = run(*make, "check", check=False, timeout=3)
-                    self.assertIn("cannot read accepted Make projection", failed.stderr)
+                    if name != "tooling-profiles.json":
+                        failed = run(*make, "check", check=False, timeout=3)
+                        self.assertIn("cannot read accepted Make projection", failed.stderr)
                 finally:
                     path.unlink()
                     path.write_bytes(original)

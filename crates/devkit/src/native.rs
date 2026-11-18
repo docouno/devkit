@@ -4,8 +4,8 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        SemVer, digest, exists, identity, input_path, is_pnpm_yaml, object, project_root,
-        read_json, relative_name, safe_path, sorted_entries, text,
+        SemVer, digest, exists, identity, input_path, object, project_root, read_regular_file,
+        relative_name, safe_path, sorted_entries, text,
     },
     model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
@@ -280,21 +280,12 @@ pub fn dependency_table(data: &Fields, field: &str) -> Result<Fields> {
 }
 
 fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
-    let before =
-        identity(path)?.with_context(|| format!("Missing native input: {}", path.display()))?;
-    let bytes = if is_pnpm_yaml(path) {
-        crate::pnpm::read_yaml_file(path)?
-            .context("Missing pnpm YAML input")?
-            .0
+    if crate::files::is_pnpm_yaml(path) {
+        crate::pnpm::read_yaml_file(path)?.context("Missing pnpm YAML input")
     } else {
-        fs::read(path)?
-    };
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(path)? == Some(before.clone()),
-        "Native input changed while reading: {}",
-        path.display()
-    );
-    Ok((bytes, before))
+        read_regular_file(path, 32 * 1024 * 1024, "native metadata")?
+            .with_context(|| format!("Missing native input: {}", path.display()))
+    }
 }
 fn manifest_snapshot(root: &Path, path: &str) -> Result<(Fields, FileIdentity)> {
     let name = if path.is_empty() {
@@ -1908,7 +1899,13 @@ pub fn assert_component_manifests(root: &Path, state: &ProjectState) -> Result<(
     Ok(())
 }
 pub fn assert_tool_profiles(root: &Path, state: &ProjectState) -> Result<()> {
-    let value: Value = read_json(&safe_path(root, ".devkit/tooling-profiles.json")?)?;
+    let (bytes, _) = read_regular_file(
+        &safe_path(root, ".devkit/tooling-profiles.json")?,
+        4 * 1024 * 1024,
+        "tooling profiles",
+    )?
+    .context("Missing tooling profiles")?;
+    let value: Value = serde_json::from_slice(&bytes)?;
     let payload = object(&value, "accepted tooling profiles")?;
     ensure!(
         payload.get("schemaVersion") == Some(&json!(1))
@@ -2547,13 +2544,13 @@ pub fn parse_manifest_npmrc_policy(root: &Path, kind: NodeLockKind) -> Result<Np
         reject_pnpm_hooks(root, "")?;
     }
     let path = input_path(root, ".npmrc")?;
-    if identity(&path)?.is_none() {
+    let Some((bytes, _)) = read_regular_file(&path, 1024 * 1024, "npm configuration")? else {
         return Ok(NpmrcPolicy::default());
-    }
+    };
     let mut policy = NpmrcPolicy::default();
     let mut seen_keys = BTreeSet::new();
     let defaults = npmrc_safe_defaults(kind);
-    for raw_line in fs::read_to_string(&path)?.lines() {
+    for raw_line in std::str::from_utf8(&bytes)?.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
@@ -2688,10 +2685,10 @@ pub fn parse_and_admit_npmrc(
             reject_pnpm_hooks(root, directory)?;
         }
         let path = input_path(root, format!("{directory}/.npmrc"))?;
-        if identity(&path)?.is_none() {
+        let Some((bytes, _)) = read_regular_file(&path, 1024 * 1024, "npm configuration")? else {
             continue;
-        }
-        for raw_line in fs::read_to_string(&path)?.lines() {
+        };
+        for raw_line in std::str::from_utf8(&bytes)?.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with(['#', ';']) {
                 continue;

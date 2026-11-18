@@ -19,6 +19,18 @@ export DEVKIT_PACKAGE_AGGREGATE := 0
 export DEVKIT_DEV_GROUP :=
 export DEVKIT_TARGET_COMPONENT :=
 
+# Capture aliases before unexport, which defines an absent variable in GNU Make.
+devkit_command_present := $(if $(filter undefined,$(origin command)),,1)
+devkit_cmd_present := $(if $(filter undefined,$(origin cmd)),,1)
+export DEVKIT_EXEC_CONFLICT := $(and $(devkit_command_present),$(devkit_cmd_present))
+export DEVKIT_EXEC_COMMAND := $(if $(devkit_command_present),$(value command),$(value cmd))
+export DEVKIT_EXEC_COMPONENT := $(value component)
+export DEVKIT_EXEC_WRITE := $(or $(value write),0)
+export DEVKIT_EXEC_NETWORK := $(or $(value network),none)
+export DEVKIT_EXEC_PREPARE := $(or $(value prepare),0)
+unexport app package follow tail headless cleanup reconcile preview json
+unexport name template api use profile to command cmd component write network prepare
+
 devkit_loader := .devkit/runtime/devkit.sh
 devkit_projection := $(shell test -d .devkit && test ! -L .devkit && test -f .devkit/project.mk && test ! -L .devkit/project.mk && test -r .devkit/project.mk && printf yes)
 ifeq ($(devkit_projection),yes)
@@ -112,17 +124,6 @@ $(addprefix build/packages/,$(DEVKIT_REGISTERED_PACKAGES)): build/packages/%:
 $(addprefix package/packages/,$(DEVKIT_REGISTERED_PACKAGES)): package/packages/%:
 	@exec sh $(devkit_loader) package
 
-# Capture aliases before unexport, which defines an absent variable in GNU Make.
-devkit_command_present := $(if $(filter undefined,$(origin command)),,1)
-devkit_cmd_present := $(if $(filter undefined,$(origin cmd)),,1)
-export DEVKIT_EXEC_CONFLICT := $(and $(devkit_command_present),$(devkit_cmd_present))
-export DEVKIT_EXEC_COMMAND := $(if $(devkit_command_present),$(value command),$(value cmd))
-export DEVKIT_EXEC_COMPONENT := $(value component)
-export DEVKIT_EXEC_WRITE := $(or $(value write),0)
-export DEVKIT_EXEC_NETWORK := $(or $(value network),none)
-export DEVKIT_EXEC_PREPARE := $(or $(value prepare),0)
-unexport app package follow tail headless cleanup reconcile preview json
-unexport name template api use profile to command cmd component write network prepare
 .PHONY: exec
 exec:
 	@exec sh $(devkit_loader) exec

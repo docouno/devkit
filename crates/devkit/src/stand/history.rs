@@ -64,12 +64,20 @@ impl ResourceDeclarations {
                 for (alias, resource) in data[kind].as_object().into_iter().flatten() {
                     let external = resource
                         .get("external")
-                        .is_some_and(|v| v != false && !v.is_null());
-                    let explicit = resource["name"].as_str();
-                    if external || explicit.is_some() {
+                        .filter(|v| *v != false && !v.is_null());
+                    let nested = match external {
+                        Some(value) if value != true => Some(
+                            value["name"]
+                                .as_str()
+                                .context("Unrecognized Compose external resource declaration")?,
+                        ),
+                        _ => None,
+                    };
+                    let explicit = resource["name"].as_str().or(nested);
+                    if external.is_some() || explicit.is_some() {
                         names.insert(alias.clone());
                     }
-                    if external || explicit.is_some() {
+                    if external.is_some() || explicit.is_some() {
                         let value = explicit.unwrap_or(alias);
                         let name = if value.contains('$') {
                             model[kind][alias]["name"].as_str()
@@ -149,6 +157,8 @@ pub(crate) struct History {
     pub(crate) retired: bool,
     pub(crate) cleaned: bool,
     #[serde(default)]
+    lease_cache: Option<PathBuf>,
+    #[serde(default)]
     networks: BTreeMap<String, Resource>,
     #[serde(default)]
     volumes: BTreeMap<String, Resource>,
@@ -190,6 +200,18 @@ impl History {
     ) -> Result<Option<Self>> {
         let witness: Option<Identity> =
             read_bounded(&witness_path(root, runner, deadline)?, 65536)?;
+        let local: Option<Identity> = read_bounded(
+            &safe_path(root, &format!(".devkit/cache/{WITNESS}"))?,
+            65536,
+        )?;
+        ensure!(
+            witness
+                .as_ref()
+                .zip(local.as_ref())
+                .is_none_or(|(git, cache)| git == cache),
+            "Conflicting checkout ownership witnesses"
+        );
+        let witness = witness.or(local);
         let receipt: Option<Self> = read_bounded(&safe_path(root, RECEIPT)?, 4 * 1024 * 1024)?;
         match (witness, receipt) {
             (None, None) => Ok(None),
@@ -233,6 +255,7 @@ impl History {
             daemon: None,
             retired: false,
             cleaned: false,
+            lease_cache: None,
             networks: BTreeMap::new(),
             volumes: BTreeMap::new(),
             builds: BTreeMap::new(),
@@ -265,6 +288,20 @@ impl History {
 
     pub(crate) fn has_daemon(&self) -> bool {
         self.daemon.is_some()
+    }
+
+    pub(crate) fn prove_lease_history(&self, root: &Path) -> Result<()> {
+        if let Some(cache) = &self.lease_cache {
+            super::ports::Ports::verify_checkout_claims(root, cache)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_lease_cache(&mut self, root: &Path, cache: &Path) -> Result<()> {
+        self.prove_lease_history(root)?;
+        super::ports::Ports::verify_checkout_claims(root, cache)?;
+        self.lease_cache = Some(cache.to_owned());
+        self.save(root)
     }
 
     pub(crate) fn verify_daemon(&self, runner: &ProcessRunner, deadline: Instant) -> Result<()> {
@@ -421,17 +458,59 @@ impl History {
         runner: &ProcessRunner,
     ) -> Result<()> {
         for row in rows {
-            for mount in row
+            let candidate_mounts: Vec<_> = row
                 .mounts
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|m| m["Type"] == "volume")
+                .filter_map(|m| m["Name"].as_str())
+                .filter(|name| {
+                    SHA256_RE.is_match(name) && !declarations.protected_volumes.contains(*name)
+                })
+                .collect();
+            if candidate_mounts.is_empty() {
+                continue;
+            }
+            let inspected = runner.capture(Command::new("docker").args([
+                "container", "inspect", "--format", "{{json .HostConfig.VolumesFrom}}\n{{json .HostConfig.Mounts}}\n{{json .HostConfig.Binds}}", &row.id
+            ]))?;
+            let fields = inspected
+                .text()?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ensure!(
+                fields.len() == 3
+                    && fields
+                        .iter()
+                        .all(|value| value.is_array() || value.is_null()),
+                "Cannot establish anonymous mount origin"
+            );
+            // Docker repeats the provider's anonymous label on volumes_from.
+            // Admission is limited to allocations made by the observed container.
+            if fields[0]
+                .as_array()
+                .is_some_and(|providers| !providers.is_empty())
             {
-                let Some(name) = mount["Name"].as_str().filter(|s| SHA256_RE.is_match(s)) else {
-                    continue;
-                };
-                if declarations.protected_volumes.contains(name) {
+                continue;
+            }
+            for name in candidate_mounts {
+                let explicit_mount = fields[1]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|mount| mount["Source"] == name);
+                let explicit_bind = fields[2]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|bind| {
+                        bind.split_once(':')
+                            .is_some_and(|(source, _)| source == name)
+                    });
+                if explicit_mount || explicit_bind {
                     continue;
                 }
                 let volume = inspect(runner, "volume", name)?.context("Missing mounted volume")?;

@@ -1696,8 +1696,14 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     } else {
         CheckoutLock::acquire_exclusive(&request.root, &lock_op, Some(runner))?
     };
-    if request.command == "down" && request.cleanup && cleanup_without_stand(&request, &pre_root)? {
-        return Ok(());
+    if request.command == "down" && request.cleanup {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        if let Some(history) = crate::stand::history::History::read(&pre_root, runner, deadline)? {
+            history.prove_lease_history(&pre_root)?;
+        }
+        if cleanup_without_stand(&request, &pre_root)? {
+            return Ok(());
+        }
     }
     let service = ["status", "logs", "down"].contains(&request.command.as_str());
     let tool = if service {
@@ -2263,11 +2269,13 @@ fn run_service(
             crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
         }
     }
+    let mut down_actors = None;
     if let Some((history, declarations)) = &mut resource_history {
         if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
             let mut rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
             rows.retain(|row| row.owner == ports.owner.key);
             history.record_anonymous(&ctx.admission.root, &rows, declarations, ctx.runner)?;
+            down_actors = Some((ports.owner, rows));
         }
         assert_compose_inventory(&ctx.admission.root, &inventory)?;
     }
@@ -2339,7 +2347,9 @@ fn run_service(
         for line in reservation_lines {
             println!("{line}");
         }
-    } else {
+    } else if let Some((owner, rows)) = down_actors {
+        crate::stand::ledger::stop_owned(&rows, &ctx.project, &owner, ctx.runner)?;
+    } else if resource_history.is_none() {
         ctx.runner.checked(&mut command, OutputMode::Inherit)?;
     }
     if request.command == "down" {
@@ -2610,6 +2620,7 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
     let ctx = PreparedContext::new(adm, runner, cache)?;
     if let Some(history) = crate::stand::history::History::read(&root, runner, deadline)? {
         history.allow_start()?;
+        history.prove_lease_history(&root)?;
     }
     let mut leases = ports::Ports::open(&root, &ctx.cache_root()?)?;
     if leases.possible_actors || ledger::Ledger::read(&root)?.is_some_and(|l| !l.completed_empty())
@@ -2725,6 +2736,19 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
         &BTreeSet::new(),
         &BTreeSet::new(),
         |candidate| {
+            candidate.early_plans.clone_from(&plans);
+            for service in &selected {
+                candidate
+                    .service_preview_renderer
+                    .insert(service.clone(), renderer.clone());
+            }
+            let mut history = crate::stand::history::History::open(&root, runner, deadline)?;
+            history.allow_start()?;
+            history.bind_lease_cache(&root, &candidate.cache_root)?;
+            Ok(())
+        },
+        Some(deadline),
+        || {
             runner.check_cancelled()?;
             ctx.admission.recheck()?;
             assert_compose_inventory(&root, &inventory)?;
@@ -2734,16 +2758,8 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
                     "Compose input changed before reservation"
                 );
             }
-            candidate.early_plans.clone_from(&plans);
-            for service in &selected {
-                candidate
-                    .service_preview_renderer
-                    .insert(service.clone(), renderer.clone());
-            }
-            crate::stand::history::History::open(&root, runner, deadline)?.allow_start()?;
             Ok(())
         },
-        Some(deadline),
     )?;
     Ok(true)
 }
@@ -2771,6 +2787,7 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
     if history.cleaned {
         return Ok(());
     }
+    history.prove_lease_history(&root)?;
     history.retired = true;
     history.save(&root)?;
     if history.has_daemon() {
@@ -2858,6 +2875,7 @@ fn run_development(
     let deadline = Instant::now() + Duration::from_secs(3);
     if let Some(history) = crate::stand::history::History::read(&root, ctx.runner, deadline)? {
         history.allow_start()?;
+        history.prove_lease_history(&root)?;
         history.verify_daemon(ctx.runner, deadline)?;
     }
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
@@ -3090,6 +3108,7 @@ fn run_development(
         Instant::now() + Duration::from_secs(3),
     )?;
     history.allow_start()?;
+    history.bind_lease_cache(&root, &ports.cache_root)?;
     history.bind_daemon(&root, ctx.runner)?;
     let declarations_for_removal =
         crate::stand::history::ResourceDeclarations::read(&root, &inventory, &model)?;

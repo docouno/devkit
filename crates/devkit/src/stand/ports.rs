@@ -238,6 +238,7 @@ impl Ports {
         Ok(Some(value))
     }
     pub fn open(root: &Path, cache_root: &Path) -> Result<Self> {
+        Self::verify_checkout_claims(root, cache_root)?;
         if let Some(value) = Self::read(root)? {
             ensure!(
                 value.cache_root == cache_root,
@@ -264,6 +265,23 @@ impl Ports {
         };
         value.save()?;
         Ok(value)
+    }
+
+    pub(crate) fn verify_checkout_claims(root: &Path, cache: &Path) -> Result<()> {
+        let local = Self::read(root)?;
+        let physical = Physical::at(root)?;
+        let registry = Registry::read(cache)?;
+        ensure!(
+            registry.claims.iter().all(|claim| {
+                claim.owner.root != root
+                    || claim.owner.physical != physical
+                    || local
+                        .as_ref()
+                        .is_some_and(|ports| ports.owner == claim.owner)
+            }),
+            "Port registry contains an unexplained claim for this checkout; restore the lease receipt"
+        );
+        Ok(())
     }
     pub fn save(&self) -> Result<()> {
         ensure!(
@@ -319,7 +337,7 @@ impl Ports {
         retry: &BTreeSet<String>,
         before_claims: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        self.allocate_plan_until(plan, active, retry, before_claims, None)
+        self.allocate_plan_until(plan, active, retry, before_claims, None, || Ok(()))
     }
 
     pub(crate) fn allocate_plan_until(
@@ -329,6 +347,7 @@ impl Ports {
         retry: &BTreeSet<String>,
         mut before_claims: impl FnMut(&mut Self) -> Result<()>,
         deadline: Option<Instant>,
+        recheck: impl Fn() -> Result<()>,
     ) -> Result<()> {
         ensure!(
             plan.declarations
@@ -353,17 +372,15 @@ impl Ports {
         let mut ordered: Vec<_> = plan.declarations.iter().collect();
         ordered.sort_by_key(|b| (Some(b.service.as_str()) != plan.primary, &b.service, b.slot));
         let propose = |ports: &Self, registry: &Registry| {
-            if deadline.is_some() {
-                ensure!(
-                    !registry
-                        .claims
-                        .iter()
-                        .any(|c| c.owner.physical == ports.owner.physical
-                            && c.owner.root == ports.owner.root
-                            && c.owner != ports.owner),
-                    "Port registry contains an unexplained claim for this checkout"
-                );
-            }
+            ensure!(
+                !registry
+                    .claims
+                    .iter()
+                    .any(|c| c.owner.physical == ports.owner.physical
+                        && c.owner.root == ports.owner.root
+                        && c.owner != ports.owner),
+                "Port registry contains an unexplained claim for this checkout"
+            );
             ports.propose(&plan, &ordered, active, retry, range, registry, deadline)
         };
         let retry_until = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
@@ -396,6 +413,7 @@ impl Ports {
                 );
                 continue;
             }
+            recheck()?;
             for group in candidate.groups.iter().filter(|g| g.automatic) {
                 if let Some(old) = self.previous_automatic(&group.binding.key())
                     && old.first != group.first

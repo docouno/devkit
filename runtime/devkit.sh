@@ -95,6 +95,8 @@ if [ "$mode" = project ] && [ "$command" = help ]; then
     '          [write=1] [network=bridge] [prepare=1]  Run in the root Node workspace or a component' \
     'make add-app name=NAME template=ID [api=NAME] [use="NAME ..."] [reconcile=1]' \
     'make add-package name=NAME template=ID [use="NAME ..."] [reconcile=1]' \
+    '          App templates: node-api, rust-api, react-web, electron-react' \
+    '          Package templates: ts-library, react-ui, react-client' \
     'make register app=NAME|package=NAME profile=ID [reconcile=1]  Register existing source' \
     'make sync [reconcile=1] [preview=1]       Reconcile project metadata and generated files' \
     'make update to=VERSION [preview=1] [reconcile=1]  Upgrade the pinned Devkit release' \
@@ -122,6 +124,10 @@ fi
 
 boolean() { case "$2" in 0|1) ;; *) fail "$1 must be 0 or 1" ;; esac; }
 value() { case "$2" in ''|-*) fail "set $1 to a value that does not start with a hyphen" ;; esac; }
+slug() {
+  printf '%s\n' "$2" | LC_ALL=C grep -xEq '[a-z][a-z0-9]*(-[a-z0-9]+)*' &&
+    [ "$(printf '%s' "$2" | wc -l)" -eq 0 ] || fail "$1 must be a lowercase component name"
+}
 wrapped=0
 if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
   case "$command" in
@@ -129,7 +135,7 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
       boolean json "${DEVKIT_INFO_JSON:-0}"
       set -- --non-interactive info "$root"
       if [ -n "${DEVKIT_APP:-}" ]; then
-        value app "$DEVKIT_APP"
+        slug app "$DEVKIT_APP"
         set -- "$@" --app "$DEVKIT_APP"
       fi
       [ -z "${DEVKIT_PACKAGE:-}" ] || fail 'info accepts only the app selector'
@@ -139,29 +145,37 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
       set -- --non-interactive "$command" "$root"
       case "$command" in
         add-app|add-package)
-          value name "${DEVKIT_LIFECYCLE_NAME:-}"
-          value template "${DEVKIT_LIFECYCLE_TEMPLATE:-}"
+          slug name "${DEVKIT_LIFECYCLE_NAME:-}"
+          case "$command:${DEVKIT_LIFECYCLE_TEMPLATE:-}" in
+            add-app:node|add-app:node-app|add-app:node-api|add-app:rust|add-app:rust-app|add-app:rust-api|add-app:react|add-app:react-app|add-app:react-web|add-app:electron-react|add-package:ts-library|add-package:react-ui|add-package:react-client) ;;
+            *) fail 'set template to a supported id from make help' ;;
+          esac
           set -- "$@" --name "$DEVKIT_LIFECYCLE_NAME" --template "$DEVKIT_LIFECYCLE_TEMPLATE"
           if [ "$command" = add-app ] && [ -n "${DEVKIT_LIFECYCLE_API:-}" ]; then
-            value api "$DEVKIT_LIFECYCLE_API"
+            slug api "$DEVKIT_LIFECYCLE_API"
             set -- "$@" --api "$DEVKIT_LIFECYCLE_API"
           fi
           set -f
           for dependency in ${DEVKIT_LIFECYCLE_USE:-}; do
-            value use "$dependency"
+            slug use "$dependency"
             set -- "$@" --use "$dependency"
           done
           set +f ;;
         register)
-          value profile "${DEVKIT_LIFECYCLE_PROFILE:-}"
           case "${DEVKIT_APP:+app}${DEVKIT_PACKAGE:+package}" in
-            app) value app "$DEVKIT_APP"; set -- "$@" --app "$DEVKIT_APP" ;;
-            package) value package "$DEVKIT_PACKAGE"; set -- "$@" --package "$DEVKIT_PACKAGE" ;;
+            app) slug app "$DEVKIT_APP"; set -- "$@" --app "$DEVKIT_APP" ;;
+            package) slug package "$DEVKIT_PACKAGE"; set -- "$@" --package "$DEVKIT_PACKAGE" ;;
             *) fail 'register requires exactly one of app=NAME or package=NAME' ;;
+          esac
+          case "${DEVKIT_APP:+app}${DEVKIT_PACKAGE:+package}:${DEVKIT_LIFECYCLE_PROFILE:-}" in
+            app:node|app:web|app:electron|app:rust|package:rust|package:ts-library|package:react-ui|package:react-library) ;;
+            *) fail 'set profile to a supported id for the selected component' ;;
           esac
           set -- "$@" --profile "$DEVKIT_LIFECYCLE_PROFILE" ;;
         update)
           value to "${DEVKIT_LIFECYCLE_TO:-}"
+          printf '%s\n' "$DEVKIT_LIFECYCLE_TO" | LC_ALL=C grep -xEq '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[a-z0-9][a-z0-9.-]*)?' &&
+            [ "$(printf '%s' "$DEVKIT_LIFECYCLE_TO" | wc -l)" -eq 0 ] || fail 'to must be an exact release version'
           set -- "$@" --to "$DEVKIT_LIFECYCLE_TO" ;;
       esac
       if [ "$command" != recover ]; then
@@ -183,8 +197,15 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
       case "${DEVKIT_EXEC_NETWORK:-none}" in none|bridge) ;; *) fail 'network must be none or bridge' ;; esac
       set -- exec --root "$root" --network "${DEVKIT_EXEC_NETWORK:-none}"
       case "${DEVKIT_APP:+a}${DEVKIT_PACKAGE:+p}${DEVKIT_EXEC_COMPONENT:+c}" in
-        ''|a|p) ;;
-        c) value component "$DEVKIT_EXEC_COMPONENT"; set -- "$@" --component "$DEVKIT_EXEC_COMPONENT" ;;
+        '') ;;
+        a) slug app "$DEVKIT_APP" ;;
+        p) slug package "$DEVKIT_PACKAGE" ;;
+        c)
+          case "$DEVKIT_EXEC_COMPONENT" in
+            apps/*|packages/*) slug component "${DEVKIT_EXEC_COMPONENT#*/}" ;;
+            *) fail 'component must use apps/NAME or packages/NAME' ;;
+          esac
+          set -- "$@" --component "$DEVKIT_EXEC_COMPONENT" ;;
         *) fail 'choose at most one of app=, package=, or component=' ;;
       esac
       [ "${DEVKIT_EXEC_WRITE:-0}" = 0 ] || set -- "$@" --write
@@ -210,7 +231,14 @@ valid_engine() {
   engine_stamp=$(stat -c '%d:%i:%s:%z' -- "$engine") || return 1
   size=$(stat -c %s -- "$engine") || return 1
   [ "$size" -le 134217728 ] || return 1
-  observed=$(timeout --kill-after=0.05s 2s sha256sum -- "$engine") || return 1
+  observed=$(timeout --kill-after=0.05s 2s sh -c '
+    set -eu
+    exec 3<"$1"
+    fd=/proc/$$/fd/3
+    [ "$(stat -Lc "%d:%i:%s:%z" -- "$fd")" = "$2" ]
+    head -c 134217729 <&3 | sha256sum
+    [ "$(stat -Lc "%d:%i:%s:%z" -- "$fd")" = "$2" ]
+  ' sh "$engine" "$engine_stamp") || return 1
   [ "${observed%% *}" = "$expected" ] && [ "$(stat -c '%d:%i:%s:%z' -- "$engine")" = "$engine_stamp" ]
 }
 exec_prepare=0
@@ -272,9 +300,9 @@ if ! valid_engine; then
   chmod 755 -- "$temporary"
   # Creating this link is atomic and cannot replace a concurrent installation.
   ln -- "$temporary" "$engine" 2>/dev/null || :
-  valid_engine || fail 'the accepted engine could not be installed'
   cleanup
   trap - 0 INT TERM
+  valid_engine || fail 'the accepted engine could not be installed'
 fi
 [ "$(stat -c '%d:%i:%s:%z' -- "$engine")" = "$engine_stamp" ] || fail 'accepted engine changed before dispatch'
 if [ "$mode" = bootstrap ]; then

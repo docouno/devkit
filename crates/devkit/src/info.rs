@@ -95,7 +95,7 @@ pub(crate) fn git_checkout(
         );
     } else {
         ensure!(
-            git.is_dir() && git_dir == root.join(".git"),
+            git.is_file() || git_dir == root.join(".git"),
             "Unexpected main Git admin directory"
         );
     }
@@ -121,6 +121,9 @@ fn observe_stand(
     }
     let deadline = Instant::now() + Duration::from_secs(1);
     let resources = crate::stand::history::History::read(root, runner, deadline)?;
+    if let Some(history) = &resources {
+        history.prove_lease_history(root)?;
+    }
     let history = ledger::Ledger::read(root)?;
     let no_state = !exists(&safe_path(root, ".devkit/state")?)?;
     let no_services = state.components.values().all(|c| {
@@ -306,19 +309,20 @@ pub(crate) fn inspect(
             && pins_version.as_deref() == Some(&state.version)
             && state.version == env!("CARGO_PKG_VERSION")
         {
-            let receipts = crate::doctor::local_receipts(&root, state, None)?;
-            let needed = state.components.values().all(|c| match c.toolchain {
-                Toolchain::Rust => receipts["rustImageReady"] == true,
-                Toolchain::Node => {
-                    receipts["nodeWorkspaceReady"] == true
-                        && (c.tooling_profile != ToolingProfile::Electron
-                            || receipts["desktopImageReady"] == true)
-                }
-            });
             readiness = if busy {
                 "unknown"
-            } else if needed {
-                "ready"
+            } else if let Ok(native) = crate::native::admit_native_components(&root, state) {
+                let receipts =
+                    crate::doctor::local_receipts(&root, state, Some(&native.node_inputs.digest))?;
+                let needed = state.components.values().all(|c| match c.toolchain {
+                    Toolchain::Rust => receipts["rustImageReady"] == true,
+                    Toolchain::Node => {
+                        receipts["nodeWorkspaceReady"] == true
+                            && (c.tooling_profile != ToolingProfile::Electron
+                                || receipts["desktopImageReady"] == true)
+                    }
+                });
+                if needed { "ready" } else { "setup-required" }
             } else {
                 "setup-required"
             };
@@ -327,15 +331,18 @@ pub(crate) fn inspect(
                 reservations = preview::reservations_from(ports, true).unwrap_or_default();
                 reservations.retain(|r| selected.is_none_or(|s| s == r.service));
             }
-            if let Ok((observed, rows)) = observe_stand(
-                &root,
-                runner,
-                busy,
-                ports.as_ref(),
-                state,
-                branch.as_deref(),
-                selected,
-            ) {
+            let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
+            if !unreadable_claim
+                && let Ok((observed, rows)) = observe_stand(
+                    &root,
+                    runner,
+                    busy,
+                    ports.as_ref(),
+                    state,
+                    branch.as_deref(),
+                    selected,
+                )
+            {
                 condition = observed;
                 services = rows;
             }
