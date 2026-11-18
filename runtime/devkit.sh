@@ -239,7 +239,7 @@ else
 fi
 engine_metadata() { stat -c '%h/%d:%i:%s/%z' -- "$engine"; }
 engine_link_settled() {
-  current_stamp=$(engine_metadata) || return 1
+  current_stamp=$(engine_metadata 2>/dev/null) || return 1
   before_inode=${engine_stamp#*/}
   after_inode=${current_stamp#*/}
   [ "${engine_stamp%%/*}" = 2 ] && [ "${current_stamp%%/*}" = 1 ] \
