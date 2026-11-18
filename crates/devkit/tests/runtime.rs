@@ -602,6 +602,47 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     fs::create_dir_all(&fake_bin).unwrap();
     let attempt_dir = temp.path().join("attempts");
     fs::create_dir_all(&attempt_dir).unwrap();
+    let cache = temp.path().join("cache");
+    let ports = devkit::stand::ports::Ports::open(&root, &cache).unwrap();
+    let project = devkit::doctor::compose_project_name(&root);
+    let container_id = "a".repeat(64);
+    // A daemon cgroup error happens after container creation. Preserve that
+    // outcome in the fixture instead of claiming the creator produced nothing.
+    for (name, running) in [("stopped", false), ("running", true)] {
+        let values = vec![
+            json!(container_id),
+            json!(ports.owner.key),
+            json!(project),
+            json!("web"),
+            json!(running),
+            json!(format!("sha256:{}", "b".repeat(64))),
+            if running {
+                json!({"5173/tcp":[{"HostIp":"127.0.0.1","HostPort":"45173"}]})
+            } else {
+                json!({})
+            },
+            json!([]),
+            json!({"5173/tcp":[{"HostIp":"127.0.0.1","HostPort":"45173"}]}),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!(""),
+            json!("1"),
+        ];
+        fs::write(
+            temp.path().join(format!("{name}-observation")),
+            values
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
     let docker_script = fake_bin.join("docker");
     let script = format!(
         r#"#!/bin/sh
@@ -617,13 +658,29 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit 0
 fi
+if [ "$1" = "ps" ]; then
+  if [ -f "{fixture}/created" ]; then printf '%s\n' '{container_id}'; fi
+  exit 0
+fi
+if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then
+  if [ -f "{dir}/attempt-2.json" ]; then
+    cat "{fixture}/running-observation"
+  else
+    cat "{fixture}/stopped-observation"
+  fi
+  exit 0
+fi
 if [ "$1" = "compose" ]; then
   case " $* " in
     *" config --no-env-resolution --format json "*)
       printf '{{"services":{{"web":{{}}}}}}\n'
       exit 0
       ;;
-    *" up -d --wait --pull missing web "*)
+    *" up --no-start web "*)
+      touch "{fixture}/created"
+      exit 0
+      ;;
+    *" start --wait web "*)
       overlay=""
       prev=""
       for arg in "$@"; do
@@ -652,7 +709,8 @@ fi
 printf 'unexpected docker args: %s\n' "$*" >&2
 exit 90
 "#,
-        dir = attempt_dir.display()
+        dir = attempt_dir.display(),
+        fixture = temp.path().display(),
     );
     fs::write(&docker_script, script).unwrap();
     fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -673,6 +731,7 @@ exit 90
         ])
         .env("PATH", path_env)
         .env("DEVKIT_PNPM_BIN_OVERRIDE", exe)
+        .env("DEVKIT_CACHE_DIR", &cache)
         .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
         .output()
         .unwrap();

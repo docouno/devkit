@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { within } from './paths.js';
+import { configureApiProxy, configurePreviewHosts, hostPolicy } from './preview.js';
+import { hmrRecovery } from './hmr.js';
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -175,13 +177,16 @@ function collectWorkspaceSourceMap(startDir) {
 
 export function devkitWorkspaceSource(projectDir) {
   let activeSourceMap = new Map();
+  let fallbackConfig;
+  const recoveries = new WeakMap();
 
   return {
     name: 'devkit:workspace-source',
     enforce: 'pre',
     apply: 'serve',
     config(userConfig, env) {
-      if (env && env.command !== 'serve') {
+      fallbackConfig = undefined;
+      if (env?.command !== 'serve' || process.env.VITEST) {
         activeSourceMap = new Map();
         return undefined;
       }
@@ -208,6 +213,40 @@ export function devkitWorkspaceSource(projectDir) {
           exclude: [...new Set([...existingExclude, ...excludedDeps])],
         },
       };
+    },
+    configResolved(config) {
+      if (config.command !== 'serve' || process.env.VITEST) {
+        return;
+      }
+      fallbackConfig = config;
+      recoveries.set(config, hmrRecovery());
+      configurePreviewHosts(config.server);
+    },
+    configureServer(server) {
+      if (!recoveries.has(server.config)) {
+        return;
+      }
+      const options = server.config.server;
+      const allowsHost = hostPolicy(options.allowedHosts ?? []);
+      configureApiProxy(options, allowsHost);
+      // Vite's native HTTP guard already uses the resolved allowlist. It skips
+      // HTTPS listeners, so apply the same policy there before serving requests.
+      if (options.https && options.allowedHosts !== true) {
+        server.middlewares.use((request, response, next) => {
+          if (allowsHost(request.headers.host)) {
+            next();
+            return;
+          }
+          response.statusCode = 403;
+          response.end('Blocked request: host is not allowed.');
+        });
+      }
+    },
+    transform(code, id) {
+      const config = this.environment?.getTopLevelConfig?.() ?? fallbackConfig;
+      return (
+        recoveries.get(config)?.(code, id, (message) => this.warn(message), config.server) ?? null
+      );
     },
     resolveId(source) {
       if (activeSourceMap.size === 0 || typeof source !== 'string') {

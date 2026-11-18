@@ -112,3 +112,11 @@ Pass `--reconcile-lock` when transitive lockfile dependencies require re-resolut
 ### Shared caches
 
 `DEVKIT_CACHE_DIR` defaults to `~/.cache/docouno/devkit`. Its `tools`, `pnpm-store`, `pnpm-cache`, `cargo`, and `electron` directories are reusable across repositories and Git worktrees. Node setup lazily verifies the pinned pnpm executable; Rust-only setup does not acquire it. Keep the cache on the checkout filesystem for hardlinks. If the mount differs, the package store falls back to the repository's common Git directory (`devkit-store`) or `.devkit/cache/pnpm-store`. Daily tasks mount the pnpm virtual store read-only.
+
+## Development stand addresses
+
+`make up`/`make dev` retain per-checkout host ports across `make down`; concurrent worktrees get separate automatic leases. `DEVKIT_PORT_RANGE` defaults to `10000-19999`. Use `make down cleanup=1` to release this checkout's ports and unused preview files after verified container cleanup; service data volumes remain.
+
+`DEVKIT_PREVIEW_URL_TEMPLATE` accepts HTTP(S) templates with `{port}`, `{service}`, `{branch}` and `{slug}` for an existing reverse proxy. `make status` and `devkit status --json` show applied local/preview endpoints and pending restart settings. Reserve `/run/devkit/preview-hosts.json` or `/devkit/preview-hosts.json` outside source, volume and image symlink namespaces when using custom frontend images.
+
+`init --preset fullstack-web` creates Rust API + React web. `add-app --template react-web --name dashboard --api api` connects another frontend to a registered API. Multi-app aggregate development skips Electron without `DISPLAY`; `headless=1` includes it using Xvfb. Explicit desktop selections still require display configuration.

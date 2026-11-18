@@ -10,6 +10,7 @@ pub mod pnpm;
 pub mod project;
 pub mod projections;
 pub mod release;
+pub mod stand;
 pub mod state;
 pub mod transaction;
 

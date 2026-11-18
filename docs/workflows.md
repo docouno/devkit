@@ -12,6 +12,12 @@ Initialize a single-app or multi-app workspace:
 npx @docouno/devkit@0.5.0 init my-product --app web=react-web
 ```
 
+For a web-only fullstack stand (`apps/api` Rust API + `apps/web` React SPA):
+
+```sh
+npx @docouno/devkit@0.5.0 init my-web --preset fullstack-web
+```
+
 Or scaffold the fullstack preset (`apps/api` Rust API + `apps/web` React SPA + `apps/desktop` Electron app + `packages/client` shared React library):
 
 ```sh
@@ -154,3 +160,48 @@ Web (`react-web`) and Electron (`electron-react`) applications using `devkitWork
 
 - Editing `packages/ui/src/Button.tsx` or `packages/ui/src/styles.css` triggers instant Vite Fast Refresh in `apps/playground` without running `tsdown` or modifying `packages/ui/dist/`.
 - Because `devkitWorkspaceSource()` is strictly scoped to `apply: 'serve'`, `make test` and `make build` always validate the real compiled `dist/` output and public `exports` map of every workspace library.
+
+## Development stands and preview URLs
+
+`make up` and `make dev` allocate sticky host ports for every active Compose port binding. Automatic replica bindings receive a contiguous range. Explicit ports and ranges stay explicit. TCP and UDP leases are separate, wildcard host bindings overlap conservatively, and a real bind conflict can move only the failed automatic group. The first primary-web candidate uses the branch hash convention of Worktrunk's `hash_port`; the persisted lease remains authoritative after a branch rename or restart.
+
+Leases live in the shared user cache (`port-leases.json`), with checkout identity and desired/applied references under ignored `.devkit/state/`. Every checkout using the same host should share `DEVKIT_CACHE_DIR`. `DEVKIT_PORT_RANGE` defaults to `10000-19999`; changing the range preserves an existing usable lease. A deterministic managed Compose projection uses ephemeral declarations; the untracked stand override contains actual ports. Starting and stopping services leaves tracked files clean.
+
+- `make down` stops the current Compose stack and preserves leases, metadata and data volumes.
+- `make down cleanup=1` verifies stand ownership, removes owned remnants, and releases leases and unused metadata. It preserves service volumes.
+- A never-started fresh checkout can clean up before setup without Docker or an engine download. An existing state directory requires verified launch/epoch provenance; absence of a marker alone is insufficient.
+- A daemon create with an unknown outcome leaves a recovery intent until Devkit can verify what it created. Fixing a preview image pull or build error allows another `up` without clearing leases or state.
+
+Set `DEVKIT_PREVIEW_URL_TEMPLATE` to an absolute HTTP(S) URL. `{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
+
+Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make status` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down; these reservations are not reported as running endpoints. They do not advertise a newly supplied template as already running.
+
+Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/devkit/preview-hosts.json`, falling back to `/devkit/preview-hosts.json`. The file is limited to 32 MiB and 65,535 sorted unique hosts. Managed launches clear the legacy `DEVKIT_PREVIEW_HOSTS` CSV carrier. Short `DEVKIT_PREVIEW_HOSTS_FILE`, `DEVKIT_PREVIEW_HOSTS_SHA256`, `DEVKIT_PREVIEW_URL`, `DEVKIT_SERVICE` and `DEVKIT_BRANCH` variables describe it; automatic host sets are never expanded into a large environment variable.
+
+Host metadata uses browser URL canonicalization. For example, `127.1` becomes `127.0.0.1` and `::ffff:127.0.0.1` becomes `::ffff:7f00:1`. Invalid numeric/IDNA hosts and aliases of wildcard addresses fail before launch. The rendered URL retains its path and query; its resolved hostname must belong to the canonical file set.
+
+Compose acquires frontend images and images of their recursive `volumes_from` providers, including build contexts. Devkit then inspects those images in stopped containers before mounting the preview file. Ordinary startup dependencies use the normal Compose launch path. Image symlinks, inherited mounts and retained volumes must leave a provable literal slot. A nested destination inside an opaque volume can alias a path outside that volume. Keep preview destinations provable by avoiding those nested mounts or using a bind with verifiable ancestry. The launch pins inspected image IDs and external volume-provider IDs and retains declared platforms. Inspectors have no service mounts and their own anonymous volumes are cleaned separately.
+
+Docker does not inherit a provider's tmpfs or devices through `volumes_from`. A provider's deeper tmpfs therefore cannot protect the receiver from an inherited source bind. A receiver's own writable tmpfs remains supported.
+
+## Connecting a frontend to an API
+
+```sh
+npx @docouno/devkit@0.5.0 add-app . --name dashboard --template react-web --api api
+make setup
+make up app=dashboard
+```
+
+`--api` accepts an existing registered Node/Rust API slug and works with `react-web` or `electron-react`. Validation and generation form one transaction. The connection is `development.api`, separate from package imports and library dependencies. It supplies `DEVKIT_API_TARGET`, a required Compose `service_started` edge, and frontend development prerequisites for libraries reached by the API. Backend readiness beyond process startup remains the product's responsibility.
+
+New Node/Rust API starters accept `HOST` and decimal `PORT` (`0..65535`, including ephemeral port `0`); defaults are `0.0.0.0:8080`. They log the actual bound address and retain graceful signal shutdown. Invalid values fail visibly.
+
+For multi-app aggregate `make up`/`make dev`, an empty `DISPLAY` with `headless=0` skips Electron before desktop prerequisites and prints a warning. Explicit `app=desktop`, direct `make dev-desktop` and single-app Electron projects still require a display or `headless=1`. Headless mode uses Xvfb; normal X11 validation remains active when a display is supplied.
+
+Keep ignored stand state while services or inspection creators may exist. A missing launch ledger cannot prove that cleanup is safe: an independent actor receipt preserves that uncertainty. Restore recorded state before automated cleanup when history was removed; ordinary `make down` remains available to stop the Compose project.
+
+Changing to a tree with only libraries does not erase an earlier stand. Status still shows its containers, and `make down cleanup=1` verifies and removes owned remnants before releasing leases.
+
+A failed or interrupted inspector creation may complete a Docker create after the client exits. Cleanup observes late helpers and retains incomplete creator outcomes with a bounded diagnostic. Rerun cleanup after pending daemon work completes and keep the recorded state while the outcome remains unknown.
+
+The main Compose launch records successful container creation before starting services and waiting for health checks. A readiness failure still allows cleanup of the known containers. When creation fails or is interrupted, cleanup waits for a proven outcome for every planned replica, preserving leases and metadata while accepted creates may still arrive. Existing containers do not prove that a failed replacement completed. If some planned outcomes remain unknown, inspect the original daemon failure and preserve the recorded state.

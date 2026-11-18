@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec --component apps/NAME|packages/NAME [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -291,8 +291,8 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         }
         globals.emit(
             "catalog",
-            json!({"templates":entries,"presets":["fullstack-desktop","design-system"]}),
-            "Applications: node-api, rust-api, react-web, electron-react\nPackages: ts-library, react-ui, react-client\nPresets: fullstack-desktop (Rust API, shared React web and Electron), design-system (React UI library and playground)",
+            json!({"templates":entries,"presets":["fullstack-web","fullstack-desktop","design-system"]}),
+            "Applications: node-api, rust-api, react-web, electron-react\nPackages: ts-library, react-ui, react-client\nPresets: fullstack-web (Rust API and React web), fullstack-desktop (Rust API, shared React web and Electron), design-system (React UI library and playground)",
         );
         return Ok(());
     }
@@ -409,37 +409,6 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
     crate::lifecycle_cli::run(command, &globals, runner)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AcceptedManifestHeader {
-    schema_version: u32,
-    version: String,
-    release_identity: String,
-    managed: BTreeMap<String, crate::model::FileIdentity>,
-}
-
-fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
-    let path = safe_path(root, state::MANIFEST_PATH)?;
-    state::check_manifest_regular_bounded(&path)?;
-    let before = identity(&path)?.context("Missing project manifest")?;
-    let bytes = fs::read(&path)?;
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
-        "Project manifest changed during admission"
-    );
-    let header: AcceptedManifestHeader = serde_json::from_slice(&bytes)?;
-    ensure!(
-        header.schema_version == 2,
-        "Unsupported project schemaVersion; only published schema2 is supported"
-    );
-    version(&header.version)?;
-    ensure!(
-        SHA256_RE.is_match(&header.release_identity),
-        "Invalid project release identity/generation"
-    );
-    Ok(header)
-}
-
 fn extract_lifecycle_target(args: &[OsString]) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
     let switches = ["--preview", "--reconcile-lock"];
     let mut target = None;
@@ -540,7 +509,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         (project_root(&root)?, None)
     };
     state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
-    let header = read_accepted_header(&root)?;
+    let header = state::read_accepted_header(&root)?;
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
     ensure!(
@@ -557,7 +526,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     );
     let pin = pins.engine;
     let current = fs::canonicalize(std::env::current_exe()?)?;
-    if delivery::file_digest(&current)? == pin.sha256 {
+    if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(
             pin.version == env!("CARGO_PKG_VERSION"),
             "Accepted engine version differs from its build"

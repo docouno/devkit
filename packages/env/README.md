@@ -66,6 +66,12 @@ devkit-verify
 devkit-verify --pack
 ```
 
+During serve, the plugin also merges exact preview hosts from Devkit's read-only metadata file, even when no local packages or project manifest exist. Manual launches can use a concrete `DEVKIT_PREVIEW_URL`, comma-separated `DEVKIT_ALLOWED_HOSTS`/`VITE_ALLOWED_HOSTS` (explicit leading-dot suffixes allowed), or a bounded exact `DEVKIT_PREVIEW_HOSTS` list when no FILE carrier is present. Wildcards and URLs in host lists fail validation. Explicit `server.allowedHosts: true` remains the user's opt-in.
+
+String `/api` proxy targets and an absent `/api` with `DEVKIT_API_TARGET` gain `changeOrigin: true` and `ws: true`. The automatic proxy rejects hostile WebSocket Host headers before forwarding. The automatic guards use Vite's resolved allowlist, including configured origins and additional hosts. User proxy objects and other routes retain their functions/options. Build and Vitest runs do not read preview files or install server/client patches.
+
+Default browser HMR routing on tested Vite 8.3.5/8.3.8 clients receives a guarded first-handshake recovery wrapper. It waits for an actual `connected` payload, uses one shared recovery attempt and at most one automatic reload per server token, and clears the budget after connection. Ordinary connected-session restart behavior stays native. Explicit custom HMR routing and workers retain the native transport; unknown versions/fragments produce one actionable warning.
+
 For `"private": false` libraries, `devkit-pack` (invoked by `make package`) stages `pnpm pack --config.ignore-scripts=true`, checks public `exports`, blocks leaked `src/`/test/config files and test ambient `/// <reference types="..." />` directives, runs `publint` (`strict: true`) and `@arethetypeswrong/core` (`node16-esm` and `bundler`), and atomically writes `<name>-<version>.tgz` and `package-receipt.json` into `release/`. Programmatic helpers (`verifyPackableComponent`, `packComponent`) are exported from `@docouno/env/pack`.
 
 Source defaults can be customized in `package.json`:

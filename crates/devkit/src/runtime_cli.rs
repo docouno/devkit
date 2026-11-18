@@ -72,6 +72,13 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             &env_string("DEVKIT_HEADLESS").unwrap_or_else(|| "0".into()),
             "headless",
         )?;
+        request.cleanup = boolean(
+            &env_string("DEVKIT_CLEANUP").unwrap_or_else(|| "0".into()),
+            "cleanup",
+        )?;
+        if let Some(group) = env_string("DEVKIT_DEV_GROUP") {
+            request.dev_group = group.split_whitespace().map(str::to_owned).collect();
+        }
         request.package_aggregate = boolean(
             &env_string("DEVKIT_PACKAGE_AGGREGATE").unwrap_or_else(|| "0".into()),
             "package_aggregate",
@@ -105,7 +112,9 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             }
             "--expected-manifest" => command == "task",
             "--app" | "--package" => ["task", "run", "exec"].contains(&command),
-            "--headless" | "--follow" | "--tail" => ["task", "run"].contains(&command),
+            "--headless" | "--cleanup" | "--follow" | "--tail" => {
+                ["task", "run"].contains(&command)
+            }
             _ => false,
         };
         ensure!(permitted, "Option {key} is not valid for {command}");
@@ -118,6 +127,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             | "--package"
             | "--expected-manifest"
             | "--headless"
+            | "--cleanup"
             | "--follow"
             | "--tail"
             | "--network" => {
@@ -136,6 +146,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
                     "--package" => request.package = Some(value),
                     "--expected-manifest" => request.expected_manifest = Some(value),
                     "--headless" => request.headless = boolean(&value, "headless")?,
+                    "--cleanup" => request.cleanup = boolean(&value, "cleanup")?,
                     "--follow" => request.follow = boolean(&value, "follow")?,
                     "--tail" => request.tail = value.parse().context("Invalid logs tail")?,
                     "--network" if command == "exec" => network = value,
@@ -191,6 +202,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             make.arg(format!("package={package}"));
         }
         make.arg(format!("headless={}", u8::from(request.headless)))
+            .arg(format!("cleanup={}", u8::from(request.cleanup)))
             .arg(format!("follow={}", u8::from(request.follow)))
             .arg(format!("tail={}", request.tail));
         if let Some(cache_dir) = cache_dir {

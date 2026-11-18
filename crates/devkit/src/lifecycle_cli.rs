@@ -64,6 +64,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--release-root",
         ],
         "add-app" => &[
+            "--api",
             "--name",
             "--template",
             "--use",
@@ -369,6 +370,11 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         runner: runner.clone(),
     };
     let update = UpdateOptions {
+        api: if command == "add-app" {
+            options.value("--api")?.map(str::to_owned)
+        } else {
+            None
+        },
         package_mode: mode,
         compose_normalizer: (command == "add-app")
             .then_some(&compose_normalizer as &dyn crate::compose::ComposeNormalizer),
@@ -547,29 +553,26 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                         "Rust API",
                         "React web",
                         "Electron React",
-                        "Full stack: Rust API + shared React web and Electron",
+                        "Full stack web: Rust API + React web",
+                        "Full stack desktop: Rust API + shared React web and Electron",
                         "Design system: React UI library + playground",
                         "TypeScript library (packages/*)",
                         "React UI library (packages/*)",
                     ],
                 )?;
-                if template == 4 || template == 5 {
+                if (4..=6).contains(&template) {
                     ensure!(
                         !options.flag("--app") && !options.flag("--package"),
                         "A preset must be selected on its own"
                     );
                     options.set(
                         "--preset",
-                        if template == 4 {
-                            "fullstack-desktop"
-                        } else {
-                            "design-system"
-                        },
+                        ["fullstack-web", "fullstack-desktop", "design-system"][template - 4],
                     );
                     break;
                 }
-                if template >= 6 {
-                    let pkg_idx = template - 6;
+                if template >= 7 {
+                    let pkg_idx = template - 7;
                     let name = prompt.ask("Package name", Some(["lib", "ui"][pkg_idx]))?;
                     slug(&name)?;
                     options.add(

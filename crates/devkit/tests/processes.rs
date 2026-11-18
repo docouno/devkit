@@ -602,3 +602,41 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
         );
     }
 }
+
+#[test]
+fn tracked_stdin_is_exact_bounded_and_has_a_terminal_receipt() {
+    let runner = ProcessRunner::new().unwrap();
+    let bytes = vec![b'x'; 1024 * 1024];
+    let mut reaped = false;
+    let output = runner
+        .run_tracked(
+            &mut Command::new("cat"),
+            OutputMode::Capture(2 * 1024 * 1024),
+            Some(&bytes),
+            &mut reaped,
+        )
+        .unwrap();
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stdout, bytes);
+    assert!(reaped);
+    let error = runner
+        .run_tracked(
+            &mut Command::new("/definitely-missing-devkit-test-command"),
+            OutputMode::Capture(1024),
+            None,
+            &mut reaped,
+        )
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Cannot start"));
+    assert!(reaped);
+    assert!(
+        runner
+            .run_with_input(
+                &mut Command::new("cat"),
+                OutputMode::Capture(1024),
+                &vec![0; 8 * 1024 * 1024 + 1]
+            )
+            .is_err()
+    );
+}

@@ -221,7 +221,7 @@ fn catalog_exposes_library_templates_and_design_system_preset() {
 
     assert_eq!(
         payload["result"]["presets"],
-        serde_json::json!(["fullstack-desktop", "design-system"])
+        serde_json::json!(["fullstack-web", "fullstack-desktop", "design-system"])
     );
 
     let text_out = invoke(temp.path(), &["catalog"]);

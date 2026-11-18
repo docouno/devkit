@@ -89,6 +89,37 @@ pub fn ensure_supported_checkout_floor(
     }
     Ok(ver)
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AcceptedManifestHeader {
+    schema_version: u32,
+    pub version: String,
+    pub release_identity: String,
+    pub managed: std::collections::BTreeMap<String, crate::model::FileIdentity>,
+}
+
+pub(crate) fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
+    let path = safe_path(root, MANIFEST_PATH)?;
+    check_manifest_regular_bounded(&path)?;
+    let before = identity(&path)?.context("Missing project manifest")?;
+    let bytes = fs::read(&path)?;
+    ensure!(
+        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
+        "Project manifest changed during admission"
+    );
+    let header: AcceptedManifestHeader = serde_json::from_slice(&bytes)?;
+    ensure!(
+        header.schema_version == 2,
+        "Unsupported project schemaVersion; only published schema2 is supported"
+    );
+    version(&header.version)?;
+    ensure!(
+        SHA256_RE.is_match(&header.release_identity),
+        "Invalid project release identity/generation"
+    );
+    Ok(header)
+}
+
 pub fn managed_path(name: &str) -> Result<&str> {
     relative_path(name)?;
     ensure!(
@@ -574,6 +605,12 @@ impl CheckoutLock {
         runner: Option<&crate::processes::ProcessRunner>,
     ) -> Result<Self> {
         let root = project_root(root)?;
+        let creator = if operation == "recover" {
+            None
+        } else {
+            crate::stand::epoch::before_lock(&root)?
+        };
+        let initialize_epoch = creator.is_some();
         let p = safe_path(&root, ".devkit/state/task.lock")?;
         create_dir_all_durable(p.parent().context("Lock parent")?)?;
         // Never open a FIFO/device or follow a replacement symlink as a lock.
@@ -597,7 +634,11 @@ impl CheckoutLock {
             "Expected a regular file for checkout lock"
         );
         let try_acquire = |file: &File| -> std::result::Result<(), fs::TryLockError> {
-            match mode {
+            match if initialize_epoch {
+                CheckoutLockMode::Exclusive
+            } else {
+                mode
+            } {
                 CheckoutLockMode::Shared => file.try_lock_shared(),
                 CheckoutLockMode::Exclusive => file.try_lock(),
             }
@@ -608,6 +649,17 @@ impl CheckoutLock {
         loop {
             match try_acquire(&f) {
                 Ok(()) => {
+                    ensure!(
+                        crate::stand::epoch::Physical::of(&f.metadata()?)
+                            == crate::stand::epoch::Physical::at(&p)?,
+                        "Checkout lock replaced while waiting"
+                    );
+                    if initialize_epoch {
+                        crate::stand::epoch::after_lock(&root, creator)?;
+                        if mode == CheckoutLockMode::Shared {
+                            f.lock_shared()?;
+                        }
+                    }
                     let owner_path = if mode == CheckoutLockMode::Exclusive {
                         Some(write_owner_sidecar(&root, operation)?)
                     } else {

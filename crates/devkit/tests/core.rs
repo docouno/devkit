@@ -3041,7 +3041,7 @@ fn zero_app_init_design_system_preset_and_use_flag_write_dependencies_cleanly() 
 fn project_make_stays_byte_identical_without_packageable_libraries() {
     let f = TempDir::new().unwrap();
     let release = fixture_release(f.path(), "0.5.0");
-    let target = f.path().join("fullstack");
+    let target = f.path().join("fullstack-web");
     init_project(
         &release,
         &target,
@@ -3410,4 +3410,137 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
     .unwrap_err();
     assert_eq!(error_code(&strict_err), "UNSUPPORTED_UPGRADE_PATH");
     assert!(!proj_040.join(".devkit/state").exists());
+}
+
+#[test]
+fn fullstack_preset_and_api_add_are_transactional_and_separate_from_library_dependencies() {
+    struct ApiInventory;
+    impl ComposeNormalizer for ApiInventory {
+        fn normalize(&self, _: &Path, _: &[String]) -> Result<Value> {
+            Ok(json!({"services":{"api":{},"web":{}}}))
+        }
+    }
+    let f = TempDir::new().unwrap();
+    let release = fixture_release(f.path(), "0.5.0");
+    let root = f.path().join("connected");
+    let state = init_project(
+        &release,
+        &root,
+        &InitOptions {
+            preset: Some("fullstack-web".into()),
+            package_mode: Some(PackageMode::Local),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .components
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["apps/api", "apps/web"]
+    );
+    assert_eq!(
+        state.components["apps/web"]
+            .development
+            .as_ref()
+            .unwrap()
+            .api
+            .as_deref(),
+        Some("apps/api")
+    );
+    assert!(state.components["apps/web"].dependencies.is_empty());
+    let projection = devkit::projections::render_app_compose_value(&state).unwrap();
+    assert_eq!(
+        projection["services"]["web"]["depends_on"]["api"],
+        json!({"condition":"service_started","required":true})
+    );
+    assert_eq!(
+        projection["services"]["api"]["env_file"],
+        json!([".devkit/runtime/api.env"])
+    );
+    assert!(
+        projection["services"]["api"]["environment"]
+            .get("HOST")
+            .is_none()
+    );
+    assert!(
+        projection["services"]["api"]["environment"]
+            .get("PORT")
+            .is_none()
+    );
+    assert!(projection["services"]["web"].get("env_file").is_none());
+    let mut historical = state.clone();
+    historical.version = "0.4.1".into();
+    assert!(
+        devkit::projections::render_app_compose_value(&historical).unwrap()["services"]["web"]
+            .get("depends_on")
+            .is_none()
+    );
+    for api in ["missing", "web", "added"] {
+        let before = author_port_payload(&root);
+        let inventory = admit_compose_inventory(&root, &ApiInventory).unwrap();
+        assert!(
+            add_project_component(
+                &release,
+                &root,
+                Role::App,
+                ComponentSpec {
+                    name: "added".into(),
+                    template: "react-web".into(),
+                    uses: vec![]
+                },
+                &UpdateOptions {
+                    api: Some(api.into()),
+                    compose_inventory: Some(&inventory),
+                    ..Default::default()
+                },
+                &FixtureResolver
+            )
+            .is_err()
+        );
+        assert_eq!(author_port_payload(&root), before);
+        assert!(!root.join("apps/added").exists());
+        assert!(!root.join(PENDING_PATH).exists());
+    }
+    let inventory = admit_compose_inventory(&root, &ApiInventory).unwrap();
+    let outcome = add_project_component(
+        &release,
+        &root,
+        Role::App,
+        ComponentSpec {
+            name: "added".into(),
+            template: "react-web".into(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            api: Some("api".into()),
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &FixtureResolver,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.state.components["apps/added"]
+            .development
+            .as_ref()
+            .unwrap()
+            .api
+            .as_deref(),
+        Some("apps/api")
+    );
+    assert!(
+        outcome.state.components["apps/added"]
+            .dependencies
+            .is_empty()
+    );
+    let mut state = outcome.state;
+    state.components.get_mut("apps/api").unwrap().dependencies = vec!["packages/server".into()];
+    state.components.get_mut("apps/added").unwrap().dependencies = vec!["packages/ui".into()];
+    let make = devkit::projections::render_project_make(&state);
+    assert!(make.contains("dev-added: build/packages/server build/packages/ui\n"));
+    assert!(!make.contains("build-added: build/packages/server"));
 }

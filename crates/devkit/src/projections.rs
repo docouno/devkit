@@ -55,9 +55,20 @@ pub fn render_project_make(state: &ProjectState) -> String {
             if c.role == Role::Library && command == "dev" {
                 continue;
             }
-            let deps = c
-                .dependencies
-                .iter()
+            let mut dependencies: BTreeSet<_> = c.dependencies.iter().collect();
+            if command == "dev"
+                && SemVer::parse(&state.version)
+                    .is_ok_and(|v| v >= SemVer::parse("0.5.0").expect("valid version"))
+                && let Some(api) = c
+                    .development
+                    .as_ref()
+                    .and_then(|d| d.api.as_ref())
+                    .and_then(|p| state.components.get(p))
+            {
+                dependencies.extend(api.dependencies.iter());
+            }
+            let deps = dependencies
+                .into_iter()
                 .flat_map(|d| {
                     if command == "check" {
                         vec![format!("check/{d}"), format!("build/{d}")]
@@ -133,7 +144,18 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
                 .as_ref()
                 .context("Missing API development integration")?;
             ensure!(
-                server.role == Role::App && sd.kind == DevelopmentKind::Compose,
+                server.role == Role::App
+                    && sd.kind == DevelopmentKind::Compose
+                    && (!modern
+                        || (api != path
+                            && matches!(
+                                server.tooling_profile,
+                                ToolingProfile::Node | ToolingProfile::Rust
+                            )
+                            && matches!(
+                                c.tooling_profile,
+                                ToolingProfile::Web | ToolingProfile::Electron
+                            ))),
                 "Invalid API connection: {api}"
             );
             env.insert(
@@ -205,6 +227,25 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             ]
         };
         let mut service = json!({"image":if rust{"${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"}else if desktop{"${DEVKIT_DESKTOP_IMAGE:-devkit-unprepared-desktop}"}else{"${DEVKIT_NODE_IMAGE:?}"},"init":true,"user":"${DEVKIT_UID:?}:${DEVKIT_GID:?}","working_dir":format!("/workspace/{path}"),"command":command,"environment":env,"volumes":volumes});
+        if modern
+            && matches!(
+                c.tooling_profile,
+                ToolingProfile::Node | ToolingProfile::Rust
+            )
+        {
+            // Project Compose follows this projection. Its env files and explicit
+            // environment take precedence over the starter defaults.
+            service["env_file"] = json!([".devkit/runtime/api.env"]);
+        }
+        if modern && let Some(api) = &d.api {
+            let backend = &state.components[api];
+            let name = backend
+                .development
+                .as_ref()
+                .and_then(|d| d.service.as_deref())
+                .unwrap_or_else(|| basename(api));
+            service["depends_on"] = json!({name:{"condition":"service_started","required":true}});
+        }
         if modern && !rust && !desktop {
             service["tmpfs"] = json!(["/tmp:mode=1777"]);
         }
@@ -220,7 +261,15 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             map.extend(serde_json::from_value::<serde_json::Map<String,Value>>(json!({"read_only":true,"tmpfs":["/tmp:mode=1777"],"shm_size":"256m","cap_drop":["ALL"],"security_opt":["no-new-privileges:true","seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"]}))?);
         } else {
             service["ports"] = json!([format!(
-                "127.0.0.1::{}",
+                "127.0.0.1:{}:{}",
+                if modern {
+                    format!(
+                        "${{DEVKIT_PORT_{}:-0}}",
+                        name.to_uppercase().replace('-', "_")
+                    )
+                } else {
+                    String::new()
+                },
                 if c.tooling_profile == ToolingProfile::Web {
                     "5173"
                 } else {

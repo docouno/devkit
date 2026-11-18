@@ -50,8 +50,9 @@ const TEMPLATES: [&str; 7] = [
     "ts-library",
     "react-ui",
 ];
-const RUNTIME_FILES: [&str; 9] = [
+const RUNTIME_FILES: [&str; 10] = [
     "devkit.mk",
+    "api.env",
     "compose.tools.yaml",
     "rust.Dockerfile",
     "desktop.Dockerfile",
