@@ -23,7 +23,8 @@ export function hmrRecovery() {
     }
     const hmr = server?.hmr;
     const ws = server?.ws;
-    if (hmr === false || ws === false || changesRouting(ws) || changesRouting(hmr)) {
+    // Vite resolves deprecated HMR routing options into server.ws.
+    if (hmr === false || ws === false || changesRouting(ws)) {
       return null;
     }
     const complain = () => {

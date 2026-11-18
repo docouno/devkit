@@ -257,6 +257,10 @@ fn target_mount(value: &Value) -> Result<Mount> {
         implicit: false,
     })
 }
+
+fn file_mount_name(mount: &Value) -> Option<&str> {
+    mount.as_str().or_else(|| mount["source"].as_str())
+}
 /// Never infer a backing volume's contents from a fresh image snapshot. Bind
 /// ancestry is checked on the host without following any symlink.
 fn prove_backing(
@@ -426,35 +430,36 @@ fn model_mounts(
             continue;
         }
         for mount in service[key].as_array().into_iter().flatten() {
-            let target = if let Some(raw) = mount.as_str() {
-                if key == "devices" {
-                    raw.split(':')
-                        .nth(1)
-                        .context("Unproved device destination")?
-                        .to_owned()
-                } else {
-                    format!(
-                        "/{}{}",
-                        if key == "secrets" { "run/secrets/" } else { "" },
-                        raw
-                    )
-                }
-            } else {
-                mount["target"]
+            let target = if key == "devices" {
+                mount
                     .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        format!(
-                            "/{}{}",
-                            if key == "secrets" { "run/secrets/" } else { "" },
-                            mount["source"].as_str().unwrap_or("")
-                        )
-                    })
+                    .and_then(|raw| raw.split(':').nth(1))
+                    .or_else(|| mount["target"].as_str())
+                    .context("Unproved device destination")?
+                    .to_owned()
+            } else {
+                let target = mount["target"]
+                    .as_str()
+                    .or_else(|| file_mount_name(mount))
+                    .context("Unproved config or secret destination")?;
+                if target.starts_with('/') {
+                    target.to_owned()
+                } else if key == "secrets" {
+                    format!("/run/secrets/{target}")
+                } else {
+                    format!("/{target}")
+                }
             };
             result.push(Mount {
                 target,
                 tmpfs_rw: false,
-                backing: Backing::Opaque,
+                backing: if key == "devices" {
+                    Backing::Opaque
+                } else {
+                    file_mount_name(mount)
+                        .and_then(|name| model[key][name]["file"].as_str())
+                        .map_or(Backing::Opaque, |file| Backing::Bind(file.into()))
+                },
                 implicit: false,
             });
         }
@@ -940,18 +945,7 @@ pub fn prepare(
                     mounts.push(Mount {
                         target: target.into(),
                         tmpfs_rw,
-                        backing: if mount["Type"] == "bind" {
-                            Backing::Bind(
-                                mount["Source"]
-                                    .as_str()
-                                    .context("Unproved retained bind source")?
-                                    .into(),
-                            )
-                        } else if mount["Type"] == "tmpfs" {
-                            Backing::Tmpfs
-                        } else {
-                            Backing::Opaque
-                        },
+                        backing,
                         implicit: false,
                     });
                 }
@@ -1047,6 +1041,19 @@ pub fn verify_launch(
                         .all(|key| actual.get(key) == expected.get(key)),
                 "Launch mount namespace differs from inspected model for {service}"
             );
+            for key in ["configs", "secrets"] {
+                for name in expected[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(file_mount_name)
+                {
+                    ensure!(
+                        model[key][name] == requested[key][name],
+                        "Launch {key} source {name} differs from inspected model for {service}"
+                    );
+                }
+            }
         }
     }
     for service in active {

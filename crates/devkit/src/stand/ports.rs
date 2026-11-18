@@ -10,6 +10,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub type ActivePorts = BTreeSet<(String, u16, String, String, u16)>;
@@ -297,7 +298,8 @@ impl Ports {
         let propose = |ports: &Self, registry: &Registry| {
             ports.propose(&plan, &ordered, active, retry, range, registry)
         };
-        for _ in 0..3 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
             let next = {
                 let _lock = Registry::lock(&self.cache_root)?;
                 let mut registry = Registry::read(&self.cache_root)?;
@@ -320,6 +322,10 @@ impl Ports {
             let mut registry = Registry::read(&self.cache_root)?;
             registry.collect_stale()?;
             if propose(self, &registry)? != candidate.groups {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Stand port candidates changed repeatedly before publication"
+                );
                 continue;
             }
             for group in candidate.groups.iter().filter(|g| g.automatic) {
@@ -353,7 +359,6 @@ impl Ports {
             self.allocation_intent = false;
             return self.save();
         }
-        anyhow::bail!("Stand port candidates changed repeatedly before publication")
     }
 
     fn previous_automatic(&self, key: &str) -> Option<&Group> {

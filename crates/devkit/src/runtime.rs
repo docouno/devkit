@@ -2960,7 +2960,8 @@ fn run_development(
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let mut create = compose()?;
-            create.args(["create", &service]);
+            // Compose up includes build-only dependencies in image acquisition.
+            create.args(["up", "--no-start", &service]);
             ledger = crate::stand::ledger::Ledger::intent(
                 &ctx.admission.root,
                 &ports.owner,

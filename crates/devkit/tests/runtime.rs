@@ -676,7 +676,7 @@ if [ "$1" = "compose" ]; then
       printf '{{"services":{{"web":{{}}}}}}\n'
       exit 0
       ;;
-    *" create web "*)
+    *" up --no-start web "*)
       touch "{fixture}/created"
       exit 0
       ;;

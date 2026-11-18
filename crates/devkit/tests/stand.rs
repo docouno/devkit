@@ -27,12 +27,12 @@ fn allocate(ports: &mut Ports, bindings: &[Binding]) {
 }
 
 #[test]
-fn allocation_rechecks_a_candidate_after_another_checkout_claims_it() {
+fn allocation_rechecks_candidates_claimed_by_other_checkouts() {
     let root = tempfile::tempdir().unwrap();
-    let peer = tempfile::tempdir().unwrap();
+    let peers: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
     let cache = tempfile::tempdir().unwrap();
     let mut ports = Ports::open(root.path(), cache.path()).unwrap();
-    let mut competing_port = None;
+    let mut competing_ports = Vec::new();
     let mut attempts = 0;
     ports
         .allocate_with(
@@ -43,7 +43,7 @@ fn allocation_rechecks_a_candidate_after_another_checkout_claims_it() {
             &Default::default(),
             |candidate| {
                 attempts += 1;
-                if competing_port.is_none() {
+                if let Some(peer) = peers.get(competing_ports.len()) {
                     let first = candidate.groups[0].first;
                     let root = peer.path().to_owned();
                     let cache = cache.path().to_owned();
@@ -58,14 +58,14 @@ fn allocation_rechecks_a_candidate_after_another_checkout_claims_it() {
                     finished
                         .recv_timeout(std::time::Duration::from_secs(5))
                         .expect("Another checkout can publish while this candidate is validated");
-                    competing_port = Some(first);
+                    competing_ports.push(first);
                 }
                 Ok(())
             },
         )
         .unwrap();
-    assert_eq!(attempts, 2);
-    assert_ne!(Some(ports.groups[0].first), competing_port);
+    assert_eq!(attempts, peers.len() + 1);
+    assert!(!competing_ports.contains(&ports.groups[0].first));
 }
 
 #[test]

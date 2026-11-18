@@ -675,7 +675,13 @@ class RuntimeTests(unittest.TestCase):
     def test_preview_metadata_is_literal_readonly_and_status_uses_applied_snapshot(self):
         service, project = self.preview_fixture()
         (self.root / "preview.env").write_text("DEVKIT_ALLOWED_HOSTS=from-file.example.test\n")
+        (self.root / "preview-config.txt").write_text("fixture config")
+        (self.root / "preview-secret.txt").write_text("fixture secret")
         spec = json.loads((self.root / "compose.yaml").read_text())
+        spec["configs"] = {"sample-config": {"file": "preview-config.txt"}}
+        spec["secrets"] = {"sample-secret": {"file": "preview-secret.txt"}}
+        spec["services"]["main"]["configs"] = [{"source": "sample-config", "target": "preview-config"}]
+        spec["services"]["main"]["secrets"] = [{"source": "sample-secret", "target": "preview-secret"}]
         spec["services"]["main"]["env_file"] = [str(self.root / "preview.env")]
         spec["services"]["main"]["environment"] = {"DEVKIT_PREVIEW_HOSTS": "stale.invalid.test"}
         (self.root / "compose.yaml").write_text(json.dumps(spec))
@@ -697,6 +703,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("DEVKIT_PREVIEW_HOSTS=stale.invalid.test", actual["Config"]["Env"])
         mount = next(m for m in actual["Mounts"] if m["Destination"] == file["slot"])
         self.assertFalse(mount["RW"])
+        actual_mounts = {m["Destination"]: m for m in actual["Mounts"]}
+        self.assertFalse(actual_mounts["/preview-config"]["RW"])
+        self.assertFalse(actual_mounts["/run/secrets/preview-secret"]["RW"])
         self.assertEqual(actual["Image"], receipt["deployments"][receipt["serviceDesired"]["main"]]["images"]["main"])
         status = run(str(ENGINE), "status", str(self.root), "--json", env=environment)
         status = json.loads(status.stdout)["result"]["services"][0]
@@ -714,6 +723,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(".example.test", self.make("status", env=environment).stdout)
         self.assertEqual(json.loads((self.root / ".devkit/state/stand.active").read_text())["inspections"], {})
         self.make("up", "app=main", env=environment)
+        self.assertEqual(container(project + "-main-1")["Id"], actual["Id"])
         repeated = json.loads((self.root / ".devkit/state/ports.json").read_text())
         self.assertEqual(repeated["deployments"][repeated["serviceDesired"]["main"]]["files"][0], file)
         self.make("down", env=environment)
@@ -1203,8 +1213,10 @@ class RuntimeTests(unittest.TestCase):
         self.images.append(tag)
         frontend.update({"image": tag, "build": {"context": "."}, "depends_on": ["helper"]})
         spec = json.loads((self.root / "compose.yaml").read_text())
+        self.images.append(project + "-helper")
         spec["services"].update({"main": frontend, "helper": {
-            "image": IMAGE, "platform": "linux/x86_64", "labels": {LABEL: self.token},
+            "build": {"context": ".", "dockerfile_inline": f"FROM {IMAGE}\nLABEL {LABEL}={self.token}\n"},
+            "platform": "linux/x86_64", "labels": {LABEL: self.token},
             "command": ["node", "-e", "require('node:http').createServer((q,s)=>s.end('helper')).listen(3001,'0.0.0.0')"],
             "ports": ["127.0.0.1::3001"], "environment": {"DEVKIT_SERVICE": "helper"},
         }})

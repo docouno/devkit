@@ -216,7 +216,12 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
     );
     assert.equal(shim('unknown', client, warn), null);
     assert.equal(warnings, 1);
-    for (const server of [{ hmr: false }, { hmr: { host: 'custom' } }, { ws: { server: {} } }]) {
+    for (const server of [
+      { hmr: false },
+      { ws: false },
+      { ws: { host: 'custom' } },
+      { ws: { server: {} } },
+    ]) {
       assert.equal(shim(source, client, warn, server), null);
     }
     assert.ok(
@@ -239,6 +244,9 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
         );
       assert.equal(transform(first), null);
       assert.match(transform(second).code, /devkit:hmr-recovery:/u);
+      first.server.hmr = { clientPort: 19998 };
+      first.server.ws = {};
+      assert.match(transform(first).code, /devkit:hmr-recovery:/u);
     });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
