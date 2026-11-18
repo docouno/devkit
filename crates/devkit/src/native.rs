@@ -279,13 +279,19 @@ pub fn dependency_table(data: &Fields, field: &str) -> Result<Fields> {
     }
 }
 
+const NATIVE_METADATA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
     if crate::files::is_pnpm_yaml(path) {
         crate::pnpm::read_yaml_file(path)?.context("Missing pnpm YAML input")
     } else {
-        read_regular_file(path, 32 * 1024 * 1024, "native metadata")?
+        read_regular_file(path, NATIVE_METADATA_MAX_BYTES, "native metadata")?
             .with_context(|| format!("Missing native input: {}", path.display()))
     }
+}
+
+fn bounded_identity(path: &Path, maximum: u64) -> Result<Option<FileIdentity>> {
+    Ok(read_regular_file(path, maximum, "native metadata")?.map(|(_, id)| id))
 }
 
 fn identity(path: &Path) -> Result<Option<FileIdentity>> {
@@ -296,7 +302,7 @@ fn identity(path: &Path) -> Result<Option<FileIdentity>> {
         path.file_name().and_then(|name| name.to_str()),
         Some(".npmrc" | "config")
     ) {
-        return Ok(read_regular_file(path, 32 * 1024 * 1024, "native metadata")?.map(|(_, id)| id));
+        return bounded_identity(path, NATIVE_METADATA_MAX_BYTES);
     }
     crate::files::identity(path)
 }
@@ -1828,7 +1834,7 @@ fn record(
     required: bool,
 ) -> Result<()> {
     let path = input_path(root, name)?;
-    let value = identity(&path)?;
+    let value = bounded_identity(&path, NATIVE_METADATA_MAX_BYTES)?;
     ensure!(!required || value.is_some(), "Missing native input: {name}");
     files.insert(relative_name(&project_root(root)?, &path)?, value);
     Ok(())
@@ -1839,18 +1845,20 @@ fn record_dependency(
     name: &str,
     budget: &mut Option<u64>,
 ) -> Result<()> {
-    let Some(remaining) = budget else {
-        return record(root, files, name, true);
-    };
     let path = input_path(root, name)?;
     let key = relative_name(&project_root(root)?, &path)?;
-    if files.get(&key).is_some_and(Option::is_some) {
-        return Ok(());
-    }
-    let (bytes, identity) = read_regular_file(&path, *remaining, "local dependency input")?
-        .with_context(|| format!("Missing native input: {name}"))?;
-    *remaining -= bytes.len() as u64;
-    files.insert(key, Some(identity));
+    let observed = if let Some(remaining) = budget {
+        if files.get(&key).is_some_and(Option::is_some) {
+            return Ok(());
+        }
+        let (bytes, identity) = read_regular_file(&path, *remaining, "local dependency input")?
+            .with_context(|| format!("Missing native input: {name}"))?;
+        *remaining -= bytes.len() as u64;
+        identity
+    } else {
+        identity(&path)?.with_context(|| format!("Missing native input: {name}"))?
+    };
+    files.insert(key, Some(observed));
     Ok(())
 }
 fn local_dependency(
@@ -2007,18 +2015,32 @@ impl NativeAdmission {
     }
 }
 pub fn assert_input_identities(root: &Path, inputs: &InputIdentitySet) -> Result<()> {
+    assert_input_identities_with_limit(root, inputs, None)
+}
+
+fn assert_input_identities_with_limit(
+    root: &Path,
+    inputs: &InputIdentitySet,
+    maximum: Option<u64>,
+) -> Result<()> {
     ensure!(
         inputs.schema_version == 1,
         "Unsupported native input identity schema"
     );
     for (name, expected) in &inputs.files {
+        let path = input_path(root, name)?;
+        let observed = match maximum {
+            Some(maximum) => bounded_identity(&path, maximum)?,
+            None => identity(&path)?,
+        };
         ensure!(
-            &identity(&input_path(root, name)?)? == expected,
+            &observed == expected,
             "Native input changed during admission: {name}"
         );
     }
     Ok(())
 }
+
 pub fn assert_native_components(root: &Path, state: &ProjectState) -> Result<()> {
     admit_native_components(root, state).map(|_| ())
 }
@@ -2029,7 +2051,7 @@ pub(crate) fn inspect_native_components(
     root: &Path,
     state: &ProjectState,
 ) -> Result<NativeAdmission> {
-    admit_native_with_dependency_limit(root, state, Some(32 * 1024 * 1024))
+    admit_native_with_dependency_limit(root, state, Some(NATIVE_METADATA_MAX_BYTES))
 }
 fn admit_native_with_dependency_limit(
     root: &Path,
@@ -2237,7 +2259,9 @@ fn admit_native_with_dependency_limit(
     }
     let inputs = context.closure_with_structure(state, &structure)?;
     let npmrc_policy = parse_and_admit_npmrc(root, &inputs.directories, lock_kind)?;
-    assert_input_identities(root, &inputs)?;
+    // Keep inspection bounded through the final recheck, including files that
+    // changed size after collection.
+    assert_input_identities_with_limit(root, &inputs, dependency_byte_limit)?;
     let node_inputs = context
         .node_inputs
         .take()
@@ -2859,4 +2883,33 @@ pub fn resolve_ca_cert_path() -> Result<Option<std::path::PathBuf>> {
         )
     })?;
     Ok(Some(canonical))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_recheck_rejects_a_dependency_that_has_grown() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let patch = root.path().join("example.patch");
+        fs::write(&patch, b"original patch")?;
+        let inputs = InputIdentitySet {
+            schema_version: 1,
+            files: BTreeMap::from([("example.patch".into(), identity(&patch)?)]),
+            directories: Vec::new(),
+            digest: String::new(),
+        };
+        assert_input_identities_with_limit(root.path(), &inputs, Some(32))?;
+        fs::write(&patch, [b'x'; 33])?;
+        let error = assert_input_identities_with_limit(root.path(), &inputs, Some(32))
+            .expect_err("the updated input exceeds the inspection limit");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::FileTooLarge)
+        );
+        Ok(())
+    }
 }
