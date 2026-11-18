@@ -1292,7 +1292,7 @@ if [ "$1" = compose ] && [ ! -f "$RACE_MARKER" ]; then
   start=0
   previous=
   for arg in "$@"; do
-    [ "$arg" != up ] || start=1
+    [ "$arg" != start ] || start=1
     if [ "$previous" = --file ]; then
       case "$arg" in *compose.stand.yaml) RACE_OVERLAY=$arg; export RACE_OVERLAY ;; esac
     fi
@@ -1512,6 +1512,31 @@ exec "$RACE_REAL_DOCKER" "$@"
         self.make("up")
         self.assertEqual(container(f"{project}-main-1")["Id"], before)
         self.make("down", "cleanup=1")
+
+    def test_warm_healthcheck_failure_keeps_known_container_and_allows_cleanup(self):
+        service, project = self.preview_fixture()
+        service["command"] = ["sleep", "300"]
+        service["healthcheck"] = {"test": ["CMD", "test", "!", "-e", "/tmp/unhealthy"],
+                                  "interval": "100ms", "retries": 1}
+        compose = self.root / "compose.yaml"
+        spec = json.loads(compose.read_text())
+        spec["services"]["main"] = service
+        compose.write_text(json.dumps(spec))
+        name = project + "-main-1"
+        self.make("setup")
+        self.make("up", "app=main")
+        before = container(name)["Id"]
+        run("docker", "exec", name, "touch", "/tmp/unhealthy")
+        wait_until(lambda: container(name)["State"]["Health"]["Status"] == "unhealthy")
+        failed = self.make("up", "app=main", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("unhealthy", failed.stderr)
+        run("docker", "exec", name, "rm", "/tmp/unhealthy")
+        wait_until(lambda: container(name)["State"]["Health"]["Status"] == "healthy")
+        self.make("up", "app=main")
+        self.assertEqual(container(name)["Id"], before)
+        self.make("down", "cleanup=1")
+        self.assertIsNone(container(name))
 
     def test_native_setup_gates_fix_purity_stale_lock_and_secret_boundary(self):
         write_fixture(self.root)

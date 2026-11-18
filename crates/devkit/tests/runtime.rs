@@ -659,7 +659,7 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit 0
 fi
 if [ "$1" = "ps" ]; then
-  if [ -f "{dir}/attempt-1.json" ]; then printf '%s\n' '{container_id}'; fi
+  if [ -f "{fixture}/created" ]; then printf '%s\n' '{container_id}'; fi
   exit 0
 fi
 if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then
@@ -676,7 +676,11 @@ if [ "$1" = "compose" ]; then
       printf '{{"services":{{"web":{{}}}}}}\n'
       exit 0
       ;;
-    *" up -d --wait web "*)
+    *" create web "*)
+      touch "{fixture}/created"
+      exit 0
+      ;;
+    *" start --wait web "*)
       overlay=""
       prev=""
       for arg in "$@"; do

@@ -219,9 +219,7 @@ export function devkitWorkspaceSource(projectDir) {
         return;
       }
       fallbackConfig = config;
-      const recovery = hmrRecovery();
-      recovery.configure(config, true);
-      recoveries.set(config, recovery);
+      recoveries.set(config, hmrRecovery());
       configurePreviewHosts(config.server);
     },
     configureServer(server) {
@@ -246,7 +244,9 @@ export function devkitWorkspaceSource(projectDir) {
     },
     transform(code, id) {
       const config = this.environment?.getTopLevelConfig?.() ?? fallbackConfig;
-      return recoveries.get(config)?.transform(code, id, (message) => this.warn(message)) ?? null;
+      return (
+        recoveries.get(config)?.(code, id, (message) => this.warn(message), config.server) ?? null
+      );
     },
     resolveId(source) {
       if (activeSourceMap.size === 0 || typeof source !== 'string') {

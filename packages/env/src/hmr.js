@@ -8,65 +8,58 @@ const acceptedVersions = new Set(['8.3.5', '8.3.8']);
 const fragmentSha = '1b4cea2bb341695cc81fe550e6425ab04e2db736996379b5f743808a108c7897';
 
 export function hmrRecovery() {
-  let enabled = false;
   let warned = false;
-  return {
-    configure(config, serve) {
-      const server = config?.server;
-      const hmr = server?.hmr;
-      const changesRouting = (options) =>
-        options &&
-        typeof options === 'object' &&
-        ['host', 'protocol', 'port', 'clientPort', 'server'].some(
-          (key) => options[key] !== undefined,
+  const changesRouting = (options) =>
+    options &&
+    typeof options === 'object' &&
+    ['host', 'protocol', 'port', 'clientPort', 'server'].some((key) => options[key] !== undefined);
+  return (code, id, warn, server) => {
+    if (
+      typeof id !== 'string' ||
+      id.includes('?') ||
+      !id.replaceAll('\\', '/').endsWith('/vite/dist/client/client.mjs')
+    ) {
+      return null;
+    }
+    const hmr = server?.hmr;
+    const ws = server?.ws;
+    if (hmr === false || ws === false || changesRouting(ws) || changesRouting(hmr)) {
+      return null;
+    }
+    const complain = () => {
+      if (!warned) {
+        warned = true;
+        warn(
+          'Devkit HMR recovery skipped: unsupported Vite client/version; use a tested Vite 8.3.5 or 8.3.8 client or configure server.hmr explicitly.',
         );
-      const custom =
-        hmr === false || server?.ws === false || changesRouting(server?.ws) || changesRouting(hmr);
-      enabled = serve && !custom;
-    },
-    transform(code, id, warn) {
-      if (
-        !enabled ||
-        typeof id !== 'string' ||
-        id.includes('?') ||
-        !id.replaceAll('\\', '/').endsWith('/vite/dist/client/client.mjs')
-      ) {
-        return null;
       }
-      const complain = () => {
-        if (!warned) {
-          warned = true;
-          warn(
-            'Devkit HMR recovery skipped: unsupported Vite client/version; use a tested Vite 8.3.5 or 8.3.8 client or configure server.hmr explicitly.',
-          );
-        }
-        return null;
-      };
-      let version;
-      try {
-        version = JSON.parse(
-          fs.readFileSync(path.resolve(path.dirname(id), '../../package.json'), 'utf8'),
-        ).version;
-      } catch {
-        return complain();
-      }
-      const start = code.indexOf(opening);
-      const end = code.indexOf(closing, start);
-      if (
-        !acceptedVersions.has(version) ||
-        start < 0 ||
-        code.indexOf(opening, start + 1) !== -1 ||
-        end < start
-      ) {
-        return complain();
-      }
-      const finish = end + closing.length;
-      const original = code.slice(start, finish);
-      if (createHash('sha256').update(original).digest('hex') !== fragmentSha) {
-        return complain();
-      }
-      const nativeBody = original.slice(opening.length, -closing.length);
-      const replacement = `const transport = normalizeModuleRunnerTransport((() => {
+      return null;
+    };
+    let version;
+    try {
+      version = JSON.parse(
+        fs.readFileSync(path.resolve(path.dirname(id), '../../package.json'), 'utf8'),
+      ).version;
+    } catch {
+      return complain();
+    }
+    const start = code.indexOf(opening);
+    const end = code.indexOf(closing, start);
+    if (
+      !acceptedVersions.has(version) ||
+      start < 0 ||
+      code.indexOf(opening, start + 1) !== -1 ||
+      end < start
+    ) {
+      return complain();
+    }
+    const finish = end + closing.length;
+    const original = code.slice(start, finish);
+    if (createHash('sha256').update(original).digest('hex') !== fragmentSha) {
+      return complain();
+    }
+    const nativeBody = original.slice(opening.length, -closing.length);
+    const replacement = `const transport = normalizeModuleRunnerTransport((() => {
     if (typeof document === "undefined") return (() => { ${nativeBody} })();
     let phase = "awaiting-connected";
     let recoveryPromise;
@@ -126,7 +119,6 @@ export function hmrRecovery() {
       send(data) { wsTransport.send(data); }
     };
   })());`;
-      return { code: code.slice(0, start) + replacement + code.slice(finish), map: null };
-    },
+    return { code: code.slice(0, start) + replacement + code.slice(finish), map: null };
   };
 }

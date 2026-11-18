@@ -27,6 +27,48 @@ fn allocate(ports: &mut Ports, bindings: &[Binding]) {
 }
 
 #[test]
+fn allocation_rechecks_a_candidate_after_another_checkout_claims_it() {
+    let root = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut ports = Ports::open(root.path(), cache.path()).unwrap();
+    let mut competing_port = None;
+    let mut attempts = 0;
+    ports
+        .allocate_with(
+            &bindings(1),
+            Some("web"),
+            "same-seed",
+            &Default::default(),
+            &Default::default(),
+            |candidate| {
+                attempts += 1;
+                if competing_port.is_none() {
+                    let first = candidate.groups[0].first;
+                    let root = peer.path().to_owned();
+                    let cache = cache.path().to_owned();
+                    let (done, finished) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let mut peer = Ports::open(&root, &cache).unwrap();
+                        let mut explicit = bindings(1);
+                        explicit[0].explicit = Some((first, first));
+                        allocate(&mut peer, &explicit);
+                        done.send(()).unwrap();
+                    });
+                    finished
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("Another checkout can publish while this candidate is validated");
+                    competing_port = Some(first);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert_ne!(Some(ports.groups[0].first), competing_port);
+}
+
+#[test]
 fn concurrent_checkouts_lease_disjoint_replica_sets_and_reuse_them() {
     let cache = tempfile::tempdir().unwrap();
     let threads: Vec<_> = (0..8)

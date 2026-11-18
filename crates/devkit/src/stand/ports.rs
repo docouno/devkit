@@ -249,7 +249,7 @@ impl Ports {
         seed: &str,
         active: &ActivePorts,
         retry: &BTreeSet<String>,
-        before_claims: impl FnOnce(&mut Self) -> Result<()>,
+        before_claims: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<()> {
         let selected = declarations.iter().map(|b| b.service.clone()).collect();
         self.allocate_plan(
@@ -270,21 +270,19 @@ impl Ports {
         plan: Allocation<'_>,
         active: &ActivePorts,
         retry: &BTreeSet<String>,
-        before_claims: impl FnOnce(&mut Self) -> Result<()>,
+        mut before_claims: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        let Allocation {
-            declarations,
-            selected,
-            stopped,
-            primary,
-            seed,
-        } = plan;
         ensure!(
-            declarations.iter().all(|b| selected.contains(&b.service)),
+            plan.declarations
+                .iter()
+                .all(|b| plan.selected.contains(&b.service)),
             "Published binding lies outside selected services"
         );
-        ensure!(declarations.len() <= 65535, "Too many published bindings");
-        for binding in declarations {
+        ensure!(
+            plan.declarations.len() <= 65535,
+            "Too many published bindings"
+        );
+        for binding in plan.declarations {
             Group {
                 binding: binding.clone(),
                 first: 1,
@@ -294,19 +292,97 @@ impl Ports {
             .validate()?;
         }
         let range = port_range(std::env::var("DEVKIT_PORT_RANGE").ok().as_deref())?;
-        let lock = Registry::lock(&self.cache_root)?;
-        let mut registry = Registry::read(&self.cache_root)?;
-        registry.collect_stale()?;
+        let mut ordered: Vec<_> = plan.declarations.iter().collect();
+        ordered.sort_by_key(|b| (Some(b.service.as_str()) != plan.primary, &b.service, b.slot));
+        let propose = |ports: &Self, registry: &Registry| {
+            ports.propose(&plan, &ordered, active, retry, range, registry)
+        };
+        for _ in 0..3 {
+            let next = {
+                let _lock = Registry::lock(&self.cache_root)?;
+                let mut registry = Registry::read(&self.cache_root)?;
+                registry.collect_stale()?;
+                propose(self, &registry)?
+            };
+            let mut candidate = self.clone();
+            // Keep the complete prior union until a scoped observation retires it.
+            for group in &self.groups {
+                if !candidate.retained.contains(group) {
+                    candidate.retained.push(group.clone());
+                }
+            }
+            candidate.groups = next;
+            before_claims(&mut candidate)?;
+
+            // Normalization may call Docker. Revalidate after it returns, with
+            // the registry locked across publication of the local and global intents.
+            let lock = Registry::lock(&self.cache_root)?;
+            let mut registry = Registry::read(&self.cache_root)?;
+            registry.collect_stale()?;
+            if propose(self, &registry)? != candidate.groups {
+                continue;
+            }
+            for group in candidate.groups.iter().filter(|g| g.automatic) {
+                if let Some(old) = self.previous_automatic(&group.binding.key())
+                    && old.first != group.first
+                {
+                    eprintln!(
+                        "devkit: warning: {} stand port changed from {}-{} to {}-{}",
+                        group.binding.service, old.first, old.last, group.first, group.last
+                    );
+                }
+            }
+            *self = candidate;
+            self.allocation_intent = true;
+            self.save()?;
+            registry.claims.retain(|c| c.owner.key != self.owner.key);
+            for group in self.groups.iter().chain(&self.retained) {
+                if !registry
+                    .claims
+                    .iter()
+                    .any(|c| c.owner.key == self.owner.key && c.group == *group)
+                {
+                    registry.claims.push(Claim {
+                        owner: self.owner.clone(),
+                        group: group.clone(),
+                    });
+                }
+            }
+            registry.save(&self.cache_root)?;
+            drop(lock);
+            self.allocation_intent = false;
+            return self.save();
+        }
+        anyhow::bail!("Stand port candidates changed repeatedly before publication")
+    }
+
+    fn previous_automatic(&self, key: &str) -> Option<&Group> {
+        self.groups
+            .iter()
+            .chain(&self.retained)
+            .find(|g| g.automatic && g.binding.key() == key)
+    }
+
+    fn propose(
+        &self,
+        plan: &Allocation<'_>,
+        ordered: &[&Binding],
+        active: &ActivePorts,
+        retry: &BTreeSet<String>,
+        range: (u16, u16),
+        registry: &Registry,
+    ) -> Result<Vec<Group>> {
+        let Allocation {
+            selected,
+            stopped,
+            primary,
+            seed,
+            ..
+        } = *plan;
         let mut next = Vec::new();
-        let mut ordered: Vec<_> = declarations.iter().collect();
-        ordered.sort_by_key(|b| (Some(b.service.as_str()) != primary, &b.service, b.slot));
-        for binding in ordered {
+        for &binding in ordered {
             let key = binding.key();
-            let previous = self
-                .groups
-                .iter()
-                .chain(&self.retained)
-                .find(|g| g.automatic && g.binding.key() == key);
+            let previous = self.previous_automatic(&key);
             let count = binding.replicas as u32;
             let automatic = binding.explicit.is_none();
             let make = |first: u16, last: u16| Group {
@@ -413,30 +489,16 @@ impl Ports {
                             break;
                         }
                     }
-                    let group = selected.with_context(|| {
+                    selected.with_context(|| {
                         format!(
                             "No free contiguous block of {count} ports in {}-{} for {}",
                             range.0, range.1, binding.service
                         )
-                    })?;
-                    if let Some(old) = previous {
-                        eprintln!(
-                            "devkit: warning: {} stand port changed from {}-{} to {}-{}",
-                            binding.service, old.first, old.last, group.first, group.last
-                        );
-                    }
-                    group
+                    })?
                 }
             };
             group.validate()?;
             next.push(group);
-        }
-        let mut candidate = self.clone();
-        // Keep the complete prior union until a scoped observation retires it.
-        for group in &self.groups {
-            if !candidate.retained.contains(group) {
-                candidate.retained.push(group.clone());
-            }
         }
         next.extend(
             self.groups
@@ -444,28 +506,7 @@ impl Ports {
                 .filter(|g| !selected.contains(&g.binding.service))
                 .cloned(),
         );
-        candidate.groups = next;
-        before_claims(&mut candidate)?;
-        *self = candidate;
-        self.allocation_intent = true;
-        self.save()?;
-        registry.claims.retain(|c| c.owner.key != self.owner.key);
-        for group in self.groups.iter().chain(&self.retained) {
-            if !registry
-                .claims
-                .iter()
-                .any(|c| c.owner.key == self.owner.key && c.group == *group)
-            {
-                registry.claims.push(Claim {
-                    owner: self.owner.clone(),
-                    group: group.clone(),
-                });
-            }
-        }
-        registry.save(&self.cache_root)?;
-        drop(lock);
-        self.allocation_intent = false;
-        self.save()
+        Ok(next)
     }
     pub fn release(&self) -> Result<()> {
         super::preview::collect_files(&self.owner.root, &self.owner, &BTreeSet::new())?;

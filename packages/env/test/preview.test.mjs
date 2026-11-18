@@ -204,27 +204,42 @@ test('HMR seam is guarded by exact Vite package, version, fragment and routing',
     const shim = hmrRecovery();
     let warnings = 0;
     const warn = () => warnings++;
-    shim.configure({}, true);
-    assert.match(shim.transform(source, client, warn).code, /devkit:hmr-recovery:/u);
-    assert.equal(shim.transform(source, `${client}?query`, warn), null);
+    assert.match(shim(source, client, warn).code, /devkit:hmr-recovery:/u);
+    assert.equal(shim(source, `${client}?query`, warn), null);
     assert.equal(
-      shim.transform(
+      shim(
         source.replace('await wsTransport.connect(handlers);', 'await changed();'),
         client,
         warn,
       ),
       null,
     );
-    assert.equal(shim.transform('unknown', client, warn), null);
+    assert.equal(shim('unknown', client, warn), null);
     assert.equal(warnings, 1);
     for (const server of [{ hmr: false }, { hmr: { host: 'custom' } }, { ws: { server: {} } }]) {
-      shim.configure({ server }, true);
-      assert.equal(shim.transform(source, client, warn), null);
+      assert.equal(shim(source, client, warn, server), null);
     }
-    shim.configure({ server: { hmr: { path: '/custom', timeout: 123, overlay: false } } }, true);
-    assert.ok(shim.transform(source, client, warn));
-    shim.configure({ server: { ws: { path: '/custom', timeout: 123 } } }, true);
-    assert.ok(shim.transform(source, client, warn));
+    assert.ok(
+      shim(source, client, warn, { hmr: { path: '/custom', timeout: 123, overlay: false } }),
+    );
+    assert.ok(shim(source, client, warn, { ws: { path: '/custom', timeout: 123 } }));
+
+    environment({}, () => {
+      const plugin = devkitWorkspaceSource('/no-project');
+      const first = { command: 'serve', server: {} };
+      const second = { command: 'serve', server: {} };
+      plugin.configResolved(first);
+      plugin.configResolved(second);
+      first.server.ws = { clientPort: 19999 };
+      const transform = (config) =>
+        plugin.transform.call(
+          { environment: { getTopLevelConfig: () => config }, warn },
+          source,
+          client,
+        );
+      assert.equal(transform(first), null);
+      assert.match(transform(second).code, /devkit:hmr-recovery:/u);
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

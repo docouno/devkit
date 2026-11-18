@@ -694,26 +694,24 @@ impl<'a> PreparedContext<'a> {
             c.env(k, v);
         }
     }
-    fn compose(&self) -> Result<Command> {
+    fn compose_project(&self) -> Command {
         let mut c = self.docker();
         c.args(["compose", "--project-directory"])
             .arg(&self.admission.root)
-            .args([
-                "--project-name",
-                &self.project,
-                "--env-file",
-                "/dev/null",
-                "--file",
-            ])
-            .arg(safe_path(
-                &self.admission.root,
-                ".devkit/compose.apps.yaml",
-            )?);
+            .args(["--project-name", &self.project, "--env-file", "/dev/null"]);
+        self.env(&mut c);
+        c
+    }
+    fn compose(&self) -> Result<Command> {
+        let mut c = self.compose_project();
+        c.arg("--file").arg(safe_path(
+            &self.admission.root,
+            ".devkit/compose.apps.yaml",
+        )?);
         if identity(&safe_path(&self.admission.root, "compose.yaml")?)?.is_some() {
             c.arg("--file")
                 .arg(self.admission.root.join("compose.yaml"));
         }
-        self.env(&mut c);
         Ok(c)
     }
     fn prerequisite_service(&self) -> Result<()> {
@@ -2856,38 +2854,44 @@ fn run_development(
     let validate_mounts = |ports: &crate::stand::ports::Ports,
                            resource_file: Option<&tempfile::NamedTempFile>,
                            stand: &Path|
-     -> Result<()> {
-        if !proof.images.is_empty() {
-            let mut command = launch_command(resource_file, stand)?;
-            command.args([
-                "--profile",
-                "*",
-                "config",
-                "--no-env-resolution",
-                "--format",
-                "json",
-            ]);
-            // This query may hold the shared lease lock until the candidate
-            // passes. Bound it just like the other preview metadata queries.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            let output = ctx.runner.capture_before(&mut command, deadline)?;
-            crate::stand::inspection::verify_launch(
-                &crate::stand::preview::compose_model(&output.stdout)?,
-                &inspected_model,
-                ports,
-                &active_services,
-                &proof,
-            )?;
+     -> Result<Option<Vec<u8>>> {
+        if proof.images.is_empty() {
+            return Ok(None);
         }
-        Ok(())
+        let mut command = launch_command(resource_file, stand)?;
+        command.args([
+            "--profile",
+            "*",
+            "config",
+            "--no-env-resolution",
+            "--format",
+            "json",
+        ]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let output = ctx.runner.capture_before(&mut command, deadline)?;
+        ensure!(
+            output.stdout.len() <= crate::processes::MAX_NATIVE_INPUT,
+            "Normalized Compose launch exceeds native stdin byte budget"
+        );
+        crate::stand::inspection::verify_launch(
+            &crate::stand::preview::compose_model(&output.stdout)?,
+            &inspected_model,
+            ports,
+            &active_services,
+            &proof,
+        )?;
+        // Compose already escaped this output for use as input. Keep the exact
+        // verified model in memory so later commands cannot read amended files.
+        Ok(Some(output.stdout))
     };
     let allocate = |ports: &mut crate::stand::ports::Ports,
                     rows: &[crate::stand::ledger::Container],
                     active_ports: &crate::stand::ports::ActivePorts,
                     conflicts: &BTreeSet<String>,
                     resource_file: Option<&tempfile::NamedTempFile>|
-     -> Result<PathBuf> {
+     -> Result<(PathBuf, Option<Vec<u8>>)> {
         let mut overlay = Vec::new();
+        let mut snapshot = None;
         ports.allocate_plan(
             crate::stand::ports::Allocation {
                 declarations: &declarations,
@@ -2920,17 +2924,20 @@ fn run_development(
                         .suffix(".yaml")
                         .tempfile_in(&state_dir)?;
                     file.write_all(&overlay)?;
-                    validate_mounts(candidate, resource_file, file.path())?;
+                    snapshot = validate_mounts(candidate, resource_file, file.path())?;
                     assert_compose_inventory(&ctx.admission.root, &inventory)?;
                 }
                 Ok(())
             },
         )?;
-        crate::stand::save_overlay(&ctx.admission.root, &overlay)
+        Ok((
+            crate::stand::save_overlay(&ctx.admission.root, &overlay)?,
+            snapshot,
+        ))
     };
     let result = (|| -> Result<()> {
         let mut resource_file = write_resources(resources.as_ref())?;
-        let mut stand_overlay = allocate(
+        let (mut stand_overlay, mut snapshot) = allocate(
             &mut ports,
             &rows,
             &active_ports,
@@ -2940,11 +2947,20 @@ fn run_development(
         let mut bind_attempts = 1;
         let mut cgroup_retried = false;
         loop {
-            let mut command = launch_command(resource_file.as_ref(), &stand_overlay)?;
-            command.args(["up", "-d", "--wait", &service]);
+            let compose = || -> Result<Command> {
+                if snapshot.is_some() {
+                    let mut command = ctx.compose_project();
+                    command.args(["--file", "-"]);
+                    Ok(command)
+                } else {
+                    launch_command(resource_file.as_ref(), &stand_overlay)
+                }
+            };
             full.recheck()?;
-            assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+            assert_compose_inventory(&ctx.admission.root, &inventory)?;
+            let mut create = compose()?;
+            create.args(["create", &service]);
             ledger = crate::stand::ledger::Ledger::intent(
                 &ctx.admission.root,
                 &ports.owner,
@@ -2957,17 +2973,24 @@ fn run_development(
             crate::stand::epoch::anchor(&ctx.admission.root)?;
             ledger.begin_launch(&ctx.admission.root, &model, &active_services, &before)?;
             let mut reaped = false;
-            let up_result = ctx.runner.run_tracked(
-                &mut command,
-                OutputMode::TeeStderr(64 * 1024),
-                None,
-                &mut reaped,
-            );
+            let mode = OutputMode::TeeStderr(64 * 1024);
+            let creation =
+                ctx.runner
+                    .run_tracked(&mut create, mode, snapshot.as_deref(), &mut reaped);
             ledger.launch_finished = reaped;
             ledger.launch.as_mut().unwrap().daemon_finished =
-                matches!(up_result.as_ref(), Ok(output) if output.code == 0) && reaped;
+                matches!(creation.as_ref(), Ok(output) if output.code == 0) && reaped;
             ledger.save(&ctx.admission.root)?;
-            let mut up_output = up_result?;
+            let mut up_output = creation?;
+            if up_output.code == 0 {
+                let mut start = compose()?;
+                start.args(["start", "--wait", &service]);
+                up_output = if let Some(input) = &snapshot {
+                    ctx.runner.run_with_input(&mut start, mode, input)?
+                } else {
+                    ctx.runner.run(&mut start, mode)?
+                };
+            }
             if up_output.code == 0 {
                 break;
             }
@@ -2983,7 +3006,7 @@ fn run_development(
                 );
                 budget.disable_cgroup_limits();
                 resource_file = write_resources(resource_overlay(&budget)?.as_ref())?;
-                validate_mounts(&ports, resource_file.as_ref(), &stand_overlay)?;
+                snapshot = validate_mounts(&ports, resource_file.as_ref(), &stand_overlay)?;
                 cgroup_retried = true;
                 *ctx.budget.borrow_mut() = Some(budget.clone());
                 continue;
@@ -2992,7 +3015,7 @@ fn run_development(
             if bind_attempts < 3 && !conflicts.is_empty() {
                 let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
                 let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
-                stand_overlay = allocate(
+                (stand_overlay, snapshot) = allocate(
                     &mut ports,
                     &rows,
                     &active_ports,

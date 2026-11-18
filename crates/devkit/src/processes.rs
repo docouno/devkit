@@ -60,6 +60,8 @@ pub enum OutputMode {
     TeeStderr(usize),
     Capture(usize),
 }
+pub const MAX_NATIVE_INPUT: usize = 8 * 1024 * 1024;
+
 pub struct ProcessOutput {
     pub code: u8,
     pub stdout: Vec<u8>,
@@ -309,7 +311,7 @@ impl ProcessRunner {
         input: &[u8],
     ) -> Result<ProcessOutput> {
         ensure!(
-            input.len() <= 8 * 1024 * 1024,
+            input.len() <= MAX_NATIVE_INPUT,
             "Native stdin exceeds byte budget"
         );
         self.run_input_inner(command, mode, false, None, Some(input), None)
@@ -322,7 +324,7 @@ impl ProcessRunner {
         reaped: &mut bool,
     ) -> Result<ProcessOutput> {
         ensure!(
-            input.is_none_or(|v| v.len() <= 8 * 1024 * 1024),
+            input.is_none_or(|v| v.len() <= MAX_NATIVE_INPUT),
             "Native stdin exceeds byte budget"
         );
         *reaped = false;
