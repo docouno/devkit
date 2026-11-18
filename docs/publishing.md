@@ -1,6 +1,6 @@
 # Publishing Libraries
 
-Devkit `ts-library` and `react-ui` packages are created with `"private": true` so internal monorepo libraries never publish accidentally. Opting a library into publication requires only native `package.json` edits followed by `devkit sync` and `make package`.
+Devkit `ts-library` and `react-ui` packages are created with `"private": true` so internal monorepo libraries never publish accidentally. Opting a library into publication requires only native `package.json` edits followed by `make sync` and `make package`.
 
 ## 1. Opt In to Publication
 
@@ -62,8 +62,7 @@ make setup
 Always bump versions inside the pinned Node container then refresh root `pnpm-lock.yaml` with `make sync` before setup:
 
 ```sh
-npx @docouno/devkit@0.5.0 exec --component packages/ui --write -- \
-  pnpm version 0.2.0 --no-git-tag-version
+make exec package=ui write=1 command='pnpm version 0.2.0 --no-git-tag-version'
 make sync
 make setup
 ```
@@ -88,7 +87,7 @@ make package package=ui
    - `<safe-name>-<version>.tgz` (for example `acme-ui-0.2.0.tgz`)
    - `package-receipt.json` (`name`, `version`, `filename`, `sha256`, `shasum`, `integrity`, `size`, `entryCount`, `publintPassed`, `attwProfile`, `attwPassed`)
 
-If `"private": true` is still set, `make package package=<slug>` fails with an actionable hint explaining how to enable `"private": false` and run `devkit sync`.
+If `"private": true` is still set, `make package package=<slug>` explains how to enable `"private": false` and run `make sync`.
 
 ## 4. Publish to Public npm (GitHub Actions OIDC Trusted Publishing)
 

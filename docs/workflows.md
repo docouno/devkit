@@ -53,40 +53,29 @@ cd acme-design
 make setup
 ```
 
-## 2. Add Components and Wire Internal Packages (`--use`)
+## 2. Add Components and Wire Internal Packages
 
-Add libraries or applications at any time and wire them to existing `packages/<slug>` components with repeatable `--use`:
+Add libraries or applications and wire them to existing `packages/<slug>` components with `use=`:
 
 ```sh
-npx @docouno/devkit@0.5.0 add-package . --name tokens --template ts-library
-npx @docouno/devkit@0.5.0 add-package . --name ui --template react-ui --use tokens
-npx @docouno/devkit@0.5.0 add-app . --name docs --template react-web --use tokens --use ui
+make add-package name=tokens template=ts-library
+make add-package name=ui template=react-ui use=tokens
+make add-app name=docs template=react-web use='tokens ui'
 make setup
 ```
 
-`--use <slug>` adds `"<pkgName>": "workspace:*"` to the consumer's `package.json`, updates `pnpm-lock.yaml`, and derives the build/check DAG automatically in `.devkit/manifest.json` and `.devkit/project.mk`.
+`use=` adds `"<pkgName>": "workspace:*"` to the consumer's `package.json`, updates `pnpm-lock.yaml`, and derives the build/check DAG in `.devkit/manifest.json` and `.devkit/project.mk`.
 
-## 3. Add or Update Third-Party Dependencies (`devkit exec`)
+## 3. Add or Update Third-Party Dependencies
 
-Never run host `npm install` or `cargo` directly on the checkout. Always execute package-manager mutations inside the pinned container with `--write` and `--network bridge`:
-
-```sh
-# Node.js / React / TypeScript component (including npm: aliases)
-npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
-  pnpm add clsx
-
-npx @docouno/devkit@0.5.0 exec --component packages/ui --write --network bridge -- \
-  pnpm add legacy-zod@npm:zod@^3.24.0
-
-# Rust component
-npx @docouno/devkit@0.5.0 exec --component apps/api --write --network bridge -- \
-  cargo update --manifest-path Cargo.toml
-```
-
-Without host Node.js, use the root `Makefile` wrapper:
+Run package-manager mutations inside the pinned container. Use `write=1` to allow edits and `network=bridge` for registry access.
 
 ```sh
-make exec package=ui write=1 network=bridge command="pnpm add clsx"
+# A Node package
+make exec package=ui write=1 network=bridge command='pnpm add clsx'
+
+# A Rust app
+make exec app=api write=1 network=bridge command='cargo update --manifest-path Cargo.toml'
 ```
 
 Follow dependency mutations with `make setup` to refresh the verified workspace lock receipt.
@@ -138,7 +127,7 @@ For repositories with runnable applications (`apps/*`):
 make dev                    # Start development services and print http://127.0.0.1:<port> URLs
 make up                     # Start development stack in the background and print service URLs
 make info                   # Inspect checkout readiness, leases and observed services
-npx @docouno/devkit@0.5.0 status . --json    # Structured services, health, URLs, and receipts
+make info json=1            # Print the checkout summary as JSON
 make logs app=playground    # Print recent service logs (follow=1 streams without holding task.lock)
 make down                   # Stop and remove project containers and networks
 ```
@@ -150,7 +139,7 @@ sh .devkit/runtime/devkit.sh cli doctor . --json    # Lock-free Docker, cgroup v
 sh .devkit/runtime/devkit.sh cli describe . --json  # Offline component graph, selectors, ports, and receipts
 ```
 
-Read-only commands such as `make logs` and read-only `make exec` share the checkout lock. `make info` probes the checkout lock without waiting and reports whether the stand can be observed. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).
+Read-only commands such as `make logs` and read-only `make exec` share the checkout lock. `make info` probes the checkout lock without waiting and reports whether the stand can be observed. On first use it can download the verified pinned executable. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).
 
 In zero-app library repositories, `make info` lists the registered packages. `make dev` and `make up` require an application.
 
