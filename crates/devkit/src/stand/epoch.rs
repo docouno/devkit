@@ -134,8 +134,7 @@ fn manifest(root: &Path) -> Result<Option<(File, Witness)>> {
     Ok(Some((file, witness)))
 }
 
-/// This ticket cannot be reconstructed from persistent state. Its directory FD
-/// holds the exact successful mkdir incarnation until acquisition finishes.
+/// Only the publisher of a prelocked state directory may use this ticket.
 pub struct Creator {
     root: Physical,
     directory: File,
@@ -143,21 +142,11 @@ pub struct Creator {
     before: Witness,
 }
 
-pub fn before_lock(root: &Path) -> Result<Option<Creator>> {
-    if fs::symlink_metadata(safe_path(root, ".devkit/state")?).is_ok() {
-        return Ok(None);
-    }
+pub(crate) fn prepare_creator(root: &Path, staging: &Path) -> Result<Option<Creator>> {
     let Some((file, before)) = manifest(root)? else {
         return Ok(None);
     };
-    let state = safe_path(root, ".devkit/state")?;
-    match fs::create_dir(&state) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    sync_directory(state.parent().context("State parent")?)?;
-    let directory = regular(&state)?;
+    let directory = regular(staging)?;
     Ok(Some(Creator {
         root: Physical::at(root)?,
         directory,

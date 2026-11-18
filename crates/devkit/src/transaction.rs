@@ -103,10 +103,21 @@ fn validate_journal(tx: &UpdateJournal) -> Result<()> {
     }
     Ok(())
 }
-pub fn read_journal(root: &Path) -> Result<UpdateJournal> {
-    let tx: UpdateJournal = read_json(&safe_path(root, PENDING_PATH)?)?;
+const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+
+fn parse_journal(bytes: &[u8]) -> Result<UpdateJournal> {
+    let tx: UpdateJournal = serde_json::from_slice(bytes)?;
     validate_journal(&tx)?;
     Ok(tx)
+}
+pub fn read_journal(root: &Path) -> Result<UpdateJournal> {
+    let (bytes, _) = read_regular_file(
+        &safe_path(root, PENDING_PATH)?,
+        MAX_JOURNAL_BYTES,
+        "update journal",
+    )?
+    .context("Missing update journal")?;
+    parse_journal(&bytes)
 }
 fn verify_saved(root: &Path, file: &PlannedFile) -> Result<()> {
     if let Some(p) = &file.backup {
@@ -190,15 +201,22 @@ pub fn recover_project_with(
     root: &Path,
     runner: Option<&crate::processes::ProcessRunner>,
 ) -> Result<bool> {
-    let lock = CheckoutLock::acquire_exclusive(root, "recover", runner)?;
+    let root = project_root(root)?;
+    let pending = safe_path(&root, PENDING_PATH)?;
+    if !exists(&pending)? && !exists(&safe_path(&root, ".devkit/state")?)? {
+        return Ok(false);
+    }
+    let lock = CheckoutLock::acquire_exclusive(&root, "recover", runner)?;
     recover_locked(&lock.root)
 }
 pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
-    let pending = identity(&safe_path(root, PENDING_PATH)?)?;
-    if pending.is_none() {
+    let pending_path = safe_path(root, PENDING_PATH)?;
+    let Some((bytes, _, stamp)) =
+        read_regular_snapshot(&pending_path, MAX_JOURNAL_BYTES, "update journal")?
+    else {
         return Ok(false);
-    }
-    let tx = read_journal(root)?;
+    };
+    let tx = parse_journal(&bytes)?;
     // No rollback writes until every saved/current identity and every created
     // source path has passed preflight.
     verify_new_sources(root, &tx)?;
@@ -212,10 +230,10 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
         );
     }
     ensure!(
-        identity(&safe_path(root, PENDING_PATH)?)? == pending,
+        stamp.matches(&pending_path)?,
         "Update journal changed during recovery"
     );
-    crate::stand::epoch::recovery_transfer(root, &json_bytes(&tx)?)?;
+    crate::stand::epoch::recovery_transfer(root, &bytes)?;
     for file in tx.files.iter().rev() {
         let p = safe_path(root, &file.path)?;
         let actual = identity(&p)?;
@@ -248,7 +266,7 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
             remove_empty_dir_durable(&p)?;
         }
     }
-    crate::stand::epoch::finish_transfer(root, &json_bytes(&tx)?)?;
+    crate::stand::epoch::finish_transfer(root, &bytes)?;
     remove_file(&safe_path(root, PENDING_PATH)?)?;
     crate::stand::epoch::clear_transfer(root)?;
     remove_tree_durable(&safe_path(root, &tx.stage)?)?;
@@ -391,10 +409,15 @@ impl PreparedTransaction {
         // Also bind already-existing ancestry up to the admitted checkout.
         // It may have been created by an older engine without directory fsync.
         sync_stage_ancestry(root, &self.journal.stage)?;
+        let bytes = json_bytes(&self.journal)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_JOURNAL_BYTES,
+            "Update journal exceeds 4 MiB byte budget"
+        );
         let epoch_transfer = crate::stand::epoch::prepare_transfer(root)?;
-        write_json(&safe_path(root, PENDING_PATH)?, &self.journal)?;
+        write_atomic(&safe_path(root, PENDING_PATH)?, &bytes, 0o644)?;
         let result = (|| {
-            crate::stand::epoch::begin_transfer(root, &json_bytes(&self.journal)?, epoch_transfer)?;
+            crate::stand::epoch::begin_transfer(root, &bytes, epoch_transfer)?;
             for (i, file) in self.journal.files.iter().enumerate() {
                 let p = safe_path(root, &file.path)?;
                 ensure!(
@@ -416,7 +439,7 @@ impl PreparedTransaction {
                     h.after_write(i + 1, &file.path)?;
                 }
             }
-            crate::stand::epoch::finish_transfer(root, &json_bytes(&self.journal)?)?;
+            crate::stand::epoch::finish_transfer(root, &bytes)?;
             remove_file(&safe_path(root, PENDING_PATH)?)?;
             crate::stand::epoch::clear_transfer(root)?;
             Ok(())

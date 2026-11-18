@@ -164,6 +164,8 @@ class Harness:
         self.base = '/docouno/devkit/releases/download'
         self.engine_route = f'{self.base}/v{self.version}/{self.index["engine"]}'
         self.fixture.routes[self.engine_route] = self.engine.read_bytes()
+        self.fixture.routes[f'{self.base}/v{self.version}/release-index.json'] = (self.build_set / 'release-index.json').read_bytes()
+        self.fixture.routes[f'{self.base}/v{self.version}/{self.index["archive"]}'] = (self.build_set / self.index['archive']).read_bytes()
         self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
         self.old_base = f'{self.base}/v{self.old_version}'
         self.old_index_route = f'{self.old_base}/release-index.json'
@@ -188,9 +190,9 @@ class Harness:
         self.results = []
     def environment(self, name):
         return dict(self.env, DEVKIT_CACHE_DIR=str(self.scratch / ('cache ' + name)))
-    def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None):
+    def run(self, name, argv, *, expected=None, env=None, timeout=45, memory_limit=None, cwd=None):
         started = time.monotonic()
-        result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=self.scratch,
+        result = subprocess.run([str(v) for v in argv], env=env or self.environment(name), cwd=cwd or self.scratch,
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
             preexec_fn=(lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))) if memory_limit else None)
         output = result.stdout + result.stderr
@@ -231,10 +233,18 @@ class Harness:
         (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
         before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml')}
         self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
-        self.run('explicit-baseline-preview', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--preview', '--non-interactive'])
-        self.run('explicit-baseline-native-update', [self.engine, 'update', baseline, '--to', self.version, '--release-root', self.payload, '--non-interactive'])
+        bridge_env = self.environment('genuine-baseline-http-init')
+        old_loader = baseline / '.devkit/runtime/devkit.sh'
+        old_bytes = old_loader.read_bytes()
+        bridge = ['sh', old_loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive']
+        self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
+        require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
+        self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
         require(all(p.read_bytes() == data for p, data in before.items()), 'Migration changed product inputs')
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+        info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
+        require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
+        require(not (baseline / 'AGENTS.md').exists() and not (baseline / '.config/wt.toml').exists(), 'Upgrade created project-owned files')
         pre_040 = self.scratch / 'pre-040-checkout'
         (pre_040 / '.devkit').mkdir(parents=True)
         (pre_040 / '.devkit/manifest.json').write_text(json.dumps({

@@ -56,7 +56,14 @@ function config(input, mode) {
   const definitions = [
     {
       name: 'devkit/generated-output',
-      ignores: ['node_modules/**', 'dist/**', 'release/**', 'coverage/**', '.devkit/**'],
+      ignores: [
+        'node_modules/**',
+        'dist/**',
+        'release/**',
+        'coverage/**',
+        '.devkit/**',
+        '**/.worktrees/**',
+      ],
     },
     {
       name: 'devkit/javascript',

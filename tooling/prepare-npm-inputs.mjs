@@ -46,6 +46,7 @@ const excluded = new Set([
   'dist',
   'release',
   '.artifacts',
+  '.worktrees',
   '.tmp',
   '.git',
 ]);
@@ -130,6 +131,9 @@ function sources(root) {
         if (!excluded.has(child)) {
           if (child === '.npmrc') {
             throw new Error('Package .npmrc is not an accepted npm preparation input');
+          }
+          if (['agents.md', 'claude.md', 'gemini.md'].includes(child.toLowerCase())) {
+            throw new Error(`Forbidden environment package input: ${name}/${child}`);
           }
           visit(`${name}/${child}`);
         }

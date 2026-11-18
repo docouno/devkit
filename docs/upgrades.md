@@ -46,6 +46,10 @@ make check
 
 ## What `devkit update` Changes vs Preserves
 
+Use `make update to=VERSION preview=1` to review changes from a checkout on `0.5.0` or later. Apply with `make update to=VERSION` and run `make recover` if a local transaction is interrupted. On `0.4.1`, use `sh .devkit/runtime/devkit.sh cli update . --to 0.5.0`. On `0.4.0`, use the [versioned installer](https://github.com/docouno/devkit/releases/download/v0.5.0/install.sh) with `update . --to 0.5.0` or use `npx @docouno/devkit@0.5.0 update . --to 0.5.0`.
+
+If a `0.4.x` to `0.5.0` update leaves the older loader installed, use the `0.5.0` installer with `recover .` or `npx @docouno/devkit@0.5.0 recover .`. For journals older than `0.5.0` that exceed 4 MiB, run recovery with the pinned release that wrote the journal.
+
 - **Updated automatically**:
   - `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.*.yaml|json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`
   - `{rust-component}/rust-toolchain.toml`

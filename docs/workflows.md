@@ -137,7 +137,7 @@ For repositories with runnable applications (`apps/*`):
 ```sh
 make dev                    # Start development services and print http://127.0.0.1:<port> URLs
 make up                     # Start development stack in the background and print service URLs
-make status                 # Inspect running service containers via Docker Compose
+make info                   # Inspect checkout readiness, leases and observed services
 npx @docouno/devkit@0.5.0 status . --json    # Structured services, health, URLs, and receipts
 make logs app=playground    # Print recent service logs (follow=1 streams without holding task.lock)
 make down                   # Stop and remove project containers and networks
@@ -150,9 +150,9 @@ sh .devkit/runtime/devkit.sh cli doctor . --json    # Lock-free Docker, cgroup v
 sh .devkit/runtime/devkit.sh cli describe . --json  # Offline component graph, selectors, ports, and receipts
 ```
 
-Read-only commands (`devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs`, and read-only `devkit exec`) use shared checkout locks so multiple terminals or automation tools can inspect the repository concurrently. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).
+Read-only commands such as `make logs` and read-only `make exec` share the checkout lock. `make info` probes the checkout lock without waiting and reports whether the stand can be observed. Mutating commands serialize automatically via `.devkit/state/task.owner.json` (tunable with `DEVKIT_LOCK_TIMEOUT_MS`).
 
-In zero-app library repositories, `make status`, `make logs`, and `make down` succeed as clean no-ops, while `make dev` and `make up` exit with a hint explaining how to add a playground app via `devkit add-app`.
+In zero-app library repositories, `make info` lists the registered packages. `make dev` and `make up` require an application.
 
 ## 6. Live Design-System HMR (`devkitWorkspaceSource`)
 
@@ -162,6 +162,23 @@ Web (`react-web`) and Electron (`electron-react`) applications using `devkitWork
 - Because `devkitWorkspaceSource()` is strictly scoped to `apply: 'serve'`, `make test` and `make build` always validate the real compiled `dist/` output and public `exports` map of every workspace library.
 
 ## Development stands and preview URLs
+
+### Use Worktrunk
+
+New projects include the project-owned `.config/wt.toml` unless initialized with `--no-worktrunk`. Install Worktrunk independently and approve its project hooks from a checkout that has the config. Worktrunk applies the config in the invoking checkout and manages worktree paths, branches and removal.
+
+```sh
+wt switch --create feature/dashboard
+make info
+wt list
+wt remove feature/dashboard
+```
+
+Set `WORKTRUNK_WORKTREE_PATH='{{ repo_path }}/.worktrees/{{ branch | sanitize }}'` or configure `worktree-path` in the Worktrunk user config to use nested worktrees. Keep `/.worktrees/` in your project's `.gitignore`. Use `make info` in the selected checkout for the confirmed address.
+
+The `pre-start` hook reserves ports without starting containers. It can download a verified pinned engine on first use. A reservation failure reports a skip and leaves the checkout available for `make up`. Set `DEVKIT_WT_AUTOSTART=1` to run `make setup` and `make up` in the optional `post-start` hook. With the `pre-remove` hook approved, Worktrunk stops removal when cleanup fails. Declining approval or using `--no-hooks` can skip cleanup. In that case, first run `sh .devkit/runtime/devkit.sh cli stand remove .` in the target checkout. Declare long-lived data in Compose `external` volumes.
+
+Other worktree managers can call `sh .devkit/runtime/devkit.sh cli stand reserve .` and `sh .devkit/runtime/devkit.sh cli stand remove .` from the target checkout. Keep the checkout on a cleanup error and retry after resolving the reported issue.
 
 `make up` and `make dev` allocate sticky host ports for every active Compose port binding. Automatic replica bindings receive a contiguous range. Explicit ports and ranges stay explicit. TCP and UDP leases are separate, wildcard host bindings overlap conservatively, and a real bind conflict can move only the failed automatic group. The first primary-web candidate uses the branch hash convention of Worktrunk's `hash_port`; the persisted lease remains authoritative after a branch rename or restart.
 
@@ -174,7 +191,7 @@ Leases live in the shared user cache (`port-leases.json`), with checkout identit
 
 Set `DEVKIT_PREVIEW_URL_TEMPLATE` to an absolute HTTP(S) URL. `{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
 
-Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make status` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down; these reservations are not reported as running endpoints. They do not advertise a newly supplied template as already running.
+Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make info` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down; these reservations are not reported as running endpoints. They do not advertise a newly supplied template as already running.
 
 Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/devkit/preview-hosts.json`, falling back to `/devkit/preview-hosts.json`. The file is limited to 32 MiB and 65,535 sorted unique hosts. Managed launches clear the legacy `DEVKIT_PREVIEW_HOSTS` CSV carrier. Short `DEVKIT_PREVIEW_HOSTS_FILE`, `DEVKIT_PREVIEW_HOSTS_SHA256`, `DEVKIT_PREVIEW_URL`, `DEVKIT_SERVICE` and `DEVKIT_BRANCH` variables describe it; automatic host sets are never expanded into a large environment variable.
 

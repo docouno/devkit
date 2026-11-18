@@ -848,6 +848,13 @@ pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
     let Some(ports) = super::ports::Ports::read(root)? else {
         return Ok(Vec::new());
     };
+    reservations_from(&ports, false)
+}
+
+pub(crate) fn reservations_from(
+    ports: &super::ports::Ports,
+    include_ranges: bool,
+) -> Result<Vec<Reservation>> {
     ports
         .groups
         .iter()
@@ -862,7 +869,8 @@ pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
                         .and_then(|id| ports.deployments.get(id))
                         .map(|d| &d.renderer)
                 });
-            let single = group.first == group.last && group.binding.protocol == "tcp";
+            let endpoint =
+                (include_ranges || group.first == group.last) && group.binding.protocol == "tcp";
             Ok(Reservation {
                 service: group.binding.service.clone(),
                 target: group.binding.target,
@@ -873,8 +881,8 @@ pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
                 replicas: group.binding.replicas,
                 automatic: group.automatic,
                 state: "reserved",
-                local_url: single.then(|| local_url(&group.binding.host_ip, group.first)),
-                preview_url: if single {
+                local_url: endpoint.then(|| local_url(&group.binding.host_ip, group.first)),
+                preview_url: if endpoint {
                     renderer
                         .map(|r| r.render(group.first, &group.binding.service))
                         .transpose()?

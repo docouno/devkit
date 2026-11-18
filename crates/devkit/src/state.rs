@@ -244,13 +244,13 @@ pub fn validate_project_state(s: &ProjectState) -> Result<()> {
 pub fn read_project_state(root: &Path) -> Result<ProjectState> {
     let path = safe_path(root, MANIFEST_PATH)?;
     check_manifest_regular_bounded(&path)?;
-    let before = identity(&path)?.context("Missing project manifest")?;
-    let bytes = fs::read(&path)?;
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
-        "Project manifest changed during admission"
-    );
-    let s: ProjectState = serde_json::from_slice(&bytes)?;
+    let (bytes, _) = read_regular_file(&path, MAX_MANIFEST_BYTES, "project manifest")?
+        .context("Missing project manifest")?;
+    parse_project_state(&bytes)
+}
+
+pub(crate) fn parse_project_state(bytes: &[u8]) -> Result<ProjectState> {
+    let s: ProjectState = serde_json::from_slice(bytes)?;
     validate_project_state(&s)?;
     Ok(s)
 }
@@ -275,7 +275,7 @@ pub fn assert_no_pending(root: &Path) -> Result<()> {
 }
 pub fn excluded_snapshot_path(name: &str) -> bool {
     name.split('/')
-        .any(|p| [".git", "node_modules", ".artifacts"].contains(&p))
+        .any(|p| [".git", "node_modules", ".artifacts", ".worktrees"].contains(&p))
         || name == "target"
         || name.starts_with("target/")
         || [".devkit/state", ".devkit/cache"]
@@ -486,17 +486,38 @@ fn is_ancestor_or_self(target_pid: u32) -> bool {
 
 pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
     let path = safe_path(root, ".devkit/state/task.owner.json").ok()?;
-    let meta = fs::symlink_metadata(&path).ok()?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
+    let (bytes, _) = read_regular_file(&path, 65536, "checkout lock owner").ok()??;
     let owner: LockOwner = serde_json::from_slice(&bytes).ok()?;
     if owner.pid == 0 {
         return None;
     }
     let (_, ticks) = proc_stat_ppid_and_start(owner.pid)?;
     (ticks == owner.start_time_ticks).then_some(owner)
+}
+
+pub(crate) fn probe_checkout_lock(root: &Path) -> Result<bool> {
+    let path = safe_path(root, ".devkit/state/task.lock")?;
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = lock.metadata()?;
+    ensure!(metadata.is_file(), "Checkout lock must be regular");
+    let busy = match lock.try_lock() {
+        Ok(()) => false,
+        Err(fs::TryLockError::WouldBlock) => true,
+        Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+    };
+    ensure!(
+        FileStamp::of(&metadata).matches(&path)?,
+        "Checkout lock changed while probing"
+    );
+    Ok(busy)
 }
 
 fn write_owner_sidecar(root: &Path, operation: &str) -> Result<PathBuf> {
@@ -604,15 +625,66 @@ impl CheckoutLock {
         operation: &str,
         runner: Option<&crate::processes::ProcessRunner>,
     ) -> Result<Self> {
+        Self::acquire_until(root, mode, operation, runner, None)
+    }
+
+    pub(crate) fn acquire_until(
+        root: &Path,
+        mode: CheckoutLockMode,
+        operation: &str,
+        runner: Option<&crate::processes::ProcessRunner>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
         let root = project_root(root)?;
-        let creator = if operation == "recover" {
-            None
-        } else {
-            crate::stand::epoch::before_lock(&root)?
-        };
-        let initialize_epoch = creator.is_some();
+        let recovery = operation == "recover";
         let p = safe_path(&root, ".devkit/state/task.lock")?;
-        create_dir_all_durable(p.parent().context("Lock parent")?)?;
+        let state_dir = p.parent().context("Lock parent")?;
+        if !recovery && !exists(state_dir)? {
+            let cache = safe_path(&root, ".devkit/cache")?;
+            create_dir_all_durable(&cache)?;
+            let staging = tempfile::Builder::new()
+                .prefix("state-")
+                .tempdir_in(&cache)?;
+            let log = staging.path().join("task.lock");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&log)?;
+            file.try_lock().context("Cannot prelock checkout state")?;
+            file.sync_all()?;
+            sync_directory(staging.path())?;
+            let creator = crate::stand::epoch::prepare_creator(&root, staging.path())?;
+            if let Some(runner) = runner {
+                runner.check_cancelled()?;
+            }
+            ensure!(
+                deadline.is_none_or(|at| std::time::Instant::now() < at),
+                "Checkout lock deadline exceeded"
+            );
+            match crate::archive::rename_noreplace(staging.path(), state_dir) {
+                Ok(()) => {
+                    sync_directory(&cache)?;
+                    sync_directory(state_dir.parent().context("Checkout state parent")?)?;
+                    crate::stand::epoch::after_lock(&root, creator)?;
+                    if mode == CheckoutLockMode::Shared {
+                        file.lock_shared()?;
+                    }
+                    return Ok(Self {
+                        owner_path: if mode == CheckoutLockMode::Exclusive {
+                            Some(write_owner_sidecar(&root, operation)?)
+                        } else {
+                            None
+                        },
+                        _file: file,
+                        root,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).context("Cannot publish checkout lock state"),
+            }
+        }
         // Never open a FIFO/device or follow a replacement symlink as a lock.
         // O_NONBLOCK also makes an unexpected FIFO replacement fail promptly.
         if let Ok(metadata) = fs::symlink_metadata(&p) {
@@ -625,7 +697,7 @@ impl CheckoutLock {
         let f = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(!recovery)
             .truncate(false)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&p)?;
@@ -634,11 +706,7 @@ impl CheckoutLock {
             "Expected a regular file for checkout lock"
         );
         let try_acquire = |file: &File| -> std::result::Result<(), fs::TryLockError> {
-            match if initialize_epoch {
-                CheckoutLockMode::Exclusive
-            } else {
-                mode
-            } {
+            match mode {
                 CheckoutLockMode::Shared => file.try_lock_shared(),
                 CheckoutLockMode::Exclusive => file.try_lock(),
             }
@@ -647,6 +715,10 @@ impl CheckoutLock {
         let started = std::time::Instant::now();
         let mut printed_wait = false;
         loop {
+            ensure!(
+                deadline.is_none_or(|at| std::time::Instant::now() < at),
+                "Checkout lock deadline exceeded"
+            );
             match try_acquire(&f) {
                 Ok(()) => {
                     ensure!(
@@ -654,13 +726,7 @@ impl CheckoutLock {
                             == crate::stand::epoch::Physical::at(&p)?,
                         "Checkout lock replaced while waiting"
                     );
-                    if initialize_epoch {
-                        crate::stand::epoch::after_lock(&root, creator)?;
-                        if mode == CheckoutLockMode::Shared {
-                            f.lock_shared()?;
-                        }
-                    }
-                    let owner_path = if mode == CheckoutLockMode::Exclusive {
+                    let owner_path = if mode == CheckoutLockMode::Exclusive && !recovery {
                         Some(write_owner_sidecar(&root, operation)?)
                     } else {
                         None

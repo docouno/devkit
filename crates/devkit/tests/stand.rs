@@ -284,15 +284,22 @@ fn physical_epoch_survives_reads_and_detects_same_byte_replacement() {
 }
 
 #[test]
-fn state_creator_can_finish_after_peer_creates_the_stable_lock() {
+fn concurrent_checkout_acquisition_uses_the_published_lock_and_epoch() {
     let root = tempfile::tempdir().unwrap();
     modern(root.path());
-    let ticket = epoch::before_lock(root.path()).unwrap();
-    assert!(ticket.is_some());
-    drop(CheckoutLock::acquire_shared(root.path(), "describe", None).unwrap());
-    assert!(!epoch::trusted(root.path()).unwrap());
-    let _lock = CheckoutLock::acquire(root.path()).unwrap();
-    epoch::after_lock(root.path(), ticket).unwrap();
+    let ready = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let peer = scope.spawn(|| {
+            ready.wait();
+            let _lock = CheckoutLock::acquire_shared(root.path(), "describe", None).unwrap();
+            assert!(epoch::trusted(root.path()).unwrap());
+        });
+        ready.wait();
+        let lock = CheckoutLock::acquire_shared(root.path(), "describe", None).unwrap();
+        assert!(epoch::trusted(root.path()).unwrap());
+        drop(lock);
+        peer.join().unwrap();
+    });
     assert!(epoch::trusted(root.path()).unwrap());
 }
 
@@ -300,16 +307,11 @@ fn state_creator_can_finish_after_peer_creates_the_stable_lock() {
 fn crashed_creator_and_unexplained_state_never_become_fresh() {
     let root = tempfile::tempdir().unwrap();
     modern(root.path());
-    drop(epoch::before_lock(root.path()).unwrap());
-    drop(CheckoutLock::acquire(root.path()).unwrap());
+    let state = root.path().join(".devkit/state");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("task.lock"), "").unwrap();
+    let _lock = CheckoutLock::acquire(root.path()).unwrap();
     assert!(!epoch::trusted(root.path()).unwrap());
-    let other = tempfile::tempdir().unwrap();
-    modern(other.path());
-    let ticket = epoch::before_lock(other.path()).unwrap();
-    fs::write(other.path().join(".devkit/state/stand.active"), "unknown").unwrap();
-    let _lock = CheckoutLock::acquire(other.path()).unwrap();
-    epoch::after_lock(other.path(), ticket).unwrap();
-    assert!(!epoch::trusted(other.path()).unwrap());
 }
 
 #[test]

@@ -317,6 +317,12 @@ def seal_runtime(root):
                for path in sorted((root / ".devkit/runtime").rglob("*")) if path.is_file()}
     state_path = root / ".devkit/manifest.json"
     state = json.loads(state_path.read_text())
+    release_identity = hashlib.sha256(json.dumps(managed, sort_keys=True).encode()).hexdigest()
+    projection = root / ".devkit/project.mk"
+    rules, token, _ = projection.read_bytes().partition(b"DEVKIT_EXPECTED_PLAN := ")
+    if token:
+        plan = hashlib.sha256(release_identity.encode() + b"\n" + rules).hexdigest().encode()
+        projection.write_bytes(rules + token + plan + b"\n")
     for name in ("project.mk", "compose.apps.yaml", "compose.workspace.json", "tooling-profiles.json"):
         managed[".devkit/" + name] = identity(root / ".devkit" / name)
     for component, info in state["components"].items():
@@ -326,7 +332,7 @@ def seal_runtime(root):
     checksum = root / ".devkit/runtime.sha256"
     checksum.write_text("".join(f"{value['sha256']}  {name}\n" for name, value in sorted(managed.items())))
     managed[str(checksum.relative_to(root))] = identity(checksum)
-    state.update({"releaseIdentity": hashlib.sha256(json.dumps(managed, sort_keys=True).encode()).hexdigest(),
+    state.update({"releaseIdentity": release_identity,
                   "managed": managed})
     state_path.write_text(json.dumps(state) + "\n")
 
@@ -400,6 +406,85 @@ def write_rust_fixture(root):
 
 
 class EngineVersionAdmissionTests(unittest.TestCase):
+    def test_early_reservation_on_linked_checkout_requires_no_docker_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-linked-reservation-") as temporary:
+            base = Path(temporary)
+            root = base / "main checkout"
+            linked = base / "review checkout"
+            write_rust_fixture(root)
+            manifest = root / ".devkit/manifest.json"
+            state = json.loads(manifest.read_text())
+            state["components"]["apps/api"]["development"]["owner"] = "managed"
+            manifest.write_text(json.dumps(state))
+            accept_runtime(root)
+            run("git", "-C", str(root), "init", "-b", "main")
+            run("git", "-C", str(root), "add", ".")
+            run("git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-m", "Create test checkout")
+            run("git", "-C", str(root), "worktree", "add", "-b", "review/api", str(linked))
+            environment = dict(env(), DOCKER_HOST=f"unix://{base / 'unavailable.sock'}",
+                               DEVKIT_CACHE_DIR=str(base / "cache"),
+                               DEVKIT_PREVIEW_URL_TEMPLATE="https://{port}-{branch}.example.test")
+            loader = linked / ".devkit/runtime/devkit.sh"
+            for _ in range(2):
+                result = run("sh", str(loader), "cli", "stand", "reserve", ".", "--json",
+                             cwd=linked, env=environment, timeout=4)
+                self.assertTrue(json.loads(result.stdout)["result"]["reserved"])
+                result = run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                             env=environment, timeout=4)
+                info = json.loads(result.stdout)["result"]
+                self.assertEqual(info["worktreeKind"], "linked")
+                self.assertEqual(info["branch"], "review/api")
+                self.assertEqual(info["standState"], "stopped")
+                port = info["standPorts"][0]
+                self.assertEqual(port["localUrl"], f"http://127.0.0.1:{port['first']}")
+                self.assertEqual(port["previewUrl"], f"https://{port['first']}-review-api.example.test")
+            self.assertFalse((linked / ".devkit/state/stand.active").exists())
+
+    def test_make_metadata_ignores_nonregular_projection_and_manifest(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory(prefix="devkit-worktree-info-") as temporary:
+            base = Path(temporary)
+            root = base / "checkout with space"
+            write_rust_fixture(root)
+            run("git", "init", "-b", "main", str(root))
+            make = ["make", "--no-print-directory", "-C", str(root)]
+            initial = json.loads(run(*make, "info", "json=1", timeout=4).stdout)
+            self.assertEqual(initial["command"], "info")
+            self.assertEqual(initial["result"]["branch"], "main")
+            self.assertEqual(initial["result"]["worktreeKind"], "main")
+            self.assertEqual(initial["result"]["apps"], ["api"])
+            self.assertEqual(initial["result"]["standState"], "stopped")
+            self.assertEqual(initial["result"]["readiness"], "setup-required")
+            self.assertEqual(initial, json.loads(run(*make, "status", "json=1", timeout=4).stdout))
+            state = root / ".devkit/state"
+            self.assertFalse(state.exists())
+            run(*make, "recover", timeout=4)
+            self.assertFalse(state.exists())
+            state.mkdir()
+            with (state / "task.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+                started = time.monotonic()
+                busy = json.loads(run(*make, "info", "json=1", timeout=4).stdout)["result"]
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(busy["lock"]["state"], "busy")
+                self.assertEqual(busy["standState"], "unknown")
+            for name in ("manifest.json", "project.mk"):
+                path = root / ".devkit" / name
+                original = path.read_bytes()
+                path.unlink()
+                os.mkfifo(path)
+                try:
+                    self.assertIn("make exec", run(*make, "help", timeout=3).stdout)
+                    run(*make, "info", "json=1", timeout=3)
+                    run(*make, "recover", timeout=3)
+                    failed = run(*make, "check", check=False, timeout=3)
+                    self.assertIn("cannot read accepted Make projection", failed.stderr)
+                finally:
+                    path.unlink()
+                    path.write_bytes(original)
+
     def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:
             base = Path(temporary)
@@ -633,6 +718,56 @@ class RuntimeTests(unittest.TestCase):
         name = "devkit-runtime-test-" + self.token + "-" + str(len(self.resources))
         self.resources.append(name)
         return name
+
+    def test_stand_remove_releases_owned_resources_and_preserves_external_data(self):
+        write_fixture(self.root)
+        project = "devkit-" + hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        name = project + "-main-1"
+        self.resources.append(name)
+        labels = {LABEL: self.token}
+        external = "devkit-external-" + self.token
+        run("docker", "volume", "create", "--label", f"{LABEL}={self.token}", external)
+        spec = {"services": {"main": {"image": "${DEVKIT_NODE_IMAGE:?}", "labels": labels,
+                        "command": ["node", "-e", "setTimeout(()=>{},120000)"],
+                        "ports": ["127.0.0.1:0:3000"], "volumes": ["state:/state", "external:/external", "/anonymous"]}},
+                "volumes": {"state": {"labels": labels}, "external": {"external": True, "name": external}},
+                "networks": {"default": {"labels": labels}}}
+        compose = self.root / "compose.yaml"
+        compose.write_text(json.dumps(spec))
+        loader = self.root / ".devkit/runtime/devkit.sh"
+        history = self.root / ".devkit/state/stand.history.json"
+        try:
+            self.make("setup", timeout=240)
+            self.make("up", timeout=120)
+            mounted = {m["Destination"]: m["Name"] for m in container(name)["Mounts"] if m["Type"] == "volume"}
+            owned = mounted["/state"]
+            anonymous = mounted["/anonymous"]
+            self.assertEqual(mounted["/external"], external)
+            self.make("down", "cleanup=1", timeout=90)
+            self.assertEqual(run("docker", "volume", "inspect", owned).returncode, 0)
+            self.make("up", timeout=120)
+            self.assertIn(owned, [m.get("Name") for m in container(name)["Mounts"]])
+            # Protect another persisted volume even after its last service mount disappears.
+            spec["services"]["main"]["volumes"].remove("external:/external")
+            compose.write_text(json.dumps(spec))
+            other_context = dict(env(), DOCKER_CONTEXT="default")
+            failed = run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root,
+                         env=other_context, check=False, timeout=30)
+            self.assertIn("original Docker context", failed.stderr)
+            self.assertTrue(container(name)["State"]["Running"])
+            for _ in range(2):
+                run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root, timeout=90)
+            self.assertIsNone(container(name))
+            self.assertFalse((self.root / ".devkit/state/ports.json").exists())
+            for volume in (owned, anonymous):
+                self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
+            self.assertIn(external, run("docker", "volume", "inspect", external).stdout)
+            self.assertTrue(json.loads(history.read_text())["cleaned"])
+            refused = self.make("up", check=False)
+            self.assertIn("Stand is retired", refused.stderr)
+        finally:
+            run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root, timeout=90, check=False)
+            run("docker", "volume", "rm", external, check=False)
 
     def test_make_aggregate_without_display_skips_desktop_before_its_library_prerequisites(self):
         # Exercise the real public Make DAG with a controlled task boundary;
@@ -2809,7 +2944,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
 
         # Cold-safe make help works and documents flags and diagnostic commands.
         help_out = self.make("help").stdout
-        for token in ("headless=1", "follow=1", "tail=100", "make sync", "devkit status", "devkit doctor", "devkit exec", "devkit.sh cli"):
+        for token in ("headless=1", "follow=1", "tail=100", "make sync", "make info", "make doctor", "make exec", "Registered apps: main", "Registered packages: lib"):
             self.assertIn(token, help_out)
 
         # Offline CLI invocation with cold engine cache refuses network download cleanly.

@@ -43,6 +43,7 @@ pub struct RuntimeRequest {
     pub app: Option<String>,
     pub package: Option<String>,
     pub expected_manifest: Option<String>,
+    pub expected_plan: Option<String>,
     pub headless: bool,
     pub cleanup: bool,
     pub package_aggregate: bool,
@@ -60,6 +61,7 @@ impl RuntimeRequest {
             app: None,
             package: None,
             expected_manifest: None,
+            expected_plan: None,
             headless: false,
             cleanup: false,
             package_aggregate: false,
@@ -280,6 +282,9 @@ impl ToolAdmission {
             );
         }
         let state = read_project_state(&root)?;
+        if let Some(token) = &request.expected_plan {
+            verify_make_plan(&state, token)?;
+        }
         // Runtime/integration is trusted even when product manifests need repair.
         verify_managed_set(&root, &state)?;
         for (path, id) in &state.managed {
@@ -2098,31 +2103,33 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     )?;
     let tool = ToolAdmission::capture(&request.runtime)?;
     runtime_paths(&tool)?;
-    let target = tool
-        .target(&request.runtime)?
-        .context("exec requires --component (or app/package selector)")?;
-    let component = tool.state.components[&target].clone();
-    let native = if component.toolchain == Toolchain::Node {
-        "package.json"
+    let target = tool.target(&request.runtime)?;
+    let toolchain = if let Some(target) = &target {
+        let toolchain = tool.state.components[target].toolchain;
+        let (native, competing) = match toolchain {
+            Toolchain::Node => ("package.json", "Cargo.toml"),
+            Toolchain::Rust => ("Cargo.toml", "package.json"),
+        };
+        ensure!(
+            identity(&input_path(&tool.root, format!("{target}/{native}"))?)?.is_some(),
+            "Missing registered native manifest: {target}/{native}"
+        );
+        ensure!(
+            identity(&input_path(&tool.root, format!("{target}/{competing}"))?)?.is_none(),
+            "Ambiguous native component: {target}"
+        );
+        toolchain
     } else {
-        "Cargo.toml"
+        ensure!(
+            !node_components(&tool.state).is_empty()
+                && identity(&input_path(&tool.root, "package.json")?)?.is_some(),
+            "Root exec requires a Node workspace; select an app or package with app=, package=, or --component"
+        );
+        Toolchain::Node
     };
-    ensure!(
-        identity(&input_path(&tool.root, format!("{target}/{native}"))?)?.is_some(),
-        "Missing registered native manifest: {target}/{native}"
-    );
-    let competing = if component.toolchain == Toolchain::Node {
-        "Cargo.toml"
-    } else {
-        "package.json"
-    };
-    ensure!(
-        identity(&input_path(&tool.root, format!("{target}/{competing}"))?)?.is_none(),
-        "Ambiguous native component: {target}"
-    );
     let mut ctx = PreparedContext::new(tool, runner, request.runtime.cache_dir.as_deref())?;
     ctx.prerequisite()?;
-    if request.write && component.toolchain == Toolchain::Node {
+    if request.write && toolchain == Toolchain::Node {
         let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
         if identity(&receipt)?.is_some() {
             fs::remove_file(receipt)?;
@@ -2131,7 +2138,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
             );
         }
     }
-    let image = if component.toolchain == Toolchain::Rust {
+    let image = if toolchain == Toolchain::Rust {
         ctx.derived_image("rust", request.prepare)?
     } else {
         ctx.node_image(request.prepare)?;
@@ -2139,8 +2146,8 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.admission.pins.node_image.clone()
     };
     let task_result = ctx.task(ContainerTask {
-        component: Some(&target),
-        profile: if component.toolchain == Toolchain::Rust {
+        component: target.as_deref(),
+        profile: if toolchain == Toolchain::Rust {
             ToolingProfile::Rust
         } else {
             ToolingProfile::Node
@@ -2186,7 +2193,27 @@ fn run_service(
     ctx: &mut PreparedContext<'_>,
     lock: CheckoutLock,
 ) -> Result<()> {
+    use crate::stand::history::{History, ResourceDeclarations};
+    use std::time::{Duration, Instant};
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
+    let mut resource_history = if request.command == "down" {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let value = History::read(&ctx.admission.root, ctx.runner, deadline)?;
+        if let Some(history) = &value {
+            history.verify_daemon(ctx.runner, deadline)?;
+        }
+        match value.filter(History::has_daemon) {
+            Some(history) => {
+                let model = normalize_stand(ctx, Some(Instant::now() + Duration::from_secs(3)))?;
+                let declarations =
+                    ResourceDeclarations::read(&ctx.admission.root, &inventory, &model)?;
+                Some((history, declarations))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let selected = if let Some(path) = target {
         let c = &ctx.admission.state.components[path];
         ensure!(
@@ -2235,6 +2262,14 @@ fn run_service(
                 .context("Stand origin is unknown; inspect containers and run make down explicitly before cleanup")?;
             crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
         }
+    }
+    if let Some((history, declarations)) = &mut resource_history {
+        if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
+            let mut rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+            rows.retain(|row| row.owner == ports.owner.key);
+            history.record_anonymous(&ctx.admission.root, &rows, declarations, ctx.runner)?;
+        }
+        assert_compose_inventory(&ctx.admission.root, &inventory)?;
     }
     match request.command.as_str() {
         "down" => {
@@ -2347,6 +2382,16 @@ fn run_service(
                 )?)?;
             }
             crate::stand::epoch::anchor(&ctx.admission.root)?;
+        }
+        if let Some((history, declarations)) = &mut resource_history {
+            assert_compose_inventory(&ctx.admission.root, &inventory)?;
+            history.remove_resources(
+                &ctx.admission.root,
+                &ctx.project,
+                declarations,
+                ctx.runner,
+                true,
+            )?;
         }
         if request.cleanup {
             crate::stand::clear_overlay(&ctx.admission.root)?;
@@ -2500,6 +2545,302 @@ fn preview_forwarding_presence(
     }
     Ok(())
 }
+fn normalize_stand(
+    ctx: &PreparedContext<'_>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Value> {
+    let mut compose = ctx.compose()?;
+    compose.args([
+        "--profile",
+        "*",
+        "config",
+        "--no-env-resolution",
+        "--format",
+        "json",
+    ]);
+    let output = match deadline {
+        Some(at) => ctx.runner.capture_before(&mut compose, at)?,
+        None => ctx.runner.capture(&mut compose)?,
+    };
+    crate::stand::preview::compose_model(&output.stdout)
+}
+
+fn reservation_fingerprint(
+    inventory: &ComposeInventory,
+    services: &BTreeSet<String>,
+    bindings: &[crate::stand::ports::Binding],
+) -> Result<String> {
+    Ok(digest(serde_json::to_vec(&(
+        &inventory.inputs.digest,
+        services,
+        bindings,
+    ))?))
+}
+
+pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) -> Result<bool> {
+    use crate::stand::{branch_name_until, epoch, ledger, ports, preview};
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let root = project_root(root)?;
+    runtime_pending(&root)?;
+    let request = RuntimeRequest::new(root.clone(), "stand reserve".into());
+    let before = read_project_state(&root)?;
+    let runnable = |c: &ComponentState| {
+        c.role == Role::App
+            && c.development
+                .as_ref()
+                .is_some_and(|d| d.kind == DevelopmentKind::Compose)
+    };
+    if !before.components.values().any(runnable) {
+        return Ok(false);
+    }
+    let _lock = CheckoutLock::acquire_until(
+        &root,
+        CheckoutLockMode::Exclusive,
+        "stand reserve",
+        Some(runner),
+        Some(deadline),
+    )?;
+    let adm = ToolAdmission::capture_service(&request)?;
+    ensure!(
+        epoch::trusted(&root)?,
+        "Accepted stand history is unverified; run make down before reserving or starting the stand"
+    );
+    let ctx = PreparedContext::new(adm, runner, cache)?;
+    if let Some(history) = crate::stand::history::History::read(&root, runner, deadline)? {
+        history.allow_start()?;
+    }
+    let mut leases = ports::Ports::open(&root, &ctx.cache_root()?)?;
+    if leases.possible_actors || ledger::Ledger::read(&root)?.is_some_and(|l| !l.completed_empty())
+    {
+        ensure!(
+            ports::Ports::verified_snapshot(&root)?.is_some(),
+            "Stand history needs recovery before reserving ports"
+        );
+        return Ok(!leases.groups.is_empty());
+    }
+    let compose = runner.capture_before(
+        ctx.docker().args(["compose", "version", "--short"]),
+        deadline,
+    )?;
+    validate_compose_version(compose.text()?)?;
+    let inventory = capture_compose_inputs(&root)?;
+    let mut stamps = Vec::new();
+    for (name, id) in &inventory.inputs.files {
+        let Some(id) = id else {
+            continue;
+        };
+        let path = input_path(&root, name)?;
+        let (bytes, current, stamp) =
+            read_regular_snapshot(&path, 4 * 1024 * 1024, "Compose reservation input")?
+                .context("Compose reservation input disappeared")?;
+        ensure!(
+            &current == id,
+            "Compose input changed before reservation: {name}"
+        );
+        stamps.push((path, stamp));
+        if name == ".devkit/compose.apps.yaml" || name.rsplit('/').next() == Some(".env") {
+            continue;
+        }
+        let mut source = std::str::from_utf8(&bytes)?.replace("$$", "");
+        for name in [
+            "DEVKIT_PROJECT_ROOT",
+            "DEVKIT_PROJECT_NAME",
+            "DEVKIT_UID",
+            "DEVKIT_GID",
+            "DEVKIT_NODE_IMAGE",
+            "DEVKIT_NODE_VERSION",
+            "DEVKIT_RUST_VERSION",
+        ] {
+            source = source
+                .replace(&format!("${{{name}}}"), "")
+                .replace(&format!("${{{name}:?}}"), "");
+        }
+        ensure!(
+            !source.contains('$'),
+            "Early reservation requires fixed Compose inputs; {name} uses runtime interpolation"
+        );
+    }
+    let model = normalize_stand(&ctx, Some(deadline))?;
+    let multiple = ctx
+        .admission
+        .state
+        .components
+        .values()
+        .filter(|c| c.role == Role::App)
+        .count()
+        > 1;
+    let skip_desktop = multiple && std::env::var_os("DISPLAY").is_none_or(|value| value.is_empty());
+    let mut selected = BTreeSet::new();
+    let mut plans = BTreeMap::new();
+    let mut primary = None;
+    for (path, c) in ctx
+        .admission
+        .state
+        .components
+        .iter()
+        .filter(|(_, c)| runnable(c))
+    {
+        if skip_desktop && c.tooling_profile == ToolingProfile::Electron {
+            continue;
+        }
+        let service = service_name(path, c);
+        let services = active_compose_services(&model, service)?;
+        for name in &services {
+            let config = &model["services"][name];
+            ensure!(
+                config.get("links").is_none()
+                    && config.get("volumes_from").is_none()
+                    && ["network_mode", "ipc", "pid"].iter().all(|key| config[*key]
+                        .as_str()
+                        .is_none_or(|value| !value.starts_with("service:"))),
+                "Early reservation cannot prove the service dependency graph for {name}"
+            );
+        }
+        let bindings = ports::declarations(&model, &services)?;
+        plans.insert(
+            path.clone(),
+            reservation_fingerprint(&inventory, &services, &bindings)?,
+        );
+        selected.extend(services);
+        if c.tooling_profile == ToolingProfile::Web && primary.is_none() {
+            primary = Some(service);
+        }
+    }
+    let bindings = ports::declarations(&model, &selected)?;
+    if bindings.is_empty() {
+        return Ok(false);
+    }
+    let branch = branch_name_until(&root, runner, Some(deadline))?;
+    let renderer = preview::Renderer::from_env(&branch)?;
+    leases.allocate_plan_until(
+        ports::Allocation {
+            declarations: &bindings,
+            selected: &selected,
+            stopped: &selected,
+            primary,
+            seed: &branch,
+        },
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        |candidate| {
+            runner.check_cancelled()?;
+            ctx.admission.recheck()?;
+            assert_compose_inventory(&root, &inventory)?;
+            for (path, stamp) in &stamps {
+                ensure!(
+                    stamp.matches(path)?,
+                    "Compose input changed before reservation"
+                );
+            }
+            candidate.early_plans.clone_from(&plans);
+            for service in &selected {
+                candidate
+                    .service_preview_renderer
+                    .insert(service.clone(), renderer.clone());
+            }
+            crate::stand::history::History::open(&root, runner, deadline)?.allow_start()?;
+            Ok(())
+        },
+        Some(deadline),
+    )?;
+    Ok(true)
+}
+
+pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
+    use crate::stand::{epoch, history::History};
+    use std::time::{Duration, Instant};
+
+    let root = project_root(root)?;
+    runtime_pending(&root)?;
+    let request = RuntimeRequest::new(root.clone(), "stand remove".into());
+    let _lock = CheckoutLock::acquire_exclusive(&root, "stand remove", Some(runner))?;
+    let admission = ToolAdmission::capture_service(&request)?;
+    crate::delivery::verify_current_engine(&admission.pins.engine)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let previous = History::read(&root, runner, deadline)?;
+    ensure!(
+        previous.is_some() || epoch::trusted(&root)?,
+        "Stand ownership is unknown; recover or stop the legacy stand before removing this checkout"
+    );
+    let mut history = match previous {
+        Some(history) => history,
+        None => History::open(&root, runner, deadline)?,
+    };
+    if history.cleaned {
+        return Ok(());
+    }
+    history.retired = true;
+    history.save(&root)?;
+    if history.has_daemon() {
+        use crate::stand::{history::ResourceDeclarations, inspection, ledger, ports::Ports};
+        history.verify_daemon(runner, Instant::now() + Duration::from_secs(3))?;
+        let ctx = PreparedContext::new(admission, runner, None)?;
+        let inventory = capture_compose_inputs(&root)?;
+        let model = normalize_stand(&ctx, Some(Instant::now() + Duration::from_secs(3)))?;
+        let declarations = ResourceDeclarations::read(&root, &inventory, &model)?;
+        let mut ports = Ports::read(&root)?;
+        let ledger = ledger::Ledger::read(&root)?;
+        ensure!(
+            ports
+                .as_ref()
+                .is_none_or(|p| !p.possible_actors || ledger.is_some()),
+            "Stand actor history is missing"
+        );
+        let rows = ledger::observe(&ctx.project, runner)?;
+        if let Some(ports) = &ports {
+            ledger::verify_owners(&rows, &ports.owner)?;
+        } else {
+            ensure!(
+                rows.is_empty(),
+                "Stand containers lack an ownership receipt"
+            );
+        }
+        if let Some(mut ledger) = ledger {
+            let ports = ports.as_mut().context("Missing stand lease ownership")?;
+            ensure!(
+                ledger.owner == ports.owner,
+                "Stand actor history differs from lease ownership"
+            );
+            ctx.admission.recheck()?;
+            assert_compose_inventory(&root, &inventory)?;
+            ledger.recover_launch(&root, &ctx.project, runner)?;
+            inspection::recover(&root, &mut ledger, ports, runner)?;
+        }
+        let rows = ledger::observe(&ctx.project, runner)?;
+        ctx.admission.recheck()?;
+        assert_compose_inventory(&root, &inventory)?;
+        history.verify_daemon(runner, Instant::now() + Duration::from_secs(3))?;
+        if let Some(ports) = &mut ports {
+            ledger::verify_owners(&rows, &ports.owner)?;
+            history.record_anonymous(&root, &rows, &declarations, runner)?;
+            ledger::remove_owned(&rows, &ctx.project, &ports.owner, runner)?;
+            ports.possible_actors = false;
+            ports.save()?;
+        } else {
+            ensure!(
+                rows.is_empty(),
+                "Stand containers lack an ownership receipt"
+            );
+        }
+        assert_compose_inventory(&root, &inventory)?;
+        history.remove_resources(&root, &ctx.project, &declarations, runner, false)?;
+        crate::stand::clear_overlay(&root)?;
+        remove_file(&safe_path(&root, ledger::ACTIVE)?)?;
+        if let Some(ports) = ports {
+            ports.release()?;
+        }
+    } else {
+        ensure!(
+            cleanup_without_stand(&request, &root)?,
+            "Could not prove the stand is empty; restore its ownership records before removing this checkout"
+        );
+    }
+    history.cleaned = true;
+    history.save(&root)
+}
+
 fn run_development(
     request: &RuntimeRequest,
     target: &str,
@@ -2508,21 +2849,20 @@ fn run_development(
     ctx: &mut PreparedContext<'_>,
 ) -> Result<()> {
     use std::io::Write;
+    use std::time::{Duration, Instant};
     ensure!(
         request.package.is_none() && full.state.components[target].role == Role::App,
         "Development requires an app selector"
     );
+    let root = ctx.admission.root.clone();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    if let Some(history) = crate::stand::history::History::read(&root, ctx.runner, deadline)? {
+        history.allow_start()?;
+        history.verify_daemon(ctx.runner, deadline)?;
+    }
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service = service_name(target, &full.state.components[target]).to_owned();
-    let output = ctx.runner.capture(ctx.compose()?.args([
-        "--profile",
-        "*",
-        "config",
-        "--no-env-resolution",
-        "--format",
-        "json",
-    ]))?;
-    let model: Value = crate::stand::preview::compose_model(&output.stdout)?;
+    let model = normalize_stand(ctx, None)?;
     let active_services = active_compose_services(&model, &service)?;
     let reached = development_components(&full.state, &model, &service)?;
     ensure!(
@@ -2656,6 +2996,13 @@ fn run_development(
         .context("Missing host resource budget; prerequisite not checked")?;
     let declarations = crate::stand::ports::declarations(&model, &active_services)?;
     let mut ports = crate::stand::ports::Ports::open(&ctx.admission.root, &ctx.cache_root()?)?;
+    if let Some(early_plan) = ports.early_plans.remove(target)
+        && early_plan != reservation_fingerprint(&inventory, &active_services, &declarations)?
+    {
+        eprintln!(
+            "devkit: stand inputs changed since early reservation; revalidating port bindings"
+        );
+    }
     for name in &active_services {
         if let Some(label) = model
             .pointer("/services")
@@ -2718,6 +3065,68 @@ fn run_development(
             )?);
         }
     }
+    if ports.possible_actors {
+        ensure!(
+            crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_some(),
+            "Stand launch history is missing; preserving leases"
+        );
+    }
+    let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
+    if !crate::stand::epoch::trusted(&root)? {
+        let observed = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+        ensure!(
+            observed.is_empty() && ledger.completed_empty() && !ports.possible_actors,
+            "Stand history changed; run make down with the original Docker context first"
+        );
+        crate::stand::epoch::anchor(&root)?;
+    }
+    ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
+    crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, &mut ports, ctx.runner)?;
+    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+    let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
+    let mut history = crate::stand::history::History::open(
+        &root,
+        ctx.runner,
+        Instant::now() + Duration::from_secs(3),
+    )?;
+    history.allow_start()?;
+    history.bind_daemon(&root, ctx.runner)?;
+    let declarations_for_removal =
+        crate::stand::history::ResourceDeclarations::read(&root, &inventory, &model)?;
+    let owned_resources = history.prepare_resources(
+        &root,
+        &ctx.project,
+        &model,
+        &active_services,
+        &declarations_for_removal,
+        ctx.runner,
+    )?;
+    if !owned_resources.is_empty() {
+        let mut file = tempfile::Builder::new()
+            .prefix("compose-owned-")
+            .suffix(".yaml")
+            .tempfile_in(&state_dir)?;
+        file.write_all(&owned_resources)?;
+        overlays.push(file);
+        let mut effective = ctx.compose()?;
+        for file in &overlays {
+            effective.arg("--file").arg(file.path());
+        }
+        let output = ctx.runner.capture(effective.args([
+            "--profile",
+            "*",
+            "config",
+            "--no-env-resolution",
+            "--format",
+            "json",
+        ]))?;
+        model = crate::stand::preview::compose_model(&output.stdout)?;
+        ensure!(
+            crate::stand::ports::declarations(&model, &active_services)? == declarations,
+            "Resource mappings changed the admitted port declarations"
+        );
+        preview_forwarding_presence(ctx, &mut model, &frontends)?;
+    }
     let resource_overlay = |budget: &crate::resources::HostResourceBudget| {
         crate::resources::build_compose_resource_overlay(
             budget,
@@ -2741,17 +3150,6 @@ fn run_development(
             }
         }
     }
-    if ports.possible_actors {
-        ensure!(
-            crate::stand::ledger::Ledger::read(&ctx.admission.root)?.is_some(),
-            "Stand launch history is missing; preserving leases"
-        );
-    }
-    let mut ledger = crate::stand::ledger::Ledger::open(&ctx.admission.root, &ports.owner)?;
-    ledger.recover_launch(&ctx.admission.root, &ctx.project, ctx.runner)?;
-    crate::stand::inspection::recover(&ctx.admission.root, &mut ledger, &mut ports, ctx.runner)?;
-    let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
-    let active_ports = crate::stand::ledger::active_ports(&rows, &ports.owner)?;
     let stopped = |rows: &[crate::stand::ledger::Container]| {
         active_services
             .iter()
@@ -3085,6 +3483,10 @@ fn run_development(
         });
     if result.is_ok() {
         cleanup?;
+        history.record_resources(&root, &declarations_for_removal, ctx.runner)?;
+        let rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
+        crate::stand::ledger::verify_owners(&rows, &ports.owner)?;
+        history.record_anonymous(&root, &rows, &declarations_for_removal, ctx.runner)?;
     } else if let Err(error) = cleanup {
         eprintln!("devkit: stand creator recovery retained: {error:#}");
     }

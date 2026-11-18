@@ -54,16 +54,16 @@ fullstack-product/
 
 Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. Node components share `pnpm-workspace.yaml` and `pnpm-lock.yaml` with isolated package links; Rust components own their Cargo manifests and locks.
 
-Add components as the repository grows:
+After initialization, use the checkout's Makefile for daily work and maintenance. Add components as the repository grows:
 
 ```sh
-npx @docouno/devkit@0.5.0 add-app . --name api --template rust-api
-npx @docouno/devkit@0.5.0 add-package . --name ui --template react-ui
-npx @docouno/devkit@0.5.0 add-app . --name desktop --template electron-react --use ui
+make add-app name=api template=rust-api
+make add-package name=client template=react-client
+make add-app name=desktop template=electron-react use=client
 make setup
 ```
 
-Use `register --help` to adopt an existing component without replacing its source, and `make sync` (or `devkit sync`) after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
+Use `make register app=NAME profile=ID` or `make register package=NAME profile=ID` to adopt existing source. Run `make sync` after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
 
 ```sh
 make sync
@@ -73,14 +73,15 @@ make sync
 
 | Command            | Purpose                                                                   |
 | ------------------ | ------------------------------------------------------------------------- |
+| `make help`        | List the project commands and registered apps and packages, offline       |
 | `make setup`       | Prepare accepted images and dependencies                                  |
+| `make info`        | Show the branch, checkout readiness, service state and leased addresses   |
 | `make sync`        | Synchronize projections and `pnpm-lock.yaml` after manifest edits         |
 | `make check`       | Check source, types, formatting, lint and applicable native gates         |
 | `make test`        | Run the registered components' native test suites                         |
 | `make build`       | Build the registered components                                           |
 | `make package`     | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) |
 | `make dev app=web` | Start one application's development service                               |
-| `make status`      | Show local URLs, preview URLs and applied stand state                     |
 | `make down`        | Stop services while preserving data volumes                               |
 
 Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
@@ -92,42 +93,42 @@ For a reverse proxy that routes published host ports, set a vendor-neutral templ
 ```sh
 export DEVKIT_PREVIEW_URL_TEMPLATE='https://{port}-{service}-{branch}.preview.example.com'
 make up app=web
-make status
+make info
 ```
 
 Placeholders are `{port}`, `{service}`, `{branch}` and `{slug}` (the last two use the same DNS-safe branch slug). Configure routing and TLS in your proxy. Devkit prints the URLs and passes exact frontend hosts to its Vite plugin. See [development stands](docs/workflows.md#development-stands-and-preview-urls) for custom images and status semantics.
 
-`init --preset fullstack-web` creates a Rust API and React web app. To connect another frontend to a registered Node or Rust API, use `add-app --name dashboard --template react-web --api api`. Aggregate `make up` skips Electron apps without `DISPLAY`; use `headless=1` to include them through Xvfb.
+`init --preset fullstack-web` creates a Rust API and React web app. To connect another frontend to a registered Node or Rust API, use `make add-app name=dashboard template=react-web api=api`. Aggregate `make up` skips Electron apps without `DISPLAY`. Use `headless=1` to include them through Xvfb.
 
 Checks, tests, builds and packaging keep source, configuration and lockfiles read-only. `make fix` explicitly permits formatting changes. To edit dependencies with the accepted toolchain:
 
 ```sh
-npx @docouno/devkit@0.5.0 exec --component apps/web --write --network bridge -- pnpm add zod
+make exec app=web write=1 network=bridge command='pnpm add zod'
 make setup
 make check
 ```
 
-On hosts without a global `devkit` or Node.js installation, run any CLI subcommand directly through `sh .devkit/runtime/devkit.sh cli <subcommand> ...` (for example `sh .devkit/runtime/devkit.sh cli doctor . --json`).
+Use `make exec command='pnpm …'` for commands in the root Node workspace. Run `make info json=1` for a machine-readable checkout summary. `make status` remains an alias for `make info`.
 
 `make package app=desktop` builds a Linux Electron directory and archive; `make package package=ui` builds a verified `.tgz` tarball and receipt (`publint` + `@arethetypeswrong/core`) for publishable libraries.
 
 ## Update an existing project
 
-Choose the target release, inspect the proposed changes and migration notes, then apply them on a branch:
+From a `0.5.0` checkout, choose the target release, inspect the proposed changes and migration notes, then apply them on a branch. This example repeats the accepted version:
 
 ```sh
 git switch -c chore/devkit-0.5.0
-npx @docouno/devkit@0.5.0 update . --to 0.5.0 --preview
-npx @docouno/devkit@0.5.0 update . --to 0.5.0
+make update to=0.5.0 preview=1
+make update to=0.5.0
 make setup
 make check
 ```
 
-Pass `--reconcile-lock` when transitive lockfile dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Updating the CLI alone does not update a project's accepted environment. Application source, product dependencies and product-owned Make/Compose files retain their ownership; conflicting edits to managed files stop the update.
+Pass `reconcile=1` when transitive lockfile dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Application source, product dependencies and project-owned Make/Compose files retain their ownership. Conflicting edits to managed files stop the update.
 
-After an interrupted update, `npx @docouno/devkit@0.5.0 recover .` restores the known transaction state. Unrecognized conflicting edits require resolution before recovery can proceed.
+After an interrupted update, `make recover` restores the known transaction state. See [Upgrading](docs/upgrades.md) for recovery while the older loader is still installed.
 
-Devkit `0.5.0` upgrades `0.4.x` projects directly (`minSupportedFromVersion: "0.4.0"`). For `0.2.x` or `0.3.x` repositories, bridge through `0.4.1` first (`npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check`), then upgrade to `0.5.0`.
+To upgrade from `0.4.1`, use `sh .devkit/runtime/devkit.sh cli update . --to 0.5.0`. For `0.4.0`, use the versioned `0.5.0` installer or `npx @docouno/devkit@0.5.0 update . --to 0.5.0`. Repositories on `0.2.x` or `0.3.x` must bridge through `0.4.1` first.
 
 ## Documentation
 

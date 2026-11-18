@@ -16,11 +16,13 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
 import threading
 import time
 import unittest
+import urllib.request
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
@@ -37,6 +39,35 @@ PROOF = Path(os.environ.get("DEVKIT_DELIVERY_PROOF_DIR",
 COMMANDS = []
 RESULTS = []
 EVIDENCE = []
+
+WT_VERSION = "0.74.0"
+WT_TARGET = "worktrunk-x86_64-unknown-linux-musl"
+WT_ARCHIVE_SHA = "28392033912ab0a9027192d9975284787b29f080b4f2fd6298c89fffecf34c1f"
+WT_ENGINE_SHA = "a950f2f9838f06d169a39c0d91f0c80c72890794a9235203c070050b3cb10d1c"
+
+
+def worktrunk(directory):
+    installed = shutil.which("wt")
+    if installed and digest(installed) == WT_ENGINE_SHA:
+        return installed
+    url = f"https://github.com/max-sixty/worktrunk/releases/download/v{WT_VERSION}/{WT_TARGET}.tar.xz"
+    archive = directory / "worktrunk.tar.xz"
+    limit = 32 * 1024 * 1024
+    with urllib.request.urlopen(url, timeout=30) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit or hashlib.sha256(data).hexdigest() != WT_ARCHIVE_SHA:
+        raise AssertionError("Pinned Worktrunk archive integrity differs")
+    archive.write_bytes(data)
+    with tarfile.open(archive) as source:
+        member = source.getmember(f"{WT_TARGET}/wt")
+        if not member.isfile() or member.size > limit:
+            raise AssertionError("Invalid Worktrunk executable member")
+        executable = directory / "wt"
+        executable.write_bytes(source.extractfile(member).read())
+    if digest(executable) != WT_ENGINE_SHA:
+        raise AssertionError("Pinned Worktrunk executable integrity differs")
+    executable.chmod(0o755)
+    return executable
 
 
 def digest(path):
@@ -375,6 +406,51 @@ class ReleaseFixture:
 
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
+    @unittest.skipUnless(DOCKER_ENABLED, "Requires the host Compose plugin")
+    def test_generated_worktrunk_hooks_reserve_and_finalize_native_worktrees(self):
+        project = self.create(self.root / "project with spaces")
+        wt = worktrunk(self.root)
+        env = dict(self.env, WORKTRUNK_WORKTREE_PATH="{{ repo_path }}/.worktrees/{{ branch | sanitize }}",
+                   XDG_CONFIG_HOME=str(self.root / "config"), DOCKER_HOST=f"unix://{self.root / 'absent.sock'}",
+                   DEVKIT_ENGINE_PATH=str(self.root / "invalid-parent-engine"),
+                   MAKEFILES=str(self.root / "missing-parent-include"),
+                   DEVKIT_APP="unrelated-app")
+
+        def run(*args, **kwargs):
+            return execute(args, cwd=kwargs.pop("cwd", project), env=kwargs.pop("env", env), **kwargs)
+
+        self.assertIn(WT_VERSION, run(wt, "--version").stdout)
+        self.assertTrue((project / "AGENTS.md").is_file())
+        self.assertTrue((project / ".config/wt.toml").is_file())
+        run("git", "init", "-b", "main")
+        run("git", "add", ".")
+        run("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Create test checkout")
+        run(wt, "switch", "--create", "--base", "main", "--no-cd", "--yes", "review/api")
+        listing = run("git", "worktree", "list", "--porcelain").stdout
+        linked = Path(next(line.removeprefix("worktree ") for line in listing.splitlines()
+                           if line.startswith("worktree ") and "/.worktrees/" in line))
+        self.assertIn("review/api", run(wt, "list").stdout)
+        clean_env = {key: value for key, value in env.items() if key not in ("DEVKIT_ENGINE_PATH", "MAKEFILES", "DEVKIT_APP")}
+        info = json_result(run("make", "info", "json=1", cwd=linked, env=clean_env))["result"]
+        self.assertEqual(info["standState"], "stopped")
+        self.assertEqual(info["branch"], "review/api")
+        self.assertEqual(info["worktreeKind"], "linked")
+        self.assertEqual(len(info["standPorts"]), 1)
+        self.assertFalse((linked / ".devkit/state/stand.active").exists())
+        history = linked / ".devkit/state/stand.history.json"
+        saved = history.read_bytes()
+        history.unlink()
+        try:
+            stopped = run(wt, "remove", "--foreground", "--yes", "review/api", check=False)
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertTrue(linked.is_dir())
+        finally:
+            history.write_bytes(saved)
+        for _ in range(2):
+            run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".", cwd=linked, env=clean_env)
+        run(wt, "remove", "--foreground", "--yes", "review/api")
+        self.assertFalse(linked.exists())
+
     def test_cached_engine_permissions_refuse_before_lifecycle_writes(self):
         self.create()
         accepted = self.manifest["files"]["devkit"]["sha256"]

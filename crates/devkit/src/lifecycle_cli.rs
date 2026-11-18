@@ -62,6 +62,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--package-source",
             "--to",
             "--release-root",
+            "--no-agents-md",
+            "--no-worktrunk",
         ],
         "add-app" => &[
             "--api",
@@ -69,6 +71,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--template",
             "--use",
             "--reconcile-lock",
+            "--idempotent",
             "--release-root",
         ],
         "add-package" => &[
@@ -76,6 +79,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--template",
             "--use",
             "--reconcile-lock",
+            "--idempotent",
             "--release-root",
         ],
         "register" => &[
@@ -83,6 +87,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             "--package",
             "--profile",
             "--reconcile-lock",
+            "--idempotent",
             "--release-root",
         ],
         "sync" => &["--preview", "--reconcile-lock", "--release-root"],
@@ -101,7 +106,18 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         "add-app" | "add-package" => &["--use"],
         _ => &[],
     };
-    let mut options = Options::parse(args, allowed, repeat, &["--preview", "--reconcile-lock"])?;
+    let mut options = Options::parse(
+        args,
+        allowed,
+        repeat,
+        &[
+            "--preview",
+            "--reconcile-lock",
+            "--idempotent",
+            "--no-agents-md",
+            "--no-worktrunk",
+        ],
+    )?;
     if command == "init" {
         if let Some(to_ver) = options.value("--to")? {
             ensure_supported_target_version(to_ver)?;
@@ -299,6 +315,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                 package_mode: mode,
                 name: options.value("--name")?.map(str::to_owned),
                 hooks: Some(&cancellation),
+                no_agents_md: options.flag("--no-agents-md"),
+                no_worktrunk: options.flag("--no-worktrunk"),
                 ..Default::default()
             },
             &resolver,
@@ -381,6 +399,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         runner: Some(runner),
         preview: options.flag("--preview"),
         reconcile_lock: options.flag("--reconcile-lock"),
+        idempotent: options.flag("--idempotent"),
         hooks: Some(&cancellation),
         ..Default::default()
     };

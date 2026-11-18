@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt, symlink},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
 };
 
@@ -335,6 +335,36 @@ pub(crate) fn read_regular_file(
     maximum: u64,
     label: &str,
 ) -> Result<Option<(Vec<u8>, FileIdentity)>> {
+    Ok(read_regular_snapshot(path, maximum, label)?.map(|(bytes, id, _)| (bytes, id)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp(u64, u64, u64, i64, i64, i64, i64);
+
+impl FileStamp {
+    pub(crate) fn of(meta: &fs::Metadata) -> Self {
+        Self(
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    }
+
+    pub(crate) fn matches(&self, path: &Path) -> Result<bool> {
+        let meta = fs::symlink_metadata(path)?;
+        Ok(meta.is_file() && *self == Self::of(&meta))
+    }
+}
+
+pub(crate) fn read_regular_snapshot(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Option<(Vec<u8>, FileIdentity, FileStamp)>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -356,7 +386,8 @@ pub(crate) fn read_regular_file(
         path.display()
     );
     let mut bytes = Vec::new();
-    file.take(maximum.checked_add(1).context("Invalid file byte budget")?)
+    (&file)
+        .take(maximum.checked_add(1).context("Invalid file byte budget")?)
         .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= maximum,
@@ -367,7 +398,15 @@ pub(crate) fn read_regular_file(
         sha256: digest(&bytes),
         mode: metadata.permissions().mode() & 0o777,
     };
-    Ok(Some((bytes, identity)))
+    let stamp = FileStamp::of(&metadata);
+    ensure!(
+        bytes.len() as u64 == metadata.len()
+            && stamp == FileStamp::of(&file.metadata()?)
+            && stamp.matches(path)?,
+        "{label} changed while reading: {}",
+        path.display()
+    );
+    Ok(Some((bytes, identity, stamp)))
 }
 pub fn validate_identity(value: &FileIdentity) -> Result<()> {
     ensure!(
