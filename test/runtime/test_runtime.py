@@ -2460,7 +2460,9 @@ build: simulate-update
         seal_runtime(self.root)
         rejected = self.make("check", check=False)
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Make registration projection is stale", rejected.stderr)
+        self.assertIn("Accepted Make plan changed", rejected.stderr)
+        described = run(str(ENGINE), "describe", "--root", str(self.root), check=False)
+        self.assertIn("Make registration projection is stale", described.stderr)
 
     def test_metadata_is_native_and_requires_no_docker_or_dependencies(self):
         write_fixture(self.root)
@@ -3281,6 +3283,18 @@ if (priv.value !== 'from-private-gitlab-registry') {
             finally:
                 ledger.write_bytes(recorded)
             self.assertTrue(container(svc_container)["State"]["Running"])
+            different_owner = json.loads(recorded)
+            different_owner["owner"]["key"] = "0" * 64
+            ledger.write_text(json.dumps(different_owner))
+            try:
+                for args in (("down",), ("down", "cleanup=1")):
+                    refused = self.make(*args, env=lost, check=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("Stand actor history differs from lease ownership", refused.stderr)
+                    self.assertFalse(trace.exists())
+                self.assertTrue(container(svc_container)["State"]["Running"])
+            finally:
+                ledger.write_bytes(recorded)
             self.make("down", env=environment)
             stopped = json.loads(run(str(ENGINE), "status", str(self.root), "--json", env=environment).stdout)["result"]
             self.assertEqual(stopped["services"], [])

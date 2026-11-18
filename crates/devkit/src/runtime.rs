@@ -1707,11 +1707,18 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         if let Some(history) = &history {
             history.prove_lease_history(&pre_root)?;
             if history.has_daemon() {
-                ensure!(
-                    !Ports::read(&pre_root)?.is_some_and(|ports| ports.possible_actors)
-                        || Ledger::read(&pre_root)?.is_some(),
-                    "Stand actor history is missing; preserving leases until ownership recovery"
-                );
+                let ports = Ports::read(&pre_root)?;
+                if let Some(ledger) = Ledger::read(&pre_root)? {
+                    ensure!(
+                        ports.is_some_and(|ports| ports.owner == ledger.owner),
+                        "Stand actor history differs from lease ownership"
+                    );
+                } else {
+                    ensure!(
+                        !ports.is_some_and(|ports| ports.possible_actors),
+                        "Stand actor history is missing; preserving leases until ownership recovery"
+                    );
+                }
             }
         }
         if request.cleanup
