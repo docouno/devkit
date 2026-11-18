@@ -4,8 +4,8 @@ use crate::{
     Result,
     catalog::node_components,
     files::{
-        SemVer, digest, exists, identity, input_path, object, project_root, read_regular_file,
-        relative_name, safe_path, sorted_entries, text,
+        SemVer, digest, exists, input_path, object, project_root, read_regular_file, relative_name,
+        safe_path, sorted_entries, text,
     },
     model::{FileIdentity, InputIdentitySet, ProjectState, Role, Toolchain, ToolingProfile},
 };
@@ -286,6 +286,19 @@ fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
         read_regular_file(path, 32 * 1024 * 1024, "native metadata")?
             .with_context(|| format!("Missing native input: {}", path.display()))
     }
+}
+
+fn identity(path: &Path) -> Result<Option<FileIdentity>> {
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("toml" | "json" | "lock")
+    ) || matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".npmrc" | "config")
+    ) {
+        return Ok(read_regular_file(path, 32 * 1024 * 1024, "native metadata")?.map(|(_, id)| id));
+    }
+    crate::files::identity(path)
 }
 fn manifest_snapshot(root: &Path, path: &str) -> Result<(Fields, FileIdentity)> {
     let name = if path.is_empty() {

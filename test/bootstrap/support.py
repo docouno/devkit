@@ -246,6 +246,8 @@ class Harness:
     def verify_node_recovery(self):
         target = self.scratch / 'genuine-node-migration'
         env = self.environment('genuine-node-migration')
+        sdk_env = {key: value for key, value in env.items() if key not in ('HTTPS_PROXY', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE')}
+        self.run('prime-genuine-node-pnpm', [self.engine, 'internal', 'ensure-pnpm', '--pin-file', self.payload / 'runtime/pnpm.env'], env=sdk_env, timeout=150)
         self.run('genuine-node-init', [self.engine, 'init', target, '--to', self.old_version,
                                      '--app', 'web=react-web', '--package-source', 'local', '--non-interactive'], env=env, timeout=360)
         saved = self.scratch / 'genuine-node-before'

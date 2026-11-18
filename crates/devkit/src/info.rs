@@ -131,14 +131,21 @@ fn observe_stand(
             .as_ref()
             .is_none_or(|d| d.kind != DevelopmentKind::Compose)
     });
-    if history.is_none() && (no_state || (no_services && ports.is_none())) {
+    let unconfirmed_history = ports.is_none()
+        && resources
+            .as_ref()
+            .is_some_and(|history| history.has_daemon() && !history.cleaned);
+    if !unconfirmed_history && history.is_none() && (no_state || (no_services && ports.is_none())) {
         return Ok(("stopped", vec![]));
     }
     if history.as_ref().is_none_or(ledger::Ledger::completed_empty)
         && ports.is_some_and(|p| {
             !p.possible_actors && history.as_ref().is_none_or(|l| l.owner == p.owner)
         })
-        || history.is_none() && ports.is_none() && crate::stand::epoch::trusted(root)?
+        || !unconfirmed_history
+            && history.is_none()
+            && ports.is_none()
+            && crate::stand::epoch::trusted(root)?
     {
         return Ok(("stopped", vec![]));
     }

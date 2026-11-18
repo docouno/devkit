@@ -464,8 +464,8 @@ impl History {
                 .into_iter()
                 .flatten()
                 .filter(|m| m["Type"] == "volume")
-                .filter_map(|m| m["Name"].as_str())
-                .filter(|name| {
+                .filter_map(|m| Some((m["Name"].as_str()?, m["Destination"].as_str()?)))
+                .filter(|(name, _)| {
                     SHA256_RE.is_match(name) && !declarations.protected_volumes.contains(*name)
                 })
                 .collect();
@@ -489,13 +489,28 @@ impl History {
             );
             // Docker repeats the provider's anonymous label on volumes_from.
             // Admission is limited to allocations made by the observed container.
-            if fields[0]
+            let inherited = fields[0]
                 .as_array()
-                .is_some_and(|providers| !providers.is_empty())
-            {
-                continue;
-            }
-            for name in candidate_mounts {
+                .is_some_and(|providers| !providers.is_empty());
+            for (name, target) in candidate_mounts {
+                let own_anonymous = fields[1].as_array().into_iter().flatten().any(|mount| {
+                    mount["Type"] == "volume"
+                        && mount["Target"] == target
+                        && mount["Source"].as_str().is_none_or(str::is_empty)
+                }) || fields[2]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|bind| {
+                        bind == target
+                            || bind.split_once(':').is_some_and(|(path, options)| {
+                                path == target && ["rw", "ro"].contains(&options)
+                            })
+                    });
+                if inherited && !own_anonymous {
+                    continue;
+                }
                 let explicit_mount = fields[1]
                     .as_array()
                     .into_iter()

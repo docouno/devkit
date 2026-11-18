@@ -115,6 +115,8 @@ class DelayedInspectionCreate:
         self.external = external
         self.image_read = False
         self.creator = creator
+        self.armed = threading.Event()
+        self.armed.set()
         fixture = self
 
         class Connection(http.client.HTTPConnection):
@@ -168,7 +170,7 @@ class DelayedInspectionCreate:
                                and fixture.image_read and "com.docker.compose.project=" + fixture.project in filters)
                 else:
                     delayed = create
-                delayed = delayed and not fixture.accepted.is_set()
+                delayed = delayed and fixture.armed.is_set() and not fixture.accepted.is_set()
                 if create and (delayed or "labels" not in fixture.record):
                     payload = json.loads(body)
                     fixture.record.update(labels=payload["Labels"])
@@ -480,6 +482,13 @@ class EngineVersionAdmissionTests(unittest.TestCase):
             finally:
                 receipt.write_bytes(saved)
             self.assertFalse((linked / ".devkit/state/stand.active").exists())
+            for kind in ("state", "cache"):
+                (linked / ".devkit" / kind).rename(base / ("saved-" + kind))
+            for cleanup in ([], ["cleanup=1"]):
+                result = run("make", "--no-print-directory", "-C", str(linked), "down", *cleanup,
+                             env=environment, check=False, timeout=4)
+                self.assertIn("Stand ownership history was lost", result.stderr)
+            self.assertFalse((linked / ".devkit/state").exists())
 
     def test_make_metadata_ignores_nonregular_projection_and_manifest(self):
         import fcntl
@@ -525,6 +534,13 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 finally:
                     path.unlink()
                     path.write_bytes(original)
+            import resource
+            cargo = root / "apps/api/Cargo.toml"
+            with cargo.open("r+b") as manifest:
+                manifest.truncate(256 * 1024 * 1024)
+            result = run(*make, "info", "json=1", timeout=3, preexec_fn=lambda: resource.setrlimit(
+                resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024)))
+            self.assertEqual(json.loads(result.stdout)["result"]["readiness"], "setup-required")
 
     def test_wrong_accepted_engine_version_is_rejected_before_docker(self):
         with tempfile.TemporaryDirectory(prefix="devkit-engine-version-") as temporary:
@@ -768,29 +784,58 @@ class RuntimeTests(unittest.TestCase):
         labels = {LABEL: self.token}
         external = "devkit-external-" + self.token
         run("docker", "volume", "create", "--label", f"{LABEL}={self.token}", external)
+        provider = self.owned_name()
+        run("docker", "create", "--name", provider, "--label", f"{LABEL}={self.token}", "--volume", "/borrowed", IMAGE, "true")
+        borrowed = container(provider)["Mounts"][0]["Name"]
         spec = {"services": {"main": {"image": "${DEVKIT_NODE_IMAGE:?}", "labels": labels,
                         "command": ["node", "-e", "setTimeout(()=>{},120000)"],
-                        "ports": ["127.0.0.1:0:3000"], "volumes": ["state:/state", "external:/external", "/anonymous"]}},
-                "volumes": {"state": {"labels": labels}, "external": {"external": True, "name": external}},
+                        "ports": ["127.0.0.1:0:3000"], "volumes_from": ["container:" + provider],
+                        "volumes": ["state:/state", "external:/external", "protect:/protect", "/anonymous"]}},
+                "volumes": {"state": {"labels": labels}, "external": {"external": True, "name": external},
+                            "protect": {"labels": labels}},
                 "networks": {"default": {"labels": labels}}}
         compose = self.root / "compose.yaml"
         compose.write_text(json.dumps(spec))
         loader = self.root / ".devkit/runtime/devkit.sh"
         history = self.root / ".devkit/state/stand.history.json"
+        ports = self.root / ".devkit/state/ports.json"
+        actors = self.root / ".devkit/state/stand.active"
+        protected = None
         try:
             self.make("setup", timeout=240)
             self.make("up", timeout=120)
             mounted = {m["Destination"]: m["Name"] for m in container(name)["Mounts"] if m["Type"] == "volume"}
             owned = mounted["/state"]
             anonymous = mounted["/anonymous"]
+            protected = mounted["/protect"]
             self.assertEqual(mounted["/external"], external)
+            self.assertEqual(mounted["/borrowed"], borrowed)
             self.make("down", "cleanup=1", timeout=90)
             self.assertEqual(run("docker", "volume", "inspect", owned).returncode, 0)
             self.make("up", timeout=120)
             self.assertIn(owned, [m.get("Name") for m in container(name)["Mounts"]])
+            spec["services"]["main"]["ports"] = []
+            compose.write_text(json.dumps(spec))
+            self.make("up", timeout=120)
+            before = {path: path.read_bytes() for path in (ports, actors) if path.exists()}
+            self.assertEqual(json.loads(before[ports])["groups"], [])
+            for path in before:
+                path.unlink()
+            try:
+                refused = self.make("down", check=False)
+                self.assertIn("lack an ownership receipt", refused.stderr)
+                observed = json.loads(self.make("info", "json=1").stdout)["result"]
+                self.assertEqual(observed["standState"], "unknown")
+                self.assertTrue(container(name)["State"]["Running"])
+            finally:
+                for path, data in before.items():
+                    path.write_bytes(data)
             # Protect another persisted volume even after its last service mount disappears.
             spec["services"]["main"]["volumes"].remove("external:/external")
+            spec["services"]["main"]["volumes"].remove("protect:/protect")
+            spec["volumes"]["protect"] = {"external": {"name": protected}}
             compose.write_text(json.dumps(spec))
+            run("docker", "rm", provider)
             other_context = dict(env(), DOCKER_CONTEXT="default")
             failed = run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root,
                          env=other_context, check=False, timeout=30)
@@ -803,12 +848,15 @@ class RuntimeTests(unittest.TestCase):
             for volume in (owned, anonymous):
                 self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
             self.assertIn(external, run("docker", "volume", "inspect", external).stdout)
+            self.assertIn(borrowed, run("docker", "volume", "inspect", borrowed).stdout)
+            self.assertIn(protected, run("docker", "volume", "inspect", protected).stdout)
             self.assertTrue(json.loads(history.read_text())["cleaned"])
             refused = self.make("up", check=False)
             self.assertIn("Stand is retired", refused.stderr)
         finally:
             run("sh", str(loader), "cli", "stand", "remove", ".", cwd=self.root, timeout=90, check=False)
-            run("docker", "volume", "rm", external, check=False)
+            run("docker", "rm", provider, check=False)
+            run("docker", "volume", "rm", external, borrowed, *([protected] if protected else []), check=False)
 
     def test_make_aggregate_without_display_skips_desktop_before_its_library_prerequisites(self):
         # Exercise the real public Make DAG with a controlled task boundary;
@@ -1092,7 +1140,7 @@ class RuntimeTests(unittest.TestCase):
                             ledger = json.loads(active.read_text())
                             self.assertTrue(ledger["inspections"])
                             self.assertTrue(json.loads((self.root / ".devkit/state/ports.json").read_text())["possibleActors"])
-                            refused = self.make("down", "cleanup=1", env=environment, check=False)
+                            refused = self.make("down", "cleanup=1", env=selected, check=False)
                             self.assertNotEqual(refused.returncode, 0)
                             self.assertIn("incomplete daemon outcomes", refused.stderr)
                             self.assertTrue(json.loads(active.read_text())["inspections"])
@@ -1104,7 +1152,7 @@ class RuntimeTests(unittest.TestCase):
                             self.assertEqual(actual["Config"]["Labels"]["io.docouno.devkit.inspection"], proxy.record["labels"]["io.docouno.devkit.inspection"])
                             volumes = [mount["Name"] for mount in actual["Mounts"] if mount["Type"] == "volume"]
                             self.assertTrue(volumes)
-                            self.make("down", "cleanup=1", env=environment)
+                            self.make("down", "cleanup=1", env=selected)
                             self.assertIsNone(container(helper_name))
                             for volume in volumes:
                                 self.assertNotEqual(run("docker", "volume", "inspect", volume, check=False).returncode, 0)
@@ -1163,9 +1211,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(status["services"]), 1)
         self.assertEqual(status["services"][0]["service"], "main")
         self.assertEqual(status["services"][0]["state"], "running")
-        human = self.make("status", env=environment).stdout
-        self.assertIn("Service main", human)
-        self.assertNotIn("(reserved)", human)
+        unverified = json.loads(self.make("status", "json=1", env=environment).stdout)["result"]
+        self.assertEqual(unverified["standState"], "unknown")
+        self.assertFalse(unverified["standPorts"])
         active = self.root / ".devkit/state/stand.active"
         saved = active.read_bytes()
         ledger = json.loads(saved)
@@ -1196,15 +1244,17 @@ class RuntimeTests(unittest.TestCase):
                 replicas = 1 if preview else 2
                 service["deploy"]["replicas"] = replicas
                 (self.root / "compose.yaml").write_text(json.dumps({"services": {"main": service}}))
-                if preview:
-                    self.make("up", "app=main", env=environment)
-                    before_ids = {container(project + "-main-1")["Id"]}
-                    selected["DEVKIT_PREVIEW_URL_TEMPLATE"] = "https://{port}.example.test"
                 proxy = DelayedInspectionCreate(self.base / "main.sock", creator="main")
                 proc = None
                 try:
                     with proxy:
                         fault = dict(selected, DOCKER_HOST="unix://" + str(proxy.path))
+                        if preview:
+                            proxy.armed.clear()
+                            self.make("up", "app=main", env=fault)
+                            proxy.armed.set()
+                            before_ids = {container(project + "-main-1")["Id"]}
+                            fault["DEVKIT_PREVIEW_URL_TEMPLATE"] = "https://{port}.example.test"
                         proc = subprocess.Popen([str(ENGINE), "task", "dev", "--root", str(self.root), "--app", "main"],
                                                 env=fault, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                         self.assertTrue(proxy.accepted.wait(20), "Main create never reached the daemon barrier")
@@ -1231,7 +1281,7 @@ class RuntimeTests(unittest.TestCase):
                             self.assertFalse(ledger["launch"]["daemonFinished"])
                             self.assertTrue(json.loads(ports.read_text())["possibleActors"])
                             before = ports.read_bytes()
-                            refused = self.make("down", "cleanup=1", env=selected, check=False)
+                            refused = self.make("down", "cleanup=1", env=fault, check=False)
                             self.assertNotEqual(refused.returncode, 0)
                             self.assertIn("incomplete daemon outcomes", refused.stderr)
                             self.assertEqual(ports.read_bytes(), before)
@@ -1245,7 +1295,7 @@ class RuntimeTests(unittest.TestCase):
                             self.assertTrue(ledger["launch"]["daemonFinished"])
                         self.assertEqual(proxy.record["status"], 201)
                         self.assertIsNotNone(container(proxy.record["reply"]["Id"]))
-                    self.make("down", "cleanup=1", env=selected)
+                        self.make("down", "cleanup=1", env=fault)
                     self.assertIsNone(container(held))
                     if peer:
                         self.assertIsNone(container(peer))
@@ -2103,7 +2153,7 @@ build: simulate-update
         self.make("up", "app=web")
         self.assertTrue(container(names["web"])["State"]["Running"])
         self.assertIsNone(container(names["api"]), "unrelated unprepared app was started")
-        self.assertIn(names["web"], self.make("status").stdout)
+        self.assertIn("Service web: running", self.make("status").stdout)
         self.assertIn("PROFILE_READY", self.make("logs", "app=web").stdout)
         self.assertIn("PROFILE_READY", self.make("logs").stdout)
         self.make("down")
@@ -2353,7 +2403,9 @@ build: simulate-update
         state["components"]["apps/extra"] = {**state["components"]["apps/main"],
             "development": {"owner": "project", "kind": "compose", "service": "extra"}}
         manifest.write_text(json.dumps(state))
-        self.assertIn("workspace membership differs", self.make("check", check=False).stderr)
+        self.assertIn("Accepted Make plan changed", self.make("check", check=False).stderr)
+        described = run(str(ENGINE), "describe", "--root", str(self.root), check=False)
+        self.assertIn("workspace membership differs", described.stderr)
         makefile = self.root / "Makefile"
         makefile.write_text(makefile.read_text() + "\nowner-hook:\n\t@true\n")
         accepted_makefile = makefile.read_bytes()
@@ -2378,7 +2430,7 @@ build: simulate-update
         result = run(str(ENGINE), "describe", "--root", str(self.root), env=e)
         self.assertEqual(json.loads(result.stdout)["version"], VERSION)
         self.assertFalse((self.root / "node_modules").exists())
-        self.assertFalse((self.root / ".devkit/cache").exists())
+        self.assertFalse(list((self.root / ".devkit/cache").glob("*")))
 
     def guard(self, name, argv):
         return subprocess.Popen([str(ENGINE), "internal", "guard", name, self.token, "--", *argv],
@@ -2475,7 +2527,7 @@ build: simulate-update
         for command in ("status", "logs", "down"):
             self.make(command)
         self.assertFalse((self.root / "node_modules").exists())
-        self.assertFalse((self.root / ".devkit/cache").exists())
+        self.assertFalse(list((self.root / ".devkit/cache").glob("*")))
 
     def test_guard_preserves_native_failure(self):
         name = self.owned_name()

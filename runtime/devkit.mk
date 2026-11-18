@@ -65,7 +65,7 @@ help info status doctor down logs sync add-app add-package register update recov
 devkit_manifest_digest = $(if $(filter undefined,$(origin devkit_manifest_saved)),$(eval devkit_manifest_saved := $(shell sh .devkit/runtime/devkit.sh make-manifest | awk 'length($$0) == 64 && $$0 !~ /[^a-f0-9]/ { print; exit }')))$(devkit_manifest_saved)
 $(devkit_dag): private export DEVKIT_MAKE_DAG := 1
 $(devkit_dag): private export DEVKIT_MAKE_PLAN := $(devkit_plan)
-$(devkit_dag): private export DEVKIT_EXPECTED_MANIFEST = $(devkit_manifest_digest)
+devkit_task = DEVKIT_EXPECTED_MANIFEST=$(devkit_manifest_digest) exec sh $(devkit_loader)
 
 setup: $(call devkit_targets,setup)
 check: $(call devkit_targets,check)
@@ -73,7 +73,7 @@ fix: $(call devkit_targets,fix)
 test: $(call devkit_targets,test)
 build: $(call devkit_targets,build)
 setup check fix test build:
-	@exec sh $(devkit_loader) snapshot
+	@$(devkit_task) snapshot
 
 dev up: export DEVKIT_DEV_GROUP := $(devkit_selected_apps)
 dev up: devkit-dev-selection $(addprefix dev-,$(devkit_selected_apps))
@@ -81,12 +81,12 @@ dev up: devkit-dev-selection $(addprefix dev-,$(devkit_selected_apps))
 devkit-dev-selection:
 	@$(foreach desktop,$(devkit_skipped_desktop),printf '%s\n' 'devkit: warning: skipping Electron app $(desktop) without DISPLAY; use headless=1 or app=$(desktop).' >&2;):
 dev up:
-	@exec sh $(devkit_loader) dev-snapshot
+	@$(devkit_task) dev-snapshot
 package: export DEVKIT_PACKAGE_AGGREGATE := $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),0,1)
 package: $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),$(call devkit_targets,package),$(addprefix package-,$(DEVKIT_DESKTOP_APPS)) $(addprefix package/packages/,$(DEVKIT_PACKAGEABLE_PACKAGES)))
-	@exec sh $(devkit_loader) package-snapshot
+	@$(devkit_task) package-snapshot
 setup-node-workspace:
-	@exec sh $(devkit_loader) setup-node
+	@$(devkit_task) setup-node
 setup-node-workspace: export DEVKIT_TARGET_COMPONENT :=
 
 ifneq ($(devkit_app_targets),)
@@ -97,32 +97,32 @@ $(devkit_package_targets): export DEVKIT_TARGET_COMPONENT = packages/$*
 endif
 
 $(addprefix setup-,$(DEVKIT_REGISTERED_APPS)): setup-%:
-	@exec sh $(devkit_loader) setup
+	@$(devkit_task) setup
 $(addprefix check-,$(DEVKIT_REGISTERED_APPS)): check-%:
-	@exec sh $(devkit_loader) check
+	@$(devkit_task) check
 $(addprefix fix-,$(DEVKIT_REGISTERED_APPS)): fix-%:
-	@exec sh $(devkit_loader) fix
+	@$(devkit_task) fix
 $(addprefix test-,$(DEVKIT_REGISTERED_APPS)): test-%:
-	@exec sh $(devkit_loader) test
+	@$(devkit_task) test
 $(addprefix build-,$(DEVKIT_REGISTERED_APPS)): build-%:
-	@exec sh $(devkit_loader) build
+	@$(devkit_task) build
 $(addprefix dev-,$(DEVKIT_REGISTERED_APPS)): dev-%:
-	@exec sh $(devkit_loader) dev
+	@$(devkit_task) dev
 $(addprefix package-,$(DEVKIT_REGISTERED_APPS)): package-%:
-	@exec sh $(devkit_loader) package
+	@$(devkit_task) package
 
 $(addprefix setup/packages/,$(DEVKIT_REGISTERED_PACKAGES)): setup/packages/%:
-	@exec sh $(devkit_loader) setup
+	@$(devkit_task) setup
 $(addprefix check/packages/,$(DEVKIT_REGISTERED_PACKAGES)): check/packages/%:
-	@exec sh $(devkit_loader) check
+	@$(devkit_task) check
 $(addprefix fix/packages/,$(DEVKIT_REGISTERED_PACKAGES)): fix/packages/%:
-	@exec sh $(devkit_loader) fix
+	@$(devkit_task) fix
 $(addprefix test/packages/,$(DEVKIT_REGISTERED_PACKAGES)): test/packages/%:
-	@exec sh $(devkit_loader) test
+	@$(devkit_task) test
 $(addprefix build/packages/,$(DEVKIT_REGISTERED_PACKAGES)): build/packages/%:
-	@exec sh $(devkit_loader) build
+	@$(devkit_task) build
 $(addprefix package/packages/,$(DEVKIT_REGISTERED_PACKAGES)): package/packages/%:
-	@exec sh $(devkit_loader) package
+	@$(devkit_task) package
 
 .PHONY: exec
 exec:

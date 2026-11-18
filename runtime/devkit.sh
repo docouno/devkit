@@ -45,11 +45,20 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
 fi
 if [ "$mode" = project ] && [ "$command" = down ]; then
   case "${DEVKIT_CLEANUP:-0}" in 0|1) ;; *) fail 'cleanup must be 0 or 1' ;; esac
+  git_history_absent() {
+    [ -e "$root/.git" ] || [ -L "$root/.git" ] || return 0
+    [ ! -L "$root/.git" ] || return 1
+    admin=$(timeout --kill-after=0.05s 0.25s env -i PATH="$PATH" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 \
+      git -C "$root" -c core.fsmonitor=false rev-parse --absolute-git-dir 2>/dev/null) || return 1
+    [ -d "$admin" ] && [ -x "$admin" ] && [ -r "$admin" ] \
+      && [ ! -e "$admin/devkit-stand-witness.json" ] && [ ! -L "$admin/devkit-stand-witness.json" ]
+  }
   if [ -z "${DEVKIT_APP:-}${DEVKIT_PACKAGE:-}" ] \
     && [ -d "$root/.devkit" ] && [ -r "$root/.devkit" ] && [ -x "$root/.devkit" ] && [ ! -L "$root/.devkit" ] \
     && [ ! -e "$root/.devkit/update-pending.json" ] && [ ! -L "$root/.devkit/update-pending.json" ] \
     && [ ! -e "$root/.devkit/state" ] && [ ! -L "$root/.devkit/state" ] \
-    && [ ! -e "$root/.devkit/cache" ] && [ ! -L "$root/.devkit/cache" ]; then
+    && [ ! -e "$root/.devkit/cache" ] && [ ! -L "$root/.devkit/cache" ] && git_history_absent; then
     exit 0
   fi
 fi
@@ -214,6 +223,8 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
   esac
 fi
 if [ "$mode" = project ] && [ "${DEVKIT_MAKE_DAG:-0}" = 1 ]; then
+  [ ! -L "$root/.devkit" ] && [ ! -L "$root/.devkit/project.mk" ] \
+    && [ ! -L "$root/.devkit/manifest.json" ] || fail 'accepted Make input contains a symlink'
   [ -n "${DEVKIT_MAKE_PLAN:-}" ] && [ -n "${DEVKIT_EXPECTED_MANIFEST:-}" ] \
     || fail 'cannot read accepted Make projection and manifest; run make recover or restore the managed files'
 fi
@@ -226,20 +237,32 @@ else
   [ "$(realpath -m -- "$cache")" = "$cache" ] || fail 'the cache path contains a symbolic link'
   engine=$cache/engines/$target/$version/$expected/devkit
 fi
-valid_engine() {
+engine_metadata() { stat -c '%h/%d:%i:%s/%z' -- "$engine"; }
+engine_link_settled() {
+  current_stamp=$(engine_metadata) || return 1
+  before_inode=${engine_stamp#*/}
+  after_inode=${current_stamp#*/}
+  [ "${engine_stamp%%/*}" = 2 ] && [ "${current_stamp%%/*}" = 1 ] \
+    && [ "${before_inode%%/*}" = "${after_inode%%/*}" ]
+}
+valid_engine_once() {
   [ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || return 1
-  engine_stamp=$(stat -c '%d:%i:%s:%z' -- "$engine") || return 1
+  engine_stamp=$(engine_metadata) || return 1
   size=$(stat -c %s -- "$engine") || return 1
   [ "$size" -le 134217728 ] || return 1
   observed=$(timeout --kill-after=0.05s 2s sh -c '
     set -eu
     exec 3<"$1"
     fd=/proc/$$/fd/3
-    [ "$(stat -Lc "%d:%i:%s:%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
     head -c 134217729 <&3 | sha256sum
-    [ "$(stat -Lc "%d:%i:%s:%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
   ' sh "$engine" "$engine_stamp") || return 1
-  [ "${observed%% *}" = "$expected" ] && [ "$(stat -c '%d:%i:%s:%z' -- "$engine")" = "$engine_stamp" ]
+  [ "${observed%% *}" = "$expected" ] && [ "$(engine_metadata)" = "$engine_stamp" ]
+}
+valid_engine() {
+  engine_stamp=
+  valid_engine_once || { engine_link_settled && valid_engine_once; }
 }
 exec_prepare=0
 exec_has_root=0
@@ -260,7 +283,7 @@ elif [ "$command" = cli ]; then
     [ "$arg" != --offline ] || cli_offline=1
   done
 fi
-if ! valid_engine; then
+if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
   case "$mode:$command" in
@@ -304,7 +327,8 @@ if ! valid_engine; then
   trap - 0 INT TERM
   valid_engine || fail 'the accepted engine could not be installed'
 fi
-[ "$(stat -c '%d:%i:%s:%z' -- "$engine")" = "$engine_stamp" ] || fail 'accepted engine changed before dispatch'
+[ "$(engine_metadata)" = "$engine_stamp" ] || { engine_link_settled && valid_engine_once; } \
+  || fail 'accepted engine changed before dispatch'
 if [ "$mode" = bootstrap ]; then
   DEVKIT_BOOTSTRAP_INTERACTIVE=1
   export DEVKIT_BOOTSTRAP_INTERACTIVE

@@ -495,6 +495,11 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         target = self.root / "my-product"
         self.cli("init", target, "--app", "web=react-web", "--name", "my-product",
                  "--release-root", RELEASE, "--package-source", "local", "--non-interactive", timeout=240)
+        # The frozen package is supplied by its verified archive before public
+        # publication. Pnpm can enforce registry age for all other packages.
+        package = self.manifest["environment"]
+        workspace = target / "pnpm-workspace.yaml"
+        workspace.write_text(workspace.read_text() + f"\nminimumReleaseAgeExclude:\n  - '{package['name']}@{package['version']}'\n")
         def make(*args, label):
             result = execute(["make", *args], cwd=target, env=self.env, timeout=360)
             EVIDENCE.append({"case": "readme", "step": label})
@@ -505,6 +510,23 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         readme.update_readme_project(make, self.version)
         make("setup", label="readme-after-update-setup")
         make("check", label="readme-after-update-check")
+
+    def test_worktree_guidance_opt_outs_are_independent_and_persist(self):
+        for flag, omitted, retained in (
+            ("--no-agents-md", "AGENTS.md", ".config/wt.toml"),
+            ("--no-worktrunk", ".config/wt.toml", "AGENTS.md"),
+        ):
+            with self.subTest(flag=flag):
+                target = self.root / flag.removeprefix("--")
+                self.cli("init", target, "--app", "api=rust-api", "--name", "project",
+                         "--release-root", RELEASE, "--package-source", "local", "--non-interactive", flag)
+                path = target / retained
+                customized = path.read_bytes() + b"\n# Project customization\n"
+                path.write_bytes(customized)
+                for args in (("sync", target), ("update", target, "--to", self.version)):
+                    self.cli(*args, "--non-interactive")
+                    self.assertFalse((target / omitted).exists())
+                    self.assertEqual(path.read_bytes(), customized)
 
     @unittest.skipUnless(DOCKER_ENABLED, "Requires the host Compose plugin")
     def test_generated_worktrunk_hooks_reserve_and_finalize_native_worktrees(self):

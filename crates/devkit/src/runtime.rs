@@ -1689,6 +1689,10 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     let pre_root = project_root(&request.root)?;
     runtime_pending(&pre_root)?;
     ensure_supported_checkout_floor(&pre_root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
+    if request.command == "down" && !exists(&safe_path(&pre_root, ".devkit/state")?)? {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        crate::stand::history::History::read(&pre_root, runner, deadline)?;
+    }
     let shared_lock = matches!(request.command.as_str(), "doctor" | "status" | "logs");
     let lock_op = format!("task {}", request.command);
     let lock = if shared_lock {
@@ -1696,12 +1700,12 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     } else {
         CheckoutLock::acquire_exclusive(&request.root, &lock_op, Some(runner))?
     };
-    if request.command == "down" && request.cleanup {
+    if request.command == "down" {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         if let Some(history) = crate::stand::history::History::read(&pre_root, runner, deadline)? {
             history.prove_lease_history(&pre_root)?;
         }
-        if cleanup_without_stand(&request, &pre_root)? {
+        if request.cleanup && cleanup_without_stand(&request, &pre_root)? {
             return Ok(());
         }
     }
@@ -2206,6 +2210,7 @@ fn run_service(
         let deadline = Instant::now() + Duration::from_secs(3);
         let value = History::read(&ctx.admission.root, ctx.runner, deadline)?;
         if let Some(history) = &value {
+            history.prove_lease_history(&ctx.admission.root)?;
             history.verify_daemon(ctx.runner, deadline)?;
         }
         match value.filter(History::has_daemon) {
@@ -2271,11 +2276,16 @@ fn run_service(
     }
     let mut down_actors = None;
     if let Some((history, declarations)) = &mut resource_history {
+        let mut rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
         if let Some(ports) = crate::stand::ports::Ports::read(&ctx.admission.root)? {
-            let mut rows = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
             rows.retain(|row| row.owner == ports.owner.key);
             history.record_anonymous(&ctx.admission.root, &rows, declarations, ctx.runner)?;
             down_actors = Some((ports.owner, rows));
+        } else {
+            ensure!(
+                rows.is_empty(),
+                "Stand containers lack an ownership receipt"
+            );
         }
         assert_compose_inventory(&ctx.admission.root, &inventory)?;
     }
