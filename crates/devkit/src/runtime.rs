@@ -2360,16 +2360,14 @@ fn run_service(
             &output.stdout,
             &app_service_component_map(&ctx.admission.state),
         )?;
-        crate::stand::preview::enrich_status(
+        let mut reservations = crate::stand::preview::enrich_status(
             &ctx.admission.root,
             &ctx.project,
             ctx.runner,
             &mut services,
         )?;
-        let reservation_lines = crate::stand::preview::reservation_lines(
-            &crate::stand::preview::reservations(&ctx.admission.root)?,
-            &services,
-        );
+        reservations.retain(|r| selected.as_deref().is_none_or(|s| s == r.service));
+        let reservation_lines = crate::stand::preview::reservation_lines(&reservations, &services);
         for service in services {
             println!(
                 "Service {} ({}): {}",
@@ -2768,7 +2766,7 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
         return Ok(false);
     }
     let branch = branch_name_until(&root, runner, Some(deadline))?;
-    let renderer = preview::Renderer::from_env(&branch)?;
+    let renderer = preview::Renderer::from_checkout(&root, &branch)?;
     leases.allocate_plan_until(
         ports::Allocation {
             declarations: &bindings,
@@ -3109,7 +3107,7 @@ fn run_development(
         .cloned()
         .collect();
     preview_forwarding_presence(ctx, &mut model, &frontends)?;
-    let renderer = crate::stand::preview::Renderer::from_env(&branch)?;
+    let renderer = crate::stand::preview::Renderer::from_checkout(&ctx.admission.root, &branch)?;
     // Make starts the selected applications individually. Use the same budget
     // group for every prerequisite of an aggregate invocation.
     let mut resource_services = active_services.clone();
@@ -3645,8 +3643,12 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
     command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
     let out = ctx.runner.capture(&mut command)?;
     let mut services = crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?;
-    crate::stand::preview::enrich_status(&ctx.admission.root, &ctx.project, runner, &mut services)?;
-    let stand_ports = crate::stand::preview::reservations(&ctx.admission.root)?;
+    let stand_ports = crate::stand::preview::enrich_status(
+        &ctx.admission.root,
+        &ctx.project,
+        runner,
+        &mut services,
+    )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
     ctx.admission.recheck()?;

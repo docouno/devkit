@@ -21,6 +21,7 @@ use std::{
 pub(crate) struct GitCheckout {
     pub(crate) linked: bool,
     pub(crate) branch: Option<String>,
+    pub(crate) preview_branch: String,
     pub(crate) admin: PathBuf,
 }
 
@@ -54,6 +55,7 @@ pub(crate) fn git_checkout(
                 .current_dir(root)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .args(["-c", "core.fsmonitor=false"])
                 .args(args),
@@ -100,9 +102,18 @@ pub(crate) fn git_checkout(
         );
     }
     let branch = query(&["branch", "--show-current"])?;
+    let (branch, preview_branch) = if !branch.is_empty() {
+        (Some(branch.clone()), branch)
+    } else {
+        (
+            None,
+            format!("detached-{}", query(&["rev-parse", "--short", "HEAD"])?),
+        )
+    };
     Ok(Some(GitCheckout {
         linked,
-        branch: (!branch.is_empty()).then_some(branch),
+        branch,
+        preview_branch,
         admin: git_dir,
     }))
 }
@@ -113,7 +124,7 @@ fn observe_stand(
     busy: bool,
     ports: Option<&Ports>,
     state: &crate::model::ProjectState,
-    branch: Option<&str>,
+    renderer: &preview::Renderer,
     selected: Option<&str>,
 ) -> Result<(&'static str, Vec<ComposeServiceStatus>)> {
     if busy {
@@ -212,8 +223,7 @@ fn observe_stand(
     } else {
         "unknown"
     };
-    let renderer = preview::Renderer::from_env(branch.unwrap_or_default())?;
-    preview::enrich_observed(ports, &rows, &renderer, &mut services)?;
+    preview::enrich_observed(ports, &rows, renderer, &mut services)?;
     for service in &mut services {
         service.urls = service
             .preview
@@ -259,12 +269,33 @@ pub(crate) fn inspect(
     let root = project_root(root)?;
     ensure!(root.is_dir(), "Checkout does not exist");
     let checkout = Physical::at(&root)?;
-    let (kind, branch) = git_checkout(&root, runner, Instant::now() + Duration::from_millis(350))
-        .ok()
-        .flatten()
-        .map_or(("none", None), |git| {
-            (if git.linked { "linked" } else { "main" }, git.branch)
-        });
+    let git_absent = matches!(
+        fs::symlink_metadata(root.join(".git")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    );
+    let (kind, branch, preview_branch) = if git_absent {
+        (
+            "none",
+            None,
+            Some(
+                root.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+    } else {
+        git_checkout(&root, runner, Instant::now() + Duration::from_millis(350))
+            .ok()
+            .flatten()
+            .map_or(("none", None, None), |git| {
+                (
+                    if git.linked { "linked" } else { "main" },
+                    git.branch,
+                    Some(git.preview_branch),
+                )
+            })
+    };
     let lock = state::probe_checkout_lock(&root).ok();
     let busy = lock != Some(false);
     let lock_state = match lock {
@@ -346,24 +377,32 @@ pub(crate) fn inspect(
                 readiness = local_readiness(&root, state)?;
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
-            if let Some(ports) = &ports {
-                reservations = preview::reservations_from(ports, true).unwrap_or_default();
-                reservations.retain(|r| selected.is_none_or(|s| s == r.service));
-            }
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
             if !unreadable_claim
+                && let Some(preview_branch) = preview_branch.as_deref()
+                && let Ok(renderer) = preview::Renderer::from_checkout(&root, preview_branch)
                 && let Ok((observed, rows)) = observe_stand(
                     &root,
                     runner,
                     busy,
                     ports.as_ref(),
                     state,
-                    branch.as_deref(),
+                    &renderer,
                     selected,
                 )
+                && observed != "unknown"
             {
-                condition = observed;
-                services = rows;
+                if let Some(ports) = &ports {
+                    if let Ok(mut res) = preview::reservations_from(ports, &renderer, &rows, true) {
+                        res.retain(|r| selected.is_none_or(|s| s == r.service));
+                        condition = observed;
+                        services = rows;
+                        reservations = res;
+                    }
+                } else {
+                    condition = observed;
+                    services = rows;
+                }
             }
         }
     }

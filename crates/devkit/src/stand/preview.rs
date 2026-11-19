@@ -46,13 +46,25 @@ pub fn dns_slug(raw: &str) -> String {
     slug
 }
 impl Renderer {
-    pub fn from_env(branch: &str) -> Result<Self> {
-        Self::new(
-            std::env::var("DEVKIT_PREVIEW_URL_TEMPLATE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            branch,
-        )
+    pub fn from_checkout(root: &Path, branch: &str) -> Result<Self> {
+        match std::env::var("DEVKIT_PREVIEW_URL_TEMPLATE") {
+            Ok(raw) if raw.is_empty() => return Self::new(None, branch),
+            Ok(raw) => return Self::new(Some(raw), branch),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("DEVKIT_PREVIEW_URL_TEMPLATE is not valid UTF-8")
+            }
+            Err(std::env::VarError::NotPresent) => {}
+        }
+        let checkout = project_root(root)?;
+        if let Some(raw) = parse_dotenv_preview_template(&checkout, "checkout .env")? {
+            return Self::new(Some(raw), branch);
+        }
+        if let Some(main_root) = linked_main_worktree_root(&checkout)?
+            && let Some(raw) = parse_dotenv_preview_template(&main_root, "main worktree .env")?
+        {
+            return Self::new(Some(raw), branch);
+        }
+        Self::new(None, branch)
     }
     pub fn new(template: Option<String>, branch: &str) -> Result<Self> {
         let value = Self {
@@ -106,6 +118,277 @@ impl Renderer {
         ensure!(!rest.contains('}'), "Invalid preview URL braces");
         result.push_str(rest);
         Ok(result)
+    }
+}
+
+pub fn parse_dotenv_preview_template(root: &Path, label: &str) -> Result<Option<String>> {
+    let path = safe_path(root, ".env")?;
+    let Some((bytes, _)) = read_regular_file(&path, 65536, label)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = None;
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_no = index + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let rest = match trimmed.strip_prefix("export") {
+            Some(after) if after.starts_with([' ', '\t']) => after.trim_start_matches([' ', '\t']),
+            _ => trimmed,
+        };
+        let Some((raw_key, raw_rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        if raw_key.trim_matches([' ', '\t']) != "DEVKIT_PREVIEW_URL_TEMPLATE" {
+            continue;
+        }
+        let rhs = raw_rhs.trim_start_matches([' ', '\t']);
+        if let Some(inner) = rhs.strip_prefix('\'') {
+            let end = inner.find('\'').with_context(|| {
+                format!(
+                    "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unclosed single quote",
+                    path.display()
+                )
+            })?;
+            let tail = inner[end + 1..].trim_start_matches([' ', '\t']);
+            ensure!(
+                tail.is_empty() || tail.starts_with('#'),
+                "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unexpected trailing characters after quoted value",
+                path.display()
+            );
+            found = Some(inner[..end].to_owned());
+        } else if let Some(inner) = rhs.strip_prefix('"') {
+            let mut chars = inner.char_indices();
+            let mut value = String::new();
+            let mut closed_after = None;
+            while let Some((idx, ch)) = chars.next() {
+                match ch {
+                    '"' => {
+                        closed_after = Some(&inner[idx + 1..]);
+                        break;
+                    }
+                    '\\' => match chars.next().map(|(_, next)| next) {
+                        Some('"') => value.push('"'),
+                        Some('\\') => value.push('\\'),
+                        _ => anyhow::bail!(
+                            "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unsupported escape sequence",
+                            path.display()
+                        ),
+                    },
+                    other => value.push(other),
+                }
+            }
+            let tail = closed_after
+                .with_context(|| {
+                    format!(
+                        "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unclosed double quote",
+                        path.display()
+                    )
+                })?
+                .trim_start_matches([' ', '\t']);
+            ensure!(
+                tail.is_empty() || tail.starts_with('#'),
+                "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unexpected trailing characters after quoted value",
+                path.display()
+            );
+            ensure!(
+                !value.contains(['$', '`']),
+                "Variable or command expansion is not supported in .env DEVKIT_PREVIEW_URL_TEMPLATE ({label} line {line_no}); write the literal host and use {{port}}, {{service}}, {{branch}} or {{slug}}"
+            );
+            found = Some(value);
+        } else if rhs.is_empty() || rhs.starts_with('#') {
+            found = Some(String::new());
+        } else {
+            let bytes = rhs.as_bytes();
+            let comment_at = (1..bytes.len())
+                .find(|&i| bytes[i] == b'#' && matches!(bytes[i - 1], b' ' | b'\t'));
+            let value = rhs[..comment_at.unwrap_or(rhs.len())].trim_end_matches([' ', '\t']);
+            ensure!(
+                !value.contains(['$', '`']),
+                "Variable or command expansion is not supported in .env DEVKIT_PREVIEW_URL_TEMPLATE ({label} line {line_no}); write the literal host and use {{port}}, {{service}}, {{branch}} or {{slug}}"
+            );
+            found = Some(value.to_owned());
+        }
+    }
+    Ok(found)
+}
+
+fn strip_git_config_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+        } else {
+            match ch {
+                '"' => in_quotes = true,
+                '#' | ';' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
+fn git_config_is_bare(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut in_core = false;
+    let mut bare = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_start_matches([' ', '\t']);
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some((header, tail)) = rest.split_once(']') else {
+                continue;
+            };
+            let tail = tail.trim_start_matches([' ', '\t']);
+            if !tail.is_empty() && !tail.starts_with(['#', ';']) {
+                continue;
+            }
+            in_core = header
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let uncommented = strip_git_config_comment(line).trim_end_matches([' ', '\t']);
+        if uncommented.eq_ignore_ascii_case("bare") {
+            bare = true;
+            continue;
+        }
+        if let Some((key, value)) = uncommented.split_once('=')
+            && key.trim_matches([' ', '\t']).eq_ignore_ascii_case("bare")
+        {
+            let val = value
+                .trim_matches([' ', '\t'])
+                .trim_matches('"')
+                .to_ascii_lowercase();
+            bare = matches!(val.as_str(), "true" | "yes" | "on" | "1");
+        }
+    }
+    bare
+}
+
+pub fn linked_main_worktree_root(checkout: &Path) -> Result<Option<PathBuf>> {
+    let checkout = project_root(checkout)?;
+    let git_entry = input_path(&checkout, ".git")?;
+    let meta = match fs::symlink_metadata(&git_entry) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if meta.is_dir() {
+        return Ok(None);
+    }
+    let (bytes, _) = read_regular_file(&git_entry, 16 * 1024, "Git worktree pointer")?
+        .context("Missing Git worktree pointer")?;
+    let raw_gitdir = std::str::from_utf8(&bytes)
+        .context("Invalid Git worktree pointer")?
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("gitdir: ")
+        .filter(|s| !s.is_empty())
+        .context("Invalid Git worktree pointer")?;
+    let git_dir = project_root(&checkout.join(raw_gitdir))?;
+    ensure!(
+        fs::symlink_metadata(&git_dir)
+            .with_context(|| format!(
+                "Missing Git worktree admin directory: {}",
+                git_dir.display()
+            ))?
+            .is_dir(),
+        "Invalid Git worktree admin directory: {}",
+        git_dir.display()
+    );
+    let Some((common_bytes, _)) = read_regular_file(
+        &safe_path(&git_dir, "commondir")?,
+        16 * 1024,
+        "Git common directory pointer",
+    )?
+    else {
+        return Ok(None);
+    };
+    let raw_commondir = std::str::from_utf8(&common_bytes)
+        .context("Invalid Git common directory pointer")?
+        .trim_end_matches(['\r', '\n']);
+    ensure!(
+        !raw_commondir.is_empty(),
+        "Empty Git common directory pointer"
+    );
+    let common_dir = project_root(&git_dir.join(raw_commondir))?;
+    ensure!(
+        fs::symlink_metadata(&common_dir)
+            .with_context(|| format!("Missing Git common directory: {}", common_dir.display()))?
+            .is_dir(),
+        "Invalid Git common directory: {}",
+        common_dir.display()
+    );
+    ensure!(
+        git_dir != common_dir && git_dir.parent() == Some(common_dir.join("worktrees").as_path()),
+        "Unexpected linked Git worktree admin layout"
+    );
+    let (back_bytes, _) = read_regular_file(
+        &safe_path(&git_dir, "gitdir")?,
+        16 * 1024,
+        "Git reverse worktree pointer",
+    )?
+    .context("Missing Git reverse worktree pointer")?;
+    let raw_back = std::str::from_utf8(&back_bytes)
+        .context("Invalid Git reverse worktree pointer")?
+        .trim_end_matches(['\r', '\n']);
+    ensure!(!raw_back.is_empty(), "Empty Git reverse worktree pointer");
+    let back_path = project_root(&git_dir.join(raw_back))?;
+    ensure!(
+        Physical::at(&back_path)? == Physical::at(&git_entry)?,
+        "Git worktree reverse pointer does not match checkout"
+    );
+    if common_dir.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return Ok(None);
+    }
+    let Some(parent) = common_dir.parent() else {
+        return Ok(None);
+    };
+    if let Some((cfg_bytes, _)) =
+        read_regular_file(&safe_path(&common_dir, "config")?, 256 * 1024, "Git config")?
+        && git_config_is_bare(&cfg_bytes)
+    {
+        return Ok(None);
+    }
+    let main_root = project_root(parent)?;
+    ensure!(
+        Physical::at(&input_path(&main_root, ".git")?)? == Physical::at(&common_dir)?,
+        "Main worktree .git directory mismatch"
+    );
+    let main_manifest = safe_path(&main_root, crate::state::MANIFEST_PATH)?;
+    match fs::symlink_metadata(&main_manifest) {
+        Ok(meta) => {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "Main worktree manifest must be a regular file: {}",
+                main_manifest.display()
+            );
+            Ok(Some(main_root))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -617,13 +900,15 @@ pub fn enrich_status(
     project: &str,
     runner: &crate::processes::ProcessRunner,
     services: &mut [crate::doctor::ComposeServiceStatus],
-) -> Result<()> {
+) -> Result<Vec<Reservation>> {
+    let branch = super::branch_name(root, runner)?;
+    let renderer = Renderer::from_checkout(root, &branch)?;
     let Some(ports) = super::ports::Ports::read(root)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let rows = super::ledger::observe(project, runner)?;
-    let renderer = Renderer::from_env(&super::branch_name(root, runner)?)?;
-    enrich_observed(&ports, &rows, &renderer, services)
+    enrich_observed(&ports, &rows, &renderer, services)?;
+    reservations_from(&ports, &renderer, services, false)
 }
 
 pub fn enrich_observed(
@@ -844,31 +1129,45 @@ pub struct Reservation {
     pub local_url: Option<String>,
     pub preview_url: Option<String>,
 }
-pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
-    let Some(ports) = super::ports::Ports::read(root)? else {
-        return Ok(Vec::new());
-    };
-    reservations_from(&ports, false)
-}
-
 pub(crate) fn reservations_from(
     ports: &super::ports::Ports,
+    live_renderer: &Renderer,
+    services: &[crate::doctor::ComposeServiceStatus],
     include_ranges: bool,
 ) -> Result<Vec<Reservation>> {
     ports
         .groups
         .iter()
         .map(|group| {
-            let renderer = ports
-                .service_preview_renderer
-                .get(&group.binding.service)
-                .or_else(|| {
-                    ports
-                        .service_desired
-                        .get(&group.binding.service)
+            let running: Vec<_> = services
+                .iter()
+                .filter(|s| s.service == group.binding.service && s.state == "running")
+                .collect();
+            let renderer = if !running.is_empty() {
+                if !running.iter().all(|s| s.preview.metadata_verified) {
+                    None
+                } else {
+                    running[0]
+                        .preview
+                        .applied_deployment
+                        .as_deref()
                         .and_then(|id| ports.deployments.get(id))
-                        .map(|d| &d.renderer)
-                });
+                        .map(|deployment| {
+                            let frontend =
+                                deployment.frontend.unwrap_or(!deployment.files.is_empty());
+                            if frontend {
+                                &deployment.renderer
+                            } else {
+                                ports
+                                    .service_preview_renderer
+                                    .get(&group.binding.service)
+                                    .unwrap_or(&deployment.renderer)
+                            }
+                        })
+                }
+            } else {
+                Some(live_renderer)
+            };
             let endpoint =
                 (include_ranges || group.first == group.last) && group.binding.protocol == "tcp";
             Ok(Reservation {
