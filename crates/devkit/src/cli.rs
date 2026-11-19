@@ -582,12 +582,7 @@ fn try_dispatch_info(
             return Ok(None);
         }
         let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
-        if !exists(&cache.engine_path(&pin)?)?
-            && let Some(release) = cache.cached(&header.version, &header.release_identity)?
-        {
-            cache.prime_engine(&release)?;
-        }
-        let engine = cache.accepted_engine(&pin)?;
+        let engine = cache.local_engine(&pin, &header.release_identity)?;
         let current = fs::canonicalize(std::env::current_exe()?)?;
         if engine == current {
             return Ok(None);
@@ -693,12 +688,6 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     {
         return Ok(());
     }
-    if command_name == "stand"
-        && !exists(&cache.engine_path(&pin)?)?
-        && let Some(release) = cache.cached(&header.version, &header.release_identity)?
-    {
-        cache.prime_engine(&release)?;
-    }
     if is_lifecycle && !exists(&cache.engine_path(&pin)?)? {
         cache.acquire(
             &header.version,
@@ -707,7 +696,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             globals.offline,
         )?;
     }
-    let engine = cache.accepted_engine(&pin)?;
+    let engine = if command_name == "stand" {
+        cache.local_engine(&pin, &header.release_identity)?
+    } else {
+        cache.accepted_engine(&pin)?
+    };
     ensure!(
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
         "Accepted engine dispatch did not converge"
