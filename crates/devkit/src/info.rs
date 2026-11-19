@@ -390,7 +390,6 @@ pub(crate) fn inspect(
                     &renderer,
                     selected,
                 )
-                && observed != "unknown"
             {
                 if let Some(ports) = &ports {
                     if let Ok(mut res) = preview::reservations_from(ports, &renderer, &rows, true) {
