@@ -12,7 +12,9 @@ use crate::{
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -43,24 +45,22 @@ pub(crate) fn git_checkout(
         read_regular_file(&root.join(".git"), 8192, "Git checkout pointer")?
             .context("Missing Git checkout pointer")?;
     }
-    let query = |args: &[&str]| -> Result<String> {
-        let output = runner.capture_before(crate::stand::git_command(root).args(args), deadline)?;
-        Ok(output.text()?.trim_end_matches('\n').to_owned())
+    let query =
+        |args: &[&str]| runner.capture_before(crate::stand::git_command(root).args(args), deadline);
+    let git_path = |flag: &str| -> Result<PathBuf> {
+        let output = query(&["rev-parse", "--path-format=absolute", flag])?;
+        // Each invocation returns one raw pathname and one terminating newline.
+        let path = output
+            .stdout
+            .strip_suffix(b"\n")
+            .context("Missing Git pathname")?;
+        Ok(fs::canonicalize(OsStr::from_bytes(path))?)
     };
-    let dirs = query(&[
-        "rev-parse",
-        "--path-format=absolute",
-        "--show-toplevel",
-        "--git-dir",
-        "--git-common-dir",
-    ])?;
-    let mut dirs = dirs.lines();
-    let top_level = fs::canonicalize(dirs.next().context("Missing Git top level")?)?;
-    if top_level != root {
+    if git_path("--show-toplevel")? != root {
         return Ok(None);
     }
-    let git_dir = fs::canonicalize(dirs.next().context("Missing Git directory")?)?;
-    let common = fs::canonicalize(dirs.next().context("Missing shared Git directory")?)?;
+    let git_dir = git_path("--git-dir")?;
+    let common = git_path("--git-common-dir")?;
     let linked = git_dir != common;
     if linked {
         let directory = common.join("worktrees");
@@ -85,13 +85,21 @@ pub(crate) fn git_checkout(
             "Unexpected main Git admin directory"
         );
     }
-    let branch = query(&["branch", "--show-current"])?;
+    let branch = query(&["branch", "--show-current"])?
+        .text()?
+        .trim_end_matches('\n')
+        .to_owned();
     let (branch, preview_branch) = if !branch.is_empty() {
         (Some(branch.clone()), branch)
     } else {
         (
             None,
-            format!("detached-{}", query(&["rev-parse", "--short", "HEAD"])?),
+            format!(
+                "detached-{}",
+                query(&["rev-parse", "--short", "HEAD"])?
+                    .text()?
+                    .trim_end_matches('\n')
+            ),
         )
     };
     Ok(Some(GitCheckout {

@@ -919,7 +919,7 @@ fn linked_worktree_preview_uses_only_the_configured_source_branch() {
     run_worker("local-empty", None);
     fs::remove_file(linked.join(".env")).unwrap();
 
-    let moved = temp.path().join("moved release");
+    let moved = temp.path().join("moved\nrelease\n");
     git(
         &main_root,
         &[

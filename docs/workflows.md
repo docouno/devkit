@@ -151,7 +151,7 @@ In zero-app library repositories, `make info` lists the registered packages. `ma
 Web (`react-web`) and Electron (`electron-react`) applications using `devkitWorkspaceSource()` from `@docouno/env/vite` resolve internal `packages/*/src` TypeScript, TSX, and CSS entrypoints directly during `make dev` — both for `./dist/...` library export maps (`ts-library`, `react-ui`) and direct `"development": "./src/..."` exports (`react-client`):
 
 - Editing `packages/ui/src/Button.tsx`, `packages/ui/src/styles.css`, or `packages/client/src/index.ts` triggers instant Vite Fast Refresh without running `tsdown` or modifying `dist/`.
-- Because `devkitWorkspaceSource()` is strictly scoped to `apply: 'serve'`, `make test` and `make build` always validate the real compiled `dist/` output and public `exports` map of every workspace library.
+- During tests and builds, Vitest and Vite resolve imports through the package's public `exports` and their active conditions. Vitest can select the `react-client` development export in `src/`. The default production build selects its compiled `dist/` export.
 
 ## Development stands and preview URLs
 
