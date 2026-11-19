@@ -39,6 +39,8 @@ pub struct ReleaseCache<'a> {
     executable: PathBuf,
 }
 
+const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(150);
+
 pub(crate) struct CacheLock(File);
 impl Drop for CacheLock {
     fn drop(&mut self) {
@@ -212,12 +214,14 @@ impl<'a> ReleaseCache<'a> {
         }
         Ok(())
     }
-    fn lock(&self, key: &str) -> Result<CacheLock> {
+    fn lock_path(&self, key: &str) -> Result<PathBuf> {
         self.initialize()?;
         let directory = safe_path(&self.root, ".locks")?;
         create_dir_all_durable(&directory)?;
-        let path = safe_path(&directory, &format!("{}.lock", digest(key)))?;
-        lock_file(&path, self.runner)
+        safe_path(&directory, &format!("{}.lock", digest(key)))
+    }
+    fn lock(&self, key: &str) -> Result<CacheLock> {
+        lock_file(&self.lock_path(key)?, self.runner)
     }
     pub fn release_path(&self, version: &str, identity: &str) -> Result<PathBuf> {
         crate::files::version(version)?;
@@ -284,6 +288,13 @@ impl<'a> ReleaseCache<'a> {
         )
     }
     pub fn prime_engine(&self, release: &AdmittedRelease) -> Result<()> {
+        self.prime_engine_with_timeout(release, CACHE_LOCK_TIMEOUT)
+    }
+    fn prime_engine_with_timeout(
+        &self,
+        release: &AdmittedRelease,
+        lock_timeout: Duration,
+    ) -> Result<()> {
         let pin = EnginePin {
             version: release.manifest.version.clone(),
             target: TARGET.to_owned(),
@@ -300,10 +311,11 @@ impl<'a> ReleaseCache<'a> {
             pins.engine == pin,
             "Release engine pin differs from its actual payload"
         );
-        let _lock = self.lock(&format!(
+        let lock_path = self.lock_path(&format!(
             "engine:{}:{}:{}",
             pin.target, pin.version, pin.sha256
         ))?;
+        let _lock = lock_file_with_timeout(&lock_path, self.runner, lock_timeout)?;
         let target = self.engine_path(&pin)?;
         if exists(&target)? {
             verify_cached_engine(&target, &pin)?;
@@ -340,6 +352,14 @@ impl<'a> ReleaseCache<'a> {
             publish_new_directory(&payload, destination)?;
         }
         Ok(())
+    }
+    pub(crate) fn local_engine(&self, pin: &EnginePin, release_identity: &str) -> Result<PathBuf> {
+        if !exists(&self.engine_path(pin)?)?
+            && let Some(release) = self.cached(&pin.version, release_identity)?
+        {
+            self.prime_engine_with_timeout(&release, Duration::ZERO)?;
+        }
+        self.accepted_engine(pin)
     }
     pub fn accepted_engine(&self, pin: &EnginePin) -> Result<PathBuf> {
         let target = self.engine_path(pin)?;
@@ -546,6 +566,13 @@ impl<'a> ReleaseCache<'a> {
 }
 
 pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock> {
+    lock_file_with_timeout(path, runner, CACHE_LOCK_TIMEOUT)
+}
+fn lock_file_with_timeout(
+    path: &Path,
+    runner: &ProcessRunner,
+    timeout: Duration,
+) -> Result<CacheLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -557,7 +584,7 @@ pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock
         file.metadata()?.is_file(),
         "Cache lock must be a regular file"
     );
-    let until = Instant::now() + Duration::from_secs(150);
+    let until = Instant::now() + timeout;
     loop {
         runner.check_cancelled()?;
         // SAFETY: a live descriptor and nonblocking advisory exclusive lock.
@@ -569,6 +596,10 @@ pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock
             error.kind() == std::io::ErrorKind::WouldBlock
                 || error.kind() == std::io::ErrorKind::Interrupted,
             "Cannot lock cache: {error}"
+        );
+        ensure!(
+            !timeout.is_zero(),
+            "Accepted engine cache is busy; retry shortly"
         );
         ensure!(
             Instant::now() < until,

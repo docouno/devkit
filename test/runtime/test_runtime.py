@@ -2,6 +2,7 @@
 """Production entrypoint tests. Only exact, labelled disposable Docker resources."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import http.client
 import http.server
@@ -489,6 +490,246 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                              env=environment, check=False, timeout=4)
                 self.assertIn("Stand ownership history was lost", result.stderr)
             self.assertFalse((linked / ".devkit/state").exists())
+
+    def test_linked_worktree_dotenv_inheritance_live_overrides_detached_head_and_status_filter(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-linked-dotenv-") as temporary:
+            base = Path(temporary)
+            root = base / "main with space"
+            linked = base / "linked with space"
+            detached = base / "detached with space"
+            source = base / "development checkout"
+            write_fixture(root, apps=("main", "api"), package_profiles={"apps/main": "web", "apps/api": "node"})
+            accept_runtime(root, package_profiles={"apps/main": "web", "apps/api": "node"})
+            token = "dotenv-" + uuid.uuid4().hex
+            labels = {LABEL: token}
+            server_js = (
+                "import http from 'node:http'; import { configurePreviewHosts, hostPolicy } from '/devkit-env/preview.js';"
+                "const server = { allowedHosts: [] }; configurePreviewHosts(server);"
+                "const allows = hostPolicy(server.allowedHosts);"
+                "http.createServer((req, res) => {"
+                "  if (!allows(req.headers.host)) { res.statusCode = 403; res.end('blocked'); return; }"
+                "  res.statusCode = 200; res.end(JSON.stringify({ allowed: server.allowedHosts, secret: process.env.SECRET_TOKEN ?? null }));"
+                "}).listen(8888, '0.0.0.0');"
+            )
+            api_js = "import http from 'node:http'; http.createServer((_q, s) => s.end('api')).listen(8080, '0.0.0.0');"
+            compose_spec = {
+                "services": {
+                    "main": {
+                        "image": "${DEVKIT_NODE_IMAGE:?}",
+                        "command": ["node", "--input-type=module", "-e", server_js],
+                        "ports": [{"target": 8888, "published": "0", "host_ip": "127.0.0.1"}],
+                        "volumes": [{"type": "bind", "source": str(REPO / "packages/env/src"), "target": "/devkit-env", "read_only": True}],
+                        "labels": labels,
+                    },
+                    "api": {
+                        "image": "${DEVKIT_NODE_IMAGE:?}",
+                        "command": ["node", "--input-type=module", "-e", api_js],
+                        "ports": [{"target": 8080, "published": "0", "host_ip": "127.0.0.1"}],
+                        "labels": labels,
+                    },
+                },
+                "networks": {"default": {"labels": labels}},
+            }
+            (root / "compose.yaml").write_text(json.dumps(compose_spec) + "\n")
+            run("git", "-C", str(root), "init", "-b", "main")
+            run("git", "-C", str(root), "add", ".")
+            run("git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-m", "init")
+            head_short = run("git", "-C", str(root), "rev-parse", "--short", "HEAD").stdout.strip()
+            run("git", "-C", str(root), "worktree", "add", "-b", "feat/ui", str(linked))
+            run("git", "-C", str(root), "worktree", "add", "--detach", str(detached), "HEAD")
+
+            run("git", "-C", str(root), "worktree", "add", "-b", "release/next", str(source))
+            (root / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://frozen.example.test\n")
+            run("git", "-C", str(linked), "config", "--local", "devkit.previewSourceBranch", "release/next")
+            (source / ".env").write_text(
+                "SECRET_TOKEN=super-secret-value\nDEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.example.test\n"
+            )
+            clean_env = {k: v for k, v in env().items() if k != "DEVKIT_PREVIEW_URL_TEMPLATE"}
+            clean_env["DEVKIT_CACHE_DIR"] = str(base / "cache")
+
+            try:
+                # 1. Early stand reserve + make info in linked worktree inherit the selected source .env.
+                loader = linked / ".devkit/runtime/devkit.sh"
+                run("make", "--no-print-directory", "-C", str(linked), "down", env=clean_env)
+                reserved = json.loads(run("sh", str(loader), "cli", "stand", "reserve", ".", "--json",
+                                          cwd=linked, env=clean_env).stdout)["result"]
+                self.assertTrue(reserved["reserved"])
+                info = json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                                      env=clean_env).stdout)["result"]
+                self.assertEqual(info["standState"], "stopped")
+                by_svc = {p["service"]: p for p in info["standPorts"]}
+                web_port = by_svc["main"]["first"]
+                self.assertEqual(by_svc["main"]["previewUrl"], f"https://{web_port}--feat-ui.example.test")
+
+                # 2. Live override & empty reset on stopped stand update standPorts immediately without stand reserve.
+                (linked / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}.local-wt.example.test\n")
+                local_info = json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                                            env=clean_env).stdout)["result"]
+                self.assertEqual(
+                    next(p for p in local_info["standPorts"] if p["service"] == "main")["previewUrl"],
+                    f"https://{web_port}.local-wt.example.test",
+                )
+                status_stopped = json.loads(run(str(ENGINE), "status", str(linked), "--json",
+                                                env=clean_env).stdout)["result"]
+                self.assertEqual(
+                    next(p for p in status_stopped["standPorts"] if p["service"] == "main")["previewUrl"],
+                    f"https://{web_port}.local-wt.example.test",
+                )
+                # Empty process env overrides both <linked>/.env and the selected source .env.
+                empty_proc_env = dict(clean_env, DEVKIT_PREVIEW_URL_TEMPLATE="")
+                self.assertIsNone(
+                    next(p for p in json.loads(run(str(ENGINE), "status", str(linked), "--json", env=empty_proc_env).stdout)["result"]["standPorts"] if p["service"] == "main")["previewUrl"]
+                )
+                # Empty <linked>/.env resets without falling through to the selected source .env.
+                (linked / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE= # disable\n")
+                self.assertIsNone(
+                    next(p for p in json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout)["result"]["standPorts"] if p["service"] == "main")["previewUrl"]
+                )
+                # Invalid/symlink .env on stopped stand degrades make info to unknown + empty arrays, while CLI status/reserve fail.
+                (linked / ".env").unlink()
+                (linked / ".env").symlink_to(root / ".env")
+                bad_stopped = json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                                             env=clean_env).stdout)["result"]
+                self.assertEqual(bad_stopped["standState"], "unknown")
+                self.assertEqual(bad_stopped["services"], [])
+                self.assertEqual(bad_stopped["standPorts"], [])
+                self.assertNotEqual(run(str(ENGINE), "status", str(linked), "--json", env=clean_env, check=False).returncode, 0)
+                self.assertNotEqual(run("sh", str(loader), "cli", "stand", "reserve", ".", cwd=linked, env=clean_env, check=False).returncode, 0)
+                (linked / ".env").unlink()
+
+                # 3. Launch linked stand inheriting the selected source .env: Vite hostPolicy allows rendered Host (200), blocks foreign Host (403), and SECRET_TOKEN never leaks.
+                run("make", "--no-print-directory", "-C", str(linked), "setup", env=clean_env)
+                run("make", "--no-print-directory", "-C", str(linked), "up", "app=main", env=clean_env)
+                expected_host = f"{web_port}--feat-ui.example.test"
+                req_ok = urllib.request.Request(f"http://127.0.0.1:{web_port}/", headers={"Host": expected_host})
+                with urllib.request.urlopen(req_ok, timeout=3) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.load(resp)
+                self.assertEqual(payload["allowed"], [expected_host])
+                self.assertIsNone(payload["secret"])
+                linked_project = "devkit-" + hashlib.sha256(str(linked.resolve()).encode()).hexdigest()[:16]
+                inspected = container(linked_project + "-main-1")
+                self.assertFalse(any("SECRET_TOKEN" in entry or "super-secret-value" in entry for entry in inspected["Config"]["Env"]))
+                req_blocked = urllib.request.Request(f"http://127.0.0.1:{web_port}/", headers={"Host": "evil.example.test"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx_err:
+                    urllib.request.urlopen(req_blocked, timeout=3)
+                self.assertEqual(ctx_err.exception.code, 403)
+
+                # Direct `devkit task status --app main` filters Leased lines to only `main` (api is stopped, main is running -> no `Leased api` line).
+                task_status_main = run(str(ENGINE), "task", "status", "--root", str(linked), "--app", "main", env=clean_env).stdout
+                self.assertIn("Service main", task_status_main)
+                self.assertNotIn("Leased api", task_status_main)
+                task_status_api = run(str(ENGINE), "task", "status", "--root", str(linked), "--app", "api", env=clean_env).stdout
+                self.assertIn("Leased api", task_status_api)
+                self.assertNotIn("Service main", task_status_api)
+
+                # 4. Changing the selected source .env while <linked> is running sets pendingRestart=true while keeping applied URL in services and standPorts.
+                (source / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://changed-{port}--{branch}.example.test\n")
+                for cmd_out in (
+                    run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout,
+                    run(str(ENGINE), "status", str(linked), "--json", env=clean_env).stdout,
+                ):
+                    res = json.loads(cmd_out)["result"]
+                    svc = next(s for s in res["services"] if s["service"] == "main")
+                    self.assertTrue(svc["pendingRestart"])
+                    self.assertEqual(svc["previewUrls"], [f"https://{expected_host}"])
+                    main_res = next(p for p in res["standPorts"] if p["service"] == "main")
+                    self.assertEqual(main_res["previewUrl"], f"https://{expected_host}")
+                    api_res = next(p for p in res["standPorts"] if p["service"] == "api")
+                    self.assertTrue(api_res["previewUrl"].startswith("https://changed-"))
+
+                # While `task.lock` is held (`busy == true`, e.g. active `make dev`), `make info` never advertises unapplied `.env` URLs.
+                with (linked / ".devkit/state/task.lock").open("r+b") as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        busy_info = json.loads(
+                            run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout
+                        )["result"]
+                    finally:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                self.assertEqual(busy_info["standState"], "unknown")
+                self.assertEqual(busy_info["services"], [])
+                self.assertTrue(all(p["previewUrl"] is None for p in busy_info["standPorts"]))
+
+                # Unmanaged container claiming stopped service `api` prevents both `info` and `status` from advertising a live `.env` URL for `api`.
+                orphan_api = f"devkit-orphan-{token}"
+                run(
+                    "docker", "run", "--detach", "--pull", "never", "--name", orphan_api,
+                    "--label", f"{LABEL}={token}",
+                    "--label", f"com.docker.compose.project={linked_project}",
+                    "--label", "com.docker.compose.service=api",
+                    IMAGE, "node", "-e", "setTimeout(()=>{},25000)",
+                )
+                try:
+                    orphan_info = json.loads(
+                        run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout
+                    )["result"]
+                    self.assertEqual(orphan_info["standState"], "unknown")
+                    self.assertEqual(
+                        next(p for p in orphan_info["standPorts"] if p["service"] == "main")["previewUrl"],
+                        f"https://{expected_host}",
+                    )
+                    self.assertIsNone(next(p for p in orphan_info["standPorts"] if p["service"] == "api")["previewUrl"])
+                    orphan_status = json.loads(
+                        run(str(ENGINE), "status", str(linked), "--json", env=clean_env).stdout
+                    )["result"]
+                    self.assertIsNone(next(p for p in orphan_status["standPorts"] if p["service"] == "api")["previewUrl"])
+                finally:
+                    run("docker", "rm", "--force", orphan_api)
+
+                # `--app api` filters reservations before rendering, so a 63-byte label valid for `api` (3 chars)
+                # does not fail on unselected running `main` (4 chars -> 64-byte label).
+                long_prefix = "x" * 59
+                (linked / ".env").write_text(f"DEVKIT_PREVIEW_URL_TEMPLATE=https://{long_prefix}-{{service}}.example.test\n")
+                app_info = json.loads(
+                    run("make", "--no-print-directory", "-C", str(linked), "info", "app=api", "json=1", env=clean_env).stdout
+                )["result"]
+                self.assertEqual(
+                    app_info["standPorts"][0]["previewUrl"],
+                    f"https://{long_prefix}-api.example.test",
+                )
+                app_task_status = run(
+                    str(ENGINE), "task", "status", "--root", str(linked), "--app", "api", env=clean_env
+                ).stdout
+                self.assertIn(f"https://{long_prefix}-api.example.test", app_task_status)
+                (linked / ".env").unlink()
+
+                # Invalid .env on running stand degrades make info to unknown + empty arrays, while up/status fail.
+                (linked / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://$BAD_EXPANSION.example.test\n")
+                bad_running = json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
+                                             env=clean_env).stdout)["result"]
+                self.assertEqual(bad_running["standState"], "unknown")
+                self.assertEqual(bad_running["services"], [])
+                self.assertEqual(bad_running["standPorts"], [])
+                self.assertNotEqual(run("make", "--no-print-directory", "-C", str(linked), "up", "app=main", env=clean_env, check=False).returncode, 0)
+                self.assertNotEqual(run(str(ENGINE), "status", str(linked), "--json", env=clean_env, check=False).returncode, 0)
+                (linked / ".env").unlink()
+
+                # 5. Detached HEAD worktree keeps branch=null in info and pendingRestart=false across info and status,
+                # and `stand::inspection::prepare` ignores non-Devkit `.env` keys (`--env-file /dev/null`) and `COMPOSE_*` env vars.
+                (detached / ".env").write_text(
+                    "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.example.test\n"
+                    'UNCLOSED_COMPOSE_SECRET="should-never-be-parsed-by-compose\n'
+                    "FOREIGN_COMPOSE_REQ=${MISSING_COMPOSE_VAR:?must-not-evaluate}\n"
+                )
+                poisoned_compose_env = dict(clean_env, COMPOSE_ENV_FILES="/nonexistent-compose-env-file")
+                run("make", "--no-print-directory", "-C", str(detached), "setup", env=poisoned_compose_env)
+                run("make", "--no-print-directory", "-C", str(detached), "up", "app=main", env=poisoned_compose_env)
+                det_info = json.loads(run("make", "--no-print-directory", "-C", str(detached), "info", "json=1",
+                                          env=clean_env).stdout)["result"]
+                self.assertIsNone(det_info["branch"])
+                self.assertFalse(det_info["services"][0]["pendingRestart"])
+                self.assertIn(f"detached-{head_short}", det_info["services"][0]["previewUrls"][0])
+                det_status = json.loads(run(str(ENGINE), "status", str(detached), "--json",
+                                            env=clean_env).stdout)["result"]
+                self.assertFalse(det_status["services"][0]["pendingRestart"])
+            finally:
+                for wt_dir in (linked, detached):
+                    if wt_dir.exists():
+                        (wt_dir / ".env").unlink(missing_ok=True)
+                        run("make", "--no-print-directory", "-C", str(wt_dir), "down", "cleanup=1",
+                            env=clean_env, check=False)
 
     def test_make_metadata_ignores_nonregular_projection_and_manifest(self):
         import fcntl

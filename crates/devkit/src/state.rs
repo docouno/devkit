@@ -56,21 +56,28 @@ fn unsupported_floor_error(is_update: bool, found: &str, min_from: &str) -> anyh
     )
 }
 
-pub fn ensure_supported_checkout_floor(
-    root: &Path,
+pub(crate) fn read_manifest_snapshot(path: &Path) -> Result<(Vec<u8>, FileIdentity, FileStamp)> {
+    match read_regular_snapshot(path, MAX_MANIFEST_BYTES, "Project manifest") {
+        Ok(Some(snapshot)) => Ok(snapshot),
+        Ok(None) => anyhow::bail!("Missing project manifest"),
+        Err(err) => {
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::FileTooLarge)
+            {
+                anyhow::bail!("Project manifest exceeds 4 MiB byte budget");
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(crate) fn ensure_supported_manifest_bytes(
+    bytes: &[u8],
     is_update: bool,
     min_from: &str,
 ) -> Result<String> {
-    assert_no_pending(root)?;
-    let path = safe_path(root, MANIFEST_PATH)?;
-    check_manifest_regular_bounded(&path)?;
-    let before = identity(&path)?.context("Missing project manifest")?;
-    let bytes = fs::read(&path)?;
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
-        "Project manifest changed during admission"
-    );
-    let raw: MinimalManifestFloor = serde_json::from_slice(&bytes)?;
+    let raw: MinimalManifestFloor = serde_json::from_slice(bytes)?;
     if raw.schema_version == 1 {
         return Err(unsupported_floor_error(
             is_update,
@@ -89,6 +96,17 @@ pub fn ensure_supported_checkout_floor(
     }
     Ok(ver)
 }
+
+pub fn ensure_supported_checkout_floor(
+    root: &Path,
+    is_update: bool,
+    min_from: &str,
+) -> Result<String> {
+    assert_no_pending(root)?;
+    let path = safe_path(root, MANIFEST_PATH)?;
+    let (bytes, _, _) = read_manifest_snapshot(&path)?;
+    ensure_supported_manifest_bytes(&bytes, is_update, min_from)
+}
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AcceptedManifestHeader {
@@ -98,16 +116,8 @@ pub(crate) struct AcceptedManifestHeader {
     pub managed: std::collections::BTreeMap<String, crate::model::FileIdentity>,
 }
 
-pub(crate) fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
-    let path = safe_path(root, MANIFEST_PATH)?;
-    check_manifest_regular_bounded(&path)?;
-    let before = identity(&path)?.context("Missing project manifest")?;
-    let bytes = fs::read(&path)?;
-    ensure!(
-        digest(&bytes) == before.sha256 && identity(&path)?.as_ref() == Some(&before),
-        "Project manifest changed during admission"
-    );
-    let header: AcceptedManifestHeader = serde_json::from_slice(&bytes)?;
+pub(crate) fn parse_accepted_header(bytes: &[u8]) -> Result<AcceptedManifestHeader> {
+    let header: AcceptedManifestHeader = serde_json::from_slice(bytes)?;
     ensure!(
         header.schema_version == 2,
         "Unsupported project schemaVersion; only published schema2 is supported"
@@ -118,6 +128,12 @@ pub(crate) fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedMan
         "Invalid project release identity/generation"
     );
     Ok(header)
+}
+
+pub(crate) fn read_accepted_header(root: &std::path::Path) -> Result<AcceptedManifestHeader> {
+    let path = safe_path(root, MANIFEST_PATH)?;
+    let (bytes, _, _) = read_manifest_snapshot(&path)?;
+    parse_accepted_header(&bytes)
 }
 
 pub fn managed_path(name: &str) -> Result<&str> {
@@ -243,9 +259,7 @@ pub fn validate_project_state(s: &ProjectState) -> Result<()> {
 }
 pub fn read_project_state(root: &Path) -> Result<ProjectState> {
     let path = safe_path(root, MANIFEST_PATH)?;
-    check_manifest_regular_bounded(&path)?;
-    let (bytes, _) = read_regular_file(&path, MAX_MANIFEST_BYTES, "project manifest")?
-        .context("Missing project manifest")?;
+    let (bytes, _, _) = read_manifest_snapshot(&path)?;
     parse_project_state(&bytes)
 }
 

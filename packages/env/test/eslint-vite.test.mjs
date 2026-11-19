@@ -171,3 +171,208 @@ test('devkitWorkspaceSource activates only in serve mode and maps workspace dist
     await fs.rm(temp, { recursive: true, force: true });
   }
 });
+
+test('devkitWorkspaceSource includes react-client development ./src exports and rejects symlinked paths', async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'devkit-vite-react-client-'));
+  const prevVitest = process.env.VITEST;
+  try {
+    delete process.env.VITEST;
+    const appRoot = path.join(temp, 'apps', 'web');
+    const clientRoot = path.join(temp, 'packages', 'client');
+    const external = path.join(temp, 'external');
+    await fs.mkdir(path.join(appRoot, 'src'), { recursive: true });
+    await fs.mkdir(path.join(clientRoot, 'src'), { recursive: true });
+    await fs.mkdir(external, { recursive: true });
+    await fs.mkdir(path.join(temp, '.devkit'), { recursive: true });
+
+    await fs.writeFile(
+      path.join(temp, '.devkit/manifest.json'),
+      JSON.stringify({
+        schemaVersion: 2,
+        components: {
+          'apps/web': { role: 'app' },
+          'packages/client': { role: 'library' },
+        },
+      }),
+    );
+    await fs.writeFile(
+      path.join(clientRoot, 'package.json'),
+      JSON.stringify({
+        name: 'devkit-react-client',
+        version: '0.1.0',
+        private: true,
+        type: 'module',
+        exports: {
+          '.': {
+            types: './dist/index.d.ts',
+            development: './src/index.ts',
+            import: './dist/index.js',
+          },
+          './style.css': {
+            development: './src/style.css',
+            default: './dist/style.css',
+          },
+          './sub': {
+            development: './src/sub/entry.ts',
+            import: './dist/sub/entry.js',
+          },
+        },
+      }),
+    );
+    await fs.writeFile(path.join(clientRoot, 'src/index.ts'), 'export const App = () => null;\n');
+    await fs.writeFile(path.join(clientRoot, 'src/style.css'), '.app { display: grid; }\n');
+    await fs.writeFile(path.join(external, 'entry.ts'), 'export const leaked = true;\n');
+    await fs.symlink(external, path.join(clientRoot, 'src/sub'));
+
+    const plugin = devkitWorkspaceSource(appRoot);
+    const patch = plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' });
+    assert.ok(patch);
+    assert(patch.optimizeDeps.exclude.includes('devkit-react-client'));
+    assert(patch.server.fs.allow.includes(clientRoot));
+    assert(patch.server.fs.allow.includes(path.join(clientRoot, 'src')));
+
+    const normalize = (p) => p.replaceAll('\\', '/');
+    assert.equal(
+      plugin.resolveId('devkit-react-client'),
+      normalize(path.join(clientRoot, 'src/index.ts')),
+    );
+    assert.equal(
+      plugin.resolveId('devkit-react-client/style.css'),
+      normalize(path.join(clientRoot, 'src/style.css')),
+    );
+    // Symlinked intermediate directory inside packages/client/src must be rejected.
+    assert.equal(plugin.resolveId('devkit-react-client/sub'), null);
+
+    // Inactive in build and VITEST modes.
+    assert.equal(
+      plugin.config({ root: appRoot }, { command: 'build', mode: 'production' }),
+      undefined,
+    );
+    assert.equal(plugin.resolveId('devkit-react-client'), null);
+    process.env.VITEST = 'true';
+    assert.equal(
+      plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+      undefined,
+    );
+    assert.equal(plugin.resolveId('devkit-react-client'), null);
+    delete process.env.VITEST;
+
+    // Symlinked source file or symlinked src directory itself must also be rejected.
+    await fs.unlink(path.join(clientRoot, 'src/index.ts'));
+    await fs.symlink(path.join(external, 'entry.ts'), path.join(clientRoot, 'src/index.ts'));
+    await fs.unlink(path.join(clientRoot, 'src/style.css'));
+    assert.equal(
+      plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+      undefined,
+    );
+
+    const movedSrc = path.join(temp, 'moved-src');
+    await fs.rm(path.join(clientRoot, 'src'), { recursive: true, force: true });
+    await fs.mkdir(movedSrc, { recursive: true });
+    await fs.writeFile(path.join(movedSrc, 'index.ts'), 'export const App = () => null;\n');
+    await fs.symlink(movedSrc, path.join(clientRoot, 'src'));
+    assert.equal(
+      plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+      undefined,
+    );
+
+    // Restore valid client package, then test `packages/../../outside`, multi-segment `packages/nested/lib`,
+    // symlinked `pkgRoot`, symlinked `.devkit/manifest.json`, and symlinked `.devkit`.
+    await fs.unlink(path.join(clientRoot, 'src'));
+    await fs.mkdir(path.join(clientRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(clientRoot, 'src/index.ts'), 'export const App = () => null;\n');
+    const outsidePkg = path.join(path.dirname(temp), `devkit-outside-${path.basename(temp)}`);
+    const nestedPkg = path.join(temp, 'packages', 'nested', 'lib');
+    try {
+      for (const [dir, pkgName] of [
+        [outsidePkg, 'devkit-outside-escape'],
+        [nestedPkg, 'devkit-nested-escape'],
+      ]) {
+        await fs.mkdir(path.join(dir, 'src'), { recursive: true });
+        await fs.writeFile(
+          path.join(dir, 'package.json'),
+          JSON.stringify({
+            name: pkgName,
+            version: '0.1.0',
+            private: true,
+            type: 'module',
+            exports: { '.': { development: './src/index.ts', import: './dist/index.js' } },
+          }),
+        );
+        await fs.writeFile(path.join(dir, 'src/index.ts'), 'export const escaped = true;\n');
+      }
+      await fs.writeFile(
+        path.join(temp, '.devkit/manifest.json'),
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            [`packages/../../${path.basename(outsidePkg)}`]: { role: 'library' },
+            'packages/nested/lib': { role: 'library' },
+          },
+        }),
+      );
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+      assert.equal(plugin.resolveId('devkit-outside-escape'), null);
+      assert.equal(plugin.resolveId('devkit-nested-escape'), null);
+
+      // Symlinked pkgRoot (`packages/escaped -> outsidePkg`) must be rejected.
+      await fs.symlink(outsidePkg, path.join(temp, 'packages', 'escaped'));
+      await fs.writeFile(
+        path.join(temp, '.devkit/manifest.json'),
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            'packages/escaped': { role: 'library' },
+          },
+        }),
+      );
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+
+      // Symlinked `.devkit/manifest.json` and symlinked `.devkit` directory must be rejected.
+      const extManifest = path.join(external, 'manifest.json');
+      await fs.writeFile(
+        extManifest,
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            'packages/client': { role: 'library' },
+          },
+        }),
+      );
+      await fs.unlink(path.join(temp, '.devkit/manifest.json'));
+      await fs.symlink(extManifest, path.join(temp, '.devkit/manifest.json'));
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+
+      const extDevkit = path.join(external, 'fake-devkit');
+      await fs.mkdir(extDevkit, { recursive: true });
+      await fs.copyFile(extManifest, path.join(extDevkit, 'manifest.json'));
+      await fs.rm(path.join(temp, '.devkit'), { recursive: true, force: true });
+      await fs.symlink(extDevkit, path.join(temp, '.devkit'));
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+    } finally {
+      await fs.rm(outsidePkg, { recursive: true, force: true });
+    }
+  } finally {
+    if (prevVitest === undefined) {
+      delete process.env.VITEST;
+    } else {
+      process.env.VITEST = prevVitest;
+    }
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});

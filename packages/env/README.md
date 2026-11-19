@@ -45,7 +45,7 @@ export { default } from '@docouno/env/prettier';
 
 ## Workspace Source HMR (`@docouno/env/vite`)
 
-In `react-web` and `electron-react` applications, `devkitWorkspaceSource()` resolves internal `packages/*` TypeScript, TSX, and CSS entrypoints directly from `src/` during `vite serve` (`make dev`), while leaving `vite build` (`make build`) and Vitest (`make test`) pointed at compiled `dist/` outputs:
+In `react-web` and `electron-react` applications, `devkitWorkspaceSource()` resolves internal `packages/*` TypeScript, TSX, and CSS entrypoints directly from `src/` during `vite serve` (`make dev`). Vite builds and Vitest use their normal export conditions. For `react-client`, Vitest can select the `development` export from `src/`, while production builds use the compiled export from `dist/`.
 
 ```js
 import { devkitWorkspaceSource } from '@docouno/env/vite';

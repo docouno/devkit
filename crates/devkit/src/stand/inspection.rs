@@ -724,6 +724,11 @@ pub fn prepare(
     }
     let command = || {
         let mut command = Command::new("docker");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("COMPOSE_") {
+                command.env_remove(key);
+            }
+        }
         command
             .current_dir(root)
             .args([
@@ -733,7 +738,7 @@ pub fn prepare(
                 "--project-directory",
             ])
             .arg(root)
-            .args(["--file", "-", "create"]);
+            .args(["--env-file", "/dev/null", "--file", "-", "create"]);
         command
     };
     // Compose prepares images before convergence. All acquisition services

@@ -15,16 +15,16 @@
 - Make targets for component registration, environment updates and recovery, offline component help, root Node workspace `make exec`, and the per-worktree `make info` summary.
 - Checkout-local stand reservation and cleanup, optional Worktrunk hooks, and project-owned development instructions generated at initialization.
 - Sticky per-checkout TCP/UDP host-port leases, replica ranges, ownership-aware cleanup, and cold cleanup before setup without Docker or downloads.
-- Vendor-neutral preview URL templates, bounded immutable host metadata with image-aware read-only mount proof, and applied/desired endpoint status.
+- Vendor-neutral preview URL templates (configured in the environment or checkout's root `.env`, with opt-in inheritance from the branch selected by `git config --local devkit.previewSourceBranch`), bounded immutable host metadata with image-aware read-only mount proof, and applied/desired endpoint status.
 - A web-only `fullstack-web` preset and transactional `add-app --api` connections, API library development prerequisites, configurable starter bind addresses, and display-free aggregate Electron skipping.
 
 ### Changed
 
-- Extend `devkitWorkspaceSource()` serve behavior to zero-library projects, exact preview hosts, automatic HTTP/WebSocket API proxies with Host validation, and guarded first-handshake HMR recovery.
+- Extend `devkitWorkspaceSource()` serve behavior to `react-client` `"development": "./src/..."` exports, zero-library projects, exact preview hosts, automatic HTTP/WebSocket API proxies with Host validation, and guarded first-handshake HMR recovery.
 
 - Deliver a verified static pnpm executable lazily and share pnpm, Cargo, and Electron caches across repositories and Git worktrees; preserve real hardlinks and protect the virtual store during offline gates.
 
-- Delegate `devkit init --to`, `devkit update --to`, and project lifecycle/inspection commands symmetrically across `0.4.x` and `0.5.0+` releases while keeping `describe` and `status` strictly offline when the accepted engine is not yet cached.
+- Delegate `devkit init --to`, `devkit update --to`, and project lifecycle/inspection commands (including offline `devkit stand` and lock-free `devkit info` on `0.5.0+` checkouts) symmetrically across `0.4.x` and `0.5.0+` releases while keeping `describe`, `status`, and `info` strictly offline when the accepted engine is not yet cached.
 - Tag consumer derived Docker images (`devkit-derived-{rust,desktop}:<recipe_sha>`) during `make setup` / `exec --prepare` so clean checkouts and linked worktrees reuse verified local images without rebuilding Dockerfiles.
 - Move verification, bootstrap, packaged consumer, registry, `public-baseline`, and symmetric native-vs-native performance non-regression gates from `0.2.x` to the immutable `v0.4.1` baseline, eliminate redundant `make setup` runs across non-source verification jobs via pre-built `devkit-author-fixtures`, and cache pinned baseline downloads, Cargo registries, and derived Docker images across GitHub Actions workflows.
 

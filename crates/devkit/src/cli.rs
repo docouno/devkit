@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive npm lockfile nodes when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -327,17 +327,16 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         ensure!(!globals.interactive, "doctor does not accept --interactive");
         let target = resolve_metadata_target(&globals.args[1..])?;
         if let Err(err) = (|| -> Result<()> {
-            if fs::symlink_metadata(target.join(".devkit")).is_ok() {
-                let root = project_root(&target)?;
-                if !exists(&safe_path(&root, state::PENDING_PATH)?)?
-                    && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
-                {
-                    state::ensure_supported_checkout_floor(
-                        &root,
-                        false,
-                        state::MIN_SUPPORTED_PROJECT_VERSION,
-                    )?;
-                }
+            let root = project_root(&target)?;
+            if fs::symlink_metadata(root.join(".devkit")).is_ok()
+                && !exists(&safe_path(&root, state::PENDING_PATH)?)?
+                && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
+            {
+                state::ensure_supported_checkout_floor(
+                    &root,
+                    false,
+                    state::MIN_SUPPORTED_PROJECT_VERSION,
+                )?;
             }
             Ok(())
         })() && error_code(&err) == "UNSUPPORTED_PROJECT_VERSION"
@@ -371,6 +370,16 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         ensure!(!globals.interactive, "info does not accept --interactive");
         let options = Options::parse(&globals.args[1..], &["--app"], &[], &[])?;
         let target = options.target.clone().unwrap_or(std::env::current_dir()?);
+        if let Some((engine, sha256)) = try_dispatch_info(&target, &globals, runner)? {
+            crate::processes::restore_exec_pdeathsig(runner)?;
+            let mut command = std::process::Command::new(&engine);
+            globals.write_flags(&mut command);
+            command
+                .args(&globals.args)
+                .env("DEVKIT_DISPATCHED_ENGINE", &sha256);
+            use std::os::unix::process::CommandExt;
+            return Err(command.exec()).context("Cannot execute the accepted native engine");
+        }
         let (result, human) = crate::info::inspect(&target, options.value("--app")?, runner)?;
         globals.emit("info", result, &human);
         return Ok(());
@@ -383,7 +392,25 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             .map(|arg| string(arg))
             .transpose()?
             .context("Expected stand reserve or stand remove [TARGET]")?;
-        let root = resolve_metadata_target(&globals.args[2..])?;
+        ensure!(
+            matches!(action, "reserve" | "remove"),
+            "Expected stand reserve or stand remove [TARGET]"
+        );
+        let root = project_root(&resolve_metadata_target(&globals.args[2..])?)?;
+        let version = state::ensure_supported_checkout_floor(
+            &root,
+            false,
+            state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
+        if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+            return Err(error(
+                "UNSUPPORTED_PROJECT_VERSION",
+                format!(
+                    "stand {action} requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+                ),
+            ));
+        }
+        dispatch_accepted("stand", &globals, runner)?;
         match action {
             "reserve" => {
                 let reserved =
@@ -406,7 +433,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
                     "Stand cleanup completed.",
                 );
             }
-            _ => anyhow::bail!("Expected stand reserve or stand remove [TARGET]"),
+            _ => unreachable!(),
         }
         return Ok(());
     }
@@ -498,6 +525,73 @@ fn resolve_metadata_target(args: &[OsString]) -> Result<PathBuf> {
         .unwrap_or(std::env::current_dir()?))
 }
 
+fn try_dispatch_info(
+    target: &std::path::Path,
+    globals: &Globals,
+    runner: &ProcessRunner,
+) -> Result<Option<(PathBuf, String)>> {
+    let Ok(root) = project_root(target) else {
+        return Ok(None);
+    };
+    if fs::symlink_metadata(root.join(".devkit")).is_err() {
+        return Ok(None);
+    }
+    if state::assert_no_pending(&root).is_err() {
+        return Ok(None);
+    }
+    let Ok(manifest_path) = safe_path(&root, state::MANIFEST_PATH) else {
+        return Ok(None);
+    };
+    let Ok((bytes, _, _)) = state::read_manifest_snapshot(&manifest_path) else {
+        return Ok(None);
+    };
+    if let Err(err) =
+        state::ensure_supported_manifest_bytes(&bytes, false, state::MIN_SUPPORTED_PROJECT_VERSION)
+    {
+        if error_code(&err) == "UNSUPPORTED_PROJECT_VERSION" {
+            return Err(err);
+        }
+        return Ok(None);
+    }
+    if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some() {
+        return Ok(None);
+    }
+    let candidate = (|| -> Result<Option<(PathBuf, String)>> {
+        let header = state::parse_accepted_header(&bytes)?;
+        if SemVer::parse(&header.version)? < SemVer::parse("0.5.0")? {
+            return Ok(None);
+        }
+        let pins_name = ".devkit/runtime/toolchains.env";
+        let Some(expected_pins) = header.managed.get(pins_name) else {
+            return Ok(None);
+        };
+        let Some((pins_bytes, pins_id)) =
+            read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
+        else {
+            return Ok(None);
+        };
+        if !pins_id.matches_git_tracked(expected_pins) {
+            return Ok(None);
+        }
+        let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+        if pins.version != header.version {
+            return Ok(None);
+        }
+        let pin = pins.engine;
+        if delivery::current_engine_digest()? == pin.sha256 {
+            return Ok(None);
+        }
+        let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
+        let engine = cache.local_engine(&pin, &header.release_identity)?;
+        let current = fs::canonicalize(std::env::current_exe()?)?;
+        if engine == current {
+            return Ok(None);
+        }
+        Ok(Some((engine, pin.sha256)))
+    })();
+    Ok(candidate.ok().flatten())
+}
+
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let is_lifecycle = ["sync", "add-app", "add-package", "register"].contains(&command_name);
     let is_metadata = ["describe", "status"].contains(&command_name);
@@ -528,6 +622,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             project_root(&resolve_metadata_target(&globals.args[1..])?)?,
             None,
         )
+    } else if command_name == "stand" {
+        (
+            project_root(&resolve_metadata_target(&globals.args[2..])?)?,
+            None,
+        )
     } else {
         let before_separator = globals
             .args
@@ -555,14 +654,20 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     let header = state::read_accepted_header(&root)?;
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
+    let conflict_msg = || {
+        format!(
+            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        )
+    };
+    let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
+    let (pins_bytes, pins_id) =
+        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
     ensure!(
-        crate::model::FileIdentity::matches_git_tracked_opt(
-            identity(&path)?.as_ref(),
-            header.managed.get(name),
-        ),
-        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        pins_id.matches_git_tracked(expected_pins),
+        "{}",
+        conflict_msg()
     );
-    let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
+    let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
     ensure!(
         pins.version == header.version,
         "Accepted version differs from toolchain pins"
@@ -591,7 +696,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             globals.offline,
         )?;
     }
-    let engine = cache.accepted_engine(&pin)?;
+    let engine = if command_name == "stand" {
+        cache.local_engine(&pin, &header.release_identity)?
+    } else {
+        cache.accepted_engine(&pin)?
+    };
     ensure!(
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
         "Accepted engine dispatch did not converge"

@@ -710,4 +710,18 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             .to_string()
             .contains("Duplicate migration id")
     );
+
+    // Real repository docs/migrations/index.json + 0.5.0.md must validate cleanly and expose make-targets-and-worktrunk.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo_entries = verify_migration_index(&repo_root, "0.5.0").unwrap();
+    let ids: Vec<_> = repo_entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "pnpm-workspaces",
+            "development-stands",
+            "make-targets-and-worktrunk"
+        ]
+    );
+    assert!(repo_entries[2].profiles.is_empty());
 }

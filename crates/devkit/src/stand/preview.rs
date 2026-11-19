@@ -3,7 +3,7 @@ use super::{
     epoch::Physical,
     ports::{Group, Owner},
 };
-use crate::{Result, files::*};
+use crate::{Result, files::*, processes::ProcessRunner};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,8 +11,9 @@ use std::{
     fs,
     io::Write,
     net::IpAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -46,13 +47,31 @@ pub fn dns_slug(raw: &str) -> String {
     slug
 }
 impl Renderer {
-    pub fn from_env(branch: &str) -> Result<Self> {
-        Self::new(
-            std::env::var("DEVKIT_PREVIEW_URL_TEMPLATE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            branch,
-        )
+    pub fn from_checkout(
+        root: &Path,
+        branch: &str,
+        runner: &ProcessRunner,
+        deadline: Instant,
+    ) -> Result<Self> {
+        match std::env::var("DEVKIT_PREVIEW_URL_TEMPLATE") {
+            Ok(raw) if raw.is_empty() => return Self::new(None, branch),
+            Ok(raw) => return Self::new(Some(raw), branch),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("DEVKIT_PREVIEW_URL_TEMPLATE is not valid UTF-8")
+            }
+            Err(std::env::VarError::NotPresent) => {}
+        }
+        let checkout = project_root(root)?;
+        if let Some(raw) = parse_dotenv_preview_template(&checkout, "checkout .env")? {
+            return Self::new(Some(raw), branch);
+        }
+        if let Some(source) = preview_source_worktree(&checkout, runner, deadline)?
+            && let Some(raw) =
+                parse_dotenv_preview_template(&source, "preview source worktree .env")?
+        {
+            return Self::new(Some(raw), branch);
+        }
+        Self::new(None, branch)
     }
     pub fn new(template: Option<String>, branch: &str) -> Result<Self> {
         let value = Self {
@@ -107,6 +126,190 @@ impl Renderer {
         result.push_str(rest);
         Ok(result)
     }
+}
+
+pub fn parse_dotenv_preview_template(root: &Path, label: &str) -> Result<Option<String>> {
+    let path = safe_path(root, ".env")?;
+    let Some((bytes, _)) = read_regular_file(&path, 65536, label)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = None;
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_no = index + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let rest = match trimmed.strip_prefix("export") {
+            Some(after) if after.starts_with([' ', '\t']) => after.trim_start_matches([' ', '\t']),
+            _ => trimmed,
+        };
+        let Some((raw_key, raw_rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        if raw_key.trim_matches([' ', '\t']) != "DEVKIT_PREVIEW_URL_TEMPLATE" {
+            continue;
+        }
+        let rhs = raw_rhs.trim_start_matches([' ', '\t']);
+        if let Some(inner) = rhs.strip_prefix('\'') {
+            let end = inner.find('\'').with_context(|| {
+                format!(
+                    "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unclosed single quote",
+                    path.display()
+                )
+            })?;
+            let tail = inner[end + 1..].trim_start_matches([' ', '\t']);
+            ensure!(
+                tail.is_empty() || tail.starts_with('#'),
+                "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unexpected trailing characters after quoted value",
+                path.display()
+            );
+            found = Some(inner[..end].to_owned());
+        } else if let Some(inner) = rhs.strip_prefix('"') {
+            let mut chars = inner.char_indices();
+            let mut value = String::new();
+            let mut closed_after = None;
+            while let Some((idx, ch)) = chars.next() {
+                match ch {
+                    '"' => {
+                        closed_after = Some(&inner[idx + 1..]);
+                        break;
+                    }
+                    '\\' => match chars.next().map(|(_, next)| next) {
+                        Some('"') => value.push('"'),
+                        Some('\\') => value.push('\\'),
+                        _ => anyhow::bail!(
+                            "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unsupported escape sequence",
+                            path.display()
+                        ),
+                    },
+                    other => value.push(other),
+                }
+            }
+            let tail = closed_after
+                .with_context(|| {
+                    format!(
+                        "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unclosed double quote",
+                        path.display()
+                    )
+                })?
+                .trim_start_matches([' ', '\t']);
+            ensure!(
+                tail.is_empty() || tail.starts_with('#'),
+                "Invalid DEVKIT_PREVIEW_URL_TEMPLATE in {label} ({} line {line_no}): unexpected trailing characters after quoted value",
+                path.display()
+            );
+            ensure!(
+                !value.contains(['$', '`']),
+                "Variable or command expansion is not supported in .env DEVKIT_PREVIEW_URL_TEMPLATE ({label} line {line_no}); write the literal host and use {{port}}, {{service}}, {{branch}} or {{slug}}"
+            );
+            found = Some(value);
+        } else if rhs.is_empty() || rhs.starts_with('#') {
+            found = Some(String::new());
+        } else {
+            let bytes = rhs.as_bytes();
+            let comment_at = (1..bytes.len())
+                .find(|&i| bytes[i] == b'#' && matches!(bytes[i - 1], b' ' | b'\t'));
+            let value = rhs[..comment_at.unwrap_or(rhs.len())].trim_end_matches([' ', '\t']);
+            ensure!(
+                !value.contains(['$', '`']),
+                "Variable or command expansion is not supported in .env DEVKIT_PREVIEW_URL_TEMPLATE ({label} line {line_no}); write the literal host and use {{port}}, {{service}}, {{branch}} or {{slug}}"
+            );
+            found = Some(value.to_owned());
+        }
+    }
+    Ok(found)
+}
+
+fn preview_source_worktree(
+    checkout: &Path,
+    runner: &ProcessRunner,
+    deadline: Instant,
+) -> Result<Option<PathBuf>> {
+    let git = input_path(checkout, ".git")?;
+    match fs::symlink_metadata(&git) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(meta) if !meta.is_dir() => {
+            read_regular_file(&git, 16 * 1024, "Git worktree pointer")?
+                .context("Missing Git worktree pointer")?;
+        }
+        Ok(_) => {}
+    }
+    let query =
+        |args: &[&str]| runner.capture_before(super::git_command(checkout).args(args), deadline);
+    let setting = query(&[
+        "config",
+        "--local",
+        "--no-includes",
+        "-z",
+        "--default",
+        "",
+        "--get",
+        "devkit.previewSourceBranch",
+    ])?;
+    let name = setting
+        .text()?
+        .strip_suffix('\0')
+        .context("Invalid Git config response")?;
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    let registered = crate::info::git_checkout(checkout, runner, deadline)?
+        .context("Preview inheritance requires a registered Git worktree")?;
+    let expected = format!("branch refs/heads/{name}");
+    let list = query(&["worktree", "list", "--porcelain", "-z"])?;
+    let mut fields = list.stdout.split(|b| *b == 0);
+    let mut source = None;
+    let mut checkout_listed = false;
+    while let Some(first) = fields.next().filter(|field| !field.is_empty()) {
+        let path = first
+            .strip_prefix(b"worktree ")
+            .context("Invalid Git worktree record")?;
+        let path = Path::new(std::ffi::OsStr::from_bytes(path));
+        let mut matched = false;
+        let mut active = true;
+        for field in fields.by_ref().take_while(|field| !field.is_empty()) {
+            matched |= field == expected.as_bytes();
+            active &= field != b"bare" && field != b"prunable" && !field.starts_with(b"prunable ");
+        }
+        checkout_listed |= active && path == checkout;
+        if matched && active {
+            ensure!(
+                source.is_none(),
+                "Multiple worktrees have devkit.previewSourceBranch checked out"
+            );
+            source = Some(path);
+        }
+    }
+    ensure!(
+        checkout_listed,
+        "Preview inheritance requires a registered Git worktree"
+    );
+    let path = project_root(source.with_context(|| {
+        format!("No worktree has devkit.previewSourceBranch '{name}' checked out")
+    })?)?;
+    if path == checkout {
+        // The caller already inspected this checkout's .env.
+        return Ok(None);
+    }
+    let source = crate::info::git_checkout(&path, runner, deadline)?
+        .context("The worktree selected by devkit.previewSourceBranch is unavailable")?;
+    ensure!(
+        source.common == registered.common && source.branch.as_deref() == Some(name),
+        "The worktree selected by devkit.previewSourceBranch changed"
+    );
+    let manifest = safe_path(&path, crate::state::MANIFEST_PATH)?;
+    ensure!(
+        fs::symlink_metadata(manifest).is_ok_and(|meta| meta.is_file()),
+        "The worktree selected by devkit.previewSourceBranch must be a Devkit checkout"
+    );
+    Ok(Some(path))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -616,14 +819,25 @@ pub fn enrich_status(
     root: &Path,
     project: &str,
     runner: &crate::processes::ProcessRunner,
+    selected: Option<&str>,
     services: &mut [crate::doctor::ComposeServiceStatus],
-) -> Result<()> {
+) -> Result<Vec<Reservation>> {
+    let branch = super::branch_name(root, runner)?;
+    let renderer = Renderer::from_checkout(
+        root,
+        &branch,
+        runner,
+        Instant::now() + Duration::from_secs(1),
+    )?;
     let Some(ports) = super::ports::Ports::read(root)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let ledger = super::ledger::Ledger::read(root).ok().flatten();
     let rows = super::ledger::observe(project, runner)?;
-    let renderer = Renderer::from_env(&super::branch_name(root, runner)?)?;
-    enrich_observed(&ports, &rows, &renderer, services)
+    enrich_observed(&ports, &rows, &renderer, services)?;
+    reservations_from(&ports, &renderer, services, selected, false, |svc| {
+        is_service_stopped_verified(svc, &ports, ledger.as_ref(), &rows, true)
+    })
 }
 
 pub fn enrich_observed(
@@ -844,31 +1058,89 @@ pub struct Reservation {
     pub local_url: Option<String>,
     pub preview_url: Option<String>,
 }
-pub fn reservations(root: &Path) -> Result<Vec<Reservation>> {
-    let Some(ports) = super::ports::Ports::read(root)? else {
-        return Ok(Vec::new());
+pub(crate) fn is_service_stopped_verified(
+    service: &str,
+    ports: &super::ports::Ports,
+    ledger: Option<&super::ledger::Ledger>,
+    rows: &[super::ledger::Container],
+    daemon_observed: bool,
+) -> bool {
+    let svc_rows: Vec<_> = rows.iter().filter(|r| r.service == service).collect();
+    if svc_rows
+        .iter()
+        .any(|r| r.running || r.owner != ports.owner.key)
+    {
+        return false;
+    }
+    if ledger.is_none_or(super::ledger::Ledger::completed_empty)
+        && !ports.possible_actors
+        && ledger.is_none_or(|l| l.owner == ports.owner)
+    {
+        return svc_rows.is_empty();
+    }
+    if !daemon_observed {
+        return false;
+    }
+    let Some(ledger) = ledger.filter(|l| l.owner == ports.owner && l.launch_terminal()) else {
+        return false;
     };
-    reservations_from(&ports, false)
+    if rows.is_empty() && (ports.possible_actors || !ledger.containers.is_empty()) {
+        return false;
+    }
+    if !svc_rows.iter().all(|r| ledger.containers.contains(&r.id)) {
+        return false;
+    }
+    if !svc_rows.is_empty() {
+        true
+    } else {
+        !ledger.services.contains(service)
+    }
 }
 
 pub(crate) fn reservations_from(
     ports: &super::ports::Ports,
+    live_renderer: &Renderer,
+    services: &[crate::doctor::ComposeServiceStatus],
+    selected: Option<&str>,
     include_ranges: bool,
+    stopped_verified: impl Fn(&str) -> bool,
 ) -> Result<Vec<Reservation>> {
     ports
         .groups
         .iter()
+        .filter(|group| selected.is_none_or(|s| s == group.binding.service))
         .map(|group| {
-            let renderer = ports
-                .service_preview_renderer
-                .get(&group.binding.service)
-                .or_else(|| {
-                    ports
-                        .service_desired
-                        .get(&group.binding.service)
+            let running: Vec<_> = services
+                .iter()
+                .filter(|s| s.service == group.binding.service && s.state == "running")
+                .collect();
+            let renderer = if !running.is_empty() {
+                if !running.iter().all(|s| s.preview.metadata_verified) {
+                    None
+                } else {
+                    running[0]
+                        .preview
+                        .applied_deployment
+                        .as_deref()
                         .and_then(|id| ports.deployments.get(id))
-                        .map(|d| &d.renderer)
-                });
+                        .map(|deployment| {
+                            let frontend =
+                                deployment.frontend.unwrap_or(!deployment.files.is_empty());
+                            if frontend {
+                                &deployment.renderer
+                            } else {
+                                ports
+                                    .service_preview_renderer
+                                    .get(&group.binding.service)
+                                    .unwrap_or(&deployment.renderer)
+                            }
+                        })
+                }
+            } else if stopped_verified(&group.binding.service) {
+                Some(live_renderer)
+            } else {
+                None
+            };
             let endpoint =
                 (include_ranges || group.first == group.last) && group.binding.protocol == "tcp";
             Ok(Reservation {

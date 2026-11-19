@@ -588,3 +588,414 @@ fn selected_service_with_no_bindings_retires_its_previous_ports_without_touching
     );
     assert!(!ports.possible_actors);
 }
+
+fn checkout_renderer(
+    root: &Path,
+    branch: &str,
+) -> devkit::Result<devkit::stand::preview::Renderer> {
+    use std::time::{Duration, Instant};
+    devkit::stand::preview::Renderer::from_checkout(
+        root,
+        branch,
+        &devkit::processes::ProcessRunner::new()?,
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+
+#[test]
+fn dotenv_preview_parser_handles_bom_quotes_comments_overrides_and_hides_raw_secrets() {
+    use devkit::stand::preview::parse_dotenv_preview_template;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::symlink, process::Command};
+
+    const WORKER: &str = "DEVKIT_TEST_DOTENV_PARSER_WORKER";
+    if std::env::var(WORKER).as_deref() != Ok("1") {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dotenv_preview_parser_handles_bom_quotes_comments_overrides_and_hides_raw_secrets",
+                "--test-threads=1",
+            ])
+            .env_remove("DEVKIT_PREVIEW_URL_TEMPLATE")
+            .env(WORKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let dotenv = root.path().join(".env");
+
+    assert_eq!(
+        parse_dotenv_preview_template(root.path(), "checkout .env").unwrap(),
+        None
+    );
+
+    // UTF-8 BOM on line 1 + neighboring broken/expansion keys must be ignored.
+    fs::write(
+        &dotenv,
+        "\u{feff}DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.bom.example.test\nSECRET_TOKEN=\"unclosed-secret\nAPI_URL=https://${OTHER_HOST}/v1\nNO_EQUALS_LINE\n",
+    )
+    .unwrap();
+    let rendered = checkout_renderer(root.path(), "feat/bom")
+        .unwrap()
+        .render(12000, "web")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rendered.url, "https://12000--feat-bom.bom.example.test");
+
+    // POSIX single quotes preserve literal $ and backticks; trailing # comment allowed.
+    fs::write(
+        &dotenv,
+        "  export\tDEVKIT_PREVIEW_URL_TEMPLATE = 'https://{port}.example.test/?q=$literal' \t# ok\r\n",
+    )
+    .unwrap();
+    let single = checkout_renderer(root.path(), "main")
+        .unwrap()
+        .render(12001, "web")
+        .unwrap()
+        .unwrap();
+    assert_eq!(single.url, "https://12001.example.test/?q=$literal");
+
+    // Double quotes + repeated definition: last declaration wins, including empty reset.
+    fs::write(
+        &dotenv,
+        "DEVKIT_PREVIEW_URL_TEMPLATE=\"https://{port}.first.example.test\"\nexport DEVKIT_PREVIEW_URL_TEMPLATE = \"https://{port}.second.example.test\" # comment\n",
+    )
+    .unwrap();
+    assert_eq!(
+        checkout_renderer(root.path(), "main")
+            .unwrap()
+            .render(12002, "web")
+            .unwrap()
+            .unwrap()
+            .url,
+        "https://12002.second.example.test"
+    );
+
+    for empty_case in [
+        "DEVKIT_PREVIEW_URL_TEMPLATE=\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE= # disable\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE=#disable\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE=\"\" # empty\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE='' # empty\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}.first.example.test\nDEVKIT_PREVIEW_URL_TEMPLATE= # reset\n",
+    ] {
+        fs::write(&dotenv, empty_case).unwrap();
+        assert_eq!(
+            parse_dotenv_preview_template(root.path(), "checkout .env").unwrap(),
+            Some(String::new()),
+            "{empty_case:?}"
+        );
+        assert!(
+            checkout_renderer(root.path(), "main")
+                .unwrap()
+                .template
+                .is_none(),
+            "{empty_case:?}"
+        );
+    }
+
+    // Shell expansion in unquoted or double-quoted values is rejected without leaking raw RHS.
+    for bad in [
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://${SUPER_SECRET_VALUE}.example.test\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE=\"https://$SUPER_SECRET_VALUE.example.test\"\n",
+        "DEVKIT_PREVIEW_URL_TEMPLATE=\"https://`SUPER_SECRET_VALUE`.example.test\"\n",
+    ] {
+        fs::write(&dotenv, bad).unwrap();
+        let msg = format!("{:#}", checkout_renderer(root.path(), "main").unwrap_err());
+        assert!(
+            msg.contains("Variable or command expansion is not supported"),
+            "{msg}"
+        );
+        assert!(!msg.contains("SUPER_SECRET_VALUE"), "{msg}");
+    }
+
+    // Syntax errors report file/line without echoing secret values.
+    for (bad, expected) in [
+        (
+            "DEVKIT_PREVIEW_URL_TEMPLATE='https://SUPER_SECRET_VALUE.test\n",
+            "unclosed single quote",
+        ),
+        (
+            "DEVKIT_PREVIEW_URL_TEMPLATE=\"https://SUPER_SECRET_VALUE.test\n",
+            "unclosed double quote",
+        ),
+        (
+            "DEVKIT_PREVIEW_URL_TEMPLATE=\"https://\\nSUPER_SECRET_VALUE.test\"\n",
+            "unsupported escape sequence",
+        ),
+        (
+            "DEVKIT_PREVIEW_URL_TEMPLATE='https://a.test' SUPER_SECRET_VALUE\n",
+            "unexpected trailing characters",
+        ),
+    ] {
+        fs::write(&dotenv, bad).unwrap();
+        let msg = format!("{:#}", checkout_renderer(root.path(), "main").unwrap_err());
+        assert!(msg.contains(expected), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+        assert!(!msg.contains("SUPER_SECRET_VALUE"), "{msg}");
+    }
+
+    // Bounded file checks: > 64 KiB, symlink, and FIFO are rejected.
+    fs::write(
+        &dotenv,
+        format!(
+            "# {}\nDEVKIT_PREVIEW_URL_TEMPLATE=https://{{port}}.a.test\n",
+            "x".repeat(65536)
+        ),
+    )
+    .unwrap();
+    assert!(
+        checkout_renderer(root.path(), "main")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds byte budget")
+    );
+    fs::remove_file(&dotenv).unwrap();
+    let other = root.path().join("other.env");
+    fs::write(
+        &other,
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}.a.test\n",
+    )
+    .unwrap();
+    symlink(&other, &dotenv).unwrap();
+    assert!(checkout_renderer(root.path(), "main").is_err());
+    fs::remove_file(&dotenv).unwrap();
+    let fifo = CString::new(dotenv.as_os_str().as_bytes()).unwrap();
+    // SAFETY: valid NUL-terminated path inside disposable tempdir.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(checkout_renderer(root.path(), "main").is_err());
+}
+
+#[test]
+fn linked_worktree_preview_uses_only_the_configured_source_branch() {
+    use std::process::Command;
+
+    const WORKER: &str = "DEVKIT_TEST_LINKED_DOTENV_WORKER";
+    if let Ok(mode) = std::env::var(WORKER) {
+        let linked = std::path::PathBuf::from(std::env::var("DEVKIT_TEST_LINKED_PATH").unwrap());
+        let result = checkout_renderer(&linked, "feat/ui");
+        if let Some(expected) = mode.strip_prefix("error:") {
+            assert!(format!("{:#}", result.unwrap_err()).contains(expected));
+            return;
+        }
+        let renderer = result.unwrap();
+        match mode.as_str() {
+            "empty-env" | "unset" => assert!(renderer.template.is_none()),
+            "proc-env" => assert_eq!(
+                renderer.render(13000, "web").unwrap().unwrap().url,
+                "https://13000.proc.example.test"
+            ),
+            "inherit" => assert_eq!(
+                renderer.render(13000, "web").unwrap().unwrap().url,
+                "https://13000--feat-ui.next.example.test"
+            ),
+            "local-override" => assert_eq!(
+                renderer.render(13000, "web").unwrap().unwrap().url,
+                "https://13000.local-wt.example.test"
+            ),
+            "local-empty" => assert!(renderer.template.is_none()),
+            other => panic!("unexpected mode {other}"),
+        }
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let main_root = temp.path().join("main with space");
+    let linked = temp.path().join("linked with space");
+    fs::create_dir_all(&main_root).unwrap();
+    modern(&main_root);
+
+    let git = |cwd: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&main_root, &["init", "-b", "main"]);
+    git(&main_root, &["add", "."]);
+    git(&main_root, &["commit", "-m", "init"]);
+    git(
+        &main_root,
+        &["worktree", "add", "-b", "feat/ui", linked.to_str().unwrap()],
+    );
+
+    let source = temp.path().join("release development");
+    git(
+        &main_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "release/next",
+            source.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        main_root.join(".env"),
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://frozen.example.test\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join(".env"),
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.next.example.test\n",
+    )
+    .unwrap();
+
+    let run_worker = |mode: &str, env_val: Option<&str>| {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "linked_worktree_preview_uses_only_the_configured_source_branch",
+            "--test-threads=1",
+        ])
+        .env(WORKER, mode)
+        .env("DEVKIT_TEST_LINKED_PATH", &linked);
+        match env_val {
+            Some(v) => {
+                cmd.env("DEVKIT_PREVIEW_URL_TEMPLATE", v);
+            }
+            None => {
+                cmd.env_remove("DEVKIT_PREVIEW_URL_TEMPLATE");
+            }
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{mode}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Both other worktrees have templates. Neither is a default.
+    run_worker("unset", None);
+    git(
+        &linked,
+        &[
+            "config",
+            "--local",
+            "devkit.previewSourceBranch",
+            "release/next",
+        ],
+    );
+    run_worker("inherit", None);
+    fs::write(linked.join(".env"), "UNRELATED_LOCAL=1\n").unwrap();
+    run_worker("inherit", None);
+
+    // Local and process overrides short-circuit the configured source.
+    fs::write(
+        linked.join(".env"),
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}.local-wt.example.test\n",
+    )
+    .unwrap();
+    run_worker("local-override", None);
+    run_worker("proc-env", Some("https://{port}.proc.example.test"));
+    run_worker("empty-env", Some(""));
+
+    fs::write(
+        linked.join(".env"),
+        "DEVKIT_PREVIEW_URL_TEMPLATE= # disable\n",
+    )
+    .unwrap();
+    run_worker("local-empty", None);
+    fs::remove_file(linked.join(".env")).unwrap();
+
+    let moved = temp.path().join("moved\nrelease\n");
+    git(
+        &main_root,
+        &[
+            "worktree",
+            "move",
+            source.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    run_worker("inherit", None);
+    let duplicate = temp.path().join("second source");
+    git(
+        &main_root,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            duplicate.to_str().unwrap(),
+            "release/next",
+        ],
+    );
+    run_worker("error:Multiple worktrees", None);
+    git(&duplicate, &["switch", "--detach"]);
+    git(&moved, &["switch", "--detach"]);
+    run_worker("error:No worktree has devkit.previewSourceBranch", None);
+    run_worker("proc-env", Some("https://{port}.proc.example.test"));
+
+    // 3. Anti-spoofing: manual .git pointing at real worktree admin is rejected by reverse gitdir check.
+    let spoof = temp.path().join("spoofed");
+    fs::create_dir_all(&spoof).unwrap();
+    let real_ptr = fs::read_to_string(linked.join(".git")).unwrap();
+    fs::write(spoof.join(".git"), real_ptr).unwrap();
+    let spoof_err = format!("{:#}", checkout_renderer(&spoof, "feat/ui").unwrap_err());
+    assert!(spoof_err.contains("registration changed"), "{spoof_err}");
+
+    // 4. Bare-hub layout (`git clone --bare <url> <hub>/.git`) returns Ok(None) without reading <hub>/.env.
+    let hub = temp.path().join("bare-hub");
+    fs::create_dir_all(&hub).unwrap();
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--bare",
+            main_root.to_str().unwrap(),
+            hub.join(".git").to_str().unwrap(),
+        ],
+    );
+    // The hub's directory is never an implicit preview source.
+    modern(&hub);
+    fs::write(
+        hub.join(".env"),
+        "DEVKIT_PREVIEW_URL_TEMPLATE=https://$POISONED_BARE_HUB.example.test\n",
+    )
+    .unwrap();
+    let bare_wt = temp.path().join("bare-wt");
+    git(
+        &hub.join(".git"),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/bare",
+            bare_wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    assert!(
+        checkout_renderer(&bare_wt, "feat/bare")
+            .unwrap()
+            .template
+            .is_none()
+    );
+
+    git(
+        &linked,
+        &["config", "--local", "--unset", "devkit.previewSourceBranch"],
+    );
+    run_worker("unset", None);
+}

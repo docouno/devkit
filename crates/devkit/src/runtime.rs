@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down [cleanup=1]  (preserves data; cleanup releases leases)\nmake doctor\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec --component apps/web|packages/lib [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make help\nmake info [app=<name>] [json=1]\nmake setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down [cleanup=1]  (preserves data; cleanup releases leases)\nmake exec [app=<name> | package=<name> | component=apps/<name>|packages/<name>] [write=1] [network=none|bridge] [prepare=1] command=ARGV\nmake doctor\ndevkit info [TARGET] [--app <name>] [--json]\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec [--component apps/web|packages/lib] [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -2360,16 +2360,14 @@ fn run_service(
             &output.stdout,
             &app_service_component_map(&ctx.admission.state),
         )?;
-        crate::stand::preview::enrich_status(
+        let reservations = crate::stand::preview::enrich_status(
             &ctx.admission.root,
             &ctx.project,
             ctx.runner,
+            selected.as_deref(),
             &mut services,
         )?;
-        let reservation_lines = crate::stand::preview::reservation_lines(
-            &crate::stand::preview::reservations(&ctx.admission.root)?,
-            &services,
-        );
+        let reservation_lines = crate::stand::preview::reservation_lines(&reservations, &services);
         for service in services {
             println!(
                 "Service {} ({}): {}",
@@ -2638,6 +2636,15 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
     let deadline = Instant::now() + Duration::from_secs(1);
     let root = project_root(root)?;
     runtime_pending(&root)?;
+    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
+    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+        return Err(crate::cli::error(
+            "UNSUPPORTED_PROJECT_VERSION",
+            format!(
+                "stand reserve requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+            ),
+        ));
+    }
     let request = RuntimeRequest::new(root.clone(), "stand reserve".into());
     let before = read_project_state(&root)?;
     let runnable = |c: &ComponentState| {
@@ -2768,7 +2775,7 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
         return Ok(false);
     }
     let branch = branch_name_until(&root, runner, Some(deadline))?;
-    let renderer = preview::Renderer::from_env(&branch)?;
+    let renderer = preview::Renderer::from_checkout(&root, &branch, runner, deadline)?;
     leases.allocate_plan_until(
         ports::Allocation {
             declarations: &bindings,
@@ -2814,6 +2821,15 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
 
     let root = project_root(root)?;
     runtime_pending(&root)?;
+    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
+    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+        return Err(crate::cli::error(
+            "UNSUPPORTED_PROJECT_VERSION",
+            format!(
+                "stand remove requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+            ),
+        ));
+    }
     let request = RuntimeRequest::new(root.clone(), "stand remove".into());
     let _lock = CheckoutLock::acquire_exclusive(&root, "stand remove", Some(runner))?;
     let admission = ToolAdmission::capture_service(&request)?;
@@ -3109,7 +3125,12 @@ fn run_development(
         .cloned()
         .collect();
     preview_forwarding_presence(ctx, &mut model, &frontends)?;
-    let renderer = crate::stand::preview::Renderer::from_env(&branch)?;
+    let renderer = crate::stand::preview::Renderer::from_checkout(
+        &ctx.admission.root,
+        &branch,
+        ctx.runner,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )?;
     // Make starts the selected applications individually. Use the same budget
     // group for every prerequisite of an aggregate invocation.
     let mut resource_services = active_services.clone();
@@ -3645,8 +3666,13 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
     command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
     let out = ctx.runner.capture(&mut command)?;
     let mut services = crate::doctor::parse_compose_ps_json(&out.stdout, &service_to_component)?;
-    crate::stand::preview::enrich_status(&ctx.admission.root, &ctx.project, runner, &mut services)?;
-    let stand_ports = crate::stand::preview::reservations(&ctx.admission.root)?;
+    let stand_ports = crate::stand::preview::enrich_status(
+        &ctx.admission.root,
+        &ctx.project,
+        runner,
+        None,
+        &mut services,
+    )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
     let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
     ctx.admission.recheck()?;

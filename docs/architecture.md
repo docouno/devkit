@@ -70,8 +70,8 @@ Containerized builds and test suites frequently run on shared CI runners or nest
 
 `.devkit/state/task.lock` coordinates concurrent CLI and Make invocations without blocking parallel read-only inspection:
 
-- **Lock-free**: `devkit doctor`, `devkit catalog`, `devkit --version`, and `devkit --help` never acquire `task.lock`.
-- **Shared lock (`LOCK_SH`)**: `devkit describe`, `devkit status`, `make doctor`, `make status`, `make logs` (releasing the lock before `--follow` begins streaming), and read-only `devkit exec` run concurrently across terminals and automation agents.
+- **Lock-free**: `devkit doctor`, `devkit info`, `make info` (and its quiet `make status` alias, which performs only a non-blocking `LOCK_NB` probe), `make help`, `devkit catalog`, `devkit --version`, and `devkit --help` never hold `task.lock`.
+- **Shared lock (`LOCK_SH`)**: `devkit describe`, `devkit status`, `make doctor`, `make logs` (releasing the lock before `follow=1` / `--follow` begins streaming), and read-only `make exec` / `devkit exec` run concurrently across terminals and automation agents.
 - **Exclusive lock (`LOCK_EX`)**: Mutating and build tasks write `.devkit/state/task.owner.json` (`pid`, `/proc/<pid>/stat` start ticks, operation name) so concurrent invocations wait adaptively up to `DEVKIT_LOCK_TIMEOUT_MS` (default `120000` ms) while detecting recursive self-deadlocks immediately.
 
 ## Host-local development stand authority

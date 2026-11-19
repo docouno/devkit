@@ -48,6 +48,18 @@ fn help_version_and_catalog_do_not_require_home_sdk_cache_or_docker() {
             "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if args == vec!["--help"] {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                text.contains("Commands: help, info, setup, doctor,"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Reconcile transitive lockfile resolutions when needed"),
+                "{text}"
+            );
+            assert!(!text.contains("npm lockfile"), "{text}");
+        }
         if args.contains(&"--json") {
             assert_eq!(decoded(&output)["schemaVersion"], 1);
             assert_eq!(decoded(&output)["ok"], true);
@@ -1624,4 +1636,406 @@ fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadat
         );
         assert_eq!(decoded(&from_041)["result"]["engine"], "0.5.0-target");
     }
+}
+
+#[test]
+fn info_and_stand_enforce_version_floors_and_delegate_offline_to_cached_accepted_engine() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha512};
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let temp = TempDir::new().unwrap();
+    let cache_sentinel = temp.path().join("invalid-cache-file");
+    fs::write(&cache_sentinel, "sentinel").unwrap();
+
+    // 1. Pre-0.4.0 checkouts (`schemaVersion: 1` and `0.3.2`) fail before locking with UNSUPPORTED_PROJECT_VERSION and 0 mutations.
+    for (name, manifest) in [
+        ("legacy-s1", serde_json::json!({"schemaVersion": 1})),
+        (
+            "legacy-032",
+            serde_json::json!({"schemaVersion": 2, "version": "0.3.2"}),
+        ),
+    ] {
+        let dir = temp.path().join(name);
+        fs::create_dir_all(dir.join(".devkit")).unwrap();
+        write_json(&dir.join(MANIFEST_PATH), &manifest).unwrap();
+        for args in [
+            vec!["info", ".", "--json"],
+            vec!["stand", "reserve", ".", "--json"],
+            vec!["stand", "remove", ".", "--json"],
+        ] {
+            let out = invoke(&dir, &args);
+            assert!(!out.status.success(), "{name} {args:?}");
+            assert_eq!(
+                decoded(&out)["error"]["code"],
+                "UNSUPPORTED_PROJECT_VERSION"
+            );
+            assert!(!dir.join(".devkit/state").exists(), "{name} {args:?}");
+        }
+    }
+
+    // 2. On a 0.4.1 checkout: `stand reserve|remove` (CLI and direct runtime fns) refuse pre-lock with UNSUPPORTED_PROJECT_VERSION,
+    //    while `devkit info . --json` succeeds locally with real apps/packages and `readiness: "unknown"`.
+    let proj_041 = temp.path().join("proj-041");
+    fs::create_dir_all(proj_041.join(".devkit/runtime")).unwrap();
+    let dummy_id = serde_json::json!({"sha256": "0".repeat(64), "mode": 420});
+    write_json(
+        &proj_041.join(MANIFEST_PATH),
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "version": "0.4.1",
+            "releaseIdentity": "a".repeat(64),
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "packageMode": "registry",
+            "managed": {
+                ".devkit/runtime.sha256": dummy_id,
+                ".devkit/runtime/toolchains.env": dummy_id,
+                ".devkit/project.mk": dummy_id,
+                ".devkit/compose.apps.yaml": dummy_id,
+                ".devkit/tooling-profiles.json": dummy_id
+            },
+            "components": {
+                "apps/web": {
+                    "role": "app",
+                    "toolchain": "node",
+                    "toolingProfile": "web",
+                    "origin": { "template": "react-web", "version": "0.4.1" },
+                    "toolDependencies": {},
+                    "dependencies": []
+                },
+                "packages/ui": {
+                    "role": "library",
+                    "toolchain": "node",
+                    "toolingProfile": "react-ui",
+                    "origin": { "template": "react-ui", "version": "0.4.1" },
+                    "toolDependencies": {},
+                    "dependencies": []
+                }
+            }
+        }),
+    )
+    .unwrap();
+
+    for action in ["reserve", "remove"] {
+        let out = invoke(&proj_041, &["stand", action, ".", "--json"]);
+        assert!(!out.status.success(), "{action}");
+        let body = decoded(&out);
+        assert_eq!(body["error"]["code"], "UNSUPPORTED_PROJECT_VERSION");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires Devkit 0.5.0 or newer")
+        );
+        assert!(!proj_041.join(".devkit/state").exists());
+    }
+    let runner = devkit::processes::ProcessRunner::new().unwrap();
+    let r_err = devkit::runtime::reserve_stand(&proj_041, None, &runner).unwrap_err();
+    assert_eq!(
+        devkit::cli::error_code(&r_err),
+        "UNSUPPORTED_PROJECT_VERSION"
+    );
+    let rm_err = devkit::runtime::remove_stand(&proj_041, &runner).unwrap_err();
+    assert_eq!(
+        devkit::cli::error_code(&rm_err),
+        "UNSUPPORTED_PROJECT_VERSION"
+    );
+    assert!(!proj_041.join(".devkit/state").exists());
+
+    let info_041 = invoke(&proj_041, &["info", ".", "--json"]);
+    assert!(
+        info_041.status.success(),
+        "{}",
+        String::from_utf8_lossy(&info_041.stderr)
+    );
+    let info_041_res = &decoded(&info_041)["result"];
+    assert_eq!(info_041_res["version"], "0.4.1");
+    assert_eq!(info_041_res["apps"], serde_json::json!(["web"]));
+    assert_eq!(info_041_res["packages"], serde_json::json!(["ui"]));
+    assert_eq!(info_041_res["readiness"], "unknown");
+    assert!(!proj_041.join(".devkit/state").exists());
+
+    // 3. >= 0.5.0 delegation (including unknown future `toolingProfile: "future-wasm"`), local cache priming without network,
+    //    unavailable-cache graceful behavior, and non-blocking FIFO safety.
+    let cache_dir = temp.path().join("cache");
+    let rel_future = temp.path().join("release-99.0.0");
+    fs::create_dir_all(&rel_future).unwrap();
+    let delegated_stdout =
+        b"{\"schemaVersion\":1,\"ok\":true,\"command\":\"delegated\",\"result\":{\"engine\":\"99.0.0\"}}\n";
+    let elf_bytes = minimal_static_x86_64_elf(delegated_stdout);
+    let elf_sha = digest(&elf_bytes);
+    write_atomic(&rel_future.join("devkit"), &elf_bytes, 0o755).unwrap();
+    let env_bytes = b"future env archive";
+    let env_sri = format!("sha512-{}", STANDARD.encode(Sha512::digest(env_bytes)));
+    write_atomic(&rel_future.join("npm/env-99.0.0.tgz"), env_bytes, 0o644).unwrap();
+    let recipe_hash = "d".repeat(64);
+    let toolchains = format!(
+        "DEVKIT_VERSION=99.0.0\nDEVKIT_ENGINE_SHA256={elf_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+    );
+    write_atomic(
+        &rel_future.join("runtime/toolchains.env"),
+        toolchains.as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    write_json(
+        &rel_future.join("release.json"),
+        &devkit::model::Release {
+            schema_version: 1,
+            version: "99.0.0".into(),
+            min_supported_from_version: Some("0.4.0".into()),
+            rust_version: "1.99.1".into(),
+            environment: devkit::model::Environment {
+                name: "@docouno/env".into(),
+                version: "99.0.0".into(),
+                archive: "npm/env-99.0.0.tgz".into(),
+                integrity: env_sri,
+            },
+            files: file_map(&rel_future).unwrap(),
+            migrations: vec![],
+        },
+    )
+    .unwrap();
+    let cache = devkit::cache::ReleaseCache::new(Some(&cache_dir), &runner).unwrap();
+    let admitted = cache.import(&rel_future, "99.0.0", None).unwrap();
+    // Remove `engines/` so `stand` and `info` must prime locally from `releases/99.0.0/<id>` without network!
+    fs::remove_dir_all(cache_dir.join("engines")).unwrap();
+
+    let proj_future = temp.path().join("proj-future");
+    fs::create_dir_all(proj_future.join(".devkit/runtime")).unwrap();
+    write_atomic(
+        &proj_future.join(".devkit/runtime/toolchains.env"),
+        toolchains.as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    let tc_id = identity(&proj_future.join(".devkit/runtime/toolchains.env"))
+        .unwrap()
+        .unwrap();
+    write_json(
+        &proj_future.join(MANIFEST_PATH),
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "version": "99.0.0",
+            "releaseIdentity": admitted.identity,
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "packageMode": "local",
+            "managed": {
+                ".devkit/runtime/toolchains.env": tc_id
+            },
+            "components": {
+                "apps/wasm": {
+                    "role": "app",
+                    "toolchain": "rust",
+                    "toolingProfile": "future-wasm",
+                    "origin": { "template": "wasm-app", "version": "99.0.0" },
+                    "toolDependencies": {},
+                    "dependencies": []
+                }
+            }
+        }),
+    )
+    .unwrap();
+
+    // Uncached engine: `stand` fails fast locally ("unavailable; run make setup"), while `info` falls back gracefully!
+    let empty_cache = temp.path().join("empty-cache");
+    for args in [vec!["stand", "reserve", "."], vec!["stand", "remove", "."]] {
+        let miss = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .current_dir(&proj_future)
+            .args(["--json", "--cache-dir", empty_cache.to_str().unwrap()])
+            .args(&args)
+            .env_clear()
+            .env("CI", "true")
+            .output()
+            .unwrap();
+        assert!(!miss.status.success(), "{args:?}");
+        assert!(
+            decoded(&miss)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("The accepted native engine is unavailable; run make setup")
+        );
+        assert!(!proj_future.join(".devkit/state").exists());
+    }
+    // `info` with sentinel cache-file and unset HOME does not crash; returns ok=true, readiness="unknown".
+    let info_uncached = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .current_dir(&proj_future)
+        .args(["info", ".", "--json"])
+        .env_clear()
+        .env("CI", "true")
+        .env("DEVKIT_CACHE_DIR", &cache_sentinel)
+        .output()
+        .unwrap();
+    assert!(info_uncached.status.success());
+    assert_eq!(decoded(&info_uncached)["result"]["readiness"], "unknown");
+
+    // A concurrent engine installation must not delay checkout inspection or stand hooks.
+    let engine_lock = digest(format!("engine:x86_64-unknown-linux-musl:99.0.0:{elf_sha}"));
+    let lock =
+        fs::File::open(cache_dir.join(".locks").join(format!("{engine_lock}.lock"))).unwrap();
+    lock.try_lock().unwrap();
+    for args in [
+        &["info", "."][..],
+        &["stand", "reserve", "."],
+        &["stand", "remove", "."],
+    ] {
+        let result = runner
+            .run_with_timeout(
+                Command::new(env!("CARGO_BIN_EXE_devkit"))
+                    .current_dir(&proj_future)
+                    .env_clear()
+                    .args(["--json", "--cache-dir", cache_dir.to_str().unwrap()])
+                    .args(args),
+                devkit::processes::OutputMode::Capture(65536),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&result.stdout).unwrap();
+        if args[0] == "info" {
+            assert_eq!(result.code, 0);
+            assert_eq!(json["result"]["readiness"], "unknown");
+        } else {
+            assert_ne!(result.code, 0);
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cache is busy")
+            );
+        }
+        assert!(!cache_dir.join("engines").exists());
+    }
+    drop(lock);
+
+    // Cached 99.0.0 release (with `engines/` initially absent!): `stand reserve`, `stand remove`, and `info` prime & delegate offline!
+    for (idx, args) in [
+        vec!["stand", "reserve", "."],
+        vec!["info", "."],
+        vec!["stand", "remove", "."],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if idx == 1 {
+            // Also verify `info` itself primes `engines/` when absent!
+            fs::remove_dir_all(cache_dir.join("engines")).unwrap();
+        }
+        let delegated = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .current_dir(&proj_future)
+            .args(["--json", "--cache-dir", cache_dir.to_str().unwrap()])
+            .args(&args)
+            .env_clear()
+            .env("CI", "true")
+            .output()
+            .unwrap();
+        assert!(
+            delegated.status.success(),
+            "{args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&delegated.stdout),
+            String::from_utf8_lossy(&delegated.stderr)
+        );
+        assert_eq!(decoded(&delegated)["result"]["engine"], "99.0.0");
+    }
+
+    // Non-canonical `<checkout>/missing/..` target paths still enforce `< 0.4.0` floor and `>= 0.5.0` dispatch,
+    // and terminal symlink targets are rejected without dereferencing `<symlink>/.devkit`.
+    let noncanon_v03 = temp
+        .path()
+        .join("legacy-032/missing/..")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for sub in ["info", "doctor"] {
+        let out = invoke(temp.path(), &[sub, &noncanon_v03, "--json"]);
+        assert!(!out.status.success(), "{sub} on non-canonical 0.3.2");
+        assert_eq!(
+            decoded(&out)["error"]["code"],
+            "UNSUPPORTED_PROJECT_VERSION"
+        );
+    }
+    let noncanon_future = proj_future.join("missing/..").to_str().unwrap().to_owned();
+    let delegated_noncanon = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .current_dir(temp.path())
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "info",
+            &noncanon_future,
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(delegated_noncanon.status.success());
+    assert_eq!(decoded(&delegated_noncanon)["result"]["engine"], "99.0.0");
+
+    let symlink_future = temp.path().join("symlink-future");
+    std::os::unix::fs::symlink(&proj_future, &symlink_future).unwrap();
+    let symlink_info = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .current_dir(temp.path())
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "info",
+            symlink_future.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(!symlink_info.status.success());
+    assert!(
+        decoded(&symlink_info)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("symlink")
+    );
+
+    // Corrupted checkout missing `.devkit/runtime/toolchains.env` both on disk and in `manifest.managed`
+    // returns a structured JSON error (never panics with exit 101).
+    let proj_missing_pins = temp.path().join("missing-pins");
+    fs::create_dir_all(proj_missing_pins.join(".devkit")).unwrap();
+    write_json(
+        &proj_missing_pins.join(MANIFEST_PATH),
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "version": "0.5.0",
+            "releaseIdentity": "b".repeat(64),
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "packageMode": "registry",
+            "managed": {},
+            "components": {}
+        }),
+    )
+    .unwrap();
+    for args in [
+        &["stand", "reserve", ".", "--json"][..],
+        &["status", ".", "--json"][..],
+    ] {
+        let out = invoke(&proj_missing_pins, args);
+        assert!(!out.status.success(), "{args:?}");
+        assert_ne!(
+            out.status.code(),
+            Some(101),
+            "panic in {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            decoded(&out)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Managed file conflict: .devkit/runtime/toolchains.env")
+        );
+    }
+
+    // FIFO manifest.json never blocks `devkit info`!
+    fs::remove_file(proj_future.join(MANIFEST_PATH)).unwrap();
+    let fifo_path = CString::new(proj_future.join(MANIFEST_PATH).as_os_str().as_bytes()).unwrap();
+    // SAFETY: valid NUL-terminated path in disposable tempdir.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let fifo_info = invoke(&proj_future, &["info", ".", "--json"]);
+    assert!(fifo_info.status.success());
+    assert_eq!(decoded(&fifo_info)["result"]["readiness"], "unknown");
 }

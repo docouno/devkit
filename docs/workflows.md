@@ -74,6 +74,9 @@ Run package-manager mutations inside the pinned container. Use `write=1` to allo
 # A Node package
 make exec package=ui write=1 network=bridge command='pnpm add clsx --lockfile-only --ignore-scripts'
 
+# Root Node workspace (pass -w when omitting app= / package=)
+make exec write=1 network=bridge command='pnpm add -D -w vitest --lockfile-only --ignore-scripts'
+
 # A Rust app
 make exec app=api write=1 network=bridge command='cargo update --manifest-path Cargo.toml'
 ```
@@ -145,22 +148,43 @@ In zero-app library repositories, `make info` lists the registered packages. `ma
 
 ## 6. Live Design-System HMR (`devkitWorkspaceSource`)
 
-Web (`react-web`) and Electron (`electron-react`) applications using `devkitWorkspaceSource()` from `@docouno/env/vite` resolve internal `packages/*/src` TypeScript, TSX, and CSS entrypoints directly during `make dev`:
+Web (`react-web`) and Electron (`electron-react`) applications using `devkitWorkspaceSource()` from `@docouno/env/vite` resolve internal `packages/*/src` TypeScript, TSX, and CSS entrypoints directly during `make dev` — both for `./dist/...` library export maps (`ts-library`, `react-ui`) and direct `"development": "./src/..."` exports (`react-client`):
 
-- Editing `packages/ui/src/Button.tsx` or `packages/ui/src/styles.css` triggers instant Vite Fast Refresh in `apps/playground` without running `tsdown` or modifying `packages/ui/dist/`.
-- Because `devkitWorkspaceSource()` is strictly scoped to `apply: 'serve'`, `make test` and `make build` always validate the real compiled `dist/` output and public `exports` map of every workspace library.
+- Editing `packages/ui/src/Button.tsx`, `packages/ui/src/styles.css`, or `packages/client/src/index.ts` triggers instant Vite Fast Refresh without running `tsdown` or modifying `dist/`.
+- During tests and builds, Vitest and Vite resolve imports through the package's public `exports` and their active conditions. Vitest can select the `react-client` development export in `src/`. The default production build selects its compiled `dist/` export.
 
 ## Development stands and preview URLs
 
 ### Use Worktrunk
 
-New projects include the project-owned `.config/wt.toml` unless initialized with `--no-worktrunk`. Install Worktrunk independently and approve its project hooks from a checkout that has the config. Worktrunk applies the config in the invoking checkout and manages worktree paths, branches and removal.
+New projects include the project-owned `.config/wt.toml` unless initialized with `--no-worktrunk`. Install Worktrunk independently and approve its project hooks from a checkout that has the config. Worktrunk applies the config in the invoking checkout and manages worktree paths, branches and removal:
+
+```toml
+# Worktrunk runs approved project hooks in the target checkout.
+# Pass --yes in non-interactive sessions or run wt config approvals add --yes.
+# Enable the optional start with DEVKIT_WT_AUTOSTART=1.
+[pre-start]
+devkit-reserve = "sh .devkit/runtime/devkit.sh worktree-hook reserve"
+
+[post-start]
+devkit-start = "sh .devkit/runtime/devkit.sh worktree-hook start"
+
+[pre-remove]
+devkit-remove = "sh .devkit/runtime/devkit.sh worktree-hook remove"
+```
 
 ```sh
+# Interactive shell
 wt switch --create feature/dashboard
 make info
 wt list
 wt remove feature/dashboard
+
+# Non-interactive scripts and PTY-backed agents (never blocks on hook prompts)
+wt switch --create --no-cd --yes feature/dashboard
+wt remove --foreground --yes feature/dashboard
+# Or pre-approve hooks once for this repository:
+wt config approvals add --yes
 ```
 
 Set `WORKTRUNK_WORKTREE_PATH='{{ repo_path }}/.worktrees/{{ branch | sanitize }}'` or configure `worktree-path` in the Worktrunk user config to use nested worktrees. Keep `/.worktrees/` in your project's `.gitignore`. Use `make info` in the selected checkout for the confirmed address.
@@ -178,9 +202,13 @@ Leases live in the shared user cache (`port-leases.json`), with checkout identit
 - A never-started fresh checkout can clean up before setup without Docker or an engine download. An existing state directory requires verified launch/epoch provenance; absence of a marker alone is insufficient.
 - A daemon create with an unknown outcome leaves a recovery intent until Devkit can verify what it created. Fixing a preview image pull or build error allows another `up` without clearing leases or state.
 
-Set `DEVKIT_PREVIEW_URL_TEMPLATE` to an absolute HTTP(S) URL. `{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
+Set `DEVKIT_PREVIEW_URL_TEMPLATE` to an absolute HTTP(S) URL in the process environment or the current checkout's root `.env`. Devkit checks those sources in order. An empty value at either level disables preview URLs.
 
-Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make info` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down; these reservations are not reported as running endpoints. They do not advertise a newly supplied template as already running.
+To share a template across a clone, put it in the root `.env` of a Devkit worktree on a named branch and run `git config --local devkit.previewSourceBranch next` (replace `next` with that branch). Devkit reads only the preview setting from the selected worktree when both local sources omit it. The URL uses the consuming worktree's branch. Keep the selected branch checked out in exactly one registered worktree. If it is missing or ambiguous, correct the setting or run `git config --local --unset devkit.previewSourceBranch` to return to local configuration.
+
+`{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
+
+Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make info` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down (rendering the current checkout template for stopped services while preserving the applied snapshot on running services so an unapplied template is never advertised as already running).
 
 Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/devkit/preview-hosts.json`, falling back to `/devkit/preview-hosts.json`. The file is limited to 32 MiB and 65,535 sorted unique hosts. Managed launches clear the legacy `DEVKIT_PREVIEW_HOSTS` CSV carrier. Short `DEVKIT_PREVIEW_HOSTS_FILE`, `DEVKIT_PREVIEW_HOSTS_SHA256`, `DEVKIT_PREVIEW_URL`, `DEVKIT_SERVICE` and `DEVKIT_BRANCH` variables describe it; automatic host sets are never expanded into a large environment variable.
 
@@ -193,7 +221,7 @@ Docker does not inherit a provider's tmpfs or devices through `volumes_from`. A 
 ## Connecting a frontend to an API
 
 ```sh
-npx @docouno/devkit@0.5.0 add-app . --name dashboard --template react-web --api api
+make add-app name=dashboard template=react-web api=api
 make setup
 make up app=dashboard
 ```

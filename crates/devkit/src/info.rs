@@ -12,16 +12,19 @@ use crate::{
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 
 pub(crate) struct GitCheckout {
     pub(crate) linked: bool,
     pub(crate) branch: Option<String>,
+    pub(crate) preview_branch: String,
     pub(crate) admin: PathBuf,
+    pub(crate) common: PathBuf,
 }
 
 pub(crate) fn git_checkout(
@@ -42,39 +45,22 @@ pub(crate) fn git_checkout(
         read_regular_file(&root.join(".git"), 8192, "Git checkout pointer")?
             .context("Missing Git checkout pointer")?;
     }
-    let query = |args: &[&str]| -> Result<String> {
-        let mut command = Command::new("git");
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_") {
-                command.env_remove(key);
-            }
-        }
-        let output = runner.capture_before(
-            command
-                .current_dir(root)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .args(["-c", "core.fsmonitor=false"])
-                .args(args),
-            deadline,
-        )?;
-        Ok(output.text()?.trim_end_matches('\n').to_owned())
+    let query =
+        |args: &[&str]| runner.capture_before(crate::stand::git_command(root).args(args), deadline);
+    let git_path = |flag: &str| -> Result<PathBuf> {
+        let output = query(&["rev-parse", "--path-format=absolute", flag])?;
+        // Each invocation returns one raw pathname and one terminating newline.
+        let path = output
+            .stdout
+            .strip_suffix(b"\n")
+            .context("Missing Git pathname")?;
+        Ok(fs::canonicalize(OsStr::from_bytes(path))?)
     };
-    let dirs = query(&[
-        "rev-parse",
-        "--path-format=absolute",
-        "--show-toplevel",
-        "--git-dir",
-        "--git-common-dir",
-    ])?;
-    let mut dirs = dirs.lines();
-    let top_level = fs::canonicalize(dirs.next().context("Missing Git top level")?)?;
-    if top_level != root {
+    if git_path("--show-toplevel")? != root {
         return Ok(None);
     }
-    let git_dir = fs::canonicalize(dirs.next().context("Missing Git directory")?)?;
-    let common = fs::canonicalize(dirs.next().context("Missing shared Git directory")?)?;
+    let git_dir = git_path("--git-dir")?;
+    let common = git_path("--git-common-dir")?;
     let linked = git_dir != common;
     if linked {
         let directory = common.join("worktrees");
@@ -99,11 +85,29 @@ pub(crate) fn git_checkout(
             "Unexpected main Git admin directory"
         );
     }
-    let branch = query(&["branch", "--show-current"])?;
+    let branch = query(&["branch", "--show-current"])?
+        .text()?
+        .trim_end_matches('\n')
+        .to_owned();
+    let (branch, preview_branch) = if !branch.is_empty() {
+        (Some(branch.clone()), branch)
+    } else {
+        (
+            None,
+            format!(
+                "detached-{}",
+                query(&["rev-parse", "--short", "HEAD"])?
+                    .text()?
+                    .trim_end_matches('\n')
+            ),
+        )
+    };
     Ok(Some(GitCheckout {
         linked,
-        branch: (!branch.is_empty()).then_some(branch),
+        branch,
+        preview_branch,
         admin: git_dir,
+        common,
     }))
 }
 
@@ -113,12 +117,21 @@ fn observe_stand(
     busy: bool,
     ports: Option<&Ports>,
     state: &crate::model::ProjectState,
-    branch: Option<&str>,
+    renderer: &preview::Renderer,
     selected: Option<&str>,
-) -> Result<(&'static str, Vec<ComposeServiceStatus>)> {
+) -> Result<(
+    &'static str,
+    Vec<ComposeServiceStatus>,
+    std::collections::BTreeSet<String>,
+)> {
     if busy {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     }
+    let all_leased = |ports: Option<&Ports>| -> std::collections::BTreeSet<String> {
+        ports
+            .map(|p| p.groups.iter().map(|g| g.binding.service.clone()).collect())
+            .unwrap_or_default()
+    };
     let deadline = Instant::now() + Duration::from_secs(1);
     let resources = crate::stand::history::History::read(root, runner, deadline)?;
     if let Some(history) = &resources {
@@ -136,7 +149,7 @@ fn observe_stand(
             .as_ref()
             .is_some_and(|history| history.may_have_actors());
     if !unconfirmed_history && history.is_none() && (no_state || (no_services && ports.is_none())) {
-        return Ok(("stopped", vec![]));
+        return Ok(("stopped", vec![], all_leased(ports)));
     }
     if history.as_ref().is_none_or(ledger::Ledger::completed_empty)
         && ports.is_some_and(|p| {
@@ -147,10 +160,10 @@ fn observe_stand(
             && ports.is_none()
             && crate::stand::epoch::trusted(root)?
     {
-        return Ok(("stopped", vec![]));
+        return Ok(("stopped", vec![], all_leased(ports)));
     }
     let Some(ports) = ports else {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     };
     let ledger = history.context("Stand observation requires actor history")?;
     ensure!(
@@ -163,7 +176,7 @@ fn observe_stand(
     }
     let rows = ledger::observe_until(&project, runner, deadline)?;
     if rows.is_empty() && ports.possible_actors {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     }
     let mut services = Vec::new();
     for row in &rows {
@@ -212,8 +225,7 @@ fn observe_stand(
     } else {
         "unknown"
     };
-    let renderer = preview::Renderer::from_env(branch.unwrap_or_default())?;
-    preview::enrich_observed(ports, &rows, &renderer, &mut services)?;
+    preview::enrich_observed(ports, &rows, renderer, &mut services)?;
     for service in &mut services {
         service.urls = service
             .preview
@@ -222,7 +234,14 @@ fn observe_stand(
             .filter_map(|e| e.local_url.clone())
             .collect();
     }
-    Ok((known, services))
+    let stopped_services = ports
+        .groups
+        .iter()
+        .map(|g| g.binding.service.as_str())
+        .filter(|svc| preview::is_service_stopped_verified(svc, ports, Some(&ledger), &rows, true))
+        .map(str::to_owned)
+        .collect();
+    Ok((known, services, stopped_services))
 }
 
 fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'static str> {
@@ -259,12 +278,33 @@ pub(crate) fn inspect(
     let root = project_root(root)?;
     ensure!(root.is_dir(), "Checkout does not exist");
     let checkout = Physical::at(&root)?;
-    let (kind, branch) = git_checkout(&root, runner, Instant::now() + Duration::from_millis(350))
-        .ok()
-        .flatten()
-        .map_or(("none", None), |git| {
-            (if git.linked { "linked" } else { "main" }, git.branch)
-        });
+    let git_absent = matches!(
+        fs::symlink_metadata(root.join(".git")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    );
+    let (kind, branch, preview_branch) = if git_absent {
+        (
+            "none",
+            None,
+            Some(
+                root.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+    } else {
+        git_checkout(&root, runner, Instant::now() + Duration::from_millis(350))
+            .ok()
+            .flatten()
+            .map_or(("none", None, None), |git| {
+                (
+                    if git.linked { "linked" } else { "main" },
+                    git.branch,
+                    Some(git.preview_branch),
+                )
+            })
+    };
     let lock = state::probe_checkout_lock(&root).ok();
     let busy = lock != Some(false);
     let lock_state = match lock {
@@ -346,24 +386,39 @@ pub(crate) fn inspect(
                 readiness = local_readiness(&root, state)?;
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
-            if let Some(ports) = &ports {
-                reservations = preview::reservations_from(ports, true).unwrap_or_default();
-                reservations.retain(|r| selected.is_none_or(|s| s == r.service));
-            }
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
             if !unreadable_claim
-                && let Ok((observed, rows)) = observe_stand(
+                && let Some(preview_branch) = preview_branch.as_deref()
+                && let Ok(renderer) = preview::Renderer::from_checkout(
+                    &root,
+                    preview_branch,
+                    runner,
+                    Instant::now() + Duration::from_millis(350),
+                )
+                && let Ok((observed, rows, stopped_services)) = observe_stand(
                     &root,
                     runner,
                     busy,
                     ports.as_ref(),
                     state,
-                    branch.as_deref(),
+                    &renderer,
                     selected,
                 )
             {
-                condition = observed;
-                services = rows;
+                if let Some(ports) = &ports {
+                    if let Ok(res) =
+                        preview::reservations_from(ports, &renderer, &rows, selected, true, |svc| {
+                            stopped_services.contains(svc)
+                        })
+                    {
+                        condition = observed;
+                        services = rows;
+                        reservations = res;
+                    }
+                } else {
+                    condition = observed;
+                    services = rows;
+                }
             }
         }
     }

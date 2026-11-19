@@ -88,7 +88,7 @@ Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package.
 
 Host ports are leased per checkout and survive `make down`. Concurrent Git worktrees receive separate ports; `make down cleanup=1` also releases that checkout's leases while preserving data volumes. The default automatic range is `10000-19999`, configurable with `DEVKIT_PORT_RANGE=A-B`.
 
-For a reverse proxy that routes published host ports, set a vendor-neutral template before starting the stand:
+For a reverse proxy that routes published host ports, set a preview template in the shell or in the current checkout's root `.env`. For example:
 
 ```sh
 export DEVKIT_PREVIEW_URL_TEMPLATE='https://{port}-{service}-{branch}.preview.example.com'
@@ -96,7 +96,7 @@ make up app=web
 make info
 ```
 
-Placeholders are `{port}`, `{service}`, `{branch}` and `{slug}` (the last two use the same DNS-safe branch slug). Configure routing and TLS in your proxy. Devkit prints the URLs and passes exact frontend hosts to its Vite plugin. See [development stands](docs/workflows.md#development-stands-and-preview-urls) for custom images and status semantics.
+Placeholders are `{port}`, `{service}`, `{branch}` and `{slug}` (the last two use the same DNS-safe branch slug). To share the template from the checkout on branch `next`, run `git config --local devkit.previewSourceBranch next` once in the clone. The process environment and current checkout's `.env` take precedence. An empty value disables preview URLs. Configure routing and TLS in your proxy. Devkit prints the URLs and passes exact frontend hosts to its Vite plugin. See [development stands](docs/workflows.md#development-stands-and-preview-urls) for custom images and status semantics.
 
 `init --preset fullstack-web` creates a Rust API and React web app. To connect another frontend to a registered Node or Rust API, use `make add-app name=dashboard template=react-web api=api`. Aggregate `make up` skips Electron apps without `DISPLAY`. Use `headless=1` to include them through Xvfb.
 
@@ -108,7 +108,7 @@ make setup
 make check
 ```
 
-Use `make exec command='pnpm …'` for commands in the root Node workspace. Run `make info json=1` for a machine-readable checkout summary. `make status` remains an alias for `make info`.
+Use `make exec command='pnpm …'` for commands in the root Node workspace (pass `-w` with `pnpm add` or `pnpm remove` at the workspace root). Run `make info json=1` for a machine-readable checkout summary. `make status` remains an alias for `make info`.
 
 `make package app=desktop` builds a Linux Electron directory and archive; `make package package=ui` builds a verified `.tgz` tarball and receipt (`publint` + `@arethetypeswrong/core`) for publishable libraries.
 

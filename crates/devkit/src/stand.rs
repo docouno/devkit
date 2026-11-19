@@ -14,6 +14,23 @@ use std::{
     process::Command,
 };
 
+pub(crate) fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", "core.fsmonitor=false"]);
+    command
+}
+
 pub fn branch_name(root: &Path, runner: &crate::processes::ProcessRunner) -> Result<String> {
     branch_name_until(root, runner, None)
 }
@@ -33,20 +50,8 @@ pub(crate) fn branch_name_until(
         return Ok(fallback());
     }
     let query = |args: &[&str]| -> Result<String> {
-        let mut command = Command::new("git");
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_") {
-                command.env_remove(key);
-            }
-        }
-        command
-            .current_dir(root)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args);
+        let mut command = git_command(root);
+        command.args(args);
         let output = match deadline {
             Some(at) => runner.capture_before(&mut command, at)?,
             None => runner.checked_with_timeout(

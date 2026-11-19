@@ -90,7 +90,9 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 
 ## Cross-Release Dispatch (`>= 0.4.0`)
 
-- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.4.x` or `0.5.0+` engine whenever it differs from the running binary. Read-only `devkit describe` and `devkit status` delegate when the accepted engine is already cached locally and remain strictly offline otherwise, while `devkit doctor` runs lock-free against the host and checkout directly.
+- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.4.x` or `0.5.0+` engine whenever it differs from the running binary.
+- `devkit stand` (`reserve` / `remove`) selects the cached accepted `0.5.0+` engine locally without network access and refuses before locking on checkouts older than `0.5.0`. If another process is installing the accepted engine, retry the stand command once installation finishes.
+- Read-only `devkit describe` and `devkit status` delegate when the accepted engine is already cached locally and remain strictly offline otherwise; `devkit info` uses a cached accepted `0.5.0+` engine offline and returns a local summary if the engine is unavailable or its cache lock is busy, while `devkit doctor` runs lock-free against the host and checkout directly.
 - `devkit init --to <version>` and `devkit update --to <version>` (for `<version> >= 0.4.0`) resolve and verify the target release first; whenever `<version>` differs from the currently running `devkit` binary, execution delegates symmetrically to the verified `<version>` engine.
 - On Linux hosts using a group-writable `umask 0002`, prefer `0.4.1+` (or the checked-in project loader `sh .devkit/runtime/devkit.sh cli <subcommand> ...`) when running daily `0.4.x` commands across releases; `devkit update . --to 0.5.0` works directly from both `0.4.0` and `0.4.1`.
 
