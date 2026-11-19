@@ -197,11 +197,11 @@ if (mode === 'serve') {
       'Generated workspace must select the exact environment version',
     );
     const app = join(target, 'apps/main');
-    const add = ['add', 'zod', '--lockfile-only', '--ignore-scripts'];
-    npm(add, app);
-    assert(read(join(app, 'package.json')).dependencies.zod);
+    const manifest = join(app, 'package.json');
+    assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
+    const add = ['add', 'clsx', '--lockfile-only', '--ignore-scripts'];
 
-    // Exercise the same registry and lock with the first-day exception removed.
+    // Check that the fresh release blocks this edit without its exact exception.
     writeFileSync(workspace, settings.replace(selected, 'other-package@1.0.0'));
     try {
       const rejected = npm(add, app, /minimumReleaseAge|minimum release age/iu);
@@ -209,6 +209,11 @@ if (mode === 'serve') {
     } finally {
       writeFileSync(workspace, settings);
     }
+    assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
+    assert.deepEqual(readFileSync(lock), original);
+    npm(add, app);
+    assert(read(manifest).dependencies.clsx);
+    assert.notDeepEqual(readFileSync(lock), original);
   } else if (mode === 'negative') {
     const selected = `@docouno/env@${metadata[1].version}`;
     const lines = original.toString().split('\n');
