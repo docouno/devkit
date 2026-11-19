@@ -1874,31 +1874,28 @@ fn info_and_stand_enforce_version_floors_and_delegate_offline_to_cached_accepted
     let lock =
         fs::File::open(cache_dir.join(".locks").join(format!("{engine_lock}.lock"))).unwrap();
     lock.try_lock().unwrap();
-    let (release_lock, hold_lock) = std::sync::mpsc::channel::<()>();
-    let installer = std::thread::spawn(move || {
-        // Bound the regression case as well: an erroneously waiting command will
-        // delegate when the lock is released, failing the assertions below.
-        let _ = hold_lock.recv_timeout(std::time::Duration::from_secs(10));
-        drop(lock);
-    });
     for args in [
         &["info", "."][..],
         &["stand", "reserve", "."],
         &["stand", "remove", "."],
     ] {
-        let result = Command::new(env!("CARGO_BIN_EXE_devkit"))
-            .current_dir(&proj_future)
-            .env_clear()
-            .args(["--json", "--cache-dir", cache_dir.to_str().unwrap()])
-            .args(args)
-            .output()
+        let result = runner
+            .run_with_timeout(
+                Command::new(env!("CARGO_BIN_EXE_devkit"))
+                    .current_dir(&proj_future)
+                    .env_clear()
+                    .args(["--json", "--cache-dir", cache_dir.to_str().unwrap()])
+                    .args(args),
+                devkit::processes::OutputMode::Capture(65536),
+                std::time::Duration::from_secs(30),
+            )
             .unwrap();
-        let json = decoded(&result);
+        let json: Value = serde_json::from_slice(&result.stdout).unwrap();
         if args[0] == "info" {
-            assert!(result.status.success());
+            assert_eq!(result.code, 0);
             assert_eq!(json["result"]["readiness"], "unknown");
         } else {
-            assert!(!result.status.success());
+            assert_ne!(result.code, 0);
             assert!(
                 json["error"]["message"]
                     .as_str()
@@ -1908,8 +1905,7 @@ fn info_and_stand_enforce_version_floors_and_delegate_offline_to_cached_accepted
         }
         assert!(!cache_dir.join("engines").exists());
     }
-    drop(release_lock);
-    installer.join().unwrap();
+    drop(lock);
 
     // Cached 99.0.0 release (with `engines/` initially absent!): `stand reserve`, `stand remove`, and `info` prime & delegate offline!
     for (idx, args) in [
