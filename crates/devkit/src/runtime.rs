@@ -2360,13 +2360,13 @@ fn run_service(
             &output.stdout,
             &app_service_component_map(&ctx.admission.state),
         )?;
-        let mut reservations = crate::stand::preview::enrich_status(
+        let reservations = crate::stand::preview::enrich_status(
             &ctx.admission.root,
             &ctx.project,
             ctx.runner,
+            selected.as_deref(),
             &mut services,
         )?;
-        reservations.retain(|r| selected.as_deref().is_none_or(|s| s == r.service));
         let reservation_lines = crate::stand::preview::reservation_lines(&reservations, &services);
         for service in services {
             println!(
@@ -3665,6 +3665,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
         &ctx.admission.root,
         &ctx.project,
         runner,
+        None,
         &mut services,
     )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;

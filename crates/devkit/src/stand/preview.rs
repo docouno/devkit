@@ -899,6 +899,7 @@ pub fn enrich_status(
     root: &Path,
     project: &str,
     runner: &crate::processes::ProcessRunner,
+    selected: Option<&str>,
     services: &mut [crate::doctor::ComposeServiceStatus],
 ) -> Result<Vec<Reservation>> {
     let branch = super::branch_name(root, runner)?;
@@ -906,9 +907,12 @@ pub fn enrich_status(
     let Some(ports) = super::ports::Ports::read(root)? else {
         return Ok(Vec::new());
     };
+    let ledger = super::ledger::Ledger::read(root).ok().flatten();
     let rows = super::ledger::observe(project, runner)?;
     enrich_observed(&ports, &rows, &renderer, services)?;
-    reservations_from(&ports, &renderer, services, false)
+    reservations_from(&ports, &renderer, services, selected, false, |svc| {
+        is_service_stopped_verified(svc, &ports, ledger.as_ref(), &rows, true)
+    })
 }
 
 pub fn enrich_observed(
@@ -1129,15 +1133,57 @@ pub struct Reservation {
     pub local_url: Option<String>,
     pub preview_url: Option<String>,
 }
+pub(crate) fn is_service_stopped_verified(
+    service: &str,
+    ports: &super::ports::Ports,
+    ledger: Option<&super::ledger::Ledger>,
+    rows: &[super::ledger::Container],
+    daemon_observed: bool,
+) -> bool {
+    let svc_rows: Vec<_> = rows.iter().filter(|r| r.service == service).collect();
+    if svc_rows
+        .iter()
+        .any(|r| r.running || r.owner != ports.owner.key)
+    {
+        return false;
+    }
+    if ledger.is_none_or(super::ledger::Ledger::completed_empty)
+        && !ports.possible_actors
+        && ledger.is_none_or(|l| l.owner == ports.owner)
+    {
+        return svc_rows.is_empty();
+    }
+    if !daemon_observed {
+        return false;
+    }
+    let Some(ledger) = ledger.filter(|l| l.owner == ports.owner && l.launch_terminal()) else {
+        return false;
+    };
+    if rows.is_empty() && (ports.possible_actors || !ledger.containers.is_empty()) {
+        return false;
+    }
+    if !svc_rows.iter().all(|r| ledger.containers.contains(&r.id)) {
+        return false;
+    }
+    if !svc_rows.is_empty() {
+        true
+    } else {
+        !ledger.services.contains(service)
+    }
+}
+
 pub(crate) fn reservations_from(
     ports: &super::ports::Ports,
     live_renderer: &Renderer,
     services: &[crate::doctor::ComposeServiceStatus],
+    selected: Option<&str>,
     include_ranges: bool,
+    stopped_verified: impl Fn(&str) -> bool,
 ) -> Result<Vec<Reservation>> {
     ports
         .groups
         .iter()
+        .filter(|group| selected.is_none_or(|s| s == group.binding.service))
         .map(|group| {
             let running: Vec<_> = services
                 .iter()
@@ -1165,8 +1211,10 @@ pub(crate) fn reservations_from(
                             }
                         })
                 }
-            } else {
+            } else if stopped_verified(&group.binding.service) {
                 Some(live_renderer)
+            } else {
+                None
             };
             let endpoint =
                 (include_ranges || group.first == group.last) && group.binding.protocol == "tcp";

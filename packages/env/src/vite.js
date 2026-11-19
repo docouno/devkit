@@ -6,12 +6,22 @@ import { hmrRecovery } from './hmr.js';
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+function entryExists(target) {
+  try {
+    fs.lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function findDevkitProjectRoot(startDir) {
   let current = path.resolve(startDir);
   while (true) {
-    const manifest = path.join(current, '.devkit', 'manifest.json');
-    if (fs.existsSync(manifest) && fs.statSync(manifest).isFile()) {
-      return current;
+    const devkitDir = path.join(current, '.devkit');
+    if (entryExists(devkitDir)) {
+      const manifest = path.join(devkitDir, 'manifest.json');
+      return regularDirectory(devkitDir) && regularFile(manifest) ? current : null;
     }
     const parent = path.dirname(current);
     if (parent === current) {
@@ -153,10 +163,17 @@ function collectWorkspaceSourceMap(startDir) {
 
   const packagesDir = path.join(projectRoot, 'packages');
   for (const [compId, compMeta] of Object.entries(manifest.components)) {
-    if (!compId.startsWith('packages/') || !object(compMeta) || compMeta.role !== 'library') {
+    if (
+      !/^packages\/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u.test(compId) ||
+      !object(compMeta) ||
+      compMeta.role !== 'library'
+    ) {
       continue;
     }
     const pkgRoot = path.join(projectRoot, compId);
+    if (!within(packagesDir, pkgRoot)) {
+      continue;
+    }
     const srcRoot = path.join(pkgRoot, 'src');
     const pkgJsonPath = path.join(pkgRoot, 'package.json');
     if (

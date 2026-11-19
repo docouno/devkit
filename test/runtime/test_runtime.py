@@ -2,6 +2,7 @@
 """Production entrypoint tests. Only exact, labelled disposable Docker resources."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import http.client
 import http.server
@@ -635,6 +636,62 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                     api_res = next(p for p in res["standPorts"] if p["service"] == "api")
                     self.assertTrue(api_res["previewUrl"].startswith("https://changed-"))
 
+                # While `task.lock` is held (`busy == true`, e.g. active `make dev`), `make info` never advertises unapplied `.env` URLs.
+                with (linked / ".devkit/state/task.lock").open("r+b") as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        busy_info = json.loads(
+                            run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout
+                        )["result"]
+                    finally:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                self.assertEqual(busy_info["standState"], "unknown")
+                self.assertEqual(busy_info["services"], [])
+                self.assertTrue(all(p["previewUrl"] is None for p in busy_info["standPorts"]))
+
+                # Unmanaged container claiming stopped service `api` prevents both `info` and `status` from advertising a live `.env` URL for `api`.
+                orphan_api = f"devkit-orphan-{token}"
+                run(
+                    "docker", "run", "--detach", "--pull", "never", "--name", orphan_api,
+                    "--label", f"{LABEL}={token}",
+                    "--label", f"com.docker.compose.project={linked_project}",
+                    "--label", "com.docker.compose.service=api",
+                    IMAGE, "node", "-e", "setTimeout(()=>{},25000)",
+                )
+                try:
+                    orphan_info = json.loads(
+                        run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout
+                    )["result"]
+                    self.assertEqual(orphan_info["standState"], "unknown")
+                    self.assertEqual(
+                        next(p for p in orphan_info["standPorts"] if p["service"] == "main")["previewUrl"],
+                        f"https://{expected_host}",
+                    )
+                    self.assertIsNone(next(p for p in orphan_info["standPorts"] if p["service"] == "api")["previewUrl"])
+                    orphan_status = json.loads(
+                        run(str(ENGINE), "status", str(linked), "--json", env=clean_env).stdout
+                    )["result"]
+                    self.assertIsNone(next(p for p in orphan_status["standPorts"] if p["service"] == "api")["previewUrl"])
+                finally:
+                    run("docker", "rm", "--force", orphan_api)
+
+                # `--app api` filters reservations before rendering, so a 63-byte label valid for `api` (3 chars)
+                # does not fail on unselected running `main` (4 chars -> 64-byte label).
+                long_prefix = "x" * 59
+                (linked / ".env").write_text(f"DEVKIT_PREVIEW_URL_TEMPLATE=https://{long_prefix}-{{service}}.example.test\n")
+                app_info = json.loads(
+                    run("make", "--no-print-directory", "-C", str(linked), "info", "app=api", "json=1", env=clean_env).stdout
+                )["result"]
+                self.assertEqual(
+                    app_info["standPorts"][0]["previewUrl"],
+                    f"https://{long_prefix}-api.example.test",
+                )
+                app_task_status = run(
+                    str(ENGINE), "task", "status", "--root", str(linked), "--app", "api", env=clean_env
+                ).stdout
+                self.assertIn(f"https://{long_prefix}-api.example.test", app_task_status)
+                (linked / ".env").unlink()
+
                 # Invalid .env on running stand degrades make info to unknown + empty arrays, while up/status fail.
                 (linked / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://$BAD_EXPANSION.example.test\n")
                 bad_running = json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1",
@@ -646,9 +703,16 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 self.assertNotEqual(run(str(ENGINE), "status", str(linked), "--json", env=clean_env, check=False).returncode, 0)
                 (linked / ".env").unlink()
 
-                # 5. Detached HEAD worktree keeps branch=null in info and pendingRestart=false across info and status.
-                run("make", "--no-print-directory", "-C", str(detached), "setup", env=clean_env)
-                run("make", "--no-print-directory", "-C", str(detached), "up", "app=main", env=clean_env)
+                # 5. Detached HEAD worktree keeps branch=null in info and pendingRestart=false across info and status,
+                # and `stand::inspection::prepare` ignores non-Devkit `.env` keys (`--env-file /dev/null`) and `COMPOSE_*` env vars.
+                (detached / ".env").write_text(
+                    "DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.example.test\n"
+                    'UNCLOSED_COMPOSE_SECRET="should-never-be-parsed-by-compose\n'
+                    "FOREIGN_COMPOSE_REQ=${MISSING_COMPOSE_VAR:?must-not-evaluate}\n"
+                )
+                poisoned_compose_env = dict(clean_env, COMPOSE_ENV_FILES="/nonexistent-compose-env-file")
+                run("make", "--no-print-directory", "-C", str(detached), "setup", env=poisoned_compose_env)
+                run("make", "--no-print-directory", "-C", str(detached), "up", "app=main", env=poisoned_compose_env)
                 det_info = json.loads(run("make", "--no-print-directory", "-C", str(detached), "info", "json=1",
                                           env=clean_env).stdout)["result"]
                 self.assertIsNone(det_info["branch"])

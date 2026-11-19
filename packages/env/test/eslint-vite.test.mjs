@@ -275,6 +275,98 @@ test('devkitWorkspaceSource includes react-client development ./src exports and 
       plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
       undefined,
     );
+
+    // Restore valid client package, then test `packages/../../outside`, multi-segment `packages/nested/lib`,
+    // symlinked `pkgRoot`, symlinked `.devkit/manifest.json`, and symlinked `.devkit`.
+    await fs.unlink(path.join(clientRoot, 'src'));
+    await fs.mkdir(path.join(clientRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(clientRoot, 'src/index.ts'), 'export const App = () => null;\n');
+    const outsidePkg = path.join(path.dirname(temp), `devkit-outside-${path.basename(temp)}`);
+    const nestedPkg = path.join(temp, 'packages', 'nested', 'lib');
+    try {
+      for (const [dir, pkgName] of [
+        [outsidePkg, 'devkit-outside-escape'],
+        [nestedPkg, 'devkit-nested-escape'],
+      ]) {
+        await fs.mkdir(path.join(dir, 'src'), { recursive: true });
+        await fs.writeFile(
+          path.join(dir, 'package.json'),
+          JSON.stringify({
+            name: pkgName,
+            version: '0.1.0',
+            private: true,
+            type: 'module',
+            exports: { '.': { development: './src/index.ts', import: './dist/index.js' } },
+          }),
+        );
+        await fs.writeFile(path.join(dir, 'src/index.ts'), 'export const escaped = true;\n');
+      }
+      await fs.writeFile(
+        path.join(temp, '.devkit/manifest.json'),
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            [`packages/../../${path.basename(outsidePkg)}`]: { role: 'library' },
+            'packages/nested/lib': { role: 'library' },
+          },
+        }),
+      );
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+      assert.equal(plugin.resolveId('devkit-outside-escape'), null);
+      assert.equal(plugin.resolveId('devkit-nested-escape'), null);
+
+      // Symlinked pkgRoot (`packages/escaped -> outsidePkg`) must be rejected.
+      await fs.symlink(outsidePkg, path.join(temp, 'packages', 'escaped'));
+      await fs.writeFile(
+        path.join(temp, '.devkit/manifest.json'),
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            'packages/escaped': { role: 'library' },
+          },
+        }),
+      );
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+
+      // Symlinked `.devkit/manifest.json` and symlinked `.devkit` directory must be rejected.
+      const extManifest = path.join(external, 'manifest.json');
+      await fs.writeFile(
+        extManifest,
+        JSON.stringify({
+          schemaVersion: 2,
+          components: {
+            'apps/web': { role: 'app' },
+            'packages/client': { role: 'library' },
+          },
+        }),
+      );
+      await fs.unlink(path.join(temp, '.devkit/manifest.json'));
+      await fs.symlink(extManifest, path.join(temp, '.devkit/manifest.json'));
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+
+      const extDevkit = path.join(external, 'fake-devkit');
+      await fs.mkdir(extDevkit, { recursive: true });
+      await fs.copyFile(extManifest, path.join(extDevkit, 'manifest.json'));
+      await fs.rm(path.join(temp, '.devkit'), { recursive: true, force: true });
+      await fs.symlink(extDevkit, path.join(temp, '.devkit'));
+      assert.equal(
+        plugin.config({ root: appRoot }, { command: 'serve', mode: 'development' }),
+        undefined,
+      );
+    } finally {
+      await fs.rm(outsidePkg, { recursive: true, force: true });
+    }
   } finally {
     if (prevVitest === undefined) {
       delete process.env.VITEST;

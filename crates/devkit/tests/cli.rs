@@ -1899,6 +1899,99 @@ fn info_and_stand_enforce_version_floors_and_delegate_offline_to_cached_accepted
         assert_eq!(decoded(&delegated)["result"]["engine"], "99.0.0");
     }
 
+    // Non-canonical `<checkout>/missing/..` target paths still enforce `< 0.4.0` floor and `>= 0.5.0` dispatch,
+    // and terminal symlink targets are rejected without dereferencing `<symlink>/.devkit`.
+    let noncanon_v03 = temp
+        .path()
+        .join("legacy-032/missing/..")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for sub in ["info", "doctor"] {
+        let out = invoke(temp.path(), &[sub, &noncanon_v03, "--json"]);
+        assert!(!out.status.success(), "{sub} on non-canonical 0.3.2");
+        assert_eq!(
+            decoded(&out)["error"]["code"],
+            "UNSUPPORTED_PROJECT_VERSION"
+        );
+    }
+    let noncanon_future = proj_future.join("missing/..").to_str().unwrap().to_owned();
+    let delegated_noncanon = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .current_dir(temp.path())
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "info",
+            &noncanon_future,
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(delegated_noncanon.status.success());
+    assert_eq!(decoded(&delegated_noncanon)["result"]["engine"], "99.0.0");
+
+    let symlink_future = temp.path().join("symlink-future");
+    std::os::unix::fs::symlink(&proj_future, &symlink_future).unwrap();
+    let symlink_info = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .current_dir(temp.path())
+        .args([
+            "--json",
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "info",
+            symlink_future.to_str().unwrap(),
+        ])
+        .env_clear()
+        .env("CI", "true")
+        .output()
+        .unwrap();
+    assert!(!symlink_info.status.success());
+    assert!(
+        decoded(&symlink_info)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("symlink")
+    );
+
+    // Corrupted checkout missing `.devkit/runtime/toolchains.env` both on disk and in `manifest.managed`
+    // returns a structured JSON error (never panics with exit 101).
+    let proj_missing_pins = temp.path().join("missing-pins");
+    fs::create_dir_all(proj_missing_pins.join(".devkit")).unwrap();
+    write_json(
+        &proj_missing_pins.join(MANIFEST_PATH),
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "version": "0.5.0",
+            "releaseIdentity": "b".repeat(64),
+            "generation": uuid::Uuid::new_v4().to_string(),
+            "packageMode": "registry",
+            "managed": {},
+            "components": {}
+        }),
+    )
+    .unwrap();
+    for args in [
+        &["stand", "reserve", ".", "--json"][..],
+        &["status", ".", "--json"][..],
+    ] {
+        let out = invoke(&proj_missing_pins, args);
+        assert!(!out.status.success(), "{args:?}");
+        assert_ne!(
+            out.status.code(),
+            Some(101),
+            "panic in {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            decoded(&out)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Managed file conflict: .devkit/runtime/toolchains.env")
+        );
+    }
+
     // FIFO manifest.json never blocks `devkit info`!
     fs::remove_file(proj_future.join(MANIFEST_PATH)).unwrap();
     let fifo_path = CString::new(proj_future.join(MANIFEST_PATH).as_os_str().as_bytes()).unwrap();

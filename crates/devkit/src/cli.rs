@@ -327,17 +327,16 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         ensure!(!globals.interactive, "doctor does not accept --interactive");
         let target = resolve_metadata_target(&globals.args[1..])?;
         if let Err(err) = (|| -> Result<()> {
-            if fs::symlink_metadata(target.join(".devkit")).is_ok() {
-                let root = project_root(&target)?;
-                if !exists(&safe_path(&root, state::PENDING_PATH)?)?
-                    && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
-                {
-                    state::ensure_supported_checkout_floor(
-                        &root,
-                        false,
-                        state::MIN_SUPPORTED_PROJECT_VERSION,
-                    )?;
-                }
+            let root = project_root(&target)?;
+            if fs::symlink_metadata(root.join(".devkit")).is_ok()
+                && !exists(&safe_path(&root, state::PENDING_PATH)?)?
+                && exists(&safe_path(&root, state::MANIFEST_PATH)?)?
+            {
+                state::ensure_supported_checkout_floor(
+                    &root,
+                    false,
+                    state::MIN_SUPPORTED_PROJECT_VERSION,
+                )?;
             }
             Ok(())
         })() && error_code(&err) == "UNSUPPORTED_PROJECT_VERSION"
@@ -531,12 +530,12 @@ fn try_dispatch_info(
     globals: &Globals,
     runner: &ProcessRunner,
 ) -> Result<Option<(PathBuf, String)>> {
-    if fs::symlink_metadata(target.join(".devkit")).is_err() {
-        return Ok(None);
-    }
     let Ok(root) = project_root(target) else {
         return Ok(None);
     };
+    if fs::symlink_metadata(root.join(".devkit")).is_err() {
+        return Ok(None);
+    }
     if state::assert_no_pending(&root).is_err() {
         return Ok(None);
     }
@@ -563,15 +562,15 @@ fn try_dispatch_info(
             return Ok(None);
         }
         let pins_name = ".devkit/runtime/toolchains.env";
+        let Some(expected_pins) = header.managed.get(pins_name) else {
+            return Ok(None);
+        };
         let Some((pins_bytes, pins_id)) =
             read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
         else {
             return Ok(None);
         };
-        if !crate::model::FileIdentity::matches_git_tracked_opt(
-            Some(&pins_id),
-            header.managed.get(pins_name),
-        ) {
+        if !pins_id.matches_git_tracked(expected_pins) {
             return Ok(None);
         }
         let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
@@ -660,15 +659,20 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     let header = state::read_accepted_header(&root)?;
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
-    let pins_snapshot = read_regular_file(&path, 65536, "toolchain pins")?;
+    let conflict_msg = || {
+        format!(
+            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        )
+    };
+    let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
+    let (pins_bytes, pins_id) =
+        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
     ensure!(
-        crate::model::FileIdentity::matches_git_tracked_opt(
-            pins_snapshot.as_ref().map(|(_, id)| id),
-            header.managed.get(name),
-        ),
-        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        pins_id.matches_git_tracked(expected_pins),
+        "{}",
+        conflict_msg()
     );
-    let pins = crate::runtime::ToolPins::parse(&pins_snapshot.unwrap().0)?;
+    let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
     ensure!(
         pins.version == header.version,
         "Accepted version differs from toolchain pins"

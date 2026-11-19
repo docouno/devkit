@@ -126,10 +126,19 @@ fn observe_stand(
     state: &crate::model::ProjectState,
     renderer: &preview::Renderer,
     selected: Option<&str>,
-) -> Result<(&'static str, Vec<ComposeServiceStatus>)> {
+) -> Result<(
+    &'static str,
+    Vec<ComposeServiceStatus>,
+    std::collections::BTreeSet<String>,
+)> {
     if busy {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     }
+    let all_leased = |ports: Option<&Ports>| -> std::collections::BTreeSet<String> {
+        ports
+            .map(|p| p.groups.iter().map(|g| g.binding.service.clone()).collect())
+            .unwrap_or_default()
+    };
     let deadline = Instant::now() + Duration::from_secs(1);
     let resources = crate::stand::history::History::read(root, runner, deadline)?;
     if let Some(history) = &resources {
@@ -147,7 +156,7 @@ fn observe_stand(
             .as_ref()
             .is_some_and(|history| history.may_have_actors());
     if !unconfirmed_history && history.is_none() && (no_state || (no_services && ports.is_none())) {
-        return Ok(("stopped", vec![]));
+        return Ok(("stopped", vec![], all_leased(ports)));
     }
     if history.as_ref().is_none_or(ledger::Ledger::completed_empty)
         && ports.is_some_and(|p| {
@@ -158,10 +167,10 @@ fn observe_stand(
             && ports.is_none()
             && crate::stand::epoch::trusted(root)?
     {
-        return Ok(("stopped", vec![]));
+        return Ok(("stopped", vec![], all_leased(ports)));
     }
     let Some(ports) = ports else {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     };
     let ledger = history.context("Stand observation requires actor history")?;
     ensure!(
@@ -174,7 +183,7 @@ fn observe_stand(
     }
     let rows = ledger::observe_until(&project, runner, deadline)?;
     if rows.is_empty() && ports.possible_actors {
-        return Ok(("unknown", vec![]));
+        return Ok(("unknown", vec![], std::collections::BTreeSet::new()));
     }
     let mut services = Vec::new();
     for row in &rows {
@@ -232,7 +241,14 @@ fn observe_stand(
             .filter_map(|e| e.local_url.clone())
             .collect();
     }
-    Ok((known, services))
+    let stopped_services = ports
+        .groups
+        .iter()
+        .map(|g| g.binding.service.as_str())
+        .filter(|svc| preview::is_service_stopped_verified(svc, ports, Some(&ledger), &rows, true))
+        .map(str::to_owned)
+        .collect();
+    Ok((known, services, stopped_services))
 }
 
 fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'static str> {
@@ -381,7 +397,7 @@ pub(crate) fn inspect(
             if !unreadable_claim
                 && let Some(preview_branch) = preview_branch.as_deref()
                 && let Ok(renderer) = preview::Renderer::from_checkout(&root, preview_branch)
-                && let Ok((observed, rows)) = observe_stand(
+                && let Ok((observed, rows, stopped_services)) = observe_stand(
                     &root,
                     runner,
                     busy,
@@ -392,8 +408,11 @@ pub(crate) fn inspect(
                 )
             {
                 if let Some(ports) = &ports {
-                    if let Ok(mut res) = preview::reservations_from(ports, &renderer, &rows, true) {
-                        res.retain(|r| selected.is_none_or(|s| s == r.service));
+                    if let Ok(res) =
+                        preview::reservations_from(ports, &renderer, &rows, selected, true, |svc| {
+                            stopped_services.contains(svc)
+                        })
+                    {
                         condition = observed;
                         services = rows;
                         reservations = res;
