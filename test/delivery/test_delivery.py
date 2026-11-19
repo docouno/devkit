@@ -549,6 +549,7 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
             "--lockfile-only --ignore-scripts",
             "-w",
             "DEVKIT_PREVIEW_URL_TEMPLATE",
+            "git config --local devkit.previewSourceBranch",
             "wt switch --create --no-cd --yes",
             "wt remove --foreground --yes",
         ):
@@ -563,6 +564,7 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         run("git", "init", "-b", "main")
         run("git", "add", ".")
         run("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Create test checkout")
+        run("git", "config", "--local", "devkit.previewSourceBranch", "main")
         run(wt, "switch", "--create", "--base", "main", "--no-cd", "--yes", "review/api")
         listing = run("git", "worktree", "list", "--porcelain").stdout
         linked = Path(next(line.removeprefix("worktree ") for line in listing.splitlines()

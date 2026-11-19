@@ -3,7 +3,7 @@ use super::{
     epoch::Physical,
     ports::{Group, Owner},
 };
-use crate::{Result, files::*};
+use crate::{Result, files::*, processes::ProcessRunner};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,8 +11,9 @@ use std::{
     fs,
     io::Write,
     net::IpAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -46,7 +47,12 @@ pub fn dns_slug(raw: &str) -> String {
     slug
 }
 impl Renderer {
-    pub fn from_checkout(root: &Path, branch: &str) -> Result<Self> {
+    pub fn from_checkout(
+        root: &Path,
+        branch: &str,
+        runner: &ProcessRunner,
+        deadline: Instant,
+    ) -> Result<Self> {
         match std::env::var("DEVKIT_PREVIEW_URL_TEMPLATE") {
             Ok(raw) if raw.is_empty() => return Self::new(None, branch),
             Ok(raw) => return Self::new(Some(raw), branch),
@@ -59,8 +65,9 @@ impl Renderer {
         if let Some(raw) = parse_dotenv_preview_template(&checkout, "checkout .env")? {
             return Self::new(Some(raw), branch);
         }
-        if let Some(main_root) = linked_main_worktree_root(&checkout)?
-            && let Some(raw) = parse_dotenv_preview_template(&main_root, "main worktree .env")?
+        if let Some(source) = preview_source_worktree(&checkout, runner, deadline)?
+            && let Some(raw) =
+                parse_dotenv_preview_template(&source, "preview source worktree .env")?
         {
             return Self::new(Some(raw), branch);
         }
@@ -218,178 +225,91 @@ pub fn parse_dotenv_preview_template(root: &Path, label: &str) -> Result<Option<
     Ok(found)
 }
 
-fn strip_git_config_comment(line: &str) -> &str {
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for (idx, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+fn preview_source_worktree(
+    checkout: &Path,
+    runner: &ProcessRunner,
+    deadline: Instant,
+) -> Result<Option<PathBuf>> {
+    let git = input_path(checkout, ".git")?;
+    match fs::symlink_metadata(&git) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(meta) if !meta.is_dir() => {
+            read_regular_file(&git, 16 * 1024, "Git worktree pointer")?
+                .context("Missing Git worktree pointer")?;
         }
-        if in_quotes {
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_quotes = false,
-                _ => {}
-            }
-        } else {
-            match ch {
-                '"' => in_quotes = true,
-                '#' | ';' => return &line[..idx],
-                _ => {}
-            }
-        }
+        Ok(_) => {}
     }
-    line
-}
+    let query =
+        |args: &[&str]| runner.capture_before(super::git_command(checkout).args(args), deadline);
+    let setting = query(&[
+        "config",
+        "--local",
+        "--no-includes",
+        "-z",
+        "--default",
+        "",
+        "--get",
+        "devkit.previewSourceBranch",
+    ])?;
+    let name = setting
+        .text()?
+        .strip_suffix('\0')
+        .context("Invalid Git config response")?;
+    if name.is_empty() {
+        return Ok(None);
+    }
 
-fn git_config_is_bare(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    let mut in_core = false;
-    let mut bare = false;
-    for raw_line in text.lines() {
-        let line = raw_line.trim_start_matches([' ', '\t']);
-        if line.is_empty() || line.starts_with(['#', ';']) {
-            continue;
+    let registered = crate::info::git_checkout(checkout, runner, deadline)?
+        .context("Preview inheritance requires a registered Git worktree")?;
+    let expected = format!("branch refs/heads/{name}");
+    let list = query(&["worktree", "list", "--porcelain", "-z"])?;
+    let mut fields = list.stdout.split(|b| *b == 0);
+    let mut source = None;
+    let mut checkout_listed = false;
+    while let Some(first) = fields.next().filter(|field| !field.is_empty()) {
+        let path = first
+            .strip_prefix(b"worktree ")
+            .context("Invalid Git worktree record")?;
+        let path = Path::new(std::ffi::OsStr::from_bytes(path));
+        let mut matched = false;
+        let mut active = true;
+        for field in fields.by_ref().take_while(|field| !field.is_empty()) {
+            matched |= field == expected.as_bytes();
+            active &= field != b"bare" && field != b"prunable" && !field.starts_with(b"prunable ");
         }
-        if let Some(rest) = line.strip_prefix('[') {
-            let Some((header, tail)) = rest.split_once(']') else {
-                continue;
-            };
-            let tail = tail.trim_start_matches([' ', '\t']);
-            if !tail.is_empty() && !tail.starts_with(['#', ';']) {
-                continue;
-            }
-            in_core = header
-                .trim_matches([' ', '\t'])
-                .eq_ignore_ascii_case("core");
-            continue;
-        }
-        if !in_core {
-            continue;
-        }
-        let uncommented = strip_git_config_comment(line).trim_end_matches([' ', '\t']);
-        if uncommented.eq_ignore_ascii_case("bare") {
-            bare = true;
-            continue;
-        }
-        if let Some((key, value)) = uncommented.split_once('=')
-            && key.trim_matches([' ', '\t']).eq_ignore_ascii_case("bare")
-        {
-            let val = value
-                .trim_matches([' ', '\t'])
-                .trim_matches('"')
-                .to_ascii_lowercase();
-            bare = matches!(val.as_str(), "true" | "yes" | "on" | "1");
-        }
-    }
-    bare
-}
-
-pub fn linked_main_worktree_root(checkout: &Path) -> Result<Option<PathBuf>> {
-    let checkout = project_root(checkout)?;
-    let git_entry = input_path(&checkout, ".git")?;
-    let meta = match fs::symlink_metadata(&git_entry) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    if meta.is_dir() {
-        return Ok(None);
-    }
-    let (bytes, _) = read_regular_file(&git_entry, 16 * 1024, "Git worktree pointer")?
-        .context("Missing Git worktree pointer")?;
-    let raw_gitdir = std::str::from_utf8(&bytes)
-        .context("Invalid Git worktree pointer")?
-        .trim_end_matches(['\r', '\n'])
-        .strip_prefix("gitdir: ")
-        .filter(|s| !s.is_empty())
-        .context("Invalid Git worktree pointer")?;
-    let git_dir = project_root(&checkout.join(raw_gitdir))?;
-    ensure!(
-        fs::symlink_metadata(&git_dir)
-            .with_context(|| format!(
-                "Missing Git worktree admin directory: {}",
-                git_dir.display()
-            ))?
-            .is_dir(),
-        "Invalid Git worktree admin directory: {}",
-        git_dir.display()
-    );
-    let Some((common_bytes, _)) = read_regular_file(
-        &safe_path(&git_dir, "commondir")?,
-        16 * 1024,
-        "Git common directory pointer",
-    )?
-    else {
-        return Ok(None);
-    };
-    let raw_commondir = std::str::from_utf8(&common_bytes)
-        .context("Invalid Git common directory pointer")?
-        .trim_end_matches(['\r', '\n']);
-    ensure!(
-        !raw_commondir.is_empty(),
-        "Empty Git common directory pointer"
-    );
-    let common_dir = project_root(&git_dir.join(raw_commondir))?;
-    ensure!(
-        fs::symlink_metadata(&common_dir)
-            .with_context(|| format!("Missing Git common directory: {}", common_dir.display()))?
-            .is_dir(),
-        "Invalid Git common directory: {}",
-        common_dir.display()
-    );
-    ensure!(
-        git_dir != common_dir && git_dir.parent() == Some(common_dir.join("worktrees").as_path()),
-        "Unexpected linked Git worktree admin layout"
-    );
-    let (back_bytes, _) = read_regular_file(
-        &safe_path(&git_dir, "gitdir")?,
-        16 * 1024,
-        "Git reverse worktree pointer",
-    )?
-    .context("Missing Git reverse worktree pointer")?;
-    let raw_back = std::str::from_utf8(&back_bytes)
-        .context("Invalid Git reverse worktree pointer")?
-        .trim_end_matches(['\r', '\n']);
-    ensure!(!raw_back.is_empty(), "Empty Git reverse worktree pointer");
-    let back_path = project_root(&git_dir.join(raw_back))?;
-    ensure!(
-        Physical::at(&back_path)? == Physical::at(&git_entry)?,
-        "Git worktree reverse pointer does not match checkout"
-    );
-    if common_dir.file_name() != Some(std::ffi::OsStr::new(".git")) {
-        return Ok(None);
-    }
-    let Some(parent) = common_dir.parent() else {
-        return Ok(None);
-    };
-    if let Some((cfg_bytes, _)) =
-        read_regular_file(&safe_path(&common_dir, "config")?, 256 * 1024, "Git config")?
-        && git_config_is_bare(&cfg_bytes)
-    {
-        return Ok(None);
-    }
-    let main_root = project_root(parent)?;
-    ensure!(
-        Physical::at(&input_path(&main_root, ".git")?)? == Physical::at(&common_dir)?,
-        "Main worktree .git directory mismatch"
-    );
-    let main_manifest = safe_path(&main_root, crate::state::MANIFEST_PATH)?;
-    match fs::symlink_metadata(&main_manifest) {
-        Ok(meta) => {
+        checkout_listed |= active && path == checkout;
+        if matched && active {
             ensure!(
-                meta.is_file() && !meta.file_type().is_symlink(),
-                "Main worktree manifest must be a regular file: {}",
-                main_manifest.display()
+                source.is_none(),
+                "Multiple worktrees have devkit.previewSourceBranch checked out"
             );
-            Ok(Some(main_root))
+            source = Some(path);
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
     }
+    ensure!(
+        checkout_listed,
+        "Preview inheritance requires a registered Git worktree"
+    );
+    let path = project_root(source.with_context(|| {
+        format!("No worktree has devkit.previewSourceBranch '{name}' checked out")
+    })?)?;
+    if path == checkout {
+        // The caller already inspected this checkout's .env.
+        return Ok(None);
+    }
+    let source = crate::info::git_checkout(&path, runner, deadline)?
+        .context("The worktree selected by devkit.previewSourceBranch is unavailable")?;
+    ensure!(
+        source.common == registered.common && source.branch.as_deref() == Some(name),
+        "The worktree selected by devkit.previewSourceBranch changed"
+    );
+    let manifest = safe_path(&path, crate::state::MANIFEST_PATH)?;
+    ensure!(
+        fs::symlink_metadata(manifest).is_ok_and(|meta| meta.is_file()),
+        "The worktree selected by devkit.previewSourceBranch must be a Devkit checkout"
+    );
+    Ok(Some(path))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -903,7 +823,12 @@ pub fn enrich_status(
     services: &mut [crate::doctor::ComposeServiceStatus],
 ) -> Result<Vec<Reservation>> {
     let branch = super::branch_name(root, runner)?;
-    let renderer = Renderer::from_checkout(root, &branch)?;
+    let renderer = Renderer::from_checkout(
+        root,
+        &branch,
+        runner,
+        Instant::now() + Duration::from_secs(1),
+    )?;
     let Some(ports) = super::ports::Ports::read(root)? else {
         return Ok(Vec::new());
     };

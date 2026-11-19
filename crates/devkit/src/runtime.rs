@@ -2775,7 +2775,7 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
         return Ok(false);
     }
     let branch = branch_name_until(&root, runner, Some(deadline))?;
-    let renderer = preview::Renderer::from_checkout(&root, &branch)?;
+    let renderer = preview::Renderer::from_checkout(&root, &branch, runner, deadline)?;
     leases.allocate_plan_until(
         ports::Allocation {
             declarations: &bindings,
@@ -3125,7 +3125,12 @@ fn run_development(
         .cloned()
         .collect();
     preview_forwarding_presence(ctx, &mut model, &frontends)?;
-    let renderer = crate::stand::preview::Renderer::from_checkout(&ctx.admission.root, &branch)?;
+    let renderer = crate::stand::preview::Renderer::from_checkout(
+        &ctx.admission.root,
+        &branch,
+        ctx.runner,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )?;
     // Make starts the selected applications individually. Use the same budget
     // group for every prerequisite of an aggregate invocation.
     let mut resource_services = active_services.clone();

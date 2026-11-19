@@ -497,6 +497,7 @@ class EngineVersionAdmissionTests(unittest.TestCase):
             root = base / "main with space"
             linked = base / "linked with space"
             detached = base / "detached with space"
+            source = base / "development checkout"
             write_fixture(root, apps=("main", "api"), package_profiles={"apps/main": "web", "apps/api": "node"})
             accept_runtime(root, package_profiles={"apps/main": "web", "apps/api": "node"})
             token = "dotenv-" + uuid.uuid4().hex
@@ -538,15 +539,17 @@ class EngineVersionAdmissionTests(unittest.TestCase):
             run("git", "-C", str(root), "worktree", "add", "-b", "feat/ui", str(linked))
             run("git", "-C", str(root), "worktree", "add", "--detach", str(detached), "HEAD")
 
-            # Define DEVKIT_PREVIEW_URL_TEMPLATE + SECRET_TOKEN only in <main>/.env (not in shell env!).
-            (root / ".env").write_text(
+            run("git", "-C", str(root), "worktree", "add", "-b", "release/next", str(source))
+            (root / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://frozen.example.test\n")
+            run("git", "-C", str(linked), "config", "--local", "devkit.previewSourceBranch", "release/next")
+            (source / ".env").write_text(
                 "SECRET_TOKEN=super-secret-value\nDEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.example.test\n"
             )
             clean_env = {k: v for k, v in env().items() if k != "DEVKIT_PREVIEW_URL_TEMPLATE"}
             clean_env["DEVKIT_CACHE_DIR"] = str(base / "cache")
 
             try:
-                # 1. Early stand reserve + make info in linked worktree inherit <main>/.env.
+                # 1. Early stand reserve + make info in linked worktree inherit the selected source .env.
                 loader = linked / ".devkit/runtime/devkit.sh"
                 run("make", "--no-print-directory", "-C", str(linked), "down", env=clean_env)
                 reserved = json.loads(run("sh", str(loader), "cli", "stand", "reserve", ".", "--json",
@@ -573,12 +576,12 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                     next(p for p in status_stopped["standPorts"] if p["service"] == "main")["previewUrl"],
                     f"https://{web_port}.local-wt.example.test",
                 )
-                # Empty process env overrides both <linked>/.env and <main>/.env.
+                # Empty process env overrides both <linked>/.env and the selected source .env.
                 empty_proc_env = dict(clean_env, DEVKIT_PREVIEW_URL_TEMPLATE="")
                 self.assertIsNone(
                     next(p for p in json.loads(run(str(ENGINE), "status", str(linked), "--json", env=empty_proc_env).stdout)["result"]["standPorts"] if p["service"] == "main")["previewUrl"]
                 )
-                # Empty <linked>/.env resets without falling through to <main>/.env.
+                # Empty <linked>/.env resets without falling through to the selected source .env.
                 (linked / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE= # disable\n")
                 self.assertIsNone(
                     next(p for p in json.loads(run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout)["result"]["standPorts"] if p["service"] == "main")["previewUrl"]
@@ -595,7 +598,7 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 self.assertNotEqual(run("sh", str(loader), "cli", "stand", "reserve", ".", cwd=linked, env=clean_env, check=False).returncode, 0)
                 (linked / ".env").unlink()
 
-                # 3. Launch linked stand inheriting <main>/.env: Vite hostPolicy allows rendered Host (200), blocks foreign Host (403), and SECRET_TOKEN never leaks.
+                # 3. Launch linked stand inheriting the selected source .env: Vite hostPolicy allows rendered Host (200), blocks foreign Host (403), and SECRET_TOKEN never leaks.
                 run("make", "--no-print-directory", "-C", str(linked), "setup", env=clean_env)
                 run("make", "--no-print-directory", "-C", str(linked), "up", "app=main", env=clean_env)
                 expected_host = f"{web_port}--feat-ui.example.test"
@@ -621,8 +624,8 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 self.assertIn("Leased api", task_status_api)
                 self.assertNotIn("Service main", task_status_api)
 
-                # 4. Changing <main>/.env while <linked> is running sets pendingRestart=true while keeping applied URL in services and standPorts.
-                (root / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://changed-{port}--{branch}.example.test\n")
+                # 4. Changing the selected source .env while <linked> is running sets pendingRestart=true while keeping applied URL in services and standPorts.
+                (source / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://changed-{port}--{branch}.example.test\n")
                 for cmd_out in (
                     run("make", "--no-print-directory", "-C", str(linked), "info", "json=1", env=clean_env).stdout,
                     run(str(ENGINE), "status", str(linked), "--json", env=clean_env).stdout,

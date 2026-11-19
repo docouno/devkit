@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -23,6 +22,7 @@ pub(crate) struct GitCheckout {
     pub(crate) branch: Option<String>,
     pub(crate) preview_branch: String,
     pub(crate) admin: PathBuf,
+    pub(crate) common: PathBuf,
 }
 
 pub(crate) fn git_checkout(
@@ -44,23 +44,7 @@ pub(crate) fn git_checkout(
             .context("Missing Git checkout pointer")?;
     }
     let query = |args: &[&str]| -> Result<String> {
-        let mut command = Command::new("git");
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("GIT_") {
-                command.env_remove(key);
-            }
-        }
-        let output = runner.capture_before(
-            command
-                .current_dir(root)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .args(["-c", "core.fsmonitor=false"])
-                .args(args),
-            deadline,
-        )?;
+        let output = runner.capture_before(crate::stand::git_command(root).args(args), deadline)?;
         Ok(output.text()?.trim_end_matches('\n').to_owned())
     };
     let dirs = query(&[
@@ -115,6 +99,7 @@ pub(crate) fn git_checkout(
         branch,
         preview_branch,
         admin: git_dir,
+        common,
     }))
 }
 
@@ -396,7 +381,12 @@ pub(crate) fn inspect(
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
             if !unreadable_claim
                 && let Some(preview_branch) = preview_branch.as_deref()
-                && let Ok(renderer) = preview::Renderer::from_checkout(&root, preview_branch)
+                && let Ok(renderer) = preview::Renderer::from_checkout(
+                    &root,
+                    preview_branch,
+                    runner,
+                    Instant::now() + Duration::from_millis(350),
+                )
                 && let Ok((observed, rows, stopped_services)) = observe_stand(
                     &root,
                     runner,

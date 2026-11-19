@@ -15,7 +15,7 @@
 - Make targets for component registration, environment updates and recovery, offline component help, root Node workspace `make exec`, and the per-worktree `make info` summary.
 - Checkout-local stand reservation and cleanup, optional Worktrunk hooks, and project-owned development instructions generated at initialization.
 - Sticky per-checkout TCP/UDP host-port leases, replica ranges, ownership-aware cleanup, and cold cleanup before setup without Docker or downloads.
-- Vendor-neutral preview URL templates (configured in the environment or inherited across linked Git worktrees from the main checkout's root `.env`), bounded immutable host metadata with image-aware read-only mount proof, and applied/desired endpoint status.
+- Vendor-neutral preview URL templates (configured in the environment or checkout's root `.env`, with opt-in inheritance from the branch selected by `git config --local devkit.previewSourceBranch`), bounded immutable host metadata with image-aware read-only mount proof, and applied/desired endpoint status.
 - A web-only `fullstack-web` preset and transactional `add-app --api` connections, API library development prerequisites, configurable starter bind addresses, and display-free aggregate Electron skipping.
 
 ### Changed
