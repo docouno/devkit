@@ -103,6 +103,7 @@ def main():
                 assert json.loads((consumer / '.devkit/manifest.json').read_text())['version'] == manifests[1]['version']
                 run('second-npm', node('second'))
                 run('integrity-missing-version-negatives', node('negative'))
+                run('release-day-dependency-edit', node('release-day'))
                 (proof / 'requests.json').write_bytes((scratch / 'requests.json').read_bytes())
                 assert not forbidden.exists(), 'Host SDK attempted'
                 passed = True

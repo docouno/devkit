@@ -591,6 +591,13 @@ pub fn sync_node_workspace(root: &Path, state: &ProjectState, name: Option<&str>
             crate::pnpm::Workspace::new(vec![])
         };
         workspace.packages = paths;
+        // Release admission requires @docouno/env to match the accepted version
+        // and verifies the packaged archive's integrity before projection.
+        let environment = format!("@docouno/env@{}", state.version);
+        if !workspace.minimum_release_age_exclude.contains(&environment) {
+            workspace.minimum_release_age_exclude.push(environment);
+        }
+        workspace.validate(root)?;
         crate::pnpm::write_yaml(root, "pnpm-workspace.yaml", &workspace)?;
     } else {
         manifest["workspaces"] = json!(paths);
