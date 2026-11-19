@@ -29,6 +29,7 @@ if (mode === 'serve') {
     assert.equal(sri(archive), metadata[index].environment.integrity);
     return { manifest, archive, path: `/@docouno/env/-/env-${manifest.version}.tgz` };
   });
+  const published = new Date().toISOString();
   let origin = '',
     count = 0;
   const requests = [];
@@ -71,7 +72,15 @@ if (mode === 'serve') {
         );
         body = JSON.stringify(
           path === '/@docouno/env'
-            ? { name: '@docouno/env', 'dist-tags': { latest: metadata[1].version }, versions }
+            ? {
+                name: '@docouno/env',
+                'dist-tags': { latest: metadata[1].version },
+                versions,
+                time: {
+                  [metadata[0].version]: '2020-01-01T00:00:00Z',
+                  [metadata[1].version]: published,
+                },
+              }
             : versions[path.slice('/@docouno/env/'.length)],
         );
       } else if (path.startsWith('/@docouno/')) {
@@ -125,6 +134,7 @@ if (mode === 'serve') {
     } else {
       assert.equal(result.status, 0, result.error?.message);
     }
+    return result.stdout + result.stderr;
   }
   const lock = join(target, mode === 'first' ? 'package-lock.json' : 'pnpm-lock.yaml');
   if (mode === 'second') {
@@ -178,6 +188,32 @@ if (mode === 'serve') {
     );
     assert.equal(probe.status, 0, probe.stderr);
     assert.equal(JSON.parse(probe.stdout).version, metadata[mode === 'first' ? 0 : 1].version);
+  } else if (mode === 'release-day') {
+    const workspace = join(target, 'pnpm-workspace.yaml');
+    const settings = readFileSync(workspace, 'utf8');
+    const selected = `@docouno/env@${metadata[1].environment.version}`;
+    assert(
+      settings.includes(selected),
+      'Generated workspace must select the exact environment version',
+    );
+    const app = join(target, 'apps/main');
+    const manifest = join(app, 'package.json');
+    assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
+    const add = ['add', 'clsx', '--lockfile-only', '--ignore-scripts'];
+
+    // Check that the fresh release blocks this edit without its exact exception.
+    writeFileSync(workspace, settings.replace(selected, 'other-package@1.0.0'));
+    try {
+      const rejected = npm(add, app, /minimumReleaseAge|minimum release age/iu);
+      assert(rejected.includes(selected), 'The fresh environment version must trigger the failure');
+    } finally {
+      writeFileSync(workspace, settings);
+    }
+    assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
+    assert.deepEqual(readFileSync(lock), original);
+    npm(add, app);
+    assert(read(manifest).dependencies.clsx);
+    assert.notDeepEqual(readFileSync(lock), original);
   } else if (mode === 'negative') {
     const selected = `@docouno/env@${metadata[1].version}`;
     const lines = original.toString().split('\n');
@@ -232,7 +268,7 @@ if (mode === 'serve') {
     }
     assert(requests.some((path) => !path.startsWith('/@docouno/')));
   } else {
-    throw Error('Expected serve, first, second or negative');
+    throw Error('Expected serve, first, second, negative or release-day');
   }
   assert(existsSync(lock));
   process.stdout.write(`PASS ${mode}\n`);

@@ -495,11 +495,6 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         target = self.root / "my-product"
         self.cli("init", target, "--app", "web=react-web", "--name", "my-product",
                  "--release-root", RELEASE, "--package-source", "local", "--non-interactive", timeout=240)
-        # The frozen package is supplied by its verified archive before public
-        # publication. Pnpm can enforce registry age for all other packages.
-        package = self.manifest["environment"]
-        workspace = target / "pnpm-workspace.yaml"
-        workspace.write_text(workspace.read_text() + f"\nminimumReleaseAgeExclude:\n  - '{package['name']}@{package['version']}'\n")
         def make(*args, label):
             result = execute(["make", *args], cwd=target, env=self.env, timeout=360)
             EVIDENCE.append({"case": "readme", "step": label})

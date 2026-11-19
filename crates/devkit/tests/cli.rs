@@ -1241,7 +1241,7 @@ fn init_and_update_reject_target_versions_below_0_4_0_before_prompts_or_network(
 }
 
 #[test]
-fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadata_contract() {
+fn symmetric_delegation_between_previous_current_and_future_preserves_offline_metadata_contract() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use devkit::project::{InitOptions, LockResolver, init_project};
     use sha2::{Digest, Sha512};
@@ -1375,7 +1375,8 @@ fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadat
 
     let rel_040 = build_release("0.4.0", false);
     let rel_041 = build_release("0.4.1", false);
-    let rel_050 = build_release("0.5.0", true);
+    let current_version = env!("CARGO_PKG_VERSION");
+    let rel_current = build_release(current_version, true);
     let rel_990 = build_release("99.0.0", false);
 
     let primed_cache = temp.path().join("primed-cache");
@@ -1423,7 +1424,7 @@ fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadat
     };
     let proj_040 = make_proj(&rel_040, "proj-040");
     let proj_041 = make_proj(&rel_041, "proj-041");
-    let proj_050 = make_proj(&rel_050, "proj-050");
+    let proj_current = make_proj(&rel_current, "proj-current");
     let proj_990 = make_proj(&rel_990, "proj-990");
 
     // 2. `devkit update <proj-040> --to 0.4.1` symmetrically delegates downward to 0.4.1 engine.
@@ -1496,10 +1497,10 @@ fn symmetric_delegation_between_0_4_1_0_5_0_and_99_0_0_preserves_offline_metadat
     }
 
     // 4. With EMPTY cache and dead network proxy, describe and status NEVER touch the network:
-    //    - 0.4.1 and 0.5.0 succeed locally;
+    //    - 0.4.1 and the current version succeed locally;
     //    - unprimed 99.0.0 fails locally with "run make setup".
     let empty_cache = temp.path().join("empty-cache");
-    for (proj, expected_ver) in [(&proj_041, "0.4.1"), (&proj_050, "0.5.0")] {
+    for (proj, expected_ver) in [(&proj_041, "0.4.1"), (&proj_current, current_version)] {
         let desc = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args([
                 "--json",

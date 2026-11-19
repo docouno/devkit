@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.1]
+
+### Fixed
+
+- Allow dependency edits on release day. Devkit adds the exact accepted `@docouno/env` version to the pnpm workspace's `minimumReleaseAgeExclude` list when it creates or updates a Node workspace.
+
 ## [0.5.0]
 
 ### Breaking
