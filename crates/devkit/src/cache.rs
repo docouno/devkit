@@ -237,7 +237,7 @@ impl<'a> ReleaseCache<'a> {
             ),
         )
     }
-    fn cached(&self, version: &str, identity: &str) -> Result<Option<AdmittedRelease>> {
+    pub(crate) fn cached(&self, version: &str, identity: &str) -> Result<Option<AdmittedRelease>> {
         let path = self.release_path(version, identity)?;
         if !exists(&path)? {
             return Ok(None);

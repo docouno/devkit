@@ -371,6 +371,16 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         ensure!(!globals.interactive, "info does not accept --interactive");
         let options = Options::parse(&globals.args[1..], &["--app"], &[], &[])?;
         let target = options.target.clone().unwrap_or(std::env::current_dir()?);
+        if let Some((engine, sha256)) = try_dispatch_info(&target, &globals, runner)? {
+            crate::processes::restore_exec_pdeathsig(runner)?;
+            let mut command = std::process::Command::new(&engine);
+            globals.write_flags(&mut command);
+            command
+                .args(&globals.args)
+                .env("DEVKIT_DISPATCHED_ENGINE", &sha256);
+            use std::os::unix::process::CommandExt;
+            return Err(command.exec()).context("Cannot execute the accepted native engine");
+        }
         let (result, human) = crate::info::inspect(&target, options.value("--app")?, runner)?;
         globals.emit("info", result, &human);
         return Ok(());
@@ -383,7 +393,25 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             .map(|arg| string(arg))
             .transpose()?
             .context("Expected stand reserve or stand remove [TARGET]")?;
-        let root = resolve_metadata_target(&globals.args[2..])?;
+        ensure!(
+            matches!(action, "reserve" | "remove"),
+            "Expected stand reserve or stand remove [TARGET]"
+        );
+        let root = project_root(&resolve_metadata_target(&globals.args[2..])?)?;
+        let version = state::ensure_supported_checkout_floor(
+            &root,
+            false,
+            state::MIN_SUPPORTED_PROJECT_VERSION,
+        )?;
+        if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+            return Err(error(
+                "UNSUPPORTED_PROJECT_VERSION",
+                format!(
+                    "stand {action} requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+                ),
+            ));
+        }
+        dispatch_accepted("stand", &globals, runner)?;
         match action {
             "reserve" => {
                 let reserved =
@@ -406,7 +434,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
                     "Stand cleanup completed.",
                 );
             }
-            _ => anyhow::bail!("Expected stand reserve or stand remove [TARGET]"),
+            _ => unreachable!(),
         }
         return Ok(());
     }
@@ -498,6 +526,78 @@ fn resolve_metadata_target(args: &[OsString]) -> Result<PathBuf> {
         .unwrap_or(std::env::current_dir()?))
 }
 
+fn try_dispatch_info(
+    target: &std::path::Path,
+    globals: &Globals,
+    runner: &ProcessRunner,
+) -> Result<Option<(PathBuf, String)>> {
+    if fs::symlink_metadata(target.join(".devkit")).is_err() {
+        return Ok(None);
+    }
+    let Ok(root) = project_root(target) else {
+        return Ok(None);
+    };
+    if state::assert_no_pending(&root).is_err() {
+        return Ok(None);
+    }
+    let Ok(manifest_path) = safe_path(&root, state::MANIFEST_PATH) else {
+        return Ok(None);
+    };
+    let Ok((bytes, _, _)) = state::read_manifest_snapshot(&manifest_path) else {
+        return Ok(None);
+    };
+    if let Err(err) =
+        state::ensure_supported_manifest_bytes(&bytes, false, state::MIN_SUPPORTED_PROJECT_VERSION)
+    {
+        if error_code(&err) == "UNSUPPORTED_PROJECT_VERSION" {
+            return Err(err);
+        }
+        return Ok(None);
+    }
+    if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some() {
+        return Ok(None);
+    }
+    let candidate = (|| -> Result<Option<(PathBuf, String)>> {
+        let header = state::parse_accepted_header(&bytes)?;
+        if SemVer::parse(&header.version)? < SemVer::parse("0.5.0")? {
+            return Ok(None);
+        }
+        let pins_name = ".devkit/runtime/toolchains.env";
+        let Some((pins_bytes, pins_id)) =
+            read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
+        else {
+            return Ok(None);
+        };
+        if !crate::model::FileIdentity::matches_git_tracked_opt(
+            Some(&pins_id),
+            header.managed.get(pins_name),
+        ) {
+            return Ok(None);
+        }
+        let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+        if pins.version != header.version {
+            return Ok(None);
+        }
+        let pin = pins.engine;
+        if delivery::current_engine_digest()? == pin.sha256 {
+            return Ok(None);
+        }
+        let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
+        if !exists(&cache.engine_path(&pin)?)?
+            && let Some(release) = cache.cached(&header.version, &header.release_identity)?
+        {
+            cache.prime_engine(&release)?;
+        }
+        let engine = cache.accepted_engine(&pin)?;
+        let current = fs::canonicalize(std::env::current_exe()?)?;
+        if engine == current {
+            return Ok(None);
+        }
+        Ok(Some((engine, pin.sha256)))
+    })();
+    Ok(candidate.ok().flatten())
+}
+
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let is_lifecycle = ["sync", "add-app", "add-package", "register"].contains(&command_name);
     let is_metadata = ["describe", "status"].contains(&command_name);
@@ -528,6 +628,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
             project_root(&resolve_metadata_target(&globals.args[1..])?)?,
             None,
         )
+    } else if command_name == "stand" {
+        (
+            project_root(&resolve_metadata_target(&globals.args[2..])?)?,
+            None,
+        )
     } else {
         let before_separator = globals
             .args
@@ -555,14 +660,15 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     let header = state::read_accepted_header(&root)?;
     let name = ".devkit/runtime/toolchains.env";
     let path = safe_path(&root, name)?;
+    let pins_snapshot = read_regular_file(&path, 65536, "toolchain pins")?;
     ensure!(
         crate::model::FileIdentity::matches_git_tracked_opt(
-            identity(&path)?.as_ref(),
+            pins_snapshot.as_ref().map(|(_, id)| id),
             header.managed.get(name),
         ),
         "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
     );
-    let pins = crate::runtime::ToolPins::parse(&fs::read(path)?)?;
+    let pins = crate::runtime::ToolPins::parse(&pins_snapshot.unwrap().0)?;
     ensure!(
         pins.version == header.version,
         "Accepted version differs from toolchain pins"
@@ -582,6 +688,12 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         && SemVer::parse(&pin.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
     {
         return Ok(());
+    }
+    if command_name == "stand"
+        && !exists(&cache.engine_path(&pin)?)?
+        && let Some(release) = cache.cached(&header.version, &header.release_identity)?
+    {
+        cache.prime_engine(&release)?;
     }
     if is_lifecycle && !exists(&cache.engine_path(&pin)?)? {
         cache.acquire(

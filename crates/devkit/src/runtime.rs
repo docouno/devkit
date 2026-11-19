@@ -2636,6 +2636,15 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
     let deadline = Instant::now() + Duration::from_secs(1);
     let root = project_root(root)?;
     runtime_pending(&root)?;
+    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
+    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+        return Err(crate::cli::error(
+            "UNSUPPORTED_PROJECT_VERSION",
+            format!(
+                "stand reserve requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+            ),
+        ));
+    }
     let request = RuntimeRequest::new(root.clone(), "stand reserve".into());
     let before = read_project_state(&root)?;
     let runnable = |c: &ComponentState| {
@@ -2812,6 +2821,15 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
 
     let root = project_root(root)?;
     runtime_pending(&root)?;
+    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
+    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
+        return Err(crate::cli::error(
+            "UNSUPPORTED_PROJECT_VERSION",
+            format!(
+                "stand remove requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
+            ),
+        ));
+    }
     let request = RuntimeRequest::new(root.clone(), "stand remove".into());
     let _lock = CheckoutLock::acquire_exclusive(&root, "stand remove", Some(runner))?;
     let admission = ToolAdmission::capture_service(&request)?;
