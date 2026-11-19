@@ -544,6 +544,22 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         self.assertIn(WT_VERSION, run(wt, "--version").stdout)
         self.assertTrue((project / "AGENTS.md").is_file())
         self.assertTrue((project / ".config/wt.toml").is_file())
+        agents_text = (project / "AGENTS.md").read_text()
+        for snippet in (
+            "--lockfile-only --ignore-scripts",
+            "-w",
+            "DEVKIT_PREVIEW_URL_TEMPLATE",
+            "wt switch --create --no-cd --yes",
+            "wt remove --foreground --yes",
+        ):
+            self.assertIn(snippet, agents_text)
+        wt_text = (project / ".config/wt.toml").read_text()
+        self.assertIn("wt config approvals add --yes", wt_text)
+        readme_text = (project / "README.md").read_text()
+        self.assertIn("`make info` shows readiness, leased ports and preview URLs", readme_text)
+        self.assertIn("`make update to=VERSION`", readme_text)
+        self.assertNotIn("`make status` shows local ports", readme_text)
+        (project / ".env").write_text("DEVKIT_PREVIEW_URL_TEMPLATE=https://{port}--{branch}.wt.example.test\n")
         run("git", "init", "-b", "main")
         run("git", "add", ".")
         run("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Create test checkout")
@@ -552,12 +568,16 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         linked = Path(next(line.removeprefix("worktree ") for line in listing.splitlines()
                            if line.startswith("worktree ") and "/.worktrees/" in line))
         self.assertIn("review/api", run(wt, "list").stdout)
-        clean_env = {key: value for key, value in env.items() if key not in ("DEVKIT_ENGINE_PATH", "MAKEFILES", "DEVKIT_APP")}
+        clean_env = {key: value for key, value in env.items() if key not in ("DEVKIT_ENGINE_PATH", "MAKEFILES", "DEVKIT_APP", "DEVKIT_PREVIEW_URL_TEMPLATE")}
         info = json_result(run("make", "info", "json=1", cwd=linked, env=clean_env))["result"]
         self.assertEqual(info["standState"], "stopped")
         self.assertEqual(info["branch"], "review/api")
         self.assertEqual(info["worktreeKind"], "linked")
         self.assertEqual(len(info["standPorts"]), 1)
+        self.assertEqual(
+            info["standPorts"][0]["previewUrl"],
+            f"https://{info['standPorts'][0]['first']}--review-api.wt.example.test",
+        )
         self.assertFalse((linked / ".devkit/state/stand.active").exists())
         history = linked / ".devkit/state/stand.history.json"
         saved = history.read_bytes()

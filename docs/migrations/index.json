@@ -20,6 +20,16 @@
       "profiles": ["node", "web", "electron", "rust"],
       "docPath": "docs/migrations/0.5.0.md",
       "anchor": "sticky-ports-preview-and-connected-stands"
+    },
+    {
+      "id": "make-targets-and-worktrunk",
+      "version": "0.5.0",
+      "severity": "recommended",
+      "title": "Adopt Make lifecycle targets and Worktrunk hooks",
+      "summary": "Review colliding root Make target names, optional .config/wt.toml hook setup, non-interactive agent flags and .gitignore /.worktrees/ coverage.",
+      "profiles": [],
+      "docPath": "docs/migrations/0.5.0.md",
+      "anchor": "make-targets-and-worktrunk"
     }
   ]
 }

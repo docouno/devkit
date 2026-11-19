@@ -28,12 +28,15 @@ const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/
 const PROJECT_AGENTS: &[u8] = b"# Development instructions\n\n\
 - Start with `make help` and `make info`. Use `make setup` to prepare pinned tools and dependencies.\n\
 - Run `make check`, `make test`, and `make build` in the checkout. These gates use offline containers.\n\
-- Change dependencies with `make exec write=1 network=bridge command='pnpm add ...'` in the Node workspace or with an explicit component selector. Use the pinned container tools for Rust too. Run `make sync` and `make setup` after changing dependency inputs.\n\
-- Use `make add-app`, `make add-package`, and `make register` for component registration. Keep accepted `.devkit/` files managed through `make sync`, `make update`, or `make recover`.\n\
+- Change dependencies through `make exec` with an explicit component selector and lockfile-only flags, for example `make exec app=<name> write=1 network=bridge command='pnpm add <pkg> --lockfile-only --ignore-scripts'` (or `package=<name>`, `-w` for `pnpm add`/`pnpm remove` in the root Node workspace without a selector, `prepare=1` before the first `make setup`, and `cargo` inside `app=`/`package=` for Rust), then run `make setup` (and `make sync` after manual `package.json` or `.npmrc` edits). Do not edit managed `toolDependencies` manually or invoke host package managers.\n\
+- Use `make add-app`, `make add-package`, `make register`, `make sync`, `make update`, and `make recover` to manage components and environment updates.\n\
+- Set `DEVKIT_PREVIEW_URL_TEMPLATE` in the main checkout's root `.env` when using a preview reverse proxy; linked Git worktrees inherit it automatically.\n\
+- In non-interactive Worktrunk sessions (including agent PTY runners), pass `--yes` (`wt switch --create --no-cd --yes <branch>`, `wt remove --foreground --yes <branch>`, or approve hooks once with `wt config approvals add --yes`) to avoid interactive hook prompts.\n\
 - Keep application and shared code in `apps/` and `packages/`. The root `Makefile` and `compose.yaml` belong to this project. See [.devkit/runtime/GUIDE.md](.devkit/runtime/GUIDE.md) for command details.\n";
 
 const PROJECT_WORKTRUNK: &[u8] =
     br#"# Worktrunk runs approved project hooks in the target checkout.
+# Pass --yes in non-interactive sessions or run wt config approvals add --yes.
 # Enable the optional start with DEVKIT_WT_AUTOSTART=1.
 [pre-start]
 devkit-reserve = "sh .devkit/runtime/devkit.sh worktree-hook reserve"
@@ -77,8 +80,8 @@ fn project_readme(name: &str, state: &ProjectState) -> String {
         });
     if let Some((path, _)) = app {
         text += &format!(
-            "\nStart development with `make dev app={}`. `make status` shows local ports; \
-             `make down` stops the project stack and preserves data volumes.\n",
+            "\nStart development with `make dev app={}`. `make info` shows readiness, leased ports \
+             and preview URLs; `make down` stops the project stack and preserves data volumes.\n",
             path.rsplit('/').next().unwrap()
         );
     }
@@ -87,9 +90,10 @@ fn project_readme(name: &str, state: &ProjectState) -> String {
          Shared code lives in `packages/` and is consumed through its native public interfaces. \
          See [.devkit/runtime/GUIDE.md](.devkit/runtime/GUIDE.md) for daily commands, \
          ownership boundaries, dependency workflows and library packaging.\n\n\
-         Use the [Devkit CLI](https://github.com/docouno/devkit/blob/v{}/README.md) to add \
-         components or explicitly accept an environment update. A newer CLI does not update \
-         this project's accepted environment automatically.\n",
+         Use `make add-app`, `make add-package`, `make register`, and `make update to=VERSION` \
+         to register components or explicitly accept an environment update (see the \
+         [Devkit documentation](https://github.com/docouno/devkit/blob/v{}/README.md)). \
+         A newer external CLI does not update this project's accepted environment automatically.\n",
         env!("CARGO_PKG_VERSION")
     );
     text

@@ -48,6 +48,18 @@ fn help_version_and_catalog_do_not_require_home_sdk_cache_or_docker() {
             "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if args == vec!["--help"] {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                text.contains("Commands: help, info, setup, doctor,"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Reconcile transitive lockfile resolutions when needed"),
+                "{text}"
+            );
+            assert!(!text.contains("npm lockfile"), "{text}");
+        }
         if args.contains(&"--json") {
             assert_eq!(decoded(&output)["schemaVersion"], 1);
             assert_eq!(decoded(&output)["ok"], true);
