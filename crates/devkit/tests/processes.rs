@@ -554,7 +554,10 @@ fn stopped_creator_group_wakes_and_terminates_without_sigkill_delay() {
         )
         .err()
         .unwrap();
-    assert!(error.to_string().contains("exceeded its deadline"));
+    assert!(
+        error.to_string().contains("exceeded its deadline"),
+        "{error:#}"
+    );
     assert!(
         started.elapsed() < Duration::from_millis(1500),
         "Stopped creator waited for SIGKILL instead of waking on SIGCONT: {:?}",
