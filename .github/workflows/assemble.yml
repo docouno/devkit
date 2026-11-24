@@ -194,8 +194,11 @@ jobs:
           make pack-local output="$PWD/.artifacts/preview" npm_inputs="$PWD/.artifacts/npm-inputs" \
             target_inputs="x86_64-unknown-linux-musl:.artifacts/amd64:$AMD64 aarch64-unknown-linux-musl:.artifacts/arm64:$ARM64 aarch64-apple-darwin:.artifacts/darwin:$DARWIN" build_run="$BUILD_RUN"
           jq -e '.publicationEligible == false and (.engines | length) == 3' .artifacts/preview/release-index.json
-          echo "preview_artifact=devkit-darwin-preview-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          echo "preview_index_sha256=$(sha256sum .artifacts/preview/release-index.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          preview_artifact="devkit-darwin-preview-$GITHUB_RUN_ATTEMPT"
+          preview_sha256=$(sha256sum .artifacts/preview/release-index.json | cut -d ' ' -f 1)
+          echo "preview_artifact=$preview_artifact" >> "$GITHUB_OUTPUT"
+          echo "preview_index_sha256=$preview_sha256" >> "$GITHUB_OUTPUT"
+          printf 'Darwin preview artifact %s has index SHA-256 %s.\n' "$preview_artifact" "$preview_sha256" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: inputs.state == 'fresh'
         with:

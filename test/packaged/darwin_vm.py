@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run the Apple Silicon Docker acceptance gate on an unpublished three-target set."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +9,7 @@ import subprocess
 import tarfile
 
 from verify import Verification, require
-from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, payload_engine
+from release_targets import DARWIN_ARM64, executable_header_matches, host_target, payload_engine
 
 
 def check_vm(test, context, daemon, bundle):
@@ -95,19 +94,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--expected-index-sha256", required=True)
-    parser.add_argument("--checkout-bundle", type=Path, required=True)
-    parser.add_argument("--docker-context", required=True)
+    bundle = parser.add_mutually_exclusive_group(required=True)
+    bundle.add_argument("--export-checkout-bundle", type=Path,
+                        help="Create and verify a Linux consumer checkout for transfer to the Mac")
+    bundle.add_argument("--checkout-bundle", type=Path, help="Verify the transferred Linux checkout on the Mac")
+    parser.add_argument("--docker-context", help="Named local Docker context on the Mac")
     args = parser.parse_args()
+    if args.export_checkout_bundle:
+        require(host_target() != DARWIN_ARM64 and not args.docker_context,
+                "Export the checkout from a native Linux runner")
+        require(not args.export_checkout_bundle.exists(), "Cross-host bundle already exists")
+        helper = Verification(args.build_set, preview_index_sha256=args.expected_index_sha256)
+        try:
+            helper.cross_host_checkout(export=args.export_checkout_bundle)
+            require(not helper.forbidden_log.exists(), "Attempted to use a host language SDK")
+        finally:
+            helper.cleanup()
+        proof = {**helper.results[-1], "indexSha256": args.expected_index_sha256}
+        receipt = helper.receipt / "linux-bundle.json"
+        receipt.write_text(json.dumps(proof, indent=2) + "\n")
+        print("Exported checkout:", args.export_checkout_bundle, "commit:", proof["commit"], flush=True)
+        print("Linux bundle evidence:", receipt, flush=True)
+        shutil.rmtree(helper.scratch)
+        return
     require(host_target() == DARWIN_ARM64, "Run on Apple Silicon")
-    require(args.docker_context != "default" and not os.environ.get("DOCKER_HOST"),
+    require(args.docker_context and args.docker_context != "default" and not os.environ.get("DOCKER_HOST"),
             "Use a named local Docker context without a DOCKER_HOST override")
-    raw = (args.build_set / "release-index.json").read_bytes()
-    require(hashlib.sha256(raw).hexdigest() == args.expected_index_sha256, "Frozen index differs")
-    index = json.loads(raw)
-    require(set(index["engines"]) == {LINUX_X64, LINUX_ARM64, DARWIN_ARM64}, "Expected all three targets")
-    release = args.build_set / "payload"
-    require(hashlib.sha256((release / "release.json").read_bytes()).hexdigest() == index["releaseIdentity"],
-            "Staged payload differs from the frozen identity")
+    bundle_path = args.checkout_bundle.resolve(strict=True)
     endpoint = subprocess.check_output(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}",
                                         args.docker_context], text=True, timeout=30).strip()
     require(endpoint.startswith("unix:///"), "Docker context must refer to a local Linux VM Unix socket")
@@ -115,18 +128,19 @@ def main():
                                                  "--format", "{{json .}}"], text=True, timeout=30))
     require(daemon["OSType"] == "linux", "Expected a Linux Docker VM")
     arch = {"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64"}[daemon["Architecture"]]
-    helper = Verification(release, daemon_arch=arch, scratch_parent=Path.home())
+    helper = Verification(args.build_set, daemon_arch=arch, scratch_parent=Path.home(),
+                          preview_index_sha256=args.expected_index_sha256)
     (helper.scratch / "without-host-sdks/make").symlink_to("/usr/bin/make")
     home = helper.scratch / "test home"
     home.mkdir()
     helper.environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
                               DOCKER_CONFIG=os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker")),
                               DOCKER_CONTEXT=args.docker_context, WORKTRUNK_WORKTREE_PATH="{{ repo_path }}/.worktrees/{{ branch | sanitize }}")
-    evidence = {"passed": False, "indexSha256": args.expected_index_sha256, "releaseIdentity": index["releaseIdentity"],
+    evidence = {"passed": False, "indexSha256": args.expected_index_sha256, "releaseIdentity": helper.release_identity,
                 "macOS": subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip(),
                 "dockerBackend": daemon.get("OperatingSystem"), "dockerVersion": daemon.get("ServerVersion")}
     try:
-        evidence.update(check_vm(helper, args.docker_context, daemon, args.checkout_bundle.resolve(strict=True)))
+        evidence.update(check_vm(helper, args.docker_context, daemon, bundle_path))
         require(not helper.forbidden_log.exists(), "Attempted to use a host language SDK")
         evidence["passed"] = True
     finally:

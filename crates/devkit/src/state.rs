@@ -490,32 +490,40 @@ pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
-    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+pub(crate) fn darwin_bsd_info(
+    pid: i32,
+    include_zombie: bool,
+) -> std::io::Result<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let length = size_of::<libc::proc_bsdinfo>() as i32;
-    // SAFETY: info is an aligned output buffer of exactly the declared size.
+    // SDK proc_pidinfo's nonzero argument includes unreaped BSD records.
     let count = unsafe {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            u64::from(include_zombie),
             info.as_mut_ptr().cast(),
             length,
         )
     };
-    if count == length {
-        let info = unsafe { info.assume_init() };
-        return (info.pbi_pid == pid as u32 && info.pbi_status != libc::SZOMB).then_some((
-            info.pbi_ppid,
-            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
-        ));
+    if count != length {
+        return Err(std::io::Error::last_os_error());
     }
-    if !matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM | libc::EACCES)
-    ) {
-        return None;
+    Ok(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    match darwin_bsd_info(pid, false) {
+        Ok(info) => {
+            return (info.pbi_pid == pid as u32 && info.pbi_status != libc::SZOMB).then_some((
+                info.pbi_ppid,
+                info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(_) => return None,
     }
     // KERN_PROC_PID exposes BSD identity for a live parent/lock holder under another UID.
     unsafe extern "C" {

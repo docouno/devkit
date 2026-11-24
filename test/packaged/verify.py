@@ -30,7 +30,7 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "test"))
-from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, linux_arch, payload_engine  # noqa: E402
+from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, linux_arch, payload_engine, payload_name  # noqa: E402
 
 OWNERSHIP = "io.docouno.devkit.packaged-test"
 
@@ -120,14 +120,15 @@ def changed_files(changes):
 
 class Verification:
     def __init__(self, release, next_release=None, *, package_source="local",
-                 public_bootstrap=None, daemon_arch=None, scratch_parent=None):
+                 public_bootstrap=None, daemon_arch=None, scratch_parent=None, preview_index_sha256=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
         self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-", dir=scratch_parent))
         self.daemon_arch = daemon_arch or linux_arch()
         self.linux_target = {"amd64": LINUX_X64, "arm64": LINUX_ARM64}[self.daemon_arch]
-        self.release = self.copy_release(release, "release")
+        self.release = (self.copy_preview(release, preview_index_sha256) if preview_index_sha256 is not None
+                        else self.copy_release(release, "release"))
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
         self.release_identity = sha256((self.release / "release.json").read_bytes())
@@ -204,6 +205,43 @@ class Verification:
         if write:
             command.append("--write")
         return command + ["--", *argv]
+
+    def copy_preview(self, build_set, expected_sha256):
+        raw = (build_set / "release-index.json").read_bytes()
+        require(sha256(raw) == expected_sha256, "Frozen preview index SHA-256 differs")
+        index = json.loads(raw)
+        targets = (LINUX_X64, LINUX_ARM64, DARWIN_ARM64)
+        require(index["publicationEligible"] is False and
+                index["engines"] == {target: "devkit-" + target for target in targets},
+                "Expected an unpublished three-target preview")
+        archive_name = index["archive"]
+        require(archive_name == f'devkit-{index["version"]}.tar.gz' and Path(archive_name).name == archive_name,
+                "Invalid preview archive name")
+        # Artifact downloads do not retain executable modes or the payload directory.
+        # Extract the same private archive copy that was verified against the frozen index.
+        archive = self.scratch / archive_name
+        shutil.copyfile(build_set / archive_name, archive)
+        require(archive_name in index["files"], "Preview archive missing from the index")
+        for name, identity in index["files"].items():
+            require(Path(name).name == name and name not in ("", ".", ".."), "Invalid preview asset name")
+            path = archive if name == archive_name else build_set / name
+            with path.open("rb") as stream:
+                require(os.fstat(stream.fileno()).st_size == identity["size"] and
+                        hashlib.file_digest(stream, "sha256").hexdigest() == identity["sha256"],
+                        f"Frozen preview asset differs: {name}")
+        release = self.copy_release(archive, "release")
+        manifest = (release / "release.json").read_bytes()
+        require(sha256(manifest) == index["releaseIdentity"] == index["files"]["release.json"]["sha256"],
+                "Preview payload differs from its frozen release identity")
+        accepted = json.loads(manifest)
+        require(accepted["version"] == index["version"], "Preview manifest version differs")
+        for target, asset in index["engines"].items():
+            member = payload_name(target)
+            with (release / member).open("rb") as stream:
+                require(executable_header_matches(stream.read(64), target) and
+                        accepted["files"][member]["sha256"] == index["files"][asset]["sha256"],
+                        f"Preview payload engine differs from {asset}")
+        return release
 
     def copy_release(self, source, name):
         source = Path(source).resolve()

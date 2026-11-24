@@ -353,6 +353,37 @@ impl GroupWatcher {
     }
 }
 
+/// Observe exit before reaping so the direct child's PID still pins its PGID
+/// while we stop any remaining descendants. launchd reaps orphans on Darwin.
+pub(super) fn poll_creator(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    let pid = child.id();
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            if info.si_pid == 0 {
+                return Ok(None);
+            }
+            signal_group(pid as i32, libc::SIGKILL);
+            return child.try_wait();
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return child.try_wait();
+        }
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 // Executed in a fork child. Return raw errno so Rust's exec-error pipe reports
 // failure and std::process reaps the child; never allocate or unwind here.
 fn child_gate([pid_rd, pid_wr, gate_rd, gate_wr]: [RawFd; 4]) -> io::Result<()> {
@@ -421,9 +452,12 @@ impl Groups {
 
     fn stop(&mut self, pid: i32) {
         if let Some(started) = self.0.remove(&pid)
-            && start_of(pid) == Some(started)
-            && unsafe { libc::getpgid(pid) } == pid
+            && let Ok(info) = crate::state::darwin_bsd_info(pid, true)
+            && info.pbi_pid == pid as u32
+            && info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec == started
         {
+            // The recorded leader's PID still exists, including a zombie held
+            // by a stopped controller. Its PGID cannot have been reassigned.
             signal_group(pid, libc::SIGKILL);
         }
     }
@@ -467,13 +501,20 @@ pub fn run_watcher(args: &[OsString]) -> Result<()> {
         "Invalid observer socket"
     );
     // Post-exec and single-threaded. /dev/fd can enumerate its own transient directory FD.
-    let descriptors: Vec<i32> = std::fs::read_dir("/dev/fd")?
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|&n| n >= 3 && n != fd)
-        .collect();
+    let mut descriptors = Vec::new();
+    for entry in std::fs::read_dir("/dev/fd")? {
+        let name = entry?.file_name();
+        let n: i32 = name.to_str().context("Invalid descriptor name")?.parse()?;
+        if n >= 3 && n != fd {
+            descriptors.push(n);
+        }
+    }
     for n in descriptors {
-        unsafe {
-            libc::close(n);
+        if unsafe { libc::close(n) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EBADF) {
+                return Err(error.into());
+            }
         }
     }
     let mut channel = unsafe { UnixStream::from_raw_fd(fd) };

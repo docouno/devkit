@@ -468,7 +468,7 @@ impl ProcessRunner {
             if reader_failed.load(Ordering::SeqCst) {
                 break Err(anyhow::anyhow!("Cannot read native command output"));
             }
-            match creator.child.try_wait() {
+            match creator.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
                     if input_failed.load(Ordering::SeqCst) {
@@ -646,7 +646,7 @@ impl ProcessRunner {
                 );
                 match stdout.read(&mut header[count..]) {
                     Ok(0) => {
-                        if let Some(status) = creator.child.try_wait()? {
+                        if let Some(status) = creator.try_wait()? {
                             ensure!(count == 0, "Truncated image metadata header");
                             return Ok((None, Some(status)));
                         }
@@ -1116,13 +1116,21 @@ impl Creator {
             watcher: None,
         }
     }
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "macos")]
+        {
+            darwin::poll_creator(&mut self.child)
+        }
+        #[cfg(target_os = "linux")]
+        self.child.try_wait()
+    }
     fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
         // This process has no daemon-side mutation to reconcile. Stop it
         // immediately and never enter the mutation grace period on drop.
         self.finished = true;
         signal_group(self.pid, libc::SIGKILL);
         loop {
-            if self.child.try_wait()?.is_some() {
+            if self.try_wait()?.is_some() {
                 reap_available(self.pid)?;
                 if !group_exists(self.pid) {
                     return Ok(());
@@ -1147,7 +1155,7 @@ impl Creator {
         // Reap the direct creator via Child before waitpid handles adopted
         // descendants, and still kill the group if waiting itself fails.
         while Instant::now() < deadline {
-            match self.child.try_wait() {
+            match self.try_wait() {
                 Ok(Some(_)) => {
                     reaped = true;
                     break;

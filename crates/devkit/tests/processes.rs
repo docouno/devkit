@@ -162,7 +162,7 @@ fn native_process_probe() {
     };
     let runner = ProcessRunner::new().unwrap();
     #[cfg(target_os = "macos")]
-    if scenario == "watcher-kill" {
+    if matches!(scenario.as_str(), "watcher-kill" | "watcher-leader-exits") {
         runner
             .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
             .unwrap();
@@ -176,6 +176,9 @@ fn native_process_probe() {
         "foreign-cleanup" => "printf foreign-token > \"$DEVKIT_PROCESS_FIXTURE/container\"",
         "cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"",
         "primary-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 42",
+        "watcher-leader-exits" => {
+            r#"sleep 25 & printf '%s' "$!" > "$DEVKIT_PROCESS_FIXTURE/child-pid"; touch "$DEVKIT_PROCESS_FIXTURE/ready"; while ! test -f "$DEVKIT_PROCESS_FIXTURE/exit"; do sleep 0.02; done"#
+        }
         "wait-cancel" | "watcher-kill" => {
             "sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
         }
@@ -753,4 +756,36 @@ fn failed_group_registration_is_a_reaped_spawn_error() {
         Some(libc::ECHILD)
     );
     runner.capture(&mut Command::new("true")).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn watcher_cleans_descendants_of_an_exited_unreaped_creator() {
+    let fixture = Fixture::new();
+    let mut controller = fixture.start("watcher-leader-exits");
+    wait_for(&fixture.root().join("ready"));
+    let pid = controller.id() as i32;
+    let descendant = fs::read_to_string(fixture.root().join("child-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+        pid
+    );
+    fs::write(fixture.root().join("exit"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_exists(descendant) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let survived = process_exists(descendant);
+    controller.kill().unwrap();
+    let _ = wait(controller);
+    assert!(
+        !survived,
+        "Exited group leader left a descendant while the controller was stopped"
+    );
 }

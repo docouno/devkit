@@ -6,6 +6,8 @@ This repository uses a pinned Devkit development environment. Daily commands run
 
 The same project commit works on Linux x86-64 and ARM64. Run `make setup` on the destination host to prepare images, the Linux container helper, and any pnpm or Electron downloads for the local Docker daemon. Each host keeps its own ignored build outputs. Electron packaging produces a Linux bundle for the daemon architecture.
 
+`make info json=1` reports the CLI's `hostTarget`, the `preparedPlatform` recorded by setup, and whether the matching helper is available locally (`helperReady`). On a cold checkout, the platform and helper status can be null. Run `make doctor` to inspect the active Docker daemon when diagnosing a platform mismatch.
+
 ## Repository Layout
 
 - `apps/<name>` (`0..N`): Runnable product entry points (`node-api`, `react-web`, `electron-react`, `rust-api`). Libraries-only repositories may have zero applications.
@@ -39,7 +41,7 @@ The same project commit works on Linux x86-64 and ARM64. Run `make setup` on the
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
 | `make info [app=NAME] [json=1]` | Show checkout identity, readiness, registered components and stand addresses |
 | `make sync [reconcile=1] [preview=1]` | Synchronize workspace projections and `pnpm-lock.yaml` after manual `package.json` or `.npmrc` edits |
-| `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
+| `make doctor` | Inspect accepted images, local tool readiness, disk space, and Docker resource limits |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |
 | `make test` | Run native unit and integration test suites offline |
