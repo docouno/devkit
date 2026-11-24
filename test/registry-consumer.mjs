@@ -141,6 +141,13 @@ if (mode === 'serve') {
     return result.stdout + result.stderr;
   }
   const lock = join(target, mode === 'first' ? 'package-lock.json' : 'pnpm-lock.yaml');
+  const selected = `@docouno/env@${metadata[1].environment.version}`;
+  if (mode === 'second' || mode === 'release-day') {
+    assert(
+      readFileSync(join(target, 'pnpm-workspace.yaml'), 'utf8').includes(selected),
+      'Generated workspace must select the exact environment version',
+    );
+  }
   if (mode === 'second') {
     // Public v9 packages need only SRI; remove the exact local fixture tarball URL.
     const text = readFileSync(lock, 'utf8').replace(/,? ?tarball: ([^,}\n]+)/gu, (match, url) => {
@@ -195,11 +202,6 @@ if (mode === 'serve') {
   } else if (mode === 'release-day') {
     const workspace = join(target, 'pnpm-workspace.yaml');
     const settings = readFileSync(workspace, 'utf8');
-    const selected = `@docouno/env@${metadata[1].environment.version}`;
-    assert(
-      settings.includes(selected),
-      'Generated workspace must select the exact environment version',
-    );
     const app = join(target, 'apps/main');
     const manifest = join(app, 'package.json');
     assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
@@ -219,7 +221,6 @@ if (mode === 'serve') {
     assert(read(manifest).dependencies.clsx);
     assert.notDeepEqual(readFileSync(lock), original);
   } else if (mode === 'negative') {
-    const selected = `@docouno/env@${metadata[1].version}`;
     const lines = original.toString().split('\n');
     let inside = false,
       changed = false;
