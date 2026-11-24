@@ -46,6 +46,7 @@ sticky.on('upgrade', (q, s, h) => {
     upstream.pipe(s);
     s.pipe(upstream);
   });
+  s.on('error', () => s.destroy());
   s.on('close', () => upstream.destroy());
   upstream.on('error', () => s.destroy());
 });
