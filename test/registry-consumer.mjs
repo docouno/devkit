@@ -102,7 +102,6 @@ if (mode === 'serve') {
       res.writeHead(400).end();
     }
   });
-  server.maxConnections = 16;
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
@@ -232,32 +231,41 @@ if (mode === 'serve') {
     }
     assert(changed, 'Missing env integrity');
     writeFileSync(lock, lines.join('\n'));
-    pnpm(
+    // Relink from the populated store so only the tampered entry needs a tarball.
+    const rejected = pnpm(
       [
         'install',
         '--frozen-lockfile',
         '--ignore-scripts',
         '--trust-lockfile',
         '--store-dir',
-        '/proof/pnpm-neg-store',
+        '/proof/pnpm-store',
+        '--virtual-store-dir',
+        '/proof/pnpm-neg-modules',
         '--config.fetch-retries=0',
       ],
       target,
       /ERR_PNPM_TARBALL_INTEGRITY|EINTEGRITY/,
     );
+    assert(
+      rejected.replace(/\s/gu, '').includes(current.environment.integrity),
+      'pnpm must report the actual integrity of the released environment tarball',
+    );
     writeFileSync(lock, original);
-    pnpm(
+    const missing = '@docouno/env@99.99.99';
+    const unavailable = pnpm(
       [
         'add',
         '--lockfile-only',
         '--ignore-scripts',
         '--trust-lockfile',
-        '@docouno/env@99.99.99',
+        missing,
         '--config.fetch-retries=0',
       ],
       join(target, 'apps/main'),
       /ERR_PNPM_NO_MATCHING_VERSION|No matching version/,
     );
+    assert(unavailable.includes(missing), 'pnpm must reject the requested environment version');
     const unknown = await fetch(registry + '@docouno/unsupplied');
     assert.equal(unknown.status, 404);
     const attestation = await fetch(`${registry}-/npm/v1/attestations/${selected}`, {
