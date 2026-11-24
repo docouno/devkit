@@ -507,9 +507,9 @@ impl<'a> ReleaseCache<'a> {
         release.recheck()?;
         publish_new_directory(&unpacked, &target)?;
         let release = release::admit_release(&target)?;
-        self.remember(&release)?;
         drop(_lock);
         self.prime_engine(&release)?;
+        self.remember(&release)?;
         Ok(release)
     }
     pub fn import(
@@ -558,9 +558,9 @@ impl<'a> ReleaseCache<'a> {
             publish_new_directory(&payload, &target)?;
             release::admit_release(&target)?
         };
-        self.remember(&release)?;
         drop(_lock);
         self.prime_engine(&release)?;
+        self.remember(&release)?;
         Ok(release)
     }
 }

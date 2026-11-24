@@ -818,42 +818,31 @@ fn stage_runtime_files(
 ) -> Result<BTreeMap<String, FileIdentity>> {
     let mut managed = BTreeMap::new();
     let scoped = uses_profile_scoped_runtime(&state.version)?;
-    let omit_desktop = scoped && !has_electron(state);
-    if scoped {
-        for name in DESKTOP_RUNTIME_FILES {
-            ensure!(
-                release.manifest.files.contains_key(name),
-                "Missing release {name}"
-            );
-        }
-    }
+    ensure!(
+        release.manifest.version == state.version,
+        "Release version differs from staged project"
+    );
+    let headless_tools = if scoped {
+        let tools = release.scoped_tool_compose()?;
+        (!has_electron(state)).then_some(tools)
+    } else {
+        None
+    };
     for (name, id) in &release.manifest.files {
         if !name.starts_with("runtime/")
-            || (omit_desktop && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
+            || (headless_tools.is_some() && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
         {
             continue;
         }
-        let mut bytes = release.bytes(name)?;
-        if scoped && name == "runtime/toolchains.env" {
-            let pins = ReleaseToolPins::parse(&bytes)?;
-            ensure!(
-                pins.engine.version == state.version,
-                "Release toolchain version differs from manifest"
-            );
-            ensure!(
-                pins.desktop_recipe == release.manifest.files["runtime/desktop.Dockerfile"].sha256,
-                "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
-            );
-            if omit_desktop {
-                bytes = std::str::from_utf8(&bytes)?
-                    .split_inclusive('\n')
-                    .filter(|line| !line.starts_with("DEVKIT_DESKTOP_RECIPE_HASH="))
-                    .collect::<String>()
-                    .into_bytes();
-            }
-        } else if omit_desktop && name == "runtime/compose.tools.yaml" {
-            bytes = render_headless_tool_compose(&bytes)?;
-        }
+        let bytes = match (&headless_tools, name.as_str()) {
+            (Some(_), "runtime/toolchains.env") => std::str::from_utf8(&release.bytes(name)?)?
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("DEVKIT_DESKTOP_RECIPE_HASH="))
+                .collect::<String>()
+                .into_bytes(),
+            (Some(tools), "runtime/compose.tools.yaml") => tools.to_vec(),
+            _ => release.bytes(name)?,
+        };
         let target = format!(".devkit/{name}");
         let path = safe_path(destination, &target)?;
         write_atomic(&path, &bytes, id.mode)?;
@@ -862,16 +851,8 @@ fn stage_runtime_files(
             identity(&path)?.context("Missing staged runtime file")?,
         );
     }
-    for required in [
-        "devkit.mk",
-        "devkit.sh",
-        "toolchains.env",
-        "compose.tools.yaml",
-    ] {
-        ensure!(
-            managed.contains_key(&format!(".devkit/runtime/{required}")),
-            "Missing release runtime/{required}"
-        );
+    for name in REQUIRED_RUNTIME_FILES {
+        ensure!(managed.contains_key(&format!(".devkit/{name}")), "Missing release {name}");
     }
     Ok(managed)
 }
@@ -1297,15 +1278,22 @@ pub struct AdmissionSnapshot {
     pub inputs: InputIdentitySet,
     pub source_signature: String,
     pub manifest_identity: FileIdentity,
+    scoped_runtime: bool,
 }
 impl AdmissionSnapshot {
     pub fn capture(root: &Path) -> Result<Self> {
+        Self::capture_for_runtime(root, false)
+    }
+    fn capture_for_runtime(root: &Path, scoped_runtime: bool) -> Result<Self> {
         let root = project_root(root)?;
         assert_no_pending(&root)?;
         let manifest_identity =
             identity(&safe_path(&root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
         let state = read_project_state(&root)?;
         assert_managed(&root, &state)?;
+        if scoped_runtime {
+            verify_runtime_inventory(&root, &state, true)?;
+        }
         assert_tool_profiles(&root, &state)?;
         let inputs = collect_native_input_closure(&root, &state)?;
         let source_signature = source_signature(&root, Some(&state))?;
@@ -1318,10 +1306,14 @@ impl AdmissionSnapshot {
             state,
             inputs,
             source_signature,
+            scoped_runtime,
             manifest_identity,
         })
     }
     pub fn recheck(&self) -> Result<()> {
+        if self.scoped_runtime {
+            verify_runtime_inventory(&self.root, &self.state, true)?;
+        }
         ensure!(
             identity(&safe_path(&self.root, MANIFEST_PATH)?)?.as_ref()
                 == Some(&self.manifest_identity),
@@ -1468,7 +1460,8 @@ fn mutate(
             );
         }
     }
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let scoped = uses_profile_scoped_runtime(&release.manifest.version)?;
+    let snapshot = AdmissionSnapshot::capture_for_runtime(&lock.root, scoped)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -1914,7 +1907,6 @@ fn mutate(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
-            tx.check_runtime_removals(root)?;
             if let Some(inventory) = compose_inventory {
                 assert_compose_inventory(root, inventory)?;
             }
@@ -1926,7 +1918,9 @@ fn mutate(
             }
             preflight()?;
         } else {
-            tx.commit(root, options.hooks, &preflight)?;
+            tx.commit_checked(root, options.hooks, &preflight, &|| {
+                verify_runtime_inventory(root, &next, scoped)
+            })?;
             if old.version != next.version {
                 remove_file(&safe_path(root, ".devkit/state/node-workspace.lock")?)?;
             }
@@ -2262,7 +2256,8 @@ pub fn sync_project(
         .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
     ensure_supported_checkout_floor(&root_candidate, false, min_from)?;
     let lock = CheckoutLock::acquire(target)?;
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let scoped = uses_profile_scoped_runtime(&release.manifest.version)?;
+    let snapshot = AdmissionSnapshot::capture_for_runtime(&lock.root, scoped)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -2460,7 +2455,6 @@ pub fn sync_project(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
-            tx.check_runtime_removals(root)?;
             Ok(())
         };
         if options.preview {
@@ -2469,7 +2463,9 @@ pub fn sync_project(
             }
             preflight()?;
         } else {
-            tx.commit(root, options.hooks, &preflight)?;
+            tx.commit_checked(root, options.hooks, &preflight, &|| {
+                verify_runtime_inventory(root, &next, scoped)
+            })?;
         }
         Ok(MutationOutcome {
             state: next.clone(),

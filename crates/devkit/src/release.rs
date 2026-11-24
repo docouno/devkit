@@ -8,10 +8,18 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
 use sha2::{Digest, Sha512};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
+
+pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 4] = [
+    "runtime/devkit.mk",
+    "runtime/devkit.sh",
+    "runtime/toolchains.env",
+    "runtime/compose.tools.yaml",
+];
 
 pub fn markdown_heading_anchors(markdown: &str) -> BTreeSet<String> {
     let mut anchors = BTreeSet::new();
@@ -182,6 +190,7 @@ pub struct AdmittedRelease {
     pub root: PathBuf,
     pub manifest: Release,
     pub identity: String,
+    headless_tools: Option<Vec<u8>>,
 }
 pub fn release_identity(root: &Path) -> Result<String> {
     Ok(digest(fs::read(safe_path(root, "release.json")?)?))
@@ -261,16 +270,64 @@ pub fn admit_release(root: &Path) -> Result<AdmittedRelease> {
         identity(&safe_path(&root, "release.json")?)?.as_ref() == Some(&before),
         "Release manifest changed during admission"
     );
-    Ok(AdmittedRelease {
+    let mut release = AdmittedRelease {
         identity: before.sha256,
         root,
         manifest,
-    })
+        headless_tools: None,
+    };
+    // A newer engine owns its runtime format. Older dispatchers only need the
+    // verified payload and its engine pin to hand control to that engine.
+    if crate::state::uses_profile_scoped_runtime(&release.manifest.version)?
+        && SemVer::parse(&release.manifest.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
+    {
+        release.headless_tools = Some(release.check_scoped_runtime()?);
+    }
+    Ok(release)
 }
 pub fn read_release(root: &Path) -> Result<Release> {
     Ok(admit_release(root)?.manifest)
 }
 impl AdmittedRelease {
+    fn check_scoped_runtime(&self) -> Result<Vec<u8>> {
+        let empty = digest(b"");
+        for name in [
+            "runtime/LICENSE",
+            "runtime/devkit.mk",
+            "runtime/devkit.sh",
+            "runtime/compose.tools.yaml",
+            "runtime/toolchains.env",
+        ]
+        .into_iter()
+        .chain(crate::state::DESKTOP_RUNTIME_FILES)
+        {
+            let file = self
+                .manifest
+                .files
+                .get(name)
+                .with_context(|| format!("Missing release {name}"))?;
+            ensure!(file.sha256 != empty, "Empty release {name}");
+        }
+        let pins = crate::runtime::ReleaseToolPins::parse(&self.bytes("runtime/toolchains.env")?)?;
+        ensure!(
+            pins.engine.version == self.manifest.version,
+            "Release toolchain version differs from manifest"
+        );
+        ensure!(
+            pins.desktop_recipe == self.manifest.files["runtime/desktop.Dockerfile"].sha256,
+            "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
+        );
+        crate::projections::render_headless_tool_compose(&self.bytes("runtime/compose.tools.yaml")?)
+    }
+
+    pub(crate) fn scoped_tool_compose(&self) -> Result<Cow<'_, [u8]>> {
+        match &self.headless_tools {
+            Some(bytes) => Ok(Cow::Borrowed(bytes)),
+            // Direct lifecycle APIs can stage a payload without CLI dispatch.
+            None => Ok(Cow::Owned(self.check_scoped_runtime()?)),
+        }
+    }
+
     pub fn bytes(&self, name: &str) -> Result<Vec<u8>> {
         let expected = self
             .manifest

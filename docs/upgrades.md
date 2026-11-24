@@ -10,7 +10,7 @@ Run upgrades on a dedicated Git branch:
 git switch -c chore/devkit-0.6.0
 
 # 1. Inspect planned file changes and applicable migration notes without modifying files
-npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview
+npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview --json
 
 # 2. Apply the environment update
 npx @docouno/devkit@0.6.0 update . --to 0.6.0

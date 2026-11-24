@@ -16,6 +16,8 @@ fn write_runtime_stub(root: &Path, path: &str) {
             "../../../runtime/compose.tools.yaml"
         ))
         .unwrap()
+    } else if path.ends_with("/LICENSE") {
+        include_bytes!("../../../LICENSE").to_vec()
     } else {
         b"{}\n".to_vec()
     };
@@ -383,6 +385,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
     }
@@ -401,6 +404,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
     ] {
@@ -585,6 +589,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
     }
@@ -665,6 +670,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
     ] {
@@ -939,6 +945,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
     }
@@ -1022,6 +1029,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/rust.Dockerfile",
         "apps/api/rust-toolchain.toml",

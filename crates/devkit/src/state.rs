@@ -366,6 +366,73 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
         rows
     ]))?))
 }
+
+/// Compare the live runtime namespace before reading file contents or accepting
+/// a new manifest. The project snapshot deliberately excludes some names.
+pub(crate) fn verify_runtime_inventory(
+    root: &Path,
+    state: &ProjectState,
+    scoped_licenses: bool,
+) -> Result<()> {
+    let mut files: BTreeSet<&Path> = state
+        .managed
+        .keys()
+        .map(Path::new)
+        .filter(|name| name.starts_with(".devkit/runtime"))
+        .collect();
+    let directories: BTreeSet<_> = files
+        .iter()
+        .copied()
+        .flat_map(|name| name.ancestors().skip(1))
+        .collect();
+    let mut pending = vec![safe_path(root, ".devkit/runtime")?];
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.strip_prefix(root)?;
+            let typ = entry.file_type()?;
+            if typ.is_dir() {
+                if scoped_licenses
+                    && name.starts_with(RUNTIME_LICENSES)
+                    && !directories.contains(name)
+                {
+                    // Sync can restore the notices of a registered Electron
+                    // component when their identities are also missing.
+                    ensure!(
+                        name == Path::new(RUNTIME_LICENSES),
+                        "Unlisted runtime directory: {}",
+                        name.display()
+                    );
+                    ensure!(
+                        has_electron(state),
+                        "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
+                    );
+                }
+                pending.push(path);
+            } else {
+                ensure!(
+                    files.remove(name),
+                    "Unlisted runtime file: {}",
+                    name.display()
+                );
+                ensure!(
+                    typ.is_file(),
+                    "Managed file conflict: {}; expected a regular runtime file",
+                    name.display()
+                );
+            }
+        }
+    }
+    if let Some(missing) = files.first() {
+        anyhow::bail!(
+            "Managed file conflict: {}; restore the missing runtime file",
+            missing.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
     for required in [
         CHECKSUM_PATH,
@@ -383,16 +450,16 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
             "Missing managed runtime identity: {required}"
         );
     }
-    let runtime = safe_path(root, ".devkit/runtime")?;
-    for (name, _) in file_map(&runtime)? {
-        let path = format!(".devkit/runtime/{name}");
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
+    if scoped {
         ensure!(
-            state.managed.contains_key(&path),
-            "Unlisted runtime file: {path}"
+            state.managed.contains_key(".devkit/runtime/LICENSE"),
+            "Missing managed runtime identity: .devkit/runtime/LICENSE"
         );
     }
+    verify_runtime_inventory(root, state, scoped)?;
     let electron = has_electron(state);
-    if electron || uses_profile_scoped_runtime(&state.version)? {
+    if electron || scoped {
         for name in DESKTOP_RUNTIME_FILES {
             let path = format!(".devkit/{name}");
             if electron {

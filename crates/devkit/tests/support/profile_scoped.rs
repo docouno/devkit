@@ -230,6 +230,7 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
         ("extra-pin", "rust", ".devkit/runtime/toolchains.env"),
         ("extra-file", "node", DESKTOP_FILES[1]),
         ("missing-file", "electron-react", DESKTOP_FILES[3]),
+        ("missing-mit", "rust", ".devkit/runtime/LICENSE"),
         ("wrong-recipe", "electron-react", DESKTOP_FILES[0]),
         (
             "stale-compose",
@@ -240,7 +241,7 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
         let root = temp.path().join(case);
         let mut state = init(&release, &root, template, PackageMode::Registry);
         match case {
-            "missing-file" => fs::remove_file(root.join(path)).unwrap(),
+            "missing-file" | "missing-mit" => fs::remove_file(root.join(path)).unwrap(),
             "wrong-recipe" => put(&root, path, b"FROM another-image\n"),
             _ => put(
                 &root,
@@ -248,7 +249,12 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
                 &fs::read(release.join(path.strip_prefix(".devkit/").unwrap())).unwrap(),
             ),
         }
-        record_managed_change(&root, &mut state, path, case != "missing-file");
+        record_managed_change(
+            &root,
+            &mut state,
+            path,
+            !matches!(case, "missing-file" | "missing-mit"),
+        );
         let result = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args(["--json", "--cache-dir"])
             .arg(temp.path().join("empty-cache"))
@@ -280,6 +286,10 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
                 .unwrap_err();
             assert!(format!("{err:#}").contains(path), "{err:#}");
             assert_eq!(author_port_payload(&root), before);
+        }
+        if case == "missing-mit" {
+            sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap();
+            assert_scoped_checkout(&root, false);
         }
     }
 }
@@ -361,16 +371,38 @@ fn preview_and_apply_preserve_excluded_entries_in_retiring_licenses() {
 }
 
 #[test]
-fn newly_arrived_license_content_rolls_back_the_migration() {
-    const OWNER_FILE: &str = ".devkit/runtime/licenses/.git/owner";
+fn first_electron_preserves_hidden_content_in_the_reserved_runtime() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("consumer");
+    init(&release, &root, "rust", PackageMode::Registry);
+    put(
+        &root,
+        ".devkit/runtime/licenses/.artifacts/owner",
+        b"owned locally",
+    );
+    let before = author_port_payload(&root);
+    let error = add_electron(&release, &root, "shell", None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains(".devkit/runtime/licenses"),
+        "{error:#}"
+    );
+    assert_eq!(author_port_payload(&root), before);
+    assert!(!root.join(PENDING_PATH).exists());
+    assert!(!root.join("apps/shell").exists());
+}
+
+#[test]
+fn profile_transitions_preserve_runtime_content_created_during_commit() {
     struct OwnerWrite<'a> {
         root: &'a Path,
+        file: &'a str,
         after: &'a str,
     }
     impl MutationHooks for OwnerWrite<'_> {
         fn after_write(&self, _: usize, path: &str) -> Result<()> {
             if path == self.after {
-                put(self.root, OWNER_FILE, b"owned locally");
+                put(self.root, self.file, b"owned locally");
             }
             Ok(())
         }
@@ -378,29 +410,64 @@ fn newly_arrived_license_content_rolls_back_the_migration() {
     let temp = TempDir::new().unwrap();
     let old = fixture_release(temp.path(), "0.5.1");
     let new = fixture_release(temp.path(), "0.6.0");
-    for (i, after) in [DESKTOP_FILES[2], DESKTOP_FILES[3]].into_iter().enumerate() {
+    for (i, (add, after, owner)) in [
+        (
+            false,
+            DESKTOP_FILES[2],
+            ".devkit/runtime/licenses/.git/owner",
+        ),
+        (
+            false,
+            DESKTOP_FILES[3],
+            ".devkit/runtime/licenses/.git/owner",
+        ),
+        (false, DESKTOP_FILES[3], ".devkit/runtime/owner.txt"),
+        (
+            true,
+            DESKTOP_FILES[3],
+            ".devkit/runtime/licenses/.artifacts/owner",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let root = temp.path().join(format!("consumer-{i}"));
-        init(&old, &root, "rust", PackageMode::Registry);
-        let before = author_port_payload(&root);
-        let error = update_project(
-            &new,
+        init(
+            if add { &new } else { &old },
             &root,
-            &UpdateOptions {
-                hooks: Some(&OwnerWrite { root: &root, after }),
-                ..Default::default()
-            },
-            &NoResolver,
-        )
-        .unwrap_err();
+            "rust",
+            PackageMode::Registry,
+        );
+        let before = author_port_payload(&root);
+        let hooks = OwnerWrite {
+            root: &root,
+            file: owner,
+            after,
+        };
+        let result = if add {
+            add_electron(&new, &root, "shell", Some(&hooks))
+        } else {
+            update_project(
+                &new,
+                &root,
+                &UpdateOptions {
+                    hooks: Some(&hooks),
+                    ..Default::default()
+                },
+                &NoResolver,
+            )
+        };
+        let error = result.unwrap_err();
         assert!(
-            format!("{error:#}").contains(".devkit/runtime/licenses"),
+            format!("{error:#}").contains(".devkit/runtime/"),
             "{error:#}"
         );
-        assert!(!root.join(PENDING_PATH).exists());
-        assert_eq!(fs::read(root.join(OWNER_FILE)).unwrap(), b"owned locally");
+        assert_eq!(fs::read(root.join(owner)).unwrap(), b"owned locally");
         let mut restored = author_port_payload(&root);
-        restored.remove(OWNER_FILE);
+        restored.remove(owner);
         assert_eq!(restored, before);
+        assert!(!root.join(PENDING_PATH).exists());
+        assert!(!root.join("apps/shell").exists());
     }
 }
 
