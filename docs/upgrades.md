@@ -9,7 +9,7 @@ Run upgrades on a dedicated Git branch:
 ```sh
 git switch -c chore/devkit-0.6.0
 
-# 1. Inspect planned file changes and applicable migration notes without modifying files
+# 1. Inspect planned file changes and applicable migration notes without modifying files (add --json for file hashes and modes)
 npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview
 
 # 2. Apply the environment update
@@ -38,10 +38,13 @@ make check
 
 ## Files affected by an update
 
+Use `make update to=VERSION preview=1` to review changes from a checkout on `0.5.0` or later. Apply with `make update to=VERSION` and run `make recover` if a local transaction is interrupted.
+
 If a `0.4.x` to `0.5.0` update leaves the older loader installed, use the `0.5.0` installer with `recover .` or `npx @docouno/devkit@0.5.0 recover .`. For journals older than `0.5.0` that exceed 4 MiB, run recovery with the pinned release that wrote the journal.
 
 - **Updated automatically**:
   - `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.*.yaml|json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`
+  - On upgrade to `0.6.0`, projects without a registered Electron component drop the managed desktop Dockerfile, seccomp profile, associated notices, desktop recipe pin and tool Compose entries. Adding or registering the first Electron app restores them in the same transaction as registration.
   - `{rust-component}/rust-toolchain.toml`
   - Managed `toolDependencies` entries inside `{node-component}/package.json` `devDependencies`
   - Root `pnpm-workspace.yaml` membership, the release-day age exception for the accepted `@docouno/env` version, and `pnpm-lock.yaml`
@@ -83,6 +86,10 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 Daily commands select the checked-in release and verify the engine for the current host. `describe`, `status`, `info`, and stand cleanup operate offline. `info` can report checkout state while the cache is cold or busy. `doctor` inspects the host and checkout without holding the checkout lock.
 
 `init --to VERSION` and `update --to VERSION` resolve the requested release. When that release has no engine for the current host, use a release that provides one. To migrate an x86-64-only `0.5.x` checkout on Linux ARM64, start the update directly with the `0.6.0` CLI.
+
+### Choosing a CLI for headless projects
+
+Use the checkout's Make targets, `sh .devkit/runtime/devkit.sh cli <command> ...`, or an external CLI at `0.6.0` or newer. Headless checkouts from `0.6.0` omit `DEVKIT_DESKTOP_RECIPE_HASH`. External engines through `0.5.1` expect that pin. In `0.5.1`, `add-app`, `add-package`, `register`, `sync`, `exec`, `task`, `describe`, `status`, `stand reserve` and `stand remove` fail before dispatch. The old `doctor` reports `Missing toolchain pin`, and `info` reports readiness as `unknown`.
 
 ## Recovering Interrupted Updates (`devkit recover`)
 

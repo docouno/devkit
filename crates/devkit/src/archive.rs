@@ -17,7 +17,7 @@ use std::{
 
 pub const MAX_COMPRESSED: u64 = crate::distribution::MAX_EXECUTABLE_BYTES;
 pub const MAX_EXPANDED: u64 = 256 * 1024 * 1024;
-const MAX_FILE: u64 = crate::distribution::MAX_ENGINE_BYTES;
+pub(crate) const MAX_FILE: u64 = crate::distribution::MAX_ENGINE_BYTES;
 const MAX_ENTRIES: usize = 16_384;
 const ARCHIVE_DEADLINE: Duration = Duration::from_secs(120);
 

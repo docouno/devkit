@@ -432,6 +432,16 @@ pub(crate) fn seed_workspace_lock_with_reconciliation(
     seeds: &[LockSeed],
     reconcile: bool,
 ) -> Result<()> {
+    seed_workspace_lock_preserving(root, state, seeds, None, reconcile)
+}
+
+pub(crate) fn seed_workspace_lock_preserving(
+    root: &Path,
+    state: &ProjectState,
+    seeds: &[LockSeed],
+    existing_lock: Option<crate::pnpm::Lock>,
+    reconcile: bool,
+) -> Result<()> {
     if crate::files::SemVer::parse(&state.version)? < crate::files::SemVer::parse("0.5.0")? {
         return seed_legacy_workspace_lock(root, state, seeds);
     }
@@ -529,6 +539,26 @@ pub(crate) fn seed_workspace_lock_with_reconciliation(
     }
     crate::pnpm::refresh_importers(root, state, &mut lock)?;
     crate::files::remove_file(&input_path(root, "package-lock.json")?)?;
+    // pnpm and the Rust emitter format the same v9 lock differently. Preserve
+    // the project's bytes, including comments, when the seed adds no changes.
+    let path = input_path(root, "pnpm-lock.yaml")?;
+    let regular_non_exec = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            meta.is_file() && meta.permissions().mode() & 0o111 == 0
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err.into()),
+    };
+    if regular_non_exec {
+        let unchanged = match existing_lock {
+            Some(current) => current == lock,
+            None => crate::pnpm::read_yaml::<crate::pnpm::Lock>(root, "pnpm-lock.yaml")? == lock,
+        };
+        if unchanged {
+            return Ok(());
+        }
+    }
     lock.write(root)
 }
 

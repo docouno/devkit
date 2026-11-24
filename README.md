@@ -114,7 +114,7 @@ Use `make exec command='pnpm …'` for commands in the root Node workspace (pass
 
 ## Update an existing project
 
-From a `0.5.1` checkout on Linux x86-64, preview the update on a branch and inspect the migration notes before applying it.
+From a `0.5.1` checkout on Linux x86-64, preview the transition to `0.6.0` on a branch and inspect the migration notes before applying it. For a project without Electron, Make lists the old desktop runtime and its third-party notices for removal. To inspect file hashes and modes before and after the upgrade, run `sh .devkit/runtime/devkit.sh cli update . --to 0.6.0 --preview --json`.
 
 ```sh
 git switch -c chore/devkit-0.6.0

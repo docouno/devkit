@@ -5,6 +5,7 @@ use crate::{
     files::*,
     model::{DevelopmentKind, Role},
     processes::ProcessRunner,
+    runtime::ToolPins,
     stand::{epoch::Physical, ledger, ports::Ports, preview},
     state,
 };
@@ -246,6 +247,7 @@ fn observe_stand(
 fn local_readiness(
     root: &Path,
     state: &crate::model::ProjectState,
+    pins: &ToolPins,
     cache_dir: Option<&Path>,
 ) -> Result<(&'static str, Value)> {
     let native = match crate::native::inspect_native_components(root, state) {
@@ -264,9 +266,10 @@ fn local_readiness(
             ));
         }
     };
-    let receipts = crate::doctor::local_receipts(
+    let receipts = crate::doctor::local_receipts_with_pins(
         root,
         state,
+        pins,
         Some(&native.node_inputs.digest),
         None,
         cache_dir,
@@ -346,9 +349,13 @@ pub(crate) fn inspect(
     let mut services = Vec::new();
     let mut reservations = Vec::new();
     let pins_path = ".devkit/runtime/toolchains.env";
-    let pins = read_regular_file(&safe_path(&root, pins_path)?, 65536, "toolchain pins")
-        .ok()
-        .flatten();
+    let pins = read_regular_file(
+        &safe_path(&root, pins_path)?,
+        TOOLCHAIN_PINS_MAX_BYTES as u64,
+        "toolchain pins",
+    )
+    .ok()
+    .flatten();
     let pins_version = pins
         .as_ref()
         .and_then(|(bytes, _)| crate::runtime::EnginePins::parse(bytes).ok())
@@ -384,17 +391,11 @@ pub(crate) fn inspect(
             None
         };
         if !pending
-            && pins.as_ref().is_some_and(|(_, id)| {
-                state
-                    .managed
-                    .get(pins_path)
-                    .is_some_and(|expected| id.matches_git_tracked(expected))
-            })
-            && pins_version.as_deref() == Some(&state.version)
             && state.version == env!("CARGO_PKG_VERSION")
+            && let Ok(pins) = ToolPins::admit(&root, state)
         {
             if !busy {
-                (readiness, receipts) = local_readiness(&root, state, cache_dir)?;
+                (readiness, receipts) = local_readiness(&root, state, &pins, cache_dir)?;
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));

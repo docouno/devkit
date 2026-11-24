@@ -64,7 +64,7 @@ def main():
                    DEVKIT_FORBIDDEN_HOST_SDK_LOG=str(forbidden), DEVKIT_PNPM_BIN_OVERRIDE=pnpm_bin, CI='true')
         consumer = scratch / 'consumer'
         consumer.mkdir()
-        def node(mode):
+        def node(mode, project=consumer):
             token = str(uuid.uuid4())
             owned.append("devkit-registry-" + token)
             return [str(engine), 'internal', 'guard', 'devkit-registry-' + token, token, '--',
@@ -77,7 +77,7 @@ def main():
                     '--volume', f'{ROOT}:/source:ro,z', '--volume', f'{engine}:/devkit/devkit:ro,z',
                     *(['--volume', f'{releases[0]}:/release-old:ro,z'] if args.previous else []),
                     '--volume', f'{releases[-1]}:/release-current:ro,z',
-                    '--volume', f'{scratch}:/proof:z', '--volume', f'{consumer}:/consumer:z',
+                    '--volume', f'{scratch}:/proof:z', '--volume', f'{project}:/consumer:z',
                     '--workdir', '/source', '--env', 'HOME=/tmp/home', '--env', 'CI=true',
                     PINS['DEVKIT_NODE_IMAGE'], '/devkit/devkit', 'internal', 'node', PINS['DEVKIT_NODE_VERSION'],
                     '--', 'node', 'test/registry-consumer.mjs', mode]
@@ -107,7 +107,11 @@ def main():
                 assert json.loads((consumer / '.devkit/manifest.json').read_text())['version'] == manifests[-1]['version']
                 run('current-pnpm', node('second'))
                 run('integrity-missing-version-negatives', node('negative'))
-                run('release-day-dependency-edit', node('release-day'))
+                # Legacy npm can select newly published transitive dependencies.
+                # Exercise a release-day edit with the target template's frozen graph.
+                fresh = scratch / 'release-day'
+                run('release-day-init', [str(fixture), 'init', str(releases[-1]), str(fresh), registry])
+                run('release-day-dependency-edit', node('release-day', fresh))
                 (proof / 'requests.json').write_bytes((scratch / 'requests.json').read_bytes())
                 assert not forbidden.exists(), 'Host SDK attempted'
                 passed = True

@@ -101,6 +101,7 @@ def verify(helper, module, index, from_version, environment, products):
                "--app", "web=react-web", "--app", "api=rust-api"],
                cwd=products, environment=transport_environment)
     state, old_pins = accepted(root, from_version)
+    module.assert_desktop_runtime(root, state)
     from_identity = state["releaseIdentity"]
     require(from_identity != index["releaseIdentity"], "Native upgrade needs distinct release identities")
     require(set(state["components"]) == {"apps/web", "apps/api"}, "Unexpected native baseline graph")
@@ -163,6 +164,7 @@ def verify(helper, module, index, from_version, environment, products):
     require(module.source_snapshot(root) == before, "Native upgrade preview changed project inputs")
     cli("native-upgrade-apply", "update", ".", "--to", to_version)
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
+    helper.verify_tool_compose(root, after, "native-upgrade-applied")
     module.assert_node_workspace(root, [path for path, c in after["components"].items() if c["toolchain"] == "node"])
     require(new_pins["DEVKIT_ENGINE_SHA256_" + host_target().upper().replace("-", "_")] == index["files"][engine_asset(index)]["sha256"],
             "Updated project accepted another target engine")

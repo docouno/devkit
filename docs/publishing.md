@@ -132,7 +132,7 @@ jobs:
    //gitlab.example.com/api/v4/projects/42/packages/npm/:_authToken=${GITLAB_NPM_TOKEN}
    //gitlab.example.com/api/v4/projects/42/packages/npm/:always-auth=true
    ```
-3. Run `make sync` and commit `package.json`, `.npmrc`, and `pnpm-lock.yaml`.
+3. Run `make sync` (or `sh .devkit/runtime/devkit.sh cli sync .`) and commit `package.json`, `.npmrc`, and `pnpm-lock.yaml`. In library-only checkouts on `0.6.0+`, external CLIs through `0.5.1` require the omitted desktop recipe pin.
 4. In GitLab CI, map `CI_JOB_TOKEN` (or a Deploy Token) to `GITLAB_NPM_TOKEN`, pass `DEVKIT_CA_CERT` if your GitLab instance uses a private enterprise CA, build with `make package`, and publish the verified tarball through the pinned Node container (no host Node.js required):
    ```sh
    export GITLAB_NPM_TOKEN="${CI_JOB_TOKEN}"

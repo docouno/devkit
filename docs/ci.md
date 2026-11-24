@@ -130,17 +130,18 @@ To run lifecycle commands (`init`, `update`, `sync`) without public internet acc
 1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`) and pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` into the runner's Docker daemon (or mirror them carefully by digest).
 2. Prime the local cache once using `--release-root`:
    ```sh
-   /opt/devkit/releases/0.6.0/bin/devkit sync . \
+   /opt/devkit/releases/0.6.0/devkit sync . \
      --release-root /opt/devkit/releases/0.6.0 \
      --cache-dir /var/cache/devkit
    ```
+   Use the version accepted by the checkout. Headless projects on `0.6.0+` require the checkout loader or an external CLI at `0.6.0+`.
 3. Run subsequent lifecycle commands with `--offline --cache-dir /var/cache/devkit`, and point `.npmrc` to your internal npm mirror.
 
 ## Containerized and Docker-in-Docker Runners
 
 Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI runners so compilers, bundlers, and Vitest worker pools stay within the job's real slice even when `nproc` reports the full physical host:
 
-- **Preflight diagnostics**: Run `devkit doctor . --json` in CI setup jobs to inspect Docker Compose compatibility, cgroup v2 controller delegation, host overcommit ratios, free disk/inodes, bridge MTU mismatches, and storage drivers (`overlay2` vs `vfs`).
+- **Preflight diagnostics**: Run `sh .devkit/runtime/devkit.sh cli doctor . --json` in CI setup jobs to inspect Docker Compose compatibility, cgroup v2 controller delegation, host overcommit ratios, free disk/inodes, bridge MTU mismatches, and storage drivers (`overlay2` vs `vfs`).
 - **Explicit resource overrides**: Export `DEVKIT_CPUS` (for example `DEVKIT_CPUS=2`), `DEVKIT_MEMORY_LIMIT` (for example `DEVKIT_MEMORY_LIMIT=4g`), and `DEVKIT_CARGO_BUILD_JOBS` (for example `DEVKIT_CARGO_BUILD_JOBS=2`) when sharing a runner across concurrent jobs.
 - **Nested cgroup v2 delegation**: If a Docker-in-Docker container keeps entrypoint processes in its root cgroup (`/sys/fs/cgroup/cgroup.procs`), Linux cgroup v2 blocks `+cpu +memory` in `cgroup.subtree_control`. Devkit automatically falls back to in-process toolchain bounds without failing the job; to enable hard container cgroup limits in custom DinD images, move entrypoint processes into a child cgroup (such as `/sys/fs/cgroup/init`) before enabling `+cpu +memory +pids` on `cgroup.subtree_control`.
 

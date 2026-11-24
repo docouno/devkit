@@ -625,8 +625,10 @@ impl<'a> ReleaseCache<'a> {
         );
         verify_payload_host_engine(&admitted)?;
         let release = if let Some(release) = self.cached(version, &identity)? {
+            self.prime_engine(&release)?;
             release
         } else {
+            self.prime_engine(&admitted)?;
             let target = self.release_path(version, &identity)?;
             create_dir_all_durable(target.parent().unwrap())?;
             self.runner.check_cancelled()?;
@@ -636,7 +638,6 @@ impl<'a> ReleaseCache<'a> {
         };
         self.remember(&release)?;
         drop(_lock);
-        self.prime_engine(&release)?;
         Ok(release)
     }
 }

@@ -40,6 +40,16 @@
       "profiles": [],
       "docPath": "docs/migrations/0.6.0.md",
       "anchor": "prepare-checkouts-for-each-linux-architecture"
+    },
+    {
+      "id": "profile-scoped-desktop-runtime",
+      "version": "0.6.0",
+      "severity": "info",
+      "title": "Use the checkout loader for headless projects",
+      "summary": "Headless checkouts omit the desktop recipe pin. Use Make, the checked-in loader or CLI 0.6.0 or newer.",
+      "profiles": [],
+      "docPath": "docs/migrations/0.6.0.md",
+      "anchor": "profile-scoped-desktop-runtime"
     }
   ]
 }

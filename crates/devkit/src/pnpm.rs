@@ -696,7 +696,7 @@ pub struct Dependency {
     pub specifier: String,
     pub version: String,
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Importer {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -731,7 +731,7 @@ impl Importer {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Lock {
     pub lockfile_version: String,

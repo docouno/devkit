@@ -1,8 +1,12 @@
+#[path = "support/profile_scoped.rs"]
+mod profile_scoped;
+#[path = "support/runtime.rs"]
+mod runtime_fixture;
+
 use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     compose::{ComposeNormalizer, admit_compose_inventory, capture_compose_inputs, parse_compose},
-    distribution::Target,
     files::*,
     model::*,
     project::*,
@@ -61,44 +65,8 @@ fn seal(root: &Path, version: &str) {
 fn fixture_release(parent: &Path, version: &str) -> PathBuf {
     let root = parent.join(format!("release-{version}"));
     fs::create_dir(&root).unwrap();
-    for name in ["devkit.mk", "devkit.sh", "compose.tools.yaml"] {
-        put(
-            &root,
-            &format!("runtime/{name}"),
-            format!("fixture {name} {version}\n").as_bytes(),
-        );
-    }
     let engine_sha = digest(format!("fixture-engine-{version}").as_bytes());
-    let parsed = SemVer::parse(version).unwrap();
-    let multi_target = parsed >= SemVer::parse("0.6.0").unwrap();
-    let mut engine_pins = format!(
-        "DEVKIT_ENGINE_TARGET={}\nDEVKIT_ENGINE_SHA256={engine_sha}\n",
-        Target::LinuxX64.triple()
-    );
-    if multi_target {
-        let targets = Target::ALL.map(Target::triple).join(",");
-        engine_pins.push_str(&format!("DEVKIT_ENGINE_TARGETS={targets}\n"));
-        for target in Target::ALL {
-            let sha = if target == Target::LinuxX64 {
-                engine_sha.clone()
-            } else {
-                digest(format!("fixture-engine-{version}-{}", target.triple()).as_bytes())
-            };
-            engine_pins.push_str(&format!(
-                "DEVKIT_ENGINE_SHA256_{}={sha}\n",
-                target.key_suffix()
-            ));
-        }
-    }
-    let recipe_hash = "b".repeat(64);
-    put(
-        &root,
-        "runtime/toolchains.env",
-        format!(
-            "DEVKIT_VERSION={version}\n{engine_pins}DEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
-        )
-        .as_bytes(),
-    );
+    runtime_fixture::write_runtime(&root, version, &engine_sha);
     // These tests prove engine identity and transactions, not npm installation.
     put(
         &root,
@@ -186,13 +154,14 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             bytes.as_bytes(),
         );
     }
+    let parsed = SemVer::parse(version).unwrap();
     if parsed >= SemVer::parse("0.5.0").unwrap() {
         use devkit::runtime::PnpmPin;
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap();
-        let pins = if multi_target {
+        let pins = if parsed >= SemVer::parse("0.6.0").unwrap() {
             PnpmPin::release_env_from_source(source).unwrap()
         } else {
             PnpmPin::from_source_pins(source).unwrap().encode()
@@ -310,8 +279,12 @@ fn release_admission_is_exact_and_npm_import_normalizes_only_modes() {
     fs::remove_file(release.join("extra")).unwrap();
     let source = f.path().join("npm");
     copy_tree(&release, &source, &|_| false, false).unwrap();
-    for name in file_map(&source).unwrap().keys() {
-        fs::set_permissions(source.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    for (name, id) in file_map(&source).unwrap() {
+        fs::set_permissions(
+            source.join(name),
+            fs::Permissions::from_mode(id.mode & 0o700),
+        )
+        .unwrap();
     }
     assert!(admit_release(&source).is_err());
     let canonical = f.path().join("canonical");
@@ -727,6 +700,24 @@ fn sync_resolves_new_ranges_aliases_and_sections_without_changing_preview_inputs
 }
 
 #[test]
+fn sync_preserves_the_original_yaml_of_an_equivalent_pnpm_lock() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("consumer");
+    let initial = init(&release, &root, "node", PackageMode::Local);
+    let path = root.join("pnpm-lock.yaml");
+    let original = format!(
+        "# Project-owned lockfile\nx-metadata: {{enabled: true}}\n\n{}",
+        fs::read_to_string(&path).unwrap()
+    );
+    fs::write(&path, &original).unwrap();
+    let result = sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(result.no_op && result.files.is_empty());
+    assert_eq!(result.state.generation, initial.generation);
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+#[test]
 fn sync_preserves_unregistered_directory_snapshots_and_rejects_dangling_links() {
     let temporary = TempDir::new().unwrap();
     let release = fixture_release(temporary.path(), "0.5.0");
@@ -1090,8 +1081,11 @@ fn rollback_removes_only_created_namespaces_even_after_manifest_write() {
 struct ExitAfterWrite;
 impl MutationHooks for ExitAfterWrite {
     fn after_write(&self, _: usize, path: &str) -> Result<()> {
-        let at_manifest = std::env::var_os("DEVKIT_TEST_MANIFEST").is_some();
-        if !at_manifest || path == MANIFEST_PATH {
+        let stop_after = std::env::var("DEVKIT_TEST_WRITE_PATH").ok();
+        if stop_after
+            .as_deref()
+            .is_none_or(|selected| path == selected)
+        {
             std::process::exit(86);
         }
         Ok(())
@@ -1102,16 +1096,20 @@ impl MutationHooks for ExitAfterWrite {
 fn interruption_worker() {
     let release = PathBuf::from(std::env::var_os("DEVKIT_TEST_RELEASE").unwrap());
     let target = PathBuf::from(std::env::var_os("DEVKIT_TEST_TARGET").unwrap());
-    update_project(
-        &release,
-        &target,
-        &UpdateOptions {
-            hooks: Some(&ExitAfterWrite),
-            ..Default::default()
-        },
-        &NoResolver,
-    )
-    .unwrap();
+    if std::env::var_os("DEVKIT_TEST_ADD_ELECTRON").is_some() {
+        profile_scoped::add_electron(&release, &target, "shell", Some(&ExitAfterWrite)).unwrap();
+    } else {
+        update_project(
+            &release,
+            &target,
+            &UpdateOptions {
+                hooks: Some(&ExitAfterWrite),
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap();
+    }
 }
 #[test]
 fn durable_journal2_recovery_preflights_identities_and_rejects_journal1() {
@@ -1128,7 +1126,7 @@ fn durable_journal2_recovery_preflights_identities_and_rejects_journal1() {
             .env("DEVKIT_TEST_RELEASE", &new)
             .env("DEVKIT_TEST_TARGET", &target);
         if at_manifest {
-            child.env("DEVKIT_TEST_MANIFEST", "1");
+            child.env("DEVKIT_TEST_WRITE_PATH", MANIFEST_PATH);
         }
         let status = child.status().unwrap();
         assert_eq!(status.code(), Some(86));
@@ -1934,12 +1932,12 @@ impl MutationHooks for RetainRecoveryStage {
 #[ignore = "test-only worker invoked by the Linux strace ordering test"]
 fn durability_order_worker() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.4.1");
+    let old = fixture_release(f.path(), "0.5.1");
     put(&old, "runtime/obsolete-helper.sh", b"old helper\n");
-    seal(&old, "0.4.1");
-    let new = fixture_release(f.path(), "0.5.0");
+    seal(&old, "0.5.1");
+    let new = fixture_release(f.path(), "0.6.0");
     put(&new, "runtime/nested/helper", b"new managed helper");
-    seal(&new, "0.5.0");
+    seal(&new, "0.6.0");
     let committed = f.path().join("committed");
     init(&old, &committed, "rust", PackageMode::Registry);
     update_project(&new, &committed, &UpdateOptions::default(), &NoResolver).unwrap();
@@ -2101,6 +2099,21 @@ fn assert_durable_transaction_trace(trace: &str) {
                     .iter()
                     .any(|line| successful_sync(line, &format!("{devkit}/runtime"))),
                 "Payload deletion must be durable before final manifest"
+            );
+            let licenses = format!("{devkit}/runtime/licenses");
+            let removed = lines[published + 1..manifest]
+                .iter()
+                .position(|line| {
+                    line.contains(&format!("rmdir(\"{licenses}\")"))
+                        && line.trim_end().ends_with("= 0")
+                })
+                .map(|i| i + published + 1)
+                .expect("Expected empty licenses directory removal before manifest");
+            assert!(
+                lines[removed + 1..manifest]
+                    .iter()
+                    .any(|line| successful_sync(line, &format!("{devkit}/runtime"))),
+                "License directory removal must be durable before final manifest"
             );
             let new_parent = format!("{devkit}/runtime/nested");
             let creation = lines[published + 1..manifest]

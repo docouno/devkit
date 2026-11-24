@@ -1,3 +1,6 @@
+#[path = "support/runtime.rs"]
+mod runtime_fixture;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     files::{read_json, write_atomic, write_json},
@@ -31,18 +34,7 @@ fn runtime_release(root: &Path) -> std::path::PathBuf {
     use sha2::{Digest, Sha512};
     let release = root.join("release");
     let version = "0.5.0";
-    for name in ["devkit.mk", "devkit.sh", "compose.tools.yaml"] {
-        put(
-            &release,
-            &format!("runtime/{name}"),
-            &format!("fixture {name}\n"),
-        );
-    }
-    put(
-        &release,
-        "runtime/toolchains.env",
-        "DEVKIT_VERSION=0.5.0\nDEVKIT_RUST_VERSION=1.99.1\n",
-    );
+    runtime_fixture::write_runtime(&release, version, &devkit::files::digest(b"fixture-engine"));
     put(
         &release,
         "npm/env.tgz",

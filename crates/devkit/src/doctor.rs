@@ -240,6 +240,42 @@ pub fn local_receipts(
     cache_dir: Option<&Path>,
 ) -> Result<Value> {
     let pins = ToolPins::admit(root, project_state).ok();
+    local_receipts_impl(
+        root,
+        project_state,
+        pins.as_ref(),
+        node_inputs_digest,
+        daemon_platform,
+        cache_dir,
+    )
+}
+
+pub(crate) fn local_receipts_with_pins(
+    root: &Path,
+    project_state: &ProjectState,
+    pins: &ToolPins,
+    node_inputs_digest: Option<&str>,
+    daemon_platform: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> Result<Value> {
+    local_receipts_impl(
+        root,
+        project_state,
+        Some(pins),
+        node_inputs_digest,
+        daemon_platform,
+        cache_dir,
+    )
+}
+
+fn local_receipts_impl(
+    root: &Path,
+    project_state: &ProjectState,
+    pins: Option<&ToolPins>,
+    node_inputs_digest: Option<&str>,
+    daemon_platform: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> Result<Value> {
     let computed_node_digest = node_inputs_digest.map(str::to_owned).or_else(|| {
         crate::native::admit_native_components(root, project_state)
             .ok()
@@ -252,16 +288,18 @@ pub fn local_receipts(
             .is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
     });
     let rust = pins
-        .as_ref()
         .map(|p| read_image_receipt(root, "rust", &p.rust_recipe))
         .transpose()?
         .flatten();
-    let desktop = pins
-        .as_ref()
-        .and_then(|p| p.desktop_recipe.as_deref())
-        .map(|pin| read_image_receipt(root, "desktop", pin))
-        .transpose()?
-        .flatten();
+    let has_electron = state::has_electron(project_state);
+    let desktop = if has_electron {
+        pins.and_then(|p| p.desktop_recipe.as_deref())
+            .map(|pin| read_image_receipt(root, "desktop", pin))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let requirements = [
         (
             project_state
@@ -277,13 +315,7 @@ pub fn local_receipts(
                 .any(|c| c.toolchain == Toolchain::Rust),
             rust.as_ref().map(|r| r.platform.as_str()),
         ),
-        (
-            project_state
-                .components
-                .values()
-                .any(|c| c.tooling_profile == ToolingProfile::Electron),
-            desktop.as_ref().map(|r| r.platform.as_str()),
-        ),
+        (has_electron, desktop.as_ref().map(|r| r.platform.as_str())),
     ];
     let required: Vec<_> = requirements
         .iter()
@@ -293,8 +325,7 @@ pub fn local_receipts(
     let helper_check = daemon_platform
         .or(prepared)
         .map(|platform| -> Result<bool> {
-            let Some((p, target)) = pins.as_ref().zip(Target::from_docker_platform(platform))
-            else {
+            let Some((p, target)) = pins.zip(Target::from_docker_platform(platform)) else {
                 return Ok(false);
             };
             let pin = p.engines.for_target(target)?;
@@ -1044,15 +1075,15 @@ fn inspect_checkout_lockfree(
         };
     }
 
-    let admitted = (|| -> Result<(ProjectState, String, Value)> {
+    let admitted = (|| -> Result<(ProjectState, Value)> {
         let manifest_path = safe_path(&root, state::MANIFEST_PATH)?;
         state::check_manifest_regular_bounded(&manifest_path)?;
         let manifest_id = identity(&manifest_path)?.context("Missing project manifest")?;
         let s = state::read_project_state(&root)?;
-        state::assert_managed(&root, &s)?;
-        state::verify_managed_set(&root, &s)?;
-        let pins = ToolPins::admit(&root, &s)?;
-        if s.components
+        let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
+        if full
+            .state
+            .components
             .values()
             .any(|c| c.toolchain == Toolchain::Node)
         {
@@ -1066,7 +1097,7 @@ fn inspect_checkout_lockfree(
                         "UNSUPPORTED_HOST_TARGET",
                         format!(
                             "Devkit {} has no pnpm pin for {}. {hint}",
-                            s.version,
+                            full.state.version,
                             target.triple()
                         ),
                     ));
@@ -1074,15 +1105,15 @@ fn inspect_checkout_lockfree(
                 return Err(err);
             }
         }
-        let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
-        let receipts = local_receipts(
+        let receipts = local_receipts_with_pins(
             &root,
             &full.state,
+            &full.pins,
             Some(&full.native.node_inputs.digest),
             daemon_platform,
             cache_dir,
         )?;
-        Ok((full.state, pins.version, receipts))
+        Ok((full.state, receipts))
     })();
 
     match admitted {
@@ -1122,7 +1153,8 @@ fn inspect_checkout_lockfree(
                 remediation: Some(rem),
             }
         }
-        Ok((project_state, version, receipts)) => {
+        Ok((project_state, receipts)) => {
+            let version = &project_state.version;
             let ready = receipts["ready"].as_bool().unwrap_or(false);
 
             let (status, summary, remediation) = if let Some(owner) = &active_owner {

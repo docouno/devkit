@@ -4,14 +4,19 @@ use crate::{
     Result,
     delivery::EnginePin,
     distribution::{Target, missing_target, valid_target_triple},
-    files::{SHA256_RE, SemVer, input_path, project_root, read_regular_file, version},
-    model::{FileIdentity, ProjectState, ToolingProfile},
+    files::{
+        SHA256_RE, TOOLCHAIN_PINS_MAX_BYTES, input_path, project_root, read_regular_file, version,
+    },
+    model::{FileIdentity, ProjectState},
+    state::{has_electron, uses_profile_scoped_runtime},
 };
 use anyhow::{Context, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+
+const DESKTOP_HASH: &str = "DEVKIT_DESKTOP_RECIPE_HASH";
 
 pub(crate) fn managed_bytes(
     root: &Path,
@@ -24,8 +29,12 @@ pub(crate) fn managed_bytes(
         )
     };
     let expected = managed.get(name).with_context(conflict)?;
-    let (bytes, id) = read_regular_file(&input_path(root, name)?, 65536, "toolchain pin file")?
-        .with_context(conflict)?;
+    let (bytes, id) = read_regular_file(
+        &input_path(root, name)?,
+        TOOLCHAIN_PINS_MAX_BYTES as u64,
+        "toolchain pin file",
+    )?
+    .with_context(conflict)?;
     ensure!(id.matches_git_tracked(expected), "{}", conflict());
     Ok(bytes)
 }
@@ -34,7 +43,10 @@ pub(crate) struct Records<'a>(pub(crate) BTreeMap<&'a str, &'a str>);
 
 impl<'a> Records<'a> {
     pub(crate) fn parse(bytes: &'a [u8], prefix: &str) -> Result<Self> {
-        ensure!(bytes.len() <= 65536, "Toolchain pins exceed byte budget");
+        ensure!(
+            bytes.len() <= TOOLCHAIN_PINS_MAX_BYTES,
+            "Toolchain pins exceed byte budget"
+        );
         let mut values = BTreeMap::new();
         for line in std::str::from_utf8(bytes)?.lines() {
             if line.is_empty() || line.starts_with('#') {
@@ -113,6 +125,8 @@ pub struct EnginePins {
 }
 
 impl EnginePins {
+    /// Dispatch only uses the engine identity while checking every record.
+    /// Other runtime keys can evolve independently in the selected engine.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         Self::from_records(&Records::parse(bytes, "DEVKIT_")?)
     }
@@ -177,7 +191,7 @@ impl ToolPins {
             .rsplit_once("@sha256:")
             .context("Node image must be digest pinned")?;
         let rust_recipe = records.require("DEVKIT_RUST_RECIPE_HASH")?;
-        let desktop_recipe = records.0.get("DEVKIT_DESKTOP_RECIPE_HASH").copied();
+        let desktop_recipe = records.0.get(DESKTOP_HASH).copied();
         ensure!(
             !name.is_empty()
                 && name
@@ -185,9 +199,7 @@ impl ToolPins {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"./:-".contains(&b))
                 && SHA256_RE.is_match(hash)
                 && SHA256_RE.is_match(rust_recipe)
-                && desktop_recipe.is_none_or(|pin| SHA256_RE.is_match(pin))
-                && (desktop_recipe.is_some()
-                    || SemVer::parse(&engines.version)? >= SemVer::parse("0.6.0")?),
+                && desktop_recipe.is_none_or(|pin| SHA256_RE.is_match(pin)),
             "Invalid immutable tool pins"
         );
         Ok(Self {
@@ -215,18 +227,24 @@ impl ToolPins {
             pins.version == state.version,
             "Manifest version differs from accepted toolchains.env"
         );
-        if state
-            .components
-            .values()
-            .any(|c| c.tooling_profile == ToolingProfile::Electron)
-        {
+        if has_electron(state) {
             let recipe = state
                 .managed
                 .get(".devkit/runtime/desktop.Dockerfile")
-                .context("Missing managed desktop recipe")?;
+                .context("Missing managed desktop.Dockerfile")?;
             ensure!(
                 pins.desktop_recipe.as_ref() == Some(&recipe.sha256),
-                "Desktop recipe differs from accepted pin"
+                "{DESKTOP_HASH} differs from the managed desktop.Dockerfile"
+            );
+        } else if uses_profile_scoped_runtime(&state.version)? {
+            ensure!(
+                pins.desktop_recipe.is_none(),
+                "Unexpected {DESKTOP_HASH} in a checkout without Electron"
+            );
+        } else {
+            ensure!(
+                pins.desktop_recipe.is_some(),
+                "Missing toolchain pin: {DESKTOP_HASH}"
             );
         }
         Ok(pins)
@@ -236,10 +254,19 @@ impl ToolPins {
         let pins = Self::parse(bytes)?;
         ensure!(
             pins.desktop_recipe.is_some(),
-            "Missing release desktop recipe pin"
+            "Missing toolchain pin: {DESKTOP_HASH}"
         );
         Ok(pins)
     }
+}
+
+pub(crate) fn render_headless_toolchains(bytes: &[u8]) -> Result<Vec<u8>> {
+    let prefix = format!("{DESKTOP_HASH}=");
+    Ok(std::str::from_utf8(bytes)?
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with(&prefix))
+        .collect::<String>()
+        .into_bytes())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,7 +409,8 @@ impl PnpmPin {
     fn read_pin_file(path: &Path) -> Result<Vec<u8>> {
         let path = project_root(path)?;
         let (bytes, _) =
-            read_regular_file(&path, 65536, "pnpm pin file")?.context("Missing pnpm pin file")?;
+            read_regular_file(&path, TOOLCHAIN_PINS_MAX_BYTES as u64, "pnpm pin file")?
+                .context("Missing pnpm pin file")?;
         Ok(bytes)
     }
     pub fn encode(&self) -> String {

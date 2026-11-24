@@ -709,7 +709,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             .contains("Duplicate migration id")
     );
 
-    // Check all published migration entries against the live release and documentation.
+    // Validate the actual migration index against the release being built.
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let repo_entries = verify_migration_index(&repo_root, env!("CARGO_PKG_VERSION")).unwrap();
     let ids: Vec<_> = repo_entries.iter().map(|e| e.id.as_str()).collect();
@@ -719,7 +719,8 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             "pnpm-workspaces",
             "development-stands",
             "make-targets-and-worktrunk",
-            "portable-linux-checkouts"
+            "portable-linux-checkouts",
+            "profile-scoped-desktop-runtime",
         ]
     );
     assert!(repo_entries[2].profiles.is_empty());

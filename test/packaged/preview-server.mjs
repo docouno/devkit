@@ -201,6 +201,7 @@ async function upgrade(q, s, h) {
       staleStatus = Number(data.toString().split(' ', 2)[1]);
     });
   }
+  s.on('error', () => s.destroy());
   s.on('close', () => upstream.destroy());
   upstream.on('error', () => s.destroy());
 }

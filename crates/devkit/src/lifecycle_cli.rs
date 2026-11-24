@@ -317,8 +317,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             )
         };
         let release = cache.acquire(version, None, source.as_deref(), globals.offline)?;
-        let state = project::init_project(
-            &release.root,
+        let state = project::init_project_with_release(
+            &release,
             &root,
             &InitOptions {
                 template: options.value("--template")?.map(str::to_owned),
@@ -416,8 +416,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         ..Default::default()
     };
     let outcome = match command {
-        "sync" => project::sync_project(&release.root, &root, &update, &resolver)?,
-        "update" => project::update_project(&release.root, &root, &update, &resolver)?,
+        "sync" => project::sync_project_with_release(&release, &root, &update, &resolver)?,
+        "update" => project::update_project_with_release(&release, &root, &update, &resolver)?,
         "register" => {
             ensure!(
                 options.flag("--app") != options.flag("--package"),
@@ -429,8 +429,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             let profile: ToolingProfile =
                 serde_json::from_value(json!(options.required("--profile")?))
                     .context("Unsupported tooling profile")?;
-            project::register_project_component(
-                &release.root,
+            project::register_project_component_with_release(
+                &release,
                 &root,
                 if app { Role::App } else { Role::Library },
                 name.to_owned(),
@@ -452,8 +452,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                     uses.push(u);
                 }
             }
-            project::add_project_component(
-                &release.root,
+            project::add_project_component_with_release(
+                &release,
                 &root,
                 if command == "add-app" {
                     Role::App

@@ -9,6 +9,7 @@ use crate::{
     processes::{OutputMode, OwnedContainer, ProcessRunner},
     projections::*,
     release::*,
+    runtime::ToolPins,
     state::*,
     transaction::*,
 };
@@ -295,9 +296,7 @@ impl LockResolver for DockerPnpmResolver {
         release: &AdmittedRelease,
         registry: Option<&str>,
     ) -> Result<()> {
-        let pins =
-            crate::runtime::ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?;
-        let image = pins.node_image;
+        let image = ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?.node_image;
         let root = project_root(root)?;
         let npmrc_policy = parse_manifest_npmrc_policy(
             &root,
@@ -842,7 +841,7 @@ pub fn render_component(
     };
     Ok((path, state, Some(seed)))
 }
-pub fn write_managed(
+fn stage_runtime_files(
     release: &AdmittedRelease,
     destination: &Path,
     state: &ProjectState,
@@ -851,28 +850,60 @@ pub fn write_managed(
         crate::runtime::ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?;
     }
     let mut managed = BTreeMap::new();
-    for (name, id) in &release.manifest.files {
-        if name.starts_with("runtime/") {
-            let target = format!(".devkit/{name}");
-            write_atomic(
-                &safe_path(destination, &target)?,
-                &release.bytes(name)?,
-                id.mode,
-            )?;
-            managed.insert(target, id.clone());
-        }
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
+    ensure!(
+        release.manifest.version == state.version,
+        "Release version differs from staged project"
+    );
+    if scoped {
+        release.ensure_scoped_runtime()?;
     }
-    for required in [
-        "devkit.mk",
-        "devkit.sh",
-        "toolchains.env",
-        "compose.tools.yaml",
-    ] {
+    let headless = scoped && !has_electron(state);
+    for (name, id) in &release.manifest.files {
+        if !name.starts_with("runtime/")
+            || (headless && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
+        {
+            continue;
+        }
+        let (bytes, staged_id) = match (headless, name.as_str()) {
+            (true, "runtime/toolchains.env") => {
+                let bytes = crate::runtime::render_headless_toolchains(&release.bytes(name)?)?;
+                let staged_id = FileIdentity {
+                    sha256: digest(&bytes),
+                    mode: id.mode,
+                };
+                (bytes, staged_id)
+            }
+            (true, "runtime/compose.tools.yaml") => {
+                let bytes = render_headless_tool_compose(&release.bytes(name)?)?;
+                let staged_id = FileIdentity {
+                    sha256: digest(&bytes),
+                    mode: id.mode,
+                };
+                (bytes, staged_id)
+            }
+            _ => (release.bytes(name)?, id.clone()),
+        };
+        let target = format!(".devkit/{name}");
+        let path = safe_path(destination, &target)?;
+        write_atomic(&path, &bytes, id.mode)?;
+        managed.insert(target, staged_id);
+    }
+    for name in REQUIRED_RUNTIME_FILES {
         ensure!(
-            managed.contains_key(&format!(".devkit/runtime/{required}")),
-            "Missing release runtime/{required}"
+            managed.contains_key(&format!(".devkit/{name}")),
+            "Missing release {name}"
         );
     }
+    Ok(managed)
+}
+
+pub fn write_managed(
+    release: &AdmittedRelease,
+    destination: &Path,
+    state: &ProjectState,
+) -> Result<BTreeMap<String, FileIdentity>> {
+    let mut managed = stage_runtime_files(release, destination, state)?;
     if state.package_mode == PackageMode::Local {
         let target = format!(
             ".devkit/npm/{}",
@@ -976,6 +1007,34 @@ pub fn write_managed(
     );
     Ok(managed)
 }
+
+fn check_new_managed_files(
+    root: &Path,
+    old: &ProjectState,
+    next: &ProjectState,
+    adopted_toolchain: Option<&str>,
+) -> Result<()> {
+    for (name, id) in &next.managed {
+        if !old.managed.contains_key(name)
+            && let Some(actual) = identity(&safe_path(root, name)?)?
+        {
+            ensure!(
+                adopted_toolchain == Some(name.as_str()) && actual.matches_git_tracked(id),
+                "New managed file conflicts with project content: {name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_project(root: &Path, state: &ProjectState) -> Result<()> {
+    validate_project_state(state)?;
+    verify_managed_set(root, state)?;
+    ToolPins::admit(root, state)?;
+    let native = admit_native_components(root, state)?;
+    assert_projections(root, state, &native.inputs)
+}
+
 fn empty_target(target: &Path) -> Result<()> {
     ensure!(
         !exists(target)? || {
@@ -1037,6 +1096,15 @@ pub fn init_project(
     options: &InitOptions<'_>,
     resolver: &dyn LockResolver,
 ) -> Result<ProjectState> {
+    let release = admit_release(release_root)?;
+    init_project_with_release(&release, target, options, resolver)
+}
+pub(crate) fn init_project_with_release(
+    release: &AdmittedRelease,
+    target: &Path,
+    options: &InitOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<ProjectState> {
     let has_components = options.apps.is_some() || options.packages.is_some();
     ensure!(
         [
@@ -1050,7 +1118,6 @@ pub fn init_project(
             == 1,
         "Choose exactly one of --app/--package, --preset or --template"
     );
-    let release = admit_release(release_root)?;
     let target = project_root(target)?;
     let parent = target.parent().context("Target parent")?;
     ensure!(
@@ -1149,7 +1216,7 @@ pub fn init_project(
     let mut seeds = vec![];
     for (role, spec) in specs {
         let (path, c, seed) = render_component(
-            &release,
+            release,
             stage.path(),
             &name,
             &spec,
@@ -1174,11 +1241,11 @@ pub fn init_project(
         }
     }
     sync_node_workspace(stage.path(), &state, Some(&name))?;
-    state.managed = write_managed(&release, stage.path(), &state)?;
+    state.managed = write_managed(release, stage.path(), &state)?;
     if !node_components(&state).is_empty() {
         seed_workspace_lock(stage.path(), &state, &seeds)?;
         let product = capture_product_graph(stage.path(), &state)?;
-        resolver.regenerate(stage.path(), &release, options.registry)?;
+        resolver.regenerate(stage.path(), release, options.registry)?;
         assert_product_graphs_preserved(
             &product,
             &read_native_graph(stage.path(), NodeLockKind::for_state(&state)?)?,
@@ -1195,7 +1262,7 @@ pub fn init_project(
             )?)?;
         }
     }
-    state.managed = write_managed(&release, stage.path(), &state)?;
+    state.managed = write_managed(release, stage.path(), &state)?;
     write_atomic(
         &stage.path().join("Makefile"),
         b"include .devkit/runtime/devkit.mk\n",
@@ -1222,8 +1289,7 @@ pub fn init_project(
     let readme = project_readme(&name, &state);
     write_atomic(&stage.path().join("README.md"), readme.as_bytes(), 0o644)?;
     write_json(&safe_path(stage.path(), MANIFEST_PATH)?, &state)?;
-    assert_native_components(stage.path(), &state)?;
-    validate_project_state(&state)?;
+    validate_staged_project(stage.path(), &state)?;
     release.recheck()?;
     if let Some(h) = options.hooks {
         h.after_stage()?;
@@ -1263,14 +1329,50 @@ pub struct AdmissionSnapshot {
     pub source_signature: String,
     pub manifest_identity: FileIdentity,
 }
+fn expected_incoming_runtime_files(
+    release: &AdmittedRelease,
+    old: &ProjectState,
+    next_has_electron: bool,
+) -> Result<BTreeSet<String>> {
+    let headless = uses_profile_scoped_runtime(&release.manifest.version)? && !next_has_electron;
+    Ok(release
+        .manifest
+        .files
+        .keys()
+        .filter(|name| {
+            name.starts_with("runtime/")
+                && !(headless && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
+        })
+        .map(|name| format!(".devkit/{name}"))
+        .filter(|target| !old.managed.contains_key(target))
+        .collect())
+}
+
 impl AdmissionSnapshot {
     pub fn capture(root: &Path) -> Result<Self> {
+        Self::capture_checked(root, &|_| Ok(BTreeSet::new()))
+    }
+    fn capture_for_mutation(
+        root: &Path,
+        release: &AdmittedRelease,
+        adds_electron: bool,
+    ) -> Result<Self> {
+        Self::capture_checked(root, &|old| {
+            expected_incoming_runtime_files(release, old, has_electron(old) || adds_electron)
+        })
+    }
+    fn capture_checked(
+        root: &Path,
+        incoming_runtime: &dyn Fn(&ProjectState) -> Result<BTreeSet<String>>,
+    ) -> Result<Self> {
         let root = project_root(root)?;
         assert_no_pending(&root)?;
         let manifest_identity =
             identity(&safe_path(&root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
         let state = read_project_state(&root)?;
         assert_managed(&root, &state)?;
+        let incoming = incoming_runtime(&state)?;
+        verify_runtime_inventory_with_incoming(&root, &state, &incoming)?;
         assert_tool_profiles(&root, &state)?;
         let inputs = collect_native_input_closure(&root, &state)?;
         let source_signature = source_signature(&root, Some(&state))?;
@@ -1287,6 +1389,7 @@ impl AdmissionSnapshot {
         })
     }
     pub fn recheck(&self) -> Result<()> {
+        verify_runtime_inventory(&self.root, &self.state)?;
         ensure!(
             identity(&safe_path(&self.root, MANIFEST_PATH)?)?.as_ref()
                 == Some(&self.manifest_identity),
@@ -1399,6 +1502,16 @@ fn mutate(
     resolver: &dyn LockResolver,
 ) -> Result<MutationOutcome> {
     let release = admit_release(release_root)?;
+    mutate_with_release(&release, target, options, change, resolver)
+}
+
+fn mutate_with_release(
+    release: &AdmittedRelease,
+    target: &Path,
+    options: &UpdateOptions<'_>,
+    change: Option<Change>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
     let root_candidate = project_root(target)?;
     assert_no_pending(&root_candidate)?;
     let min_from = release
@@ -1433,7 +1546,19 @@ fn mutate(
             );
         }
     }
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let adds_electron = matches!(
+        &change,
+        Some(Change::Add { spec, .. })
+            if template(&spec.template)
+                .is_ok_and(|t| t.profile == ToolingProfile::Electron)
+    ) || matches!(
+        &change,
+        Some(Change::Register {
+            profile: ToolingProfile::Electron,
+            ..
+        })
+    );
+    let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, adds_electron)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -1459,6 +1584,9 @@ fn mutate(
             matched,
             "Component {path} already exists with different or unverified registration options; use make sync reconcile=1 to reconcile its lock"
         );
+        verify_managed_set(root, old)?;
+        ToolPins::admit(root, old)?;
+        assert_projections(root, old, &snapshot.inputs)?;
         release.recheck()?;
         snapshot.recheck()?;
         return Ok(MutationOutcome {
@@ -1541,6 +1669,8 @@ fn mutate(
         && old.release_identity == release.identity
         && mode == old.package_mode
     {
+        verify_managed_set(root, old)?;
+        ToolPins::admit(root, old)?;
         match assert_native_components(root, old)
             .and_then(|()| assert_projections(root, old, &snapshot.inputs))
         {
@@ -1566,10 +1696,14 @@ fn mutate(
     let result = (|| {
         copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
         let mut seeds = vec![];
+        let mut existing_pnpm_lock = None;
         if !node_components(old).is_empty() {
+            let (lock, parsed_pnpm) =
+                read_workspace_lock_with_pnpm(&staged_root, NodeLockKind::for_state(old)?)?;
+            existing_pnpm_lock = parsed_pnpm;
             seeds.push(LockSeed {
                 prefix: String::new(),
-                lock: read_workspace_lock(&staged_root, NodeLockKind::for_state(old)?)?,
+                lock,
             });
         }
         let mut created = vec![];
@@ -1594,7 +1728,7 @@ fn mutate(
                 String::new()
             };
             let (path, mut c, seed) = render_component(
-                &release,
+                release,
                 &staged_root,
                 &name,
                 spec,
@@ -1677,10 +1811,15 @@ fn mutate(
                         version: release.manifest.version.clone(),
                         extra: BTreeMap::new(),
                     },
-                    tool_dependencies: profile_tools(&release, *profile, mode)?,
+                    tool_dependencies: profile_tools(release, *profile, mode)?,
                     dependencies: vec![],
-                    development: (*role == Role::App)
-                        .then(|| development(name, DevelopmentOwner::Project, false)),
+                    development: (*role == Role::App).then(|| {
+                        development(
+                            name,
+                            DevelopmentOwner::Project,
+                            *profile == ToolingProfile::Electron,
+                        )
+                    }),
                     extra: BTreeMap::new(),
                 },
             );
@@ -1744,10 +1883,11 @@ fn mutate(
         next.version = release.manifest.version.clone();
         sync_node_workspace(&staged_root, &next, None)?;
         if !node_components(&next).is_empty() {
-            seed_workspace_lock_with_reconciliation(
+            seed_workspace_lock_preserving(
                 &staged_root,
                 &next,
                 &seeds,
+                existing_pnpm_lock,
                 options.reconcile_lock,
             )?;
         }
@@ -1761,7 +1901,7 @@ fn mutate(
         };
         let old_components = next.components.clone();
         for (path, c) in &mut next.components {
-            c.tool_dependencies = profile_tools(&release, c.tooling_profile, mode)?;
+            c.tool_dependencies = profile_tools(release, c.tooling_profile, mode)?;
             if c.toolchain == Toolchain::Node {
                 update_tools(&staged_root, path, &old_components[path], c)?;
             }
@@ -1775,17 +1915,17 @@ fn mutate(
                 remove_file(&safe_path(&staged_root, &format!("{path}/{file}"))?)?;
             }
         }
-        next.managed = write_managed(&release, &staged_root, &next)?;
+        next.managed = write_managed(release, &staged_root, &next)?;
         for name in old.managed.keys() {
             if !next.managed.contains_key(name) {
-                remove_file(&safe_path(&staged_root, name)?)?;
+                remove_file_and_empty_runtime_parents(&staged_root, name)?;
             }
         }
         let mut lock_reconciliation = None;
         if let Some(product) = product {
             if options.reconcile_lock {
                 let strategy =
-                    resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
+                    resolver.regenerate_reconciled(&staged_root, release, options.registry)?;
                 let after_graph = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                 assert_direct_product_roots_preserved(&product, &after_graph)?;
                 lock_reconciliation = Some(compute_reconciliation_report(
@@ -1794,7 +1934,7 @@ fn mutate(
                     &after_graph,
                 ));
             } else {
-                resolver.regenerate(&staged_root, &release, options.registry)?;
+                resolver.regenerate(&staged_root, release, options.registry)?;
                 let after_graph = read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                 assert_product_graphs_preserved(&product, &after_graph).map_err(|err| {
                     crate::cli::error(
@@ -1817,21 +1957,20 @@ fn mutate(
         for (path, c) in &mut next.components {
             c.dependencies = deps[path].clone();
         }
-        next.managed = write_managed(&release, &staged_root, &next)?;
-        for (name, id) in &next.managed {
-            if !old.managed.contains_key(name) && identity(&safe_path(root, name)?)?.is_some() {
-                let adopting = matches!(&change,Some(Change::Register{role,name:component,..}) if name==&format!("{}/rust-toolchain.toml",component_path(*role,component)?));
-                ensure!(
-                    adopting
-                        && identity(&safe_path(root, name)?)?
-                            .as_ref()
-                            .is_some_and(|actual| actual.matches_git_tracked(id)),
-                    "New managed file conflicts with project content: {name}"
-                );
-            }
-        }
-        validate_project_state(&next)?;
-        assert_native_components(&staged_root, &next)?;
+        next.managed = write_managed(release, &staged_root, &next)?;
+        let adopted_toolchain = match &change {
+            Some(Change::Register {
+                role,
+                name,
+                profile: ToolingProfile::Rust,
+            }) => Some(format!(
+                "{}/rust-toolchain.toml",
+                component_path(*role, name)?
+            )),
+            _ => None,
+        };
+        check_new_managed_files(root, old, &next, adopted_toolchain.as_deref())?;
+        validate_staged_project(&staged_root, &next)?;
         write_json(&safe_path(&staged_root, MANIFEST_PATH)?, &next)?;
         let mut paths = old
             .managed
@@ -1882,7 +2021,9 @@ fn mutate(
             }
             preflight()?;
         } else {
-            tx.commit(root, options.hooks, &preflight)?;
+            tx.commit_checked(root, options.hooks, &preflight, &|| {
+                verify_runtime_inventory(root, &next)
+            })?;
             if old.version != next.version {
                 remove_file(&safe_path(root, ".devkit/state/node-workspace.lock")?)?;
             }
@@ -1908,12 +2049,16 @@ fn mutate(
     result
 }
 
-fn read_workspace_lock(root: &Path, kind: NodeLockKind) -> Result<Value> {
+fn read_workspace_lock_with_pnpm(
+    root: &Path,
+    kind: NodeLockKind,
+) -> Result<(Value, Option<crate::pnpm::Lock>)> {
     if kind == NodeLockKind::Pnpm {
         let lock: crate::pnpm::Lock = crate::pnpm::read_yaml(root, "pnpm-lock.yaml")?;
-        Ok(serde_json::to_value(lock)?)
+        let value = serde_json::to_value(&lock)?;
+        Ok((value, Some(lock)))
     } else {
-        read_json(&safe_path(root, "package-lock.json")?)
+        Ok((read_json(&safe_path(root, "package-lock.json")?)?, None))
     }
 }
 
@@ -2210,6 +2355,15 @@ pub fn sync_project(
     resolver: &dyn LockResolver,
 ) -> Result<MutationOutcome> {
     let release = admit_release(release_root)?;
+    sync_project_with_release(&release, target, options, resolver)
+}
+
+pub(crate) fn sync_project_with_release(
+    release: &AdmittedRelease,
+    target: &Path,
+    options: &UpdateOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
     let root_candidate = project_root(target)?;
     let min_from = release
         .manifest
@@ -2218,7 +2372,7 @@ pub fn sync_project(
         .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
     ensure_supported_checkout_floor(&root_candidate, false, min_from)?;
     let lock = CheckoutLock::acquire(target)?;
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, false)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -2262,16 +2416,18 @@ pub fn sync_project(
         sync_node_workspace(&staged_root, &next, None)?;
         let mut lock_reconciliation = None;
         if !node_components(&next).is_empty() {
-            let old_lock = read_workspace_lock(&staged_root, NodeLockKind::for_state(old)?)?;
+            let (old_lock, existing_pnpm_lock) =
+                read_workspace_lock_with_pnpm(&staged_root, NodeLockKind::for_state(old)?)?;
             let (before_graph, retained_product) =
                 capture_retained_product_graph(&staged_root, &next, &old_lock)?;
-            seed_workspace_lock_with_reconciliation(
+            seed_workspace_lock_preserving(
                 &staged_root,
                 &next,
                 &[LockSeed {
                     prefix: String::new(),
                     lock: old_lock.clone(),
                 }],
+                existing_pnpm_lock,
                 options.reconcile_lock,
             )?;
             let seeded_packages = if NodeLockKind::for_state(&next)? == NodeLockKind::Pnpm {
@@ -2297,7 +2453,7 @@ pub fn sync_project(
             if needs_resolver {
                 if options.reconcile_lock {
                     let strategy =
-                        resolver.regenerate_reconciled(&staged_root, &release, options.registry)?;
+                        resolver.regenerate_reconciled(&staged_root, release, options.registry)?;
                     let after_graph =
                         read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                     let expected_current = capture_product_graph(&staged_root, &next)?;
@@ -2308,7 +2464,7 @@ pub fn sync_project(
                         &after_graph,
                     ));
                 } else {
-                    resolver.regenerate(&staged_root, &release, options.registry)?;
+                    resolver.regenerate(&staged_root, release, options.registry)?;
                     let after_graph =
                         read_native_graph(&staged_root, NodeLockKind::for_state(&next)?)?;
                     assert_retained_product_graph_preserved(&retained_product, &after_graph)
@@ -2344,14 +2500,14 @@ pub fn sync_project(
         for (path, c) in &mut next.components {
             c.dependencies = deps[path].clone();
         }
-        next.managed = write_managed(&release, &staged_root, &next)?;
+        next.managed = write_managed(release, &staged_root, &next)?;
         for name in old.managed.keys() {
             if !next.managed.contains_key(name) {
-                remove_file(&safe_path(&staged_root, name)?)?;
+                remove_file_and_empty_runtime_parents(&staged_root, name)?;
             }
         }
-        validate_project_state(&next)?;
-        assert_native_components(&staged_root, &next)?;
+        check_new_managed_files(root, old, &next, None)?;
+        validate_staged_project(&staged_root, &next)?;
         let mut paths = old
             .managed
             .keys()
@@ -2424,7 +2580,9 @@ pub fn sync_project(
             }
             preflight()?;
         } else {
-            tx.commit(root, options.hooks, &preflight)?;
+            tx.commit_checked(root, options.hooks, &preflight, &|| {
+                verify_runtime_inventory(root, &next)
+            })?;
         }
         Ok(MutationOutcome {
             state: next.clone(),
@@ -2454,6 +2612,14 @@ pub fn update_project(
 ) -> Result<MutationOutcome> {
     mutate(release_root, target, options, None, resolver)
 }
+pub(crate) fn update_project_with_release(
+    release: &AdmittedRelease,
+    target: &Path,
+    options: &UpdateOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
+    mutate_with_release(release, target, options, None, resolver)
+}
 pub fn add_project_component(
     release_root: &Path,
     target: &Path,
@@ -2470,8 +2636,38 @@ pub fn add_project_component(
         resolver,
     )
 }
+pub(crate) fn add_project_component_with_release(
+    release: &AdmittedRelease,
+    target: &Path,
+    role: Role,
+    spec: ComponentSpec,
+    options: &UpdateOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
+    mutate_with_release(
+        release,
+        target,
+        options,
+        Some(Change::Add { role, spec }),
+        resolver,
+    )
+}
 pub fn register_project_component(
     release_root: &Path,
+    target: &Path,
+    role: Role,
+    name: String,
+    profile: ToolingProfile,
+    options: &UpdateOptions<'_>,
+    resolver: &dyn LockResolver,
+) -> Result<MutationOutcome> {
+    let release = admit_release(release_root)?;
+    register_project_component_with_release(
+        &release, target, role, name, profile, options, resolver,
+    )
+}
+pub(crate) fn register_project_component_with_release(
+    release: &AdmittedRelease,
     target: &Path,
     role: Role,
     name: String,
@@ -2483,8 +2679,8 @@ pub fn register_project_component(
         profile_allows(profile, role),
         "Tooling profile {profile} cannot register a {role}"
     );
-    mutate(
-        release_root,
+    mutate_with_release(
+        release,
         target,
         options,
         Some(Change::Register {
