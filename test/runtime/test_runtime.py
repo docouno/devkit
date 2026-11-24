@@ -3415,6 +3415,10 @@ if (priv.value !== 'from-private-gitlab-registry') {
             "nodeWorkspaceReady": True,
             "rustImageReady": False,
             "desktopImageReady": False,
+            "preparedPlatform": "linux/" + linux_arch(),
+            "helperReady": True,
+            "helperError": None,
+            "ready": True,
         })
 
         # Concurrent LOCK_SH readers succeed in parallel while an external LOCK_SH is also held.
