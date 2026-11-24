@@ -3,7 +3,7 @@ use crate::{Result, files::*, processes::ProcessRunner};
 use anyhow::{Context, ensure};
 use flate2::{Compression, GzBuilder, read::MultiGzDecoder};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -25,7 +25,8 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
     let dst = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
-    // SAFETY: both C strings live for the call; Linux is the supported host.
+    // SAFETY: both C strings live for the call.
+    #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -36,14 +37,32 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::ENOTSUP) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This filesystem needs atomic exclusive rename support (use a local APFS volume)",
+            ));
+        }
+        Err(error)
     }
 }
 
-/// Linux publication must not replace a concurrently created destination,
+/// Publication must not replace a concurrently created destination,
 /// including an empty directory. Callers stage on the same filesystem.
 pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
     rename_noreplace(stage, target)
@@ -54,6 +73,30 @@ pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
 fn prefix(value: &str) -> Result<()> {
     relative_path(value)?;
     ensure!(!value.contains('/'), "Archive requires one root directory");
+    Ok(())
+}
+
+/// Register implicit directories too: a tar need not contain directory headers.
+fn register_spelling(spellings: &mut BTreeMap<String, String>, mut path: &str) -> Result<()> {
+    loop {
+        let folded = path.to_ascii_lowercase();
+        if let Some(previous) = spellings.get(&folded) {
+            ensure!(
+                previous == path,
+                "Case-colliding archive paths: {previous} and {path}"
+            );
+            break;
+        }
+        ensure!(
+            spellings.len() < MAX_ENTRIES,
+            "Archive exceeds its entry budget"
+        );
+        spellings.insert(folded, path.to_owned());
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            break;
+        };
+        path = parent;
+    }
     Ok(())
 }
 
@@ -130,6 +173,7 @@ pub fn extract_archive_with(
         runner,
     };
     let mut names = BTreeSet::new();
+    let mut spellings = BTreeMap::new();
     let mut directories = BTreeSet::new();
     let mut files = BTreeSet::new();
     let mut total = 0_u64;
@@ -163,6 +207,7 @@ pub fn extract_archive_with(
                 names.insert(encoded.to_owned()),
                 "Duplicate archive entry: {encoded}"
             );
+            register_spelling(&mut spellings, encoded)?;
             let mode = entry.header().mode()?;
             let size = entry.header().size()?;
             if kind.is_dir() {
@@ -233,10 +278,23 @@ pub fn extract_archive_with(
         now.is_file() && now.len() == source.len(),
         "Archive changed during extraction"
     );
+    // Include implicit ancestors; synchronize every directory once, deepest first.
+    let mut parents = BTreeSet::new();
     for name in &files {
-        sync_directory(safe_path(&payload, name)?.parent().unwrap())?;
+        let path = safe_path(&payload, name)?;
+        for ancestor in path
+            .ancestors()
+            .skip(1)
+            .take_while(|p| p.starts_with(&payload))
+        {
+            if !parents.insert(ancestor.to_path_buf()) {
+                break;
+            }
+        }
     }
-    sync_directory(&payload)?;
+    for parent in parents.iter().rev() {
+        sync_directory(parent)?;
+    }
     if let Some(runner) = runner {
         runner.check_cancelled()?;
     }
@@ -265,7 +323,9 @@ pub fn create_archive(source: &Path, root_name: &str, target: &Path) -> Result<(
             .write(&mut output, Compression::default());
         let mut tar = tar::Builder::new(gzip);
         let mut directories = BTreeSet::from([root_name.to_owned()]);
+        let mut spellings = BTreeMap::new();
         for name in before.keys() {
+            register_spelling(&mut spellings, name)?;
             let mut parent = Path::new(name).parent();
             while let Some(path) = parent {
                 if path.as_os_str().is_empty() {

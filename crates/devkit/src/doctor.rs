@@ -2,6 +2,7 @@
 //! Compose `ps --format json` port discovery, and zero-Docker local readiness receipts.
 use crate::{
     Result,
+    distribution::Target,
     files::*,
     model::*,
     processes::{OutputMode, ProcessRunner},
@@ -12,7 +13,7 @@ use crate::{
     state,
 };
 use anyhow::{Context, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,6 +32,7 @@ pub struct DiskSpaceStats {
     pub total_bytes: u64,
     pub available_inodes: u64,
     pub total_inodes: u64,
+    pub inode_limit_known: bool,
 }
 
 fn nearest_existing_dir(target: &Path) -> PathBuf {
@@ -61,25 +63,53 @@ pub fn statvfs_stats(target: &Path) -> Result<DiskSpaceStats> {
     let probe = nearest_existing_dir(target);
     let c_path = CString::new(probe.as_os_str().as_bytes())
         .with_context(|| format!("Path contains interior NUL byte: {}", probe.display()))?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: c_path is a valid NUL-terminated path and stat points to zeroed libc::statvfs.
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("statvfs failed for {}", probe.display()));
+    #[cfg(target_os = "macos")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: c_path is terminated and statfs initializes stat on success.
+        if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("statfs failed for {}", probe.display()));
+        }
+        let stat = unsafe { stat.assume_init() };
+        let apfs = stat
+            .f_fstypename
+            .iter()
+            .map(|c| *c as u8)
+            .take(5)
+            .eq(b"apfs\0".iter().copied());
+        Ok(DiskSpaceStats {
+            path: probe,
+            available_bytes: stat.f_bavail.saturating_mul(u64::from(stat.f_bsize)),
+            total_bytes: stat.f_blocks.saturating_mul(u64::from(stat.f_bsize)),
+            available_inodes: stat.f_ffree,
+            total_inodes: stat.f_files,
+            inode_limit_known: !apfs && stat.f_files > 0,
+        })
     }
-    let block_size = if stat.f_frsize > 0 {
-        stat.f_frsize
-    } else {
-        stat.f_bsize
-    };
-    Ok(DiskSpaceStats {
-        path: probe,
-        available_bytes: stat.f_bavail.saturating_mul(block_size),
-        total_bytes: stat.f_blocks.saturating_mul(block_size),
-        available_inodes: stat.f_favail,
-        total_inodes: stat.f_files,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: c_path is a valid NUL-terminated path and stat points to zeroed libc::statvfs.
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("statvfs failed for {}", probe.display()));
+        }
+        let block_size = if stat.f_frsize > 0 {
+            stat.f_frsize
+        } else {
+            stat.f_bsize
+        };
+        Ok(DiskSpaceStats {
+            path: probe,
+            available_bytes: stat.f_bavail.saturating_mul(block_size),
+            total_bytes: stat.f_blocks.saturating_mul(block_size),
+            available_inodes: stat.f_favail,
+            total_inodes: stat.f_files,
+            inode_limit_known: stat.f_files > 0,
+        })
+    }
 }
 
 pub fn ensure_disk_space(target: &Path) -> Result<DiskSpaceStats> {
@@ -90,7 +120,7 @@ pub fn ensure_disk_space(target: &Path) -> Result<DiskSpaceStats> {
         stats.path.display(),
         stats.available_bytes / MIB
     );
-    if stats.total_inodes > 0 {
+    if stats.inode_limit_known {
         ensure!(
             stats.available_inodes >= 1_024,
             "Insufficient free inodes at {} ({} available, >= 1024 required); run 'docker image prune -f'",
@@ -108,88 +138,187 @@ pub fn compose_project_name(root: &Path) -> String {
     )
 }
 
-fn recorded_derived_image_ready(root: &Path, kind: &str, recipe: &str, pin: &str) -> bool {
-    let Ok(recipe_path) = safe_path(root, &format!(".devkit/runtime/{recipe}")) else {
-        return false;
-    };
-    let Ok(Some((_, recipe_id))) = read_regular_file(&recipe_path, 1024 * 1024, "tool recipe")
-    else {
-        return false;
-    };
-    if recipe_id.sha256 != pin {
-        return false;
+fn linux_target(platform: &str) -> Option<Target> {
+    match platform {
+        "linux/amd64" => Some(Target::LinuxX64),
+        "linux/arm64" => Some(Target::LinuxArm64),
+        _ => None,
     }
-    let Ok(state_path) = safe_path(root, &format!(".devkit/state/{kind}-image")) else {
-        return false;
-    };
-    let Ok(Some((recorded, _))) = read_regular_file(&state_path, 4096, "image receipt") else {
-        return false;
-    };
-    std::str::from_utf8(&recorded)
-        .ok()
-        .and_then(|text| text.trim().strip_prefix("sha256:"))
-        .is_some_and(|h| SHA256_RE.is_match(h))
 }
 
-/// Computes local workspace and derived-image readiness receipts strictly from
-/// filesystem state (`0` Docker subprocess calls, `0` writes).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DerivedImageReceipt {
+    pub schema_version: u32,
+    pub platform: String,
+    pub image_id: String,
+    pub recipe_sha256: String,
+}
+
+impl DerivedImageReceipt {
+    pub fn new(platform: &str, image_id: &str, recipe_sha256: &str) -> Self {
+        Self {
+            schema_version: 1,
+            platform: platform.into(),
+            image_id: image_id.into(),
+            recipe_sha256: recipe_sha256.into(),
+        }
+    }
+}
+
+pub fn read_image_receipt(
+    root: &Path,
+    kind: &str,
+    pin: &str,
+) -> Result<Option<DerivedImageReceipt>> {
+    ensure!(
+        matches!(kind, "rust" | "desktop"),
+        "Unknown derived image kind"
+    );
+    let path = safe_path(root, &format!(".devkit/runtime/{kind}.Dockerfile"))?;
+    let Some((_, recipe)) = read_regular_file(&path, 1024 * 1024, "tool recipe")? else {
+        return Ok(None);
+    };
+    if recipe.sha256 != pin {
+        return Ok(None);
+    }
+    let path = safe_path(root, &format!(".devkit/state/{kind}-image"))?;
+    let Some((raw, _)) = read_regular_file(&path, 4096, "image receipt")? else {
+        return Ok(None);
+    };
+    let path = safe_path(root, &format!(".devkit/state/{kind}-image.json"))?;
+    let Some((bytes, _)) = read_regular_file(&path, 4096, "image platform receipt")? else {
+        return Ok(None);
+    };
+    let Ok(receipt) = serde_json::from_slice::<DerivedImageReceipt>(&bytes) else {
+        return Ok(None);
+    };
+    let valid = receipt.schema_version == 1
+        && receipt.recipe_sha256 == pin
+        && linux_target(&receipt.platform).is_some()
+        && receipt
+            .image_id
+            .strip_prefix("sha256:")
+            .is_some_and(|s| SHA256_RE.is_match(s))
+        && std::str::from_utf8(&raw).is_ok_and(|s| s.trim_end_matches('\n') == receipt.image_id);
+    Ok(valid.then_some(receipt))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeWorkspaceReceipt {
+    pub platform: String,
+    pub digest: String,
+}
+
+impl NodeWorkspaceReceipt {
+    pub fn new(platform: &str, release_identity: &str, node_digest: &str) -> Self {
+        Self {
+            platform: platform.into(),
+            digest: digest(format!("{release_identity}\n{platform}\n{node_digest}")),
+        }
+    }
+}
+
+pub fn read_node_receipt(root: &Path) -> Result<Option<NodeWorkspaceReceipt>> {
+    let path = safe_path(root, ".devkit/state/node-workspace.lock")?;
+    let Some((bytes, _)) = read_regular_file(&path, 4096, "Node workspace receipt")? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_slice::<NodeWorkspaceReceipt>(&bytes)
+        .ok()
+        .filter(|r| linux_target(&r.platform).is_some() && SHA256_RE.is_match(&r.digest)))
+}
+
+/// Missing receipts and receipts written for different daemons cannot establish a platform.
+fn prepared_platform<'a>(required: &[Option<&'a str>]) -> Option<&'a str> {
+    required
+        .first()
+        .copied()
+        .flatten()
+        .filter(|first| required.iter().all(|platform| *platform == Some(*first)))
+}
+
+/// No Docker calls, downloads or writes; diagnostics may run during setup.
 pub fn local_receipts(
     root: &Path,
     project_state: &ProjectState,
     node_inputs_digest: Option<&str>,
+    daemon_platform: Option<&str>,
+    cache_dir: Option<&Path>,
 ) -> Result<Value> {
-    let pins_path = ".devkit/runtime/toolchains.env";
-    let pins = safe_path(root, pins_path).ok().and_then(|path| {
-        let (bytes, id) = read_regular_file(&path, 65536, "toolchain pins").ok()??;
-        project_state
-            .managed
-            .get(pins_path)
-            .filter(|pin| id.matches_git_tracked(pin))?;
-        ToolPins::parse(&bytes).ok()
+    let pins = ToolPins::admit(root, project_state).ok();
+    let computed_node_digest = node_inputs_digest.map(str::to_owned).or_else(|| {
+        crate::native::admit_native_components(root, project_state)
+            .ok()
+            .map(|n| n.node_inputs.digest)
     });
-
-    let computed_node_digest = match node_inputs_digest {
-        Some(d) => Some(d.to_owned()),
-        None => crate::native::admit_native_components(root, project_state)
-            .ok()
-            .map(|n| n.node_inputs.digest),
-    };
-    let node_workspace_ready = if let Some(d) = computed_node_digest {
-        let expected = digest(format!("{}\n{}", project_state.release_identity, d));
-        let lock_ok = safe_path(root, ".devkit/state/node-workspace.lock")
-            .ok()
-            .and_then(|p| {
-                let (bytes, _) = read_regular_file(&p, 4096, "Node workspace receipt").ok()??;
-                String::from_utf8(bytes).ok()
-            })
-            .is_some_and(|s| s.trim() == expected);
-        let nm_ok = safe_path(root, "node_modules")
-            .ok()
-            .and_then(|p| fs::symlink_metadata(p).ok())
-            .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
-        lock_ok && nm_ok
-    } else {
-        false
-    };
-
-    let (rust_image_ready, desktop_image_ready) = if let Some(pins) = &pins {
+    let node = read_node_receipt(root)?.filter(|r| {
+        computed_node_digest.as_deref().is_some_and(|input| {
+            *r == NodeWorkspaceReceipt::new(&r.platform, &project_state.release_identity, input)
+        }) && safe_path(root, "node_modules")
+            .is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+    });
+    let rust = pins
+        .as_ref()
+        .map(|p| read_image_receipt(root, "rust", &p.rust_recipe))
+        .transpose()?
+        .flatten();
+    let desktop = pins
+        .as_ref()
+        .and_then(|p| p.desktop_recipe.as_deref())
+        .map(|pin| read_image_receipt(root, "desktop", pin))
+        .transpose()?
+        .flatten();
+    let requirements = [
         (
-            recorded_derived_image_ready(root, "rust", "rust.Dockerfile", &pins.rust_recipe),
-            recorded_derived_image_ready(
-                root,
-                "desktop",
-                "desktop.Dockerfile",
-                &pins.desktop_recipe,
-            ),
-        )
-    } else {
-        (false, false)
-    };
-
+            project_state
+                .components
+                .values()
+                .any(|c| c.toolchain == Toolchain::Node),
+            node.as_ref().map(|r| r.platform.as_str()),
+        ),
+        (
+            project_state
+                .components
+                .values()
+                .any(|c| c.toolchain == Toolchain::Rust),
+            rust.as_ref().map(|r| r.platform.as_str()),
+        ),
+        (
+            project_state
+                .components
+                .values()
+                .any(|c| c.tooling_profile == ToolingProfile::Electron),
+            desktop.as_ref().map(|r| r.platform.as_str()),
+        ),
+    ];
+    let required: Vec<_> = requirements
+        .iter()
+        .filter_map(|(needed, platform)| needed.then_some(*platform))
+        .collect();
+    let prepared = prepared_platform(&required);
+    let helper_check = daemon_platform
+        .or(prepared)
+        .map(|platform| -> Result<bool> {
+            let Some((p, target)) = pins.as_ref().zip(linux_target(platform)) else {
+                return Ok(false);
+            };
+            let pin = p.engines.for_target(target)?;
+            crate::cache::linux_helper_ready(&crate::cache::cache_root(cache_dir)?, &pin)
+        });
+    let helper_ready = helper_check.as_ref().map(|check| matches!(check, Ok(true)));
+    let matches_daemon =
+        |platform: Option<&str>| platform.is_some_and(|p| daemon_platform.is_none_or(|d| d == p));
+    let ready = required.is_empty() || (matches_daemon(prepared) && helper_ready == Some(true));
     Ok(json!({
-        "nodeWorkspaceReady": node_workspace_ready,
-        "rustImageReady": rust_image_ready,
-        "desktopImageReady": desktop_image_ready,
+        "nodeWorkspaceReady": matches_daemon(requirements[0].1),
+        "rustImageReady": matches_daemon(requirements[1].1),
+        "desktopImageReady": matches_daemon(requirements[2].1),
+        "preparedPlatform": prepared,
+        "helperReady": helper_ready,
+        "helperError": helper_check.and_then(|check| check.err()).map(|err| format!("{err:#}")),
+        "ready": ready,
     }))
 }
 
@@ -345,6 +474,7 @@ pub struct DoctorCheck {
 
 fn sanitized_docker() -> Command {
     let mut c = Command::new("docker");
+    c.env_remove("DOCKER_DEFAULT_PLATFORM");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("COMPOSE_") {
             c.env_remove(key);
@@ -377,30 +507,18 @@ fn detect_uplink_mtu() -> Option<(String, u32)> {
             }
         }
     }
-    let entries = fs::read_dir("/sys/class/net").ok()?;
-    let mut best: Option<(String, u32)> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(iface) = name.to_str() else {
-            continue;
-        };
-        if iface == "lo"
-            || iface == "docker0"
-            || iface.starts_with("br-")
-            || iface.starts_with("veth")
-        {
-            continue;
-        }
-        if let Some(mtu) = read_net_mtu(iface)
-            && best.as_ref().is_none_or(|(_, cur)| mtu < *cur)
-        {
-            best = Some((iface.to_owned(), mtu));
-        }
-    }
-    best
+    None
 }
 
 pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, String, bool)> {
+    run_doctor_with_cache(target, runner, None)
+}
+
+pub fn run_doctor_with_cache(
+    target: &Path,
+    runner: &ProcessRunner,
+    cache_dir: Option<&Path>,
+) -> Result<(Value, String, bool)> {
     let abs_target = if target.is_absolute() {
         target.to_path_buf()
     } else {
@@ -500,6 +618,21 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
         }
     }
 
+    let probe_env = if daemon_info.is_some() {
+        match ProbeEnvironment::capture_with_docker(runner) {
+            Ok(env) => env,
+            Err(error) => {
+                runner.check_cancelled()?;
+                docker_errors.push(format!("Cannot inspect Docker context: {error:#}"));
+                daemon_info = None;
+                ProbeEnvironment::capture_host()
+            }
+        }
+    } else {
+        ProbeEnvironment::capture_host()
+    };
+    let host_target = Target::host()?.triple();
+    let daemon_platform = daemon_info.as_ref().map(|d| d.platform);
     if docker_errors.is_empty() {
         checks.push(DoctorCheck {
             id: "docker_compose",
@@ -514,6 +647,9 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             ),
             details: json!({
                 "osType": "linux",
+                "hostTarget": host_target,
+                "daemonPlatform": daemon_platform,
+                "dockerContext": probe_env.docker_context,
                 "serverVersion": server_version,
                 "composeVersion": compose_version,
             }),
@@ -525,6 +661,9 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             status: "fail",
             summary: docker_errors.join("; "),
             details: json!({
+                "hostTarget": host_target,
+                "daemonPlatform": daemon_platform,
+                "dockerContext": probe_env.docker_context,
                 "serverVersion": server_version,
                 "composeVersion": compose_version,
                 "errors": docker_errors,
@@ -534,7 +673,6 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
     }
 
     // 2 & 3. Cgroup v2 delegation & Resource budget / overcommit
-    let probe_env = ProbeEnvironment::capture_host();
     let mut override_error: Option<String> = None;
     let (budget, eval_warnings) =
         match HostResourceBudget::evaluate(&probe_env, daemon_info.clone()) {
@@ -550,6 +688,10 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
 
     let caps = budget.capabilities;
     let (cg_status, cg_summary, cg_remediation) = match caps.state {
+        _ if probe_env.vm_host && daemon_info.is_none() => ("warn", "Docker VM unavailable; controller delegation is unknown".into(), None),
+        DelegationState::VmDaemon if !(caps.can_cpus && caps.can_memory && caps.can_pids) => (
+            "warn", format!("Docker VM reports partial controller delegation (cpus={}, memory={}, pids={})", caps.can_cpus, caps.can_memory, caps.can_pids), None
+        ),
         DelegationState::ThreadedBlocked | DelegationState::RootCgroupHasProcesses => (
             "warn",
             format!(
@@ -619,6 +761,12 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             err.clone(),
             Some("unset DEVKIT_CPUS DEVKIT_MEMORY_LIMIT".into()),
         )
+    } else if probe_env.vm_host && daemon_info.is_none() {
+        (
+            "warn",
+            "Docker VM budget is unknown until the daemon is available".into(),
+            None,
+        )
     } else if budget.effective_mem_bytes < 512 * MIB {
         (
             "fail",
@@ -675,12 +823,12 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
         status: budget_status,
         summary: budget_summary,
         details: json!({
-            "effectiveCpus": crate::resources::format_cpus(budget.effective_millicores),
+            "effectiveCpus": (!probe_env.vm_host || daemon_info.is_some()).then(|| crate::resources::format_cpus(budget.effective_millicores)),
             "cpuOvercommitRatio": cpu_overcommit,
             "memoryOvercommitRatio": mem_overcommit,
             "workingSetBytes": budget.working_set_bytes,
             "warnings": eval_warnings,
-            "budget": budget,
+            "budget": (!probe_env.vm_host || daemon_info.is_some()).then_some(&budget),
         }),
         remediation: budget_remediation,
     });
@@ -688,8 +836,8 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
     // 4. Disk space & inodes via statvfs (never docker system df)
     match statvfs_stats(&resolved_target) {
         Ok(stats) => {
-            let low_inodes_fail = stats.total_inodes > 0 && stats.available_inodes < 1_024;
-            let low_inodes_warn = stats.total_inodes > 0 && stats.available_inodes < 16_384;
+            let low_inodes_fail = stats.inode_limit_known && stats.available_inodes < 1_024;
+            let low_inodes_warn = stats.inode_limit_known && stats.available_inodes < 16_384;
             let (status, summary, remediation) = if stats.available_bytes < GIB || low_inodes_fail {
                 (
                     "fail",
@@ -742,7 +890,7 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
         }
     }
 
-    if let Ok(cache_root) = crate::cache::cache_root(None) {
+    if let Ok(cache_root) = crate::cache::cache_root(cache_dir) {
         let cache_probe = nearest_existing_dir(&cache_root);
         let target_probe = nearest_existing_dir(&resolved_target);
         use std::os::unix::fs::MetadataExt;
@@ -773,8 +921,9 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
     }
 
     // 5. DinD network MTU & storage driver
-    let docker0_mtu = read_net_mtu("docker0");
-    let uplink = detect_uplink_mtu();
+    let local_network = !probe_env.vm_host && caps.state != DelegationState::RemoteDaemon;
+    let docker0_mtu = local_network.then(|| read_net_mtu("docker0")).flatten();
+    let uplink = local_network.then(detect_uplink_mtu).flatten();
     let driver = daemon_info.as_ref().and_then(|d| d.driver.clone());
     let mtu_mismatch = match (docker0_mtu, &uplink) {
         (Some(d_mtu), Some((_, u_mtu))) => d_mtu > *u_mtu,
@@ -805,12 +954,21 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             }
         }
         ("warn", issues.join("; "), rem)
+    } else if driver.is_none() || docker0_mtu.is_none() || uplink.is_none() {
+        (
+            "warn",
+            format!(
+                "Storage driver: {}; bridge MTU health is unknown without complete Linux daemon network observations",
+                driver.as_deref().unwrap_or("unknown")
+            ),
+            None,
+        )
     } else {
         (
             "ok",
             format!(
                 "Storage driver '{}' and bridge MTU healthy",
-                driver.as_deref().unwrap_or("overlay2")
+                driver.as_deref().unwrap_or("unknown")
             ),
             None,
         )
@@ -840,7 +998,11 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             remediation: None,
         });
     } else {
-        checks.push(inspect_checkout_lockfree(&resolved_target));
+        checks.push(inspect_checkout_lockfree(
+            &resolved_target,
+            daemon_platform,
+            cache_dir,
+        ));
     }
 
     runner.check_cancelled()?;
@@ -866,7 +1028,11 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
     Ok((result, human, overall_ok))
 }
 
-fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
+fn inspect_checkout_lockfree(
+    target: &Path,
+    daemon_platform: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> DoctorCheck {
     let root = match project_root(target) {
         Ok(r) => r,
         Err(err) => {
@@ -903,19 +1069,25 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
         let s = state::read_project_state(&root)?;
         state::assert_managed(&root, &s)?;
         state::verify_managed_set(&root, &s)?;
-        let pins = ToolPins::parse(&fs::read(safe_path(
-            &root,
-            ".devkit/runtime/toolchains.env",
-        )?)?)?;
-        ensure!(
-            pins.version == s.version,
-            "Manifest version differs from accepted toolchains.env"
-        );
-        if SemVer::parse(&s.version)? >= SemVer::parse("0.5.0")? {
-            crate::runtime::PnpmPin::from_checkout(&root)?;
+        let pins = ToolPins::admit(&root, &s)?;
+        if s.components
+            .values()
+            .any(|c| c.toolchain == Toolchain::Node)
+            && SemVer::parse(&s.version)? >= SemVer::parse("0.5.0")?
+        {
+            let target = daemon_platform
+                .and_then(linux_target)
+                .unwrap_or(Target::LinuxX64);
+            crate::runtime::PnpmPin::from_checkout_for_target(&root, target)?;
         }
         let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
-        let receipts = local_receipts(&root, &full.state, Some(&full.native.node_inputs.digest))?;
+        let receipts = local_receipts(
+            &root,
+            &full.state,
+            Some(&full.native.node_inputs.digest),
+            daemon_platform,
+            cache_dir,
+        )?;
         Ok((full.state, pins.version, receipts))
     })();
 
@@ -930,7 +1102,13 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                     (!cmd.is_empty()).then(|| cmd.to_owned())
                 })
                 .unwrap_or_else(|| {
-                    if msg.contains("Managed file conflict") {
+                    if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET" {
+                        format!(
+                            "npx @docouno/devkit@{} update . --to {}",
+                            env!("CARGO_PKG_VERSION"),
+                            env!("CARGO_PKG_VERSION")
+                        )
+                    } else if msg.contains("Managed file conflict") {
                         "git checkout -- .devkit && make sync".into()
                     } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
                         "make setup".into()
@@ -951,35 +1129,7 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
             }
         }
         Ok((project_state, version, receipts)) => {
-            let need_node = project_state
-                .components
-                .values()
-                .any(|c| c.toolchain == Toolchain::Node);
-            let need_rust = project_state
-                .components
-                .values()
-                .any(|c| c.toolchain == Toolchain::Rust);
-            let need_desktop = project_state
-                .components
-                .values()
-                .any(|c| c.tooling_profile == ToolingProfile::Electron);
-
-            let node_ok = !need_node
-                || receipts
-                    .get("nodeWorkspaceReady")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            let rust_ok = !need_rust
-                || receipts
-                    .get("rustImageReady")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            let desktop_ok = !need_desktop
-                || receipts
-                    .get("desktopImageReady")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            let ready = node_ok && rust_ok && desktop_ok;
+            let ready = receipts["ready"].as_bool().unwrap_or(false);
 
             let (status, summary, remediation) = if let Some(owner) = &active_owner {
                 (
@@ -1018,10 +1168,55 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                     "componentCount": project_state.components.len(),
                     "pendingUpdate": false,
                     "activeLockOwner": active_owner,
+                    "preparedPlatform": receipts["preparedPlatform"],
+                    "helperReady": receipts["helperReady"],
                     "receipts": receipts,
                 }),
                 remediation,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_or_missing_required_receipts_cannot_identify_a_prepared_platform() {
+        let amd = Some("linux/amd64");
+        let arm = Some("linux/arm64");
+        for receipts in [&[][..], &[amd, None], &[None, arm], &[amd, arm]] {
+            assert_eq!(prepared_platform(receipts), None);
+        }
+        assert_eq!(prepared_platform(&[arm, arm]), arm);
+        let mut forged = NodeWorkspaceReceipt::new("linux/amd64", "release", "inputs");
+        forged.platform = "linux/arm64".into();
+        assert_ne!(
+            forged,
+            NodeWorkspaceReceipt::new("linux/arm64", "release", "inputs")
+        );
+    }
+
+    #[test]
+    fn derived_image_receipt_requires_matching_sidecar_recipe_and_image_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let recipe = root.join(".devkit/runtime/rust.Dockerfile");
+        write_atomic(&recipe, b"recipe", 0o644).unwrap();
+        let pin = digest(b"recipe");
+        let id = format!("sha256:{}", "a".repeat(64));
+        let raw = root.join(".devkit/state/rust-image");
+        write_atomic(&raw, id.as_bytes(), 0o644).unwrap();
+        assert!(read_image_receipt(root, "rust", &pin).unwrap().is_none());
+        let sidecar = root.join(".devkit/state/rust-image.json");
+        let expected = DerivedImageReceipt::new("linux/arm64", &id, &pin);
+        write_json(&sidecar, &expected).unwrap();
+        assert_eq!(
+            read_image_receipt(root, "rust", &pin).unwrap(),
+            Some(expected)
+        );
+        write_atomic(&raw, format!("sha256:{}", "b".repeat(64)).as_bytes(), 0o644).unwrap();
+        assert!(read_image_receipt(root, "rust", &pin).unwrap().is_none());
     }
 }

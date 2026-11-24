@@ -214,6 +214,9 @@ pub fn lexical(path: &Path) -> Result<PathBuf> {
     }
     Ok(result)
 }
+#[cfg(target_os = "macos")]
+mod darwin;
+
 pub fn project_root(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -221,7 +224,11 @@ pub fn project_root(path: &Path) -> Result<PathBuf> {
         std::env::current_dir()?.join(path)
     };
     let result = lexical(&absolute)?;
+    #[cfg(target_os = "macos")]
+    let result = darwin::system_alias(result)?;
     check_ancestors(&result)?;
+    #[cfg(target_os = "macos")]
+    let result = darwin::spelling(&result)?;
     Ok(result)
 }
 fn check_ancestors(path: &Path) -> Result<()> {

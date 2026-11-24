@@ -11,7 +11,7 @@ use std::{
 pub const MANIFEST_PATH: &str = ".devkit/manifest.json";
 pub const PENDING_PATH: &str = ".devkit/update-pending.json";
 pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
-pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
+pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.5.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn check_manifest_regular_bounded(path: &Path) -> Result<()> {
@@ -51,7 +51,7 @@ fn unsupported_floor_error(is_update: bool, found: &str, min_from: &str) -> anyh
     crate::cli::error(
         code,
         format!(
-            "Project uses Devkit {found}, which is older than the minimum supported version {min_from}. Upgrade through the 0.4.1 bridge release first: npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check (append --reconcile-lock if transitive npm peer dependencies conflict)."
+            "Project uses Devkit {found}, which is older than the minimum supported version {min_from}. On Linux x86-64, upgrade 0.4.x through the 0.5.1 bridge release: npx @docouno/devkit@0.5.1 update . --to 0.5.1 && make setup && make check. For older checkouts, first update to 0.4.1."
         ),
     )
 }
@@ -458,6 +458,8 @@ pub enum CheckoutLockMode {
 pub struct LockOwner {
     pub pid: u32,
     pub start_time_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time_scale: Option<String>,
     pub operation: String,
     pub started_at_ms: u64,
 }
@@ -469,7 +471,13 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+#[cfg(target_os = "linux")]
+const START_TIME_SCALE: &str = "linux-ticks";
+#[cfg(target_os = "macos")]
+const START_TIME_SCALE: &str = "darwin-usec";
+
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
     let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = raw.get(raw.rfind(')')? + 1..)?;
     let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
@@ -479,6 +487,43 @@ fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
     let ppid: u32 = fields[1].parse().ok()?;
     let start_ticks: u64 = fields[19].parse().ok()?;
     Some((ppid, start_ticks))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let length = size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: info is an aligned output buffer of exactly the declared size.
+    let count = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            length,
+        )
+    };
+    if count == length {
+        let info = unsafe { info.assume_init() };
+        return (info.pbi_pid == pid as u32 && info.pbi_status != libc::SZOMB).then_some((
+            info.pbi_ppid,
+            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        ));
+    }
+    if !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM | libc::EACCES)
+    ) {
+        return None;
+    }
+    // KERN_PROC_PID exposes BSD identity for a live parent/lock holder under another UID.
+    unsafe extern "C" {
+        fn devkit_sysctl_process(pid: i32, parent: *mut u32, start: *mut u64) -> i32;
+    }
+    let mut parent = 0;
+    let mut start = 0;
+    (unsafe { devkit_sysctl_process(pid, &mut parent, &mut start) } == 0).then_some((parent, start))
 }
 
 fn is_ancestor_or_self(target_pid: u32) -> bool {
@@ -498,15 +543,42 @@ fn is_ancestor_or_self(target_pid: u32) -> bool {
     false
 }
 
-pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
+enum OwnerIdentity {
+    Verified(LockOwner),
+    #[cfg(target_os = "macos")]
+    Inaccessible,
+}
+
+fn checkout_owner(root: &Path) -> Option<OwnerIdentity> {
     let path = safe_path(root, ".devkit/state/task.owner.json").ok()?;
     let (bytes, _) = read_regular_file(&path, 65536, "checkout lock owner").ok()??;
     let owner: LockOwner = serde_json::from_slice(&bytes).ok()?;
-    if owner.pid == 0 {
+    if owner.pid == 0
+        || owner.start_time_scale.as_deref().unwrap_or("linux-ticks") != START_TIME_SCALE
+    {
         return None;
     }
-    let (_, ticks) = proc_stat_ppid_and_start(owner.pid)?;
-    (ticks == owner.start_time_ticks).then_some(owner)
+    if let Some((_, ticks)) = proc_stat_ppid_and_start(owner.pid) {
+        return (ticks == owner.start_time_ticks).then_some(OwnerIdentity::Verified(owner));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(pid) = i32::try_from(owner.pid)
+        && unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    {
+        // A protected process exists but its birth time could not be verified.
+        // Honor the normal wait deadline without trusting its identity.
+        return Some(OwnerIdentity::Inaccessible);
+    }
+    None
+}
+
+pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
+    match checkout_owner(root)? {
+        OwnerIdentity::Verified(owner) => Some(owner),
+        #[cfg(target_os = "macos")]
+        OwnerIdentity::Inaccessible => None,
+    }
 }
 
 pub(crate) fn probe_checkout_lock(root: &Path) -> Result<bool> {
@@ -545,10 +617,12 @@ fn write_owner_sidecar(root: &Path, operation: &str) -> Result<PathBuf> {
         );
     }
     let pid = std::process::id();
-    let start_time_ticks = proc_stat_ppid_and_start(pid).map(|(_, t)| t).unwrap_or(0);
+    let (_, start_time_ticks) =
+        proc_stat_ppid_and_start(pid).context("Cannot establish checkout lock owner identity")?;
     let payload = serde_json::to_vec(&LockOwner {
         pid,
         start_time_ticks,
+        start_time_scale: Some(START_TIME_SCALE.to_owned()),
         operation: operation.to_owned(),
         started_at_ms: now_epoch_ms(),
     })?;
@@ -759,7 +833,8 @@ impl CheckoutLock {
                         r.check_cancelled()?;
                     }
                     let elapsed = started.elapsed();
-                    if let Some(owner) = read_live_owner(&root) {
+                    let identity = checkout_owner(&root);
+                    if let Some(OwnerIdentity::Verified(owner)) = identity {
                         ensure!(
                             !is_ancestor_or_self(owner.pid),
                             "Recursive devkit invocation detected inside active operation (pid {})",
@@ -789,6 +864,13 @@ impl CheckoutLock {
                         } else {
                             250.min(timeout_ms)
                         };
+                        #[cfg(target_os = "macos")]
+                        let unowned_limit_ms =
+                            if matches!(identity, Some(OwnerIdentity::Inaccessible)) {
+                                timeout_ms
+                            } else {
+                                unowned_limit_ms
+                            };
                         if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
                             anyhow::bail!("Another devkit operation owns this checkout");
                         }
@@ -797,5 +879,56 @@ impl CheckoutLock {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn lock_identity_rejects_other_clocks_and_stale_start_times() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = CheckoutLock::acquire(root.path()).unwrap();
+        let owner = read_live_owner(root.path()).unwrap();
+        assert_eq!(owner.start_time_scale.as_deref(), Some(START_TIME_SCALE));
+        let file = root.path().join(".devkit/state/task.owner.json");
+        let mut json = serde_json::to_value(owner).unwrap();
+        json["startTimeScale"] = "unknown".into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(read_live_owner(root.path()).is_none());
+        json.as_object_mut().unwrap().remove("startTimeScale");
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(
+            read_live_owner(root.path()).is_some(),
+            cfg!(target_os = "linux")
+        );
+        json["startTimeScale"] = START_TIME_SCALE.into();
+        json["startTimeTicks"] = 0.into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(read_live_owner(root.path()).is_none());
+        assert!(probe_checkout_lock(root.path()).unwrap());
+        drop(lock);
+    }
+
+    #[test]
+    fn process_birth_time_and_ancestry_exclude_zombies() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read x"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (parent, start) = proc_stat_ppid_and_start(pid).unwrap();
+        assert_eq!(parent, std::process::id());
+        assert!(start > 0);
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while proc_stat_ppid_and_start(pid).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait().unwrap();
     }
 }

@@ -14,6 +14,14 @@ use std::{
 use tempfile::TempDir;
 
 const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+fn process_exists(pid: i32) -> bool {
+    assert!(pid > 1);
+    // A zombie also counts: the runner must reap children before returning.
+    unsafe {
+        libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -153,6 +161,12 @@ fn native_process_probe() {
         return;
     };
     let runner = ProcessRunner::new().unwrap();
+    #[cfg(target_os = "macos")]
+    if scenario == "watcher-kill" {
+        runner
+            .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
+            .unwrap();
+    }
     let owned = OwnedContainer::new("devkit-process-test".into(), "accepted-token".into());
     let mut command = Command::new("sh");
     let source = match scenario.as_str() {
@@ -162,7 +176,7 @@ fn native_process_probe() {
         "foreign-cleanup" => "printf foreign-token > \"$DEVKIT_PROCESS_FIXTURE/container\"",
         "cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"",
         "primary-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 42",
-        "wait-cancel" => {
+        "wait-cancel" | "watcher-kill" => {
             "sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
         }
         "delayed-create" => {
@@ -251,7 +265,7 @@ fn normal_creator_exit_reaps_children_holding_output_pipe() {
     assert!(before.elapsed() < Duration::from_secs(5));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
+        !process_exists(pid.trim().parse().unwrap()),
         "Creator child was not reaped"
     );
 }
@@ -326,7 +340,7 @@ fn cancellation_reaps_before_cleanup_and_never_reports_success() {
             }
             if let Ok(pid) = fs::read_to_string(fixture.root().join("child-pid")) {
                 assert!(
-                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    !process_exists(pid.trim().parse().unwrap()),
                     "Creator child survived {scenario}"
                 );
             }
@@ -345,7 +359,7 @@ fn deadlines_reap_the_creator_group_before_exact_owned_cleanup() {
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
         assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
+            !process_exists(pid.trim().parse().unwrap()),
             "Timed-out creator descendant survived"
         );
         if scenario == "timed-owned" {
@@ -396,7 +410,7 @@ fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() 
     assert!(error.to_string().contains("exceeded its deadline"));
     assert!(started.elapsed() < Duration::from_secs(4));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
-    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    assert!(!process_exists(pid.trim().parse().unwrap()));
 }
 
 #[test]
@@ -555,7 +569,7 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
             .parse()
             .unwrap();
         assert!(
-            Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            process_exists(devkit_pid),
             "devkit died prematurely on worker thread exit"
         );
         // SAFETY: parent is the live helper process spawned above.
@@ -563,8 +577,7 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
         let _ = parent.wait();
         let mut reaped_code = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (Path::new(&format!("/proc/{devkit_pid}")).exists()
-            || Path::new(&format!("/proc/{grandchild_pid}")).exists())
+        while (process_exists(devkit_pid) || process_exists(grandchild_pid))
             && Instant::now() < deadline
         {
             let mut status = 0;
@@ -584,11 +597,11 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
             );
         }
         assert!(
-            !Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            !process_exists(devkit_pid),
             "devkit survived real parent SIGKILL: {devkit_err}"
         );
         assert!(
-            !Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+            !process_exists(grandchild_pid),
             "grandchild survived real parent SIGKILL: {devkit_err}"
         );
         assert!(
@@ -639,4 +652,105 @@ fn tracked_stdin_is_exact_bounded_and_has_a_terminal_receipt() {
             )
             .is_err()
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn killed_controller_releases_descendants_and_captured_pipes() {
+    let fixture = Fixture::new();
+    let mut child = fixture.start("watcher-kill");
+    wait_for(&fixture.root().join("ready"));
+    let descendant = fs::read_to_string(fixture.root().join("child-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_exists(descendant));
+    child.kill().unwrap();
+    let output = wait(child);
+    assert!(!output.status.success());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_exists(descendant) {
+        assert!(
+            Instant::now() < deadline,
+            "Controller died but creator descendant survived"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn observer_releases_inherited_locks_and_reusable_commands() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().join("lock");
+    let file = fs::File::create(&path).unwrap();
+    file.lock().unwrap();
+    // Simulate a tool exporting a non-CLOEXEC descriptor into devkit.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    let runner = ProcessRunner::new().unwrap();
+    runner
+        .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
+        .unwrap();
+    let mut command = Command::new("true");
+    runner.capture(&mut command).unwrap();
+    drop(file);
+    fs::File::open(&path).unwrap().try_lock().unwrap();
+    let error = runner
+        .capture(&mut Command::new("/no/such/devkit-test-command"))
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("Cannot start"));
+    runner.capture(&mut command).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_group_registration_is_a_reaped_spawn_error() {
+    use std::{io::Read, os::unix::process::CommandExt};
+    let runner = ProcessRunner::new().unwrap();
+    runner
+        .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
+        .unwrap();
+    let (mut observed, write_pid) = io::pipe().unwrap();
+    let fd = write_pid.as_raw_fd();
+    let original_group = unsafe { libc::getpgrp() };
+    let mut command = Command::new("true");
+    // Exercise the rejection path with a child already assigned a different
+    // PGID. A failed registration must never let this command reach exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, original_group) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let bytes = libc::getpid().to_ne_bytes();
+            if libc::write(fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        });
+    }
+    let mut reaped = false;
+    assert!(
+        runner
+            .run_tracked(&mut command, OutputMode::Capture(16), None, &mut reaped)
+            .is_err()
+    );
+    drop(write_pid);
+    let mut bytes = [0; 4];
+    observed.read_exact(&mut bytes).unwrap();
+    let pid = i32::from_ne_bytes(bytes);
+    assert!(reaped && !process_exists(pid));
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    runner.capture(&mut Command::new("true")).unwrap();
 }

@@ -29,7 +29,7 @@ fn release_notes_select_only_the_requested_version() {
 fn release_body_uses_changelog_and_collapses_only_verification() {
     let f = Fixture::native_update();
     let body = f.contract.body().unwrap();
-    assert!(body.contains("Raise the minimum supported project checkout"));
+    assert!(body.contains("Run the same checkout on Linux x86-64 and Linux ARM64"));
     assert!(!body.contains("Compare Git-tracked managed files"));
     assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
     let set = f.set();
@@ -47,7 +47,7 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     assert!(
         details
             > saved
-                .find("Raise the minimum supported project checkout")
+                .find("Run the same checkout on Linux x86-64 and Linux ARM64")
                 .unwrap()
     );
     assert!(saved.find("Public verification: passed.").unwrap() > details);
@@ -61,6 +61,36 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     assert_eq!(read_proof(&remote).index_sha256, proof.index_sha256);
 }
 
+fn seal_checksums(root: &Path, files: &mut BTreeMap<String, devkit::distribution::AssetIdentity>) {
+    let bytes = checksums(files);
+    fs::write(root.join("checksums.txt"), &bytes).unwrap();
+    files.insert(
+        "checksums.txt".into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(bytes.as_bytes()),
+            size: bytes.len() as u64,
+        },
+    );
+}
+
+fn elf_fixture(machine: u16) -> Vec<u8> {
+    // A format fixture with one executable PT_LOAD segment. It is never run.
+    let mut b = vec![0; 120];
+    b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    b[16..18].copy_from_slice(&2u16.to_le_bytes());
+    b[18..20].copy_from_slice(&machine.to_le_bytes());
+    b[20] = 1;
+    b[32] = 64;
+    b[52] = 64;
+    b[54] = 56;
+    b[56] = 1;
+    b[64] = 1;
+    b[68] = 5;
+    b[96] = 120;
+    b[104] = 120;
+    b
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     contract: Contract,
@@ -70,11 +100,11 @@ impl Fixture {
         Self::with_version("0.3.0")
     }
     fn native_update() -> Self {
-        let mut fixture = Self::with_version("0.5.0");
+        let mut fixture = Self::with_version("0.6.0");
         fixture.contract.previous = Selectors {
-            environment: Some("0.4.1".into()),
-            cli: Some("0.4.1".into()),
-            github: Some("v0.4.1".into()),
+            environment: Some("0.5.1".into()),
+            cli: Some("0.5.1".into()),
+            github: Some("v0.5.1".into()),
         };
         fixture
     }
@@ -83,6 +113,7 @@ impl Fixture {
         let mut files = BTreeMap::new();
         for name in [
             "devkit-x86_64-unknown-linux-musl".to_owned(),
+            "devkit-aarch64-unknown-linux-musl".to_owned(),
             format!("devkit-{version}.tar.gz"),
             "release.json".into(),
             "install.sh".into(),
@@ -91,16 +122,21 @@ impl Fixture {
             format!("docouno-env-{version}.tgz"),
             format!("docouno-devkit-{version}.tgz"),
         ] {
-            let bytes = format!("frozen {name}");
+            let bytes = match name.as_str() {
+                "devkit-x86_64-unknown-linux-musl" => elf_fixture(62),
+                "devkit-aarch64-unknown-linux-musl" => elf_fixture(183),
+                _ => format!("frozen {name}").into_bytes(),
+            };
             fs::write(directory.path().join(&name), &bytes).unwrap();
             files.insert(
                 name,
                 devkit::distribution::AssetIdentity {
-                    sha256: digest(bytes.as_bytes()),
+                    sha256: digest(&bytes),
                     size: bytes.len() as u64,
                 },
             );
         }
+        seal_checksums(directory.path(), &mut files);
         let mut packages = BTreeMap::new();
         for (kind, name, archive) in [
             (
@@ -132,6 +168,12 @@ impl Fixture {
             publication_eligible: true,
             release_identity: files["release.json"].sha256.clone(),
             engine: "devkit-x86_64-unknown-linux-musl".into(),
+            engines: Some(
+                REQUIRED_PUBLISHABLE_TARGETS
+                    .iter()
+                    .map(|t| (t.triple().into(), t.asset().into()))
+                    .collect(),
+            ),
             archive: format!("devkit-{version}.tar.gz"),
             packages,
             files,
@@ -170,6 +212,42 @@ impl Fixture {
             latest_read_elapsed: BTreeMap::new(),
         }
     }
+}
+
+#[test]
+fn release_controller_requires_the_complete_engine_matrix_and_its_checksum_listing() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.path();
+    let index = fixture.set().index;
+    let mut incomplete = index.clone();
+    incomplete
+        .engines
+        .as_mut()
+        .unwrap()
+        .remove(devkit::distribution::Target::LinuxArm64.triple());
+    files::write_json(&root.join("release-index.json"), &incomplete).unwrap();
+    assert!(FrozenSet::load(root).is_err());
+    let mut inconsistent = index;
+    let old = fs::read_to_string(root.join("checksums.txt")).unwrap();
+    let partial = old
+        .lines()
+        .filter(|line| !line.ends_with(devkit::distribution::Target::LinuxArm64.asset()))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(root.join("checksums.txt"), &partial).unwrap();
+    inconsistent.files.insert(
+        "checksums.txt".into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(partial.as_bytes()),
+            size: partial.len() as u64,
+        },
+    );
+    files::write_json(&root.join("release-index.json"), &inconsistent).unwrap();
+    let err = FrozenSet::load(root)
+        .err()
+        .expect("missing checksum must fail admission");
+    assert!(err.to_string().contains("checksums.txt differs"));
 }
 
 #[test]
@@ -217,6 +295,14 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
     let commit = git(&["rev-parse", "HEAD"]);
     let tree = git(&["rev-parse", "HEAD^{tree}"]);
     let payload_source = tempfile::tempdir().unwrap();
+    for target in REQUIRED_PUBLISHABLE_TARGETS {
+        files::write_atomic(
+            &payload_source.path().join(target.payload_name()),
+            &fs::read(fixture.directory.path().join(target.asset())).unwrap(),
+            0o755,
+        )
+        .unwrap();
+    }
     let environment = b"fixture environment archive";
     files::write_atomic(
         &payload_source.path().join("npm/env.tgz"),
@@ -269,6 +355,7 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
             },
         );
     }
+    seal_checksums(set_root, &mut index.files);
     index.release_identity = index.files["release.json"].sha256.clone();
     files::write_json(&set_root.join("release-index.json"), &index).unwrap();
     let mut args = Args {
@@ -296,6 +383,33 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
             .identity,
         index.release_identity
     );
+    // A self-consistent raw asset set must still match the bytes in the accepted payload.
+    let arm = devkit::distribution::Target::LinuxArm64.asset();
+    let original = fs::read(set_root.join(arm)).unwrap();
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"other build");
+    fs::write(set_root.join(arm), &changed).unwrap();
+    let mut mismatched = index.clone();
+    mismatched.files.insert(
+        arm.into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(&changed),
+            size: changed.len() as u64,
+        },
+    );
+    seal_checksums(set_root, &mut mismatched.files);
+    files::write_json(&set_root.join("release-index.json"), &mismatched).unwrap();
+    assert!(
+        FrozenSet::load(set_root)
+            .unwrap()
+            .hydrate()
+            .unwrap_err()
+            .to_string()
+            .contains("Hydrated engine differs")
+    );
+    fs::write(set_root.join(arm), original).unwrap();
+    seal_checksums(set_root, &mut index.files);
+    files::write_json(&set_root.join("release-index.json"), &index).unwrap();
     for (field, wrong) in [
         ("--version", "0.4.0"),
         ("--source-commit", &"c".repeat(40)),
@@ -385,7 +499,7 @@ impl Fake {
                 summary["umasks"] = json!(["022", "077"]);
             }
             if name == "performance" {
-                summary["baseline"] = json!({"version": "0.4.1"});
+                summary["baseline"] = json!({"version": "0.5.1"});
                 summary["comparisons"] =
                     json!([{"shape":"one","operation":"doctor","nonRegressionPassed":true}]);
                 summary["measurements"] = json!([{"case":"warm","sampleCount":30}]);
@@ -519,7 +633,11 @@ impl Remote for Fake {
     }
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()> {
         ensure!(
-            self.assets.len() == 9 && self.assets.contains_key("release-index.json"),
+            self.assets.len() == 8 + REQUIRED_PUBLISHABLE_TARGETS.len()
+                && self.assets.contains_key("release-index.json")
+                && REQUIRED_PUBLISHABLE_TARGETS
+                    .iter()
+                    .all(|t| self.assets.contains_key(t.asset())),
             "Registry write before complete durable GitHub staging"
         );
         ensure!(
@@ -640,11 +758,12 @@ impl Remote for Fake {
 #[test]
 fn lost_upload_response_resumes_without_overwriting_any_original_bytes() {
     let f = Fixture::new();
+    let set = f.set();
     let mut remote = f.remote();
     remote.fault = Some("upload:checksums.txt".into());
-    assert!(stage(&mut remote, &f.set(), &f.contract).is_err());
+    assert!(stage(&mut remote, &set, &f.contract).is_err());
     let first = remote.assets["checksums.txt"].clone();
-    stage(&mut remote, &f.set(), &f.contract).unwrap();
+    stage(&mut remote, &set, &f.contract).unwrap();
     assert_eq!(remote.assets["checksums.txt"], first);
     assert_eq!(
         remote
@@ -654,7 +773,7 @@ fn lost_upload_response_resumes_without_overwriting_any_original_bytes() {
             .count(),
         1
     );
-    assert_eq!(remote.assets.len(), 9);
+    assert_eq!(remote.assets.len(), set.asset_names().len());
 }
 
 #[test]
@@ -918,8 +1037,8 @@ fn native_upgrade_target_binding_blocks_proof_and_promotion_before_writes() {
     .unwrap();
     record_proof(&mut remote, &set, &fixture.contract, &proof).unwrap();
     promote(&mut remote, &set, &fixture.contract).unwrap();
-    assert_eq!(remote.selectors.environment.as_deref(), Some("0.5.0"));
-    assert_eq!(remote.selectors.cli.as_deref(), Some("0.5.0"));
+    assert_eq!(remote.selectors.environment.as_deref(), Some("0.6.0"));
+    assert_eq!(remote.selectors.cli.as_deref(), Some("0.6.0"));
 }
 
 #[test]
@@ -1349,8 +1468,8 @@ fn generated_performance(c: &Contract) -> Value {
         "sourceTree": c.source_tree,
         "indexSha256": c.index_sha256,
         "baseline": {
-            "version": "0.4.1",
-            "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+            "version": "0.5.1",
+            "releaseIdentity": "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
         },
         "comparisons": [
             {
@@ -1756,11 +1875,11 @@ fn varied_performance(c: &Contract) -> Value {
     raw["buildRun"] = json!(c.build_run);
     raw["releaseIdentity"] = json!("e".repeat(64));
     raw["baseline"] = json!({
-        "version": "0.4.1",
-        "source": "/home/runner/work/project/project/.artifacts/baseline/v0.4.1/payload",
-        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz",
-        "archiveSha256": "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a",
-        "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+        "version": "0.5.1",
+        "source": "/home/runner/work/project/project/.artifacts/baseline/v0.5.1/payload",
+        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.5.1/devkit-0.5.1.tar.gz",
+        "archiveSha256": "f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b",
+        "releaseIdentity": "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
     });
     raw
 }
@@ -1792,7 +1911,7 @@ fn public_baseline_and_performance_contract_reject_stale_versions_and_under_samp
     legacy_key.gates.insert("public-0.2.1".into(), gate);
     assert!(legacy_key.validate(c).is_err());
 
-    // Performance receipt with non-0.4.1 baseline, < 30 samples, or failed non-regression is rejected.
+    // Performance receipt with non-0.5.1 baseline, < 30 samples, or failed non-regression is rejected.
     let perf = varied_performance(c);
     let perf_bytes = serde_json::to_vec(&perf).unwrap();
     gate_from_receipt("performance", &perf_bytes, perf.clone(), c).unwrap();
@@ -1861,7 +1980,7 @@ fn complete_generated_proof_compacts_latest_and_retains_all_required_facts_with_
         identity["tarAndNpmCanonicalPayloadEqual"] = json!(true);
         identity["packages"] = json!([ENVIRONMENT,CLI].map(|name| json!({"name":name,"version":c.version,"integrity":format!("sha512-{}", "a".repeat(88)),"shasum":"b".repeat(40)})));
         summary["limits"] = json!([
-            "Actual public v0.4.1 baseline factory; source and complete package identities verified",
+            "Actual public v0.5.1 baseline factory; source and complete package identities verified",
             "No host language SDK and no authenticated downloads"
         ]);
         summary["consumerReceiptSha256"] = json!("c".repeat(64));

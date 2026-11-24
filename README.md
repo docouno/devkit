@@ -2,20 +2,20 @@
 
 A shared development environment for independent TypeScript and Rust repositories. Create applications and npm libraries from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
-Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer, and GNU Make. Node.js is needed only for the optional npm entry point.
+Requires Linux x86-64 or ARM64, GNU Make, and a local Linux Docker Engine with Docker Compose 5.0.0 or newer. Node.js is needed only for the optional npm entry point.
 
 ## Create a project
 
 Start the interactive CLI:
 
 ```sh
-npx @docouno/devkit@0.5.1
+npx @docouno/devkit@0.6.0
 ```
 
 Or provide the choices explicitly:
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-product --app web=react-web
+npx @docouno/devkit@0.6.0 init my-product --app web=react-web
 cd my-product
 make setup
 make check
@@ -25,19 +25,19 @@ make dev app=web
 Without host Node.js:
 
 ```sh
-curl -fsSL https://github.com/docouno/devkit/releases/download/v0.5.1/install.sh | sh -s -- init my-product --app web=react-web
+curl -fsSL https://github.com/docouno/devkit/releases/download/v0.6.0/install.sh | sh -s -- init my-product --app web=react-web
 ```
 
-Both entry points use the same native CLI. Projects record an exact release and its integrity; ordinary development commands use the verified local cache.
+Both entry points verify the native CLI for the host architecture. A checkout records the same release identity on both platforms. Run `make setup` in each checkout to prepare the tools and images for its Docker daemon.
 
 ## Applications, libraries and presets
 
 Application templates include `node-api`, `rust-api`, `react-web`, and `electron-react`. Package templates include `ts-library`, `react-ui`, and `react-client`. Repositories can host `0..N` applications and `1..M` packages — including standalone library workspaces without applications:
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-sdk --package sdk=ts-library
-npx @docouno/devkit@0.5.1 init my-design-system --preset design-system
-npx @docouno/devkit@0.5.1 init fullstack-product --preset fullstack-desktop
+npx @docouno/devkit@0.6.0 init my-sdk --package sdk=ts-library
+npx @docouno/devkit@0.6.0 init my-design-system --preset design-system
+npx @docouno/devkit@0.6.0 init fullstack-product --preset fullstack-desktop
 ```
 
 ```text
@@ -114,12 +114,12 @@ Use `make exec command='pnpm …'` for commands in the root Node workspace (pass
 
 ## Update an existing project
 
-From a `0.5.1` checkout, choose the target release, inspect the proposed changes and migration notes, then apply them on a branch. This example repeats the accepted version:
+From a `0.5.1` checkout on Linux x86-64, preview the update on a branch and inspect the migration notes before applying it.
 
 ```sh
-git switch -c chore/devkit-0.5.1
-make update to=0.5.1 preview=1
-make update to=0.5.1
+git switch -c chore/devkit-0.6.0
+make update to=0.6.0 preview=1
+make update to=0.6.0
 make setup
 make check
 ```
@@ -128,7 +128,7 @@ Pass `reconcile=1` when transitive lockfile dependencies require re-resolution a
 
 After an interrupted update, `make recover` restores the known transaction state. See [Upgrading](docs/upgrades.md) for recovery while the older loader is still installed.
 
-To upgrade from `0.4.1`, use `sh .devkit/runtime/devkit.sh cli update . --to 0.5.1`. For `0.4.0`, use the versioned `0.5.1` installer or `npx @docouno/devkit@0.5.1 update . --to 0.5.1`. Repositories on `0.2.x` or `0.3.x` must bridge through `0.4.1` first.
+On Linux ARM64, use `npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview` for a `0.5.x` checkout, then apply the update without `--preview`. Older checkouts must first adopt `0.5.1` on Linux x86-64. See the [upgrade window](docs/upgrades.md#supported-upgrade-window).
 
 ## Documentation
 
@@ -138,7 +138,7 @@ Every initialized repository includes a concise offline reference at `.devkit/ru
 - [Workflows](docs/workflows.md) — creating apps and libraries, `--preset design-system` live HMR, `--use`, `npm:` aliases, and `devkit sync`.
 - [Publishing Libraries](docs/publishing.md) — opting into `"private": false`, `make package` verification, npm OIDC provenance, and GitLab Package Registry.
 - [Continuous Integration](docs/ci.md) — GitHub Actions, GitLab CI, custom enterprise CAs (`DEVKIT_CA_CERT`), and airgapped runners.
-- [Upgrading](docs/upgrades.md) — `devkit update`, `--reconcile-lock`, cumulative migration notes, cross-release dispatch, the `0.4.1` bridge, and `devkit recover`.
+- [Upgrading](docs/upgrades.md) — `devkit update`, `--reconcile-lock`, cumulative migration notes, cross-release dispatch, the `0.5.1` bridge, and `devkit recover`.
 
 ## CLI and automation
 
@@ -155,6 +155,17 @@ Hardlinks require a shared filesystem and mount. If the configured cache cannot 
 Run `make help` for author commands. Releases are built, tested and published through [GitHub Actions](https://github.com/docouno/devkit/actions/workflows/release.yml).
 
 `DEVKIT_AUTHOR_PNPM_STORE` and `DEVKIT_AUTHOR_PNPM_CACHE` configure the author SDK caches for setup and subsequent Node gates, including offline integration tests. They default to `.artifacts/author/pnpm-store` and `.artifacts/author/pnpm-cache` in this checkout; external directories are mounted into the SDK containers.
+
+Build a native release contribution on each Linux architecture with `make build-target output=/absolute/new/contribution`. Each contribution contains the executable, its notices and a hashed producer receipt. Assemble the contributions from the same commit with:
+
+```sh
+make pack output=/absolute/new/build-set \
+  target_inputs="x86_64-unknown-linux-musl:$amd64_dir:$amd64_sha aarch64-unknown-linux-musl:$arm64_dir:$arm64_sha"
+```
+
+The SHA values are the producer-reported SHA-256 digests of `producer.json`. Pass `npm_inputs=/absolute/prepared/directory` to use already prepared npm inputs. For a local x86-64 preview, `make pack-local output=/absolute/new/preview` prepares a single-host set.
+
+The published engine targets are Linux x86-64 and ARM64. The Darwin ARM64 build is for host testing. Publishing it also requires a full run against a local Linux Docker VM on Apple Silicon.
 
 Template v9 locks record the complete native pnpm selection graph, including peer contexts. Release preparation validates the complete seed with frozen pnpm and changes only the owned environment version and archive identity; the producer and independent assembler reject other selection changes even when the package set and integrity values match. The source environment's dependencies, peers, and metadata must agree with that graph. Regenerate and commit template locks explicitly when changing their dependency graph.
 

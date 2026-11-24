@@ -24,16 +24,16 @@ class Safety(Harness):
                 archive.addfile(item, io.BytesIO(data))
         return stream.getvalue()
     def index_for_archive(self, *, sha256, size):
-        patched = copy.deepcopy(self.old_index)
-        patched['files'][self.old_index['archive']] = {'sha256': sha256, 'size': size}
+        patched = copy.deepcopy(self.index)
+        patched['files'][self.index['archive']] = {'sha256': sha256, 'size': size}
         return json.dumps(patched).encode()
     def reject_archive(self, name, data):
         original_archive = self.fixture.routes[self.archive_route]
-        original_index = self.fixture.routes[self.old_index_route]
+        original_index = self.fixture.routes[self.index_route]
         self.fixture.routes[self.archive_route] = data
-        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(data), size=len(data))
+        self.fixture.routes[self.index_route] = self.index_for_archive(sha256=digest(data), size=len(data))
         try:
-            result = self.cold_old(name, expected='devkit:')
+            result = self.cold_init(name, self.version, expected='devkit:')
             require(
                 'Downloaded archive checksum mismatch' not in result.stderr
                 and 'Invalid release asset' not in result.stderr
@@ -43,7 +43,7 @@ class Safety(Harness):
             )
         finally:
             self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
+            self.fixture.routes[self.index_route] = original_index
     def cancel(self, name, argv, route):
         self.fixture.ready.clear(); self.fixture.resume.clear()
         original = self.fixture.routes.get(route)
@@ -81,7 +81,7 @@ class Safety(Harness):
             require(not list(cache.rglob('devkit')) and not list(cache.rglob('.engine.*')), 'Bad ELF became a cached engine')
         self.fixture.routes[self.engine_route] = real_engine
         self.cancel('cancel-initial-curl', ['sh', self.script, '--version'], self.engine_route)
-        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.old_version, '--app', 'api=rust-api', '--non-interactive'], self.old_index_route)
+        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.version, '--app', 'api=rust-api', '--non-interactive'], self.index_route)
         # The native HTTP reader has one bounded path for known/unknown lengths.
         def unknown(handler):
             handler.send_response(200); handler.send_header('Connection', 'close'); handler.end_headers()
@@ -103,22 +103,22 @@ class Safety(Harness):
         require(time.monotonic() - started < 15 and not output.exists(), 'Stalled reader outlived its bound')
         self.fixture.resume.set()
         original_archive = self.fixture.routes[self.archive_route]
-        original_index = self.fixture.routes[self.old_index_route]
+        original_index = self.fixture.routes[self.index_route]
         try:
             self.fixture.routes[self.archive_route] = None
-            self.cold_old('missing-release-archive', expected='devkit:')
+            self.cold_init('missing-release-archive', self.version, expected='devkit:')
             def partial(handler):
                 handler.send_response(200); handler.send_header('Content-Length', str(len(original_archive))); handler.end_headers()
                 handler.wfile.write(original_archive[:128]); handler.wfile.flush(); handler.close_connection = True
             self.fixture.routes[self.archive_route] = partial
-            self.cold_old('truncated-HTTP-archive', expected='devkit:')
+            self.cold_init('truncated-HTTP-archive', self.version, expected='devkit:')
             self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256='0' * 64, size=len(original_archive))
-            self.cold_old('archive-checksum-mismatch', expected='Downloaded archive checksum mismatch')
+            self.fixture.routes[self.index_route] = self.index_for_archive(sha256='0' * 64, size=len(original_archive))
+            self.cold_init('archive-checksum-mismatch', self.version, expected='Downloaded archive checksum mismatch')
         finally:
             self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
-        prefix = f'devkit-{self.old_version}/'
+            self.fixture.routes[self.index_route] = original_index
+        prefix = f'devkit-{self.version}/'
         base = [(prefix, tarfile.DIRTYPE, 0o755, b'')]
         for name, path, kind, mode in (
             ('traversal', prefix + '../escape', tarfile.REGTYPE, 0o644),
@@ -158,8 +158,8 @@ class Safety(Harness):
         env = self.environment('cancel-native-extraction')
         target = self.scratch / 'cancel-native-extraction'
         self.fixture.routes[self.archive_route] = expanded_bytes
-        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(expanded_bytes), size=len(expanded_bytes))
-        process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.old_version,
+        self.fixture.routes[self.index_route] = self.index_for_archive(sha256=digest(expanded_bytes), size=len(expanded_bytes))
+        process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.version,
             '--app', 'api=rust-api', '--non-interactive'], cwd=self.scratch, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -177,8 +177,8 @@ class Safety(Harness):
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=5)
             self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
-        valid = self.baseline_archive.read_bytes()
+            self.fixture.routes[self.index_route] = original_index
+        valid = (self.build_set / self.index['archive']).read_bytes()
         # CRC/truncation reach the actual native reader with a matching transport hash.
         changed = bytearray(valid); changed[-8] ^= 1
         self.reject_archive('native-CRC', bytes(changed))

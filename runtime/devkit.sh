@@ -1,14 +1,18 @@
 #!/bin/sh
-# Initial transfer and delegation only; all project operations run in the ELF.
+# Initial transfer and delegation only. Project operations run in the native engine.
 # devkit-stand-protocol-v1
 set -eu
 mode=@@DEVKIT_MODE@@
 version=@@DEVKIT_VERSION@@
-expected=@@DEVKIT_ENGINE_SHA256@@
-target=@@DEVKIT_ENGINE_TARGET@@
-asset=devkit-x86_64-unknown-linux-musl
 fail() { printf 'devkit: %s\n' "$*" >&2; exit 1; }
-[ "$(uname -sm)" = 'Linux x86_64' ] || fail 'this release requires Linux x86_64'
+host_os=$(uname -s)
+host_cpu=$(uname -m)
+case "$host_os:$host_cpu" in
+# @@DEVKIT_ENGINE_PINS@@
+  *) fail "this release does not support $host_os $host_cpu" ;;
+esac
+expected=$sha256
+asset=devkit-$target
 command=${1:-help}
 root=
 loader_directory=${0%/*}
@@ -24,7 +28,7 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
   unset DEVKIT_APP DEVKIT_PACKAGE DEVKIT_TARGET_COMPONENT DEVKIT_FOLLOW DEVKIT_TAIL
   unset DEVKIT_HEADLESS DEVKIT_CLEANUP DEVKIT_PACKAGE_AGGREGATE DEVKIT_DEV_GROUP
   unset DEVKIT_SYNC_RECONCILE DEVKIT_SYNC_PREVIEW DEVKIT_INFO_JSON DEVKIT_EXPECTED_MANIFEST
-  unset DEVKIT_EXPECTED_PLAN DEVKIT_MAKE_PLAN DEVKIT_MAKE_DAG DEVKIT_ENGINE_PATH
+  unset DEVKIT_EXPECTED_PLAN DEVKIT_MAKE_PLAN DEVKIT_MAKE_DAG DEVKIT_ENGINE_PATH DEVKIT_LINUX_HELPER_PATH
   unset DEVKIT_LIFECYCLE_NAME DEVKIT_LIFECYCLE_TEMPLATE DEVKIT_LIFECYCLE_API
   unset DEVKIT_LIFECYCLE_USE DEVKIT_LIFECYCLE_PROFILE DEVKIT_LIFECYCLE_TO
   unset DEVKIT_EXEC_COMMAND DEVKIT_EXEC_COMPONENT DEVKIT_EXEC_CONFLICT
@@ -45,10 +49,45 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
 fi
 if [ "$mode" = project ] && [ "$command" = down ]; then
   case "${DEVKIT_CLEANUP:-0}" in 0|1) ;; *) fail 'cleanup must be 0 or 1' ;; esac
+  bounded_git() {
+    if [ "$host_os" = Darwin ]; then
+      # Isolate stdout so a slow descendant cannot keep the loader's pipe open.
+      /usr/bin/perl -MPOSIX=setpgid -MTime::HiRes=alarm -e '
+        my $pid = open(my $output, "-|");
+        defined($pid) or exit 1;
+        if ($pid == 0) {
+          setpgid(0, 0) == 0 or exit 1;
+          exec @ARGV;
+          exit 1;
+        }
+        my ($path, $success);
+        local $SIG{ALRM} = sub { die "deadline" };
+        my $ok = eval {
+          alarm(0.25);
+          local $/;
+          $path = <$output>;
+          $success = close($output);
+          alarm(0);
+          1;
+        };
+        unless ($ok) {
+          alarm(0);
+          kill "KILL", -$pid;
+          kill "KILL", $pid;
+          waitpid($pid, 0);
+          exit 1;
+        }
+        exit 1 unless $success;
+        print $path;
+      ' -- "$@"
+    else
+      timeout --kill-after=0.05s 0.25s "$@"
+    fi
+  }
   git_history_absent() {
     [ -e "$root/.git" ] || [ -L "$root/.git" ] || return 0
     [ ! -L "$root/.git" ] || return 1
-    admin=$(timeout --kill-after=0.05s 0.25s env -i PATH="$PATH" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+    admin=$(bounded_git env -i PATH="$PATH" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
       GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 \
       git -C "$root" -c core.fsmonitor=false rev-parse --absolute-git-dir 2>/dev/null) || return 1
     [ -d "$admin" ] && [ -x "$admin" ] && [ -r "$admin" ] \
@@ -65,7 +104,44 @@ fi
 
 # Bound both the pathname checks and the read. Compare the open file with its
 # pathname before and after, so replacement or an in-progress write fails closed.
+darwin_file() {
+  /usr/bin/perl -MFcntl=:DEFAULT,:mode -MTime::HiRes=stat,lstat,alarm -MDigest::SHA -e '
+    use strict;
+    my ($op, $path, $limit, $expected_stamp) = @ARGV;
+    alarm($limit <= 4194304 ? 0.25 : 2);
+    sub stamp {
+      return "" unless @_ && S_ISREG($_[2]);
+      # Preserve all time precision exposed by Time::HiRes.
+      return sprintf "%s/%s:%s:%s/%s", @_[3,0,1,7],
+        unpack("H*", pack("dd", @_[9,10]));
+    }
+    my @initial = lstat($path);
+    my $stamp = stamp(@initial);
+    exit 1 unless length($stamp) && $initial[7] <= $limit;
+    if ($op eq "stamp") { print $stamp; exit 0; }
+    exit 1 if defined($expected_stamp) && $stamp ne $expected_stamp;
+    sysopen(my $file, $path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or exit 1;
+    exit 1 unless stamp(stat($file)) eq $stamp;
+    my $sha = Digest::SHA->new(256);
+    my $count = 0;
+    while (1) {
+      my $n = sysread($file, my $data, 65536);
+      defined($n) or exit 1;
+      last if $n == 0;
+      $count += $n;
+      exit 1 if $count > $initial[7];
+      if ($op eq "read") { print $data; } else { $sha->add($data); }
+    }
+    exit 1 unless $count == $initial[7] && stamp(stat($file)) eq $stamp
+      && stamp(lstat($path)) eq $stamp;
+    print $sha->hexdigest if $op eq "hash";
+  ' -- "$@"
+}
 read_small() {
+  if [ "$host_os" = Darwin ]; then
+    darwin_file read "$1" 4194304
+    return
+  fi
   timeout --kill-after=0.05s 0.25s sh -c '
     set -eu
     p=$1
@@ -84,6 +160,10 @@ read_small() {
 if [ "$mode" = project ] && [ "$command" = make-manifest ]; then
   [ -d "$root/.devkit" ] && [ ! -L "$root/.devkit" ] || exit 1
   [ -f "$root/.devkit/project.mk" ] && [ ! -L "$root/.devkit/project.mk" ] && [ -r "$root/.devkit/project.mk" ] || exit 1
+  if [ "$host_os" = Darwin ]; then
+    darwin_file hash "$root/.devkit/manifest.json" 4194304 && printf '\n'
+    exit $?
+  fi
   # Preserve trailing newlines when capturing the checked bytes in the shell.
   manifest=$(read_small "$root/.devkit/manifest.json" && printf .) || exit 1
   observed=$(printf '%s' "${manifest%.}" | sha256sum)
@@ -228,16 +308,50 @@ if [ "$mode" = project ] && [ "${DEVKIT_MAKE_DAG:-0}" = 1 ]; then
   [ -n "${DEVKIT_MAKE_PLAN:-}" ] && [ -n "${DEVKIT_EXPECTED_MANIFEST:-}" ] \
     || fail 'cannot read accepted Make projection and manifest; run make recover or restore the managed files'
 fi
+cache_path() {
+  if [ "$host_os" = Darwin ]; then
+    /usr/bin/perl -MFcntl=:mode -MErrno=ENOENT -e '
+      my @parts;
+      for my $name (split m{/}, $ARGV[0]) {
+        next if $name eq "" || $name eq ".";
+        if ($name eq "..") { pop @parts; next; }
+        my $path = join "/", "", @parts, $name;
+        my @info = lstat($path);
+        exit 1 if !@info && !$!{ENOENT};
+        if (@info && S_ISLNK($info[2])) {
+          exit 1 if @parts || $name !~ /\A(?:tmp|var|etc)\z/;
+          my $dest = readlink($path);
+          exit 1 unless defined($dest) && ($dest eq "private/$name" || $dest eq "/private/$name");
+          push @parts, "private";
+          @info = lstat("/private/$name");
+          exit 1 unless @info && S_ISDIR($info[2]);
+        }
+        push @parts, $name;
+      }
+      print "/", join("/", @parts);
+    ' -- "$1"
+  else
+    lexical=$(realpath -ms -- "$1") || return 1
+    [ "$(realpath -m -- "$1")" = "$lexical" ] || return 1
+    printf '%s\n' "$lexical"
+  fi
+}
 if [ -n "${DEVKIT_ENGINE_PATH:-}" ]; then
   engine=$DEVKIT_ENGINE_PATH
 else
   cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
   case "$cache" in /*) ;; *) fail 'the cache directory must be absolute' ;; esac
-  cache=$(realpath -ms -- "$cache")
-  [ "$(realpath -m -- "$cache")" = "$cache" ] || fail 'the cache path contains a symbolic link'
-  engine=$cache/engines/$target/$version/$expected/devkit
+  cache=$(cache_path "$cache") || fail 'the cache path contains a symbolic link'
+  parent=$(cache_path "$cache/engines/$target/$version/$expected") || fail 'the engine cache path contains a symbolic link'
+  engine=$parent/devkit
 fi
-engine_metadata() { stat -c '%h/%d:%i:%s/%z' -- "$engine"; }
+engine_metadata() {
+  if [ "$host_os" = Darwin ]; then
+    darwin_file stamp "$engine" 134217728
+  else
+    stat -c '%h/%d:%i:%s/%z' -- "$engine"
+  fi
+}
 engine_link_settled() {
   current_stamp=$(engine_metadata 2>/dev/null) || return 1
   before_inode=${engine_stamp#*/}
@@ -248,6 +362,11 @@ engine_link_settled() {
 valid_engine_once() {
   [ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || return 1
   engine_stamp=$(engine_metadata) || return 1
+  if [ "$host_os" = Darwin ]; then
+    observed=$(darwin_file hash "$engine" 134217728 "$engine_stamp") || return 1
+    [ "$observed" = "$expected" ]
+    return
+  fi
   size=$(stat -c %s -- "$engine") || return 1
   [ "$size" -le 134217728 ] || return 1
   observed=$(timeout --kill-after=0.05s 2s sh -c '
@@ -290,10 +409,8 @@ if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
     bootstrap:*|project:setup|project:setup-node|project:doctor|project:info|project:status|project:down|project:sync|project:add-app|project:add-package|project:register|project:update|project:recover) ;;
     *) { [ "$command" = cli ] && [ "$cli_offline" = 0 ]; } || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup' ;;
   esac
-  parent=${engine%/*}
-  [ "$(realpath -m -- "$parent")" = "$(realpath -ms -- "$parent")" ] || fail 'the engine cache path contains a symbolic link'
   umask 077
-  mkdir -p -- "$parent"
+  mkdir -p "$parent"
   temporary=$(mktemp "$parent/.engine.XXXXXXXX")
   download_pid=
   cleanup() {
@@ -301,7 +418,7 @@ if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
       kill -TERM "$download_pid" 2>/dev/null || :
       wait "$download_pid" 2>/dev/null || :
     fi
-    rm -f -- "$temporary"
+    rm -f "$temporary"
   }
   trap cleanup 0
   trap 'exit 130' INT
@@ -318,11 +435,15 @@ if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
     download_pid=
     exit "$status"
   fi
-  observed=$(timeout --kill-after=0.05s 2s sha256sum -- "$temporary")
+  if [ "$host_os" = Darwin ]; then
+    observed=$(darwin_file hash "$temporary" 134217728)
+  else
+    observed=$(timeout --kill-after=0.05s 2s sha256sum -- "$temporary")
+  fi
   [ "${observed%% *}" = "$expected" ] || fail 'downloaded engine checksum differs'
-  chmod 755 -- "$temporary"
+  chmod 755 "$temporary"
   # Creating this link is atomic and cannot replace a concurrent installation.
-  ln -- "$temporary" "$engine" 2>/dev/null || :
+  ln "$temporary" "$engine" 2>/dev/null || :
   cleanup
   trap - 0 INT TERM
   valid_engine || fail 'the accepted engine could not be installed'

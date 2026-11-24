@@ -3,22 +3,13 @@ name: Verify one frozen set
 on:
   workflow_call:
     inputs:
-      version:
+      frozen:
         required: true
         type: string
-      source_commit:
+      amd64:
         required: true
         type: string
-      source_tree:
-        required: true
-        type: string
-      index_sha256:
-        required: true
-        type: string
-      fixtures_sha256:
-        required: true
-        type: string
-      artifact_suffix:
+      arm64:
         required: true
         type: string
       run_performance:
@@ -33,184 +24,180 @@ permissions:
   contents: read
 
 jobs:
-  functional:
-    name: ${{ matrix.group }}
+  source-linux-amd64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: source
+      platform: amd64
+      native: ${{ inputs.amd64 }}
+
+  source-linux-arm64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: source
+      platform: arm64
+      native: ${{ inputs.arm64 }}
+
+  source:
+    name: source
+    if: always()
+    needs: [source-linux-amd64, source-linux-arm64, darwin-host]
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [source, runtime, delivery, packaged, registry]
-        include:
-          - group: source
-            target: verify-source-gates
-          - group: runtime
-            target: verify-runtime-gates
-          - group: delivery
-            target: verify-delivery-gates
-          - group: packaged
-            target: verify-packaged
-          - group: registry
-            target: verify-registry
+    steps:
+      - name: Require every native verification worker to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  runtime-linux-amd64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: runtime
+      platform: amd64
+      native: ${{ inputs.amd64 }}
+
+  runtime-linux-arm64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: runtime
+      platform: arm64
+      native: ${{ inputs.arm64 }}
+
+  runtime:
+    name: runtime
+    if: always()
+    needs: [runtime-linux-amd64, runtime-linux-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every native verification worker to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  delivery-linux-amd64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: delivery
+      platform: amd64
+      native: ${{ inputs.amd64 }}
+
+  delivery-linux-arm64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: delivery
+      platform: arm64
+      native: ${{ inputs.arm64 }}
+
+  delivery:
+    name: delivery
+    if: always()
+    needs: [delivery-linux-amd64, delivery-linux-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every native verification worker to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  packaged-linux-amd64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: packaged
+      platform: amd64
+      native: ${{ inputs.amd64 }}
+
+  packaged-linux-arm64:
+    needs: packaged-linux-amd64
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: packaged
+      platform: arm64
+      native: ${{ inputs.arm64 }}
+      checkout_artifact: ${{ needs.packaged-linux-amd64.outputs.checkout_artifact }}
+
+  packaged:
+    name: packaged
+    if: always()
+    needs: [packaged-linux-amd64, packaged-linux-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every native verification worker to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  registry-linux-amd64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: registry
+      platform: amd64
+      native: ${{ inputs.amd64 }}
+
+  registry-linux-arm64:
+    uses: ./.github/workflows/verify-group.yml
+    with:
+      frozen: ${{ inputs.frozen }}
+      group: registry
+      platform: arm64
+      native: ${{ inputs.arm64 }}
+
+  registry:
+    name: registry
+    if: always()
+    needs: [registry-linux-amd64, registry-linux-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every native verification worker to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  darwin-host:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PREVIEW_ARTIFACT: ${{ fromJSON(inputs.frozen).preview_artifact }}
+      PREVIEW_SHA256: ${{ fromJSON(inputs.frozen).preview_index_sha256 }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ fromJSON(inputs.frozen).source_commit }}
           persist-credentials: false
           fetch-depth: 0
-      - uses: ./.github/actions/verify-frozen
-        with:
-          version: ${{ inputs.version }}
-          source_commit: ${{ inputs.source_commit }}
-          source_tree: ${{ inputs.source_tree }}
-          index_sha256: ${{ inputs.index_sha256 }}
-          artifact_suffix: ${{ inputs.artifact_suffix }}
-      - name: Cache verified pnpm executable
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/docouno/devkit/tools
-          key: pnpm-tools-${{ runner.os }}-${{ hashFiles('toolchains.env') }}
-      - name: Cache author pnpm store
-        if: matrix.group == 'source'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .artifacts/author/pnpm-store
-          key: author-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'toolchains.env') }}
-      - name: Cache author Cargo registry
-        if: matrix.group == 'source'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            .artifacts/author/cargo-home/registry/index
-            .artifacts/author/cargo-home/registry/cache
-            .artifacts/author/cargo-home/git/db
-          key: author-cargo-${{ hashFiles('Cargo.lock', 'toolchains.env') }}
-      - name: Cache author Rust SDK image
-        id: author_rust_cache
-        if: matrix.group == 'source'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .artifacts/cache/author-rust-image.tar
-          key: author-rust-img-${{ hashFiles('tooling/native.Dockerfile') }}
-      - name: Load cached author Rust SDK image
-        if: matrix.group == 'source' && steps.author_rust_cache.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          docker load --input .artifacts/cache/author-rust-image.tar
-          docker image inspect "devkit-author-rust:$recipe_sha" >/dev/null
-      - name: Prepare pinned author SDKs
-        if: matrix.group == 'source'
-        run: make setup
-      - name: Stage author Rust SDK image for cache
-        if: matrix.group == 'source' && steps.author_rust_cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          umask 022
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          mkdir -p .artifacts/cache
-          docker save --output .artifacts/cache/author-rust-image.tar "devkit-author-rust:$recipe_sha"
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: matrix.group == 'runtime' || matrix.group == 'registry'
+        if: env.PREVIEW_ARTIFACT != ''
         with:
-          name: devkit-author-fixtures-${{ inputs.artifact_suffix }}
-          path: .artifacts/author-fixtures
-      - name: Verify static black-box fixtures
-        if: matrix.group == 'runtime' || matrix.group == 'registry'
-        env:
-          FIXTURES_SHA256: ${{ inputs.fixtures_sha256 }}
-        run: |
-          set -euo pipefail
-          test "$(sha256sum .artifacts/author-fixtures/checksums.txt | cut -d ' ' -f 1)" = "$FIXTURES_SHA256"
-          (
-            cd .artifacts/author-fixtures
-            sha256sum --check checksums.txt
-          )
-          chmod 755 .artifacts/author-fixtures/runtime_fixture .artifacts/author-fixtures/registry_fixture
-      - name: Cache consumer Rust image for runtime gates
-        id: runtime_consumer_cache
-        if: matrix.group == 'runtime'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+          name: ${{ env.PREVIEW_ARTIFACT }}
+          path: .artifacts/preview
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        if: env.PREVIEW_ARTIFACT != ''
         with:
-          path: .artifacts/cache/consumer-images.tar
-          key: consumer-images-runtime-${{ hashFiles('runtime/rust.Dockerfile', 'toolchains.env') }}
-      - name: Load cached consumer Rust image
-        if: matrix.group == 'runtime' && steps.runtime_consumer_cache.outputs.cache-hit == 'true'
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Verify the unpublished native package, bootstrap and checkout
+        if: env.PREVIEW_ARTIFACT != ''
         run: |
           set -euo pipefail
-          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
-          docker load --input .artifacts/cache/consumer-images.tar
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:$rust_pin")" = "$rust_pin"
-      - name: Cache consumer Rust and desktop images for packaged gates
-        id: packaged_consumer_cache
-        if: matrix.group == 'packaged'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .artifacts/cache/consumer-images.tar
-          key: consumer-images-packaged-${{ hashFiles('runtime/rust.Dockerfile', 'runtime/desktop.Dockerfile', 'toolchains.env') }}
-      - name: Load cached consumer Rust and desktop images
-        if: matrix.group == 'packaged' && steps.packaged_consumer_cache.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
-          desktop_pin=$(sha256sum runtime/desktop.Dockerfile | cut -d ' ' -f 1)
-          docker load --input .artifacts/cache/consumer-images.tar
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:$rust_pin")" = "$rust_pin"
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.desktop-recipe"}}' "devkit-derived-desktop:$desktop_pin")" = "$desktop_pin"
-      - name: Prepare pinned consumer Node image
-        if: matrix.group == 'runtime' || matrix.group == 'delivery' || matrix.group == 'packaged' || matrix.group == 'registry'
-        run: |
-          set -euo pipefail
-          img=$(sed -n 's/^DEVKIT_NODE_IMAGE=//p' toolchains.env)
-          test -n "$img"
-          docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"
-      - name: Verify the selected canonical Make group
-        env:
-          VERIFY_TARGET: ${{ matrix.target }}
-          MATRIX_GROUP: ${{ matrix.group }}
-        run: |
-          set -euo pipefail
-          extra=()
-          if test "$MATRIX_GROUP" = runtime || test "$MATRIX_GROUP" = registry; then
-            extra+=(fixtures="$PWD/.artifacts/author-fixtures")
-          fi
-          make "$VERIFY_TARGET" \
-            build_set="$PWD/.artifacts/frozen" \
-            release="$PWD/.artifacts/frozen/payload" \
-            previous="$PWD/.artifacts/baseline/v0.4.1/payload" \
-            baseline_set="$PWD/.artifacts/baseline/v0.4.1" \
-            "${extra[@]}"
-      - name: Stage consumer Rust image for runtime cache
-        if: matrix.group == 'runtime' && steps.runtime_consumer_cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          umask 022
-          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:$rust_pin")" = "$rust_pin"
-          mkdir -p .artifacts/cache
-          docker save --output .artifacts/cache/consumer-images.tar "devkit-derived-rust:$rust_pin"
-      - name: Stage consumer Rust and desktop images for packaged cache
-        if: matrix.group == 'packaged' && steps.packaged_consumer_cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          umask 022
-          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
-          desktop_pin=$(sha256sum runtime/desktop.Dockerfile | cut -d ' ' -f 1)
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:$rust_pin")" = "$rust_pin"
-          test "$(docker image inspect --format '{{index .Config.Labels "io.docouno.devkit.desktop-recipe"}}' "devkit-derived-desktop:$desktop_pin")" = "$desktop_pin"
-          mkdir -p .artifacts/cache
-          docker save --output .artifacts/cache/consumer-images.tar "devkit-derived-rust:$rust_pin" "devkit-derived-desktop:$desktop_pin"
-      - name: Preserve group diagnostics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          include-hidden-files: true
-          name: verify-${{ matrix.group }}-${{ github.run_attempt }}
-          path: |
-            .artifacts/**/receipt.json
-            .artifacts/**/*.log
-          retention-days: 90
-          if-no-files-found: warn
+          dir="$PWD/.artifacts/preview"
+          test "$(shasum -a 256 "$dir/release-index.json" | cut -d ' ' -f 1)" = "$PREVIEW_SHA256"
+          archive=$(jq -er '.archive' "$dir/release-index.json")
+          test "$(shasum -a 256 "$dir/$archive" | cut -d ' ' -f 1)" = "$(jq -er --arg name "$archive" '.files[$name].sha256' "$dir/release-index.json")"
+          chmod 755 "$dir"/devkit-*-{musl,darwin} "$dir"/{install,bootstrap}.sh
+          mkdir "$dir/payload"
+          tar -xzf "$dir/$archive" --strip-components=1 -C "$dir/payload"
+          python3 test/darwin/verify.py --build-set "$dir"
+      - name: Verify stock host entry points for a restored Linux release
+        if: env.PREVIEW_ARTIFACT == ''
+        run: python3 test/bootstrap/portable.py
 
   performance:
     if: inputs.run_performance
@@ -221,22 +208,26 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ fromJSON(inputs.frozen).source_commit }}
           persist-credentials: false
           fetch-depth: 0
       - uses: ./.github/actions/verify-frozen
         with:
-          version: ${{ inputs.version }}
-          source_commit: ${{ inputs.source_commit }}
-          source_tree: ${{ inputs.source_tree }}
-          index_sha256: ${{ inputs.index_sha256 }}
-          artifact_suffix: ${{ inputs.artifact_suffix }}
+          version: ${{ fromJSON(inputs.frozen).version }}
+          source_commit: ${{ fromJSON(inputs.frozen).source_commit }}
+          source_tree: ${{ fromJSON(inputs.frozen).source_tree }}
+          index_sha256: ${{ fromJSON(inputs.frozen).index_sha256 }}
+          frozen_set_artifact: ${{ fromJSON(inputs.frozen).frozen_set_artifact }}
+          platform: amd64
+          need_baseline: 'true'
+          controller_artifact: ${{ fromJSON(inputs.amd64).controller_artifact }}
+          controller_sha256: ${{ fromJSON(inputs.amd64).controller_sha256 }}
       - name: Cache author Rust trace image
         id: author_rust_cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .artifacts/cache/author-rust-image.tar
-          key: author-rust-img-${{ hashFiles('tooling/native.Dockerfile') }}
+          key: author-rust-img-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tooling/native.Dockerfile') }}
       - name: Prepare author Rust trace image
         env:
           CACHE_HIT: ${{ steps.author_rust_cache.outputs.cache-hit }}
@@ -258,7 +249,7 @@ jobs:
           recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
           export DEVKIT_PERFORMANCE_TRACE_IMAGE
           DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
-          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/baseline/v0.4.1/payload" --output "$PWD/.artifacts/release-ops/performance.json"
+          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/baseline/v0.5.1/payload" --output "$PWD/.artifacts/release-ops/performance.json"
       - name: Preserve the exact successful performance receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

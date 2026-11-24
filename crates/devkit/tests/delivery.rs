@@ -1,6 +1,6 @@
 use devkit::{
     delivery::{EnginePin, file_digest, verify_cached_engine, verify_engine},
-    distribution::TARGET,
+    distribution::Target,
 };
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 use tempfile::TempDir;
@@ -108,7 +108,7 @@ fn source_execution_permission_and_canonical_cache_mode_are_distinct() {
     fs::copy(Path::new(env!("CARGO_BIN_EXE_devkit")), &path).unwrap();
     let pin = EnginePin {
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        target: TARGET.to_owned(),
+        target: Target::host().unwrap().triple().into(),
         sha256: file_digest(&path).unwrap(),
     };
     for mode in [0o700, 0o755, 0o644, 0o645] {
@@ -139,32 +139,122 @@ fn current_executable_authority_detects_replacement_after_verification() {
     use devkit::delivery::current_engine_digest;
     use std::os::unix::fs::PermissionsExt;
     const WORKER: &str = "DEVKIT_TEST_CURRENT_EXECUTABLE_WORKER";
-    if std::env::var(WORKER).as_deref() == Ok("1") {
-        let first = current_engine_digest().unwrap();
-        assert_eq!(first, current_engine_digest().unwrap());
+    if let Ok(order) = std::env::var(WORKER) {
+        if order == "after" {
+            let first = current_engine_digest().unwrap();
+            assert_eq!(first, current_engine_digest().unwrap());
+        }
         let current = std::env::current_exe().unwrap();
         let replacement = current.with_extension("replacement");
-        std::fs::write(&replacement, b"changed executable path").unwrap();
+        // A valid copy of the very same executable defeats a digest-only check.
+        std::fs::copy(&current, &replacement).unwrap();
         std::fs::rename(replacement, current).unwrap();
         assert!(current_engine_digest().is_err());
         return;
     }
     let temporary = tempfile::tempdir().unwrap();
     let executable = temporary.path().join("delivery-test");
-    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = std::process::Command::new(executable)
-        .args([
-            "--exact",
-            "current_executable_authority_detects_replacement_after_verification",
-            "--nocapture",
-        ])
-        .env(WORKER, "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for order in ["before", "after"] {
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "current_executable_authority_detects_replacement_after_verification",
+                "--nocapture",
+            ])
+            .env(WORKER, order)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{order}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Build a load-command table in isolation. Never execute fixture bytes.
+fn mach_o(dylib_command: u32, dependency: &str) -> Vec<u8> {
+    fn path_command(kind: u32, fixed_size: usize, path: &str) -> Vec<u8> {
+        let size = (fixed_size + path.len() + 1).next_multiple_of(8);
+        let mut cmd = vec![0; size];
+        cmd[..4].copy_from_slice(&kind.to_le_bytes());
+        cmd[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        cmd[8..12].copy_from_slice(&(fixed_size as u32).to_le_bytes());
+        cmd[fixed_size..fixed_size + path.len()].copy_from_slice(path.as_bytes());
+        cmd
+    }
+    let linker = path_command(0xe, 12, "/usr/lib/dyld");
+    let dylib = path_command(dylib_command, 24, dependency);
+    let mut signature = [0; 16];
+    let table_size = (linker.len() + dylib.len() + signature.len()) as u32;
+    signature[..4].copy_from_slice(&0x1d_u32.to_le_bytes());
+    signature[4..8].copy_from_slice(&16_u32.to_le_bytes());
+    signature[8..12].copy_from_slice(&(32 + table_size).to_le_bytes());
+    signature[12..].copy_from_slice(&1_u32.to_le_bytes());
+    let mut header = [0; 32];
+    for (at, value) in [
+        (0, 0xfeedfacf_u32),
+        (4, 0x0100000c),
+        (12, 2),
+        (16, 3),
+        (20, table_size),
+    ] {
+        header[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    [header.as_slice(), &linker, &dylib, &signature, &[0]].concat()
+}
+
+#[test]
+fn target_format_and_mach_o_load_commands_are_verified_before_execution() {
+    use devkit::{delivery::verify_executable, files::digest};
+    let temp = TempDir::new().unwrap();
+    let binary = temp.path().join("native");
+    let verify = |bytes: &[u8], target| {
+        fs::write(&binary, bytes).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        verify_executable(&binary, &digest(bytes), target, true).is_ok()
+    };
+    let signed = mach_o(0xc, "/usr/lib/libSystem.B.dylib");
+    assert!(verify(&signed, Target::DarwinArm64));
+    for (offset, value) in [
+        (0, 0xcafebabe_u32),          // universal executable
+        (4, 0x01000007),              // thin x86-64
+        (12, 6),                      // shared library
+        (16, u32::MAX),               // overflowing command count
+        (20, u32::MAX),               // table beyond EOF
+        (36, 7),                      // undersized command
+        (40, 0),                      // path inside the command header
+        (signed.len() - 17, 0),       // missing LC_CODE_SIGNATURE
+        (signed.len() - 9, 1),        // signature inside the header
+        (signed.len() - 5, u32::MAX), // signature beyond EOF
+    ] {
+        let mut bytes = signed.clone();
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(!verify(&bytes, Target::DarwinArm64), "offset {offset}");
+    }
+    assert!(!verify(&signed, Target::LinuxArm64));
+    for command in [0xc, 0x80000018, 0x8000001f, 0x20, 0x80000023] {
+        for path in [
+            "/opt/homebrew/lib/a",
+            "@rpath/a",
+            "/usr/lib/../local/lib/a",
+            "/System/Library/Frameworks/../a",
+        ] {
+            assert!(!verify(&mach_o(command, path), Target::DarwinArm64));
+        }
+    }
+    assert!(!verify(
+        &mach_o(0x8000001c, "/usr/lib/a"),
+        Target::DarwinArm64
+    ));
+    assert!(verify(
+        &mach_o(
+            0x80000018,
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        ),
+        Target::DarwinArm64
+    ));
 }

@@ -7,6 +7,10 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from release_targets import engine_asset, host_target, payload_name  # noqa: E402
 
 
 def require(condition, message):
@@ -21,8 +25,8 @@ def stable_version(value):
 
 
 def validate_versions(from_version, to_version):
-    require((0, 4, 0) <= stable_version(from_version) < stable_version(to_version),
-            "Native upgrade proof requires a supported older native environment (>= 0.4.0)")
+    require((0, 5, 0) <= stable_version(from_version) < stable_version(to_version),
+            "Native upgrade proof requires a supported older native environment (>= 0.5.0)")
 
 
 def read_json(path):
@@ -40,9 +44,17 @@ def accepted(root, version, identity=None):
     require(pins["DEVKIT_VERSION"] == version, "Managed toolchains adopted another version")
     require(re.fullmatch(r"[a-f0-9]{64}", pins["DEVKIT_ENGINE_SHA256"]), "Engine SHA256 pin is invalid")
     loader = (root / ".devkit/runtime/devkit.sh").read_text().splitlines()
-    for line in ("mode=project", "version=" + version,
-                 "expected=" + pins["DEVKIT_ENGINE_SHA256"], "target=" + pins["DEVKIT_ENGINE_TARGET"]):
-        require(line in loader, "The project loader and accepted toolchain pins differ")
+    require("mode=project" in loader and "version=" + version in loader, "Loader version differs")
+    if stable_version(version) < (0, 6, 0):
+        require("expected=" + pins["DEVKIT_ENGINE_SHA256"] in loader
+                and "target=" + pins["DEVKIT_ENGINE_TARGET"] in loader, "Legacy loader pins differ")
+    else:
+        for target in pins["DEVKIT_ENGINE_TARGETS"].split(","):
+            expected = pins["DEVKIT_ENGINE_SHA256_" + target.upper().replace("-", "_")]
+            require(re.fullmatch(r"[a-f0-9]{64}", expected)
+                    and any("target=" + target in line and "sha256=" + expected in line
+                            and "payload=" + payload_name(target) in line for line in loader),
+                    f"Loader lacks the accepted pin for {target}")
     for path, component in state["components"].items():
         if component["toolchain"] == "node":
             package = read_json(root / path / "package.json")
@@ -54,10 +66,11 @@ def accepted(root, version, identity=None):
 
 def verify_engine(helper, root, version, pins, label):
     require("DEVKIT_ENGINE_PATH" not in helper.environment, "The native smoke must use the project's pinned engine")
+    digest = pins.get("DEVKIT_ENGINE_SHA256_" + host_target().upper().replace("-", "_"), pins["DEVKIT_ENGINE_SHA256"])
     engine = (Path(helper.environment["DEVKIT_CACHE_DIR"]) / "engines" /
-              pins["DEVKIT_ENGINE_TARGET"] / version / pins["DEVKIT_ENGINE_SHA256"] / "devkit")
+              host_target() / version / digest / "devkit")
     require(engine.is_file() and not engine.is_symlink(), "The accepted cached engine is absent")
-    require(hashlib.sha256(engine.read_bytes()).hexdigest() == pins["DEVKIT_ENGINE_SHA256"],
+    require(hashlib.sha256(engine.read_bytes()).hexdigest() == digest,
             "The accepted cached engine differs from its SHA256 pin")
     result = json.loads(helper.run(label + "-engine-version", [engine, "version", "--json"], cwd=root))
     require(result["ok"] is True and result["result"]["version"] == version,
@@ -152,7 +165,7 @@ def verify(helper, module, index, from_version, environment, products):
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
     if stable_version(from_version) < (0,5,0) <= stable_version(to_version):
         module.assert_node_workspace(root,[path for path,c in after['components'].items() if c['toolchain']=='node'])
-    require(new_pins["DEVKIT_ENGINE_SHA256"] == index["files"][index["engine"]]["sha256"],
+    require(new_pins["DEVKIT_ENGINE_SHA256_" + host_target().upper().replace("-", "_")] == index["files"][engine_asset(index)]["sha256"],
             "Updated project accepted another target engine")
     require(after["nativeUpgradeOwner"] == state["nativeUpgradeOwner"], "Native upgrade lost top-level owner metadata")
     for path, component in state["components"].items():

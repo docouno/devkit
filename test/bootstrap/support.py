@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.4.1 baseline."""
+"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.5.1 baseline."""
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.server
 import json
@@ -23,16 +24,18 @@ import uuid
 AUTHOR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHOR / 'test/delivery'))
 from test_delivery import HttpsFixture, worktrunk  # noqa: E402
+sys.path.insert(0, str(AUTHOR / 'test'))
+from release_targets import engine_asset, host_target  # noqa: E402
 
-BASELINE_VERSION = '0.4.1'
-BASELINE_INDEX_SHA256 = '0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa'
-BASELINE_INDEX_SIZE = 2255
-BASELINE_RELEASE_IDENTITY = '0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a'
-BASELINE_RELEASE_SIZE = 58547
-BASELINE_ARCHIVE_SHA256 = '4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a'
-BASELINE_ARCHIVE_SIZE = 4003689
-BASELINE_ENGINE_SHA256 = '206f66322e7ae009bc9368a05df64cfef0285ec30e32e9b9dbf0ffbe1069f929'
-BASELINE_ENGINE_SIZE = 7960008
+BASELINE_VERSION = '0.5.1'
+BASELINE_INDEX_SHA256 = 'c55c5b5e0457f5c934079a8bbce272545b1cdbc2b7da25061bd7a95d2780d08a'
+BASELINE_INDEX_SIZE = 2258
+BASELINE_RELEASE_IDENTITY = '870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c'
+BASELINE_RELEASE_SIZE = 65946
+BASELINE_ARCHIVE_SHA256 = 'f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b'
+BASELINE_ARCHIVE_SIZE = 5145930
+BASELINE_ENGINE_SHA256 = '8388c1c2105b7f4b952277922ecb82747ab81d506a66d6d439258ae8196ef479'
+BASELINE_ENGINE_SIZE = 10589864
 
 
 def require(value, message):
@@ -116,7 +119,7 @@ class Harness:
         self.payload = self.build_set / 'payload'
         self.index = json.loads((self.build_set / 'release-index.json').read_text())
         self.version = self.index['version']
-        self.engine = self.build_set / self.index['engine']
+        asset = engine_asset(self.index)
         for name, identity in self.index['files'].items():
             data = (self.build_set / name).read_bytes()
             require(len(data) == identity['size'] and digest(data) == identity['sha256'], f'Build-set identity differs: {name}')
@@ -159,21 +162,28 @@ class Harness:
         }
         self.temp = tempfile.TemporaryDirectory(prefix='devkit bootstrap ')
         self.scratch = Path(self.temp.name)
+        # A raw downloaded engine has no adjacent release.json. Exercise the actual
+        # network acquisition path even when the requested version is the current one.
+        self.engine = self.scratch / asset
+        shutil.copy2(self.build_set / asset, self.engine)
+        self.engine.chmod(0o755)
         self.logs = AUTHOR / '.artifacts/bootstrap' / uuid.uuid4().hex
         self.logs.mkdir(parents=True)
         self.fixture = Fixture(self.scratch / 'tls')
         self.base = '/docouno/devkit/releases/download'
-        self.engine_route = f'{self.base}/v{self.version}/{self.index["engine"]}'
+        self.engine_route = f'{self.base}/v{self.version}/{asset}'
         self.fixture.routes[self.engine_route] = self.engine.read_bytes()
-        self.fixture.routes[f'{self.base}/v{self.version}/release-index.json'] = (self.build_set / 'release-index.json').read_bytes()
-        self.fixture.routes[f'{self.base}/v{self.version}/{self.index["archive"]}'] = (self.build_set / self.index['archive']).read_bytes()
+        self.index_route = f'{self.base}/v{self.version}/release-index.json'
+        self.archive_route = f'{self.base}/v{self.version}/{self.index["archive"]}'
+        self.fixture.routes[self.index_route] = (self.build_set / 'release-index.json').read_bytes()
+        self.fixture.routes[self.archive_route] = (self.build_set / self.index['archive']).read_bytes()
         self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
         self.old_base = f'{self.base}/v{self.old_version}'
         self.old_index_route = f'{self.old_base}/release-index.json'
-        self.archive_route = f'{self.old_base}/{archive_name}'
+        self.old_archive_route = f'{self.old_base}/{archive_name}'
         self.old_engine_route = f'{self.old_base}/{engine_name}'
         self.fixture.routes[self.old_index_route] = index_bytes
-        self.fixture.routes[self.archive_route] = archive_bytes
+        self.fixture.routes[self.old_archive_route] = archive_bytes
         self.fixture.routes[self.old_engine_route] = engine_bytes
         self.forbidden = self.scratch / 'host-sdk-attempts'
         blockers = self.scratch / 'without host SDK'
@@ -206,14 +216,36 @@ class Harness:
         return result
     def boot(self, name, *args, **kwargs):
         return self.run(name, ['sh', self.script, *args], **kwargs)
-    def cold_old(self, name, *, expected=None):
+    def cold_init(self, name, version, *, expected=None):
         target = self.scratch / name
-        result = self.run(name, [self.engine, 'init', target, '--to', self.old_version, '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], expected=expected, memory_limit=512 * 1024 * 1024 if expected is not None else None)
+        result = self.run(name, [self.engine, 'init', target, '--to', version, '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], expected=expected, memory_limit=512 * 1024 * 1024 if expected is not None else None)
         cache = self.scratch / ('cache ' + name)
         require(not list(cache.glob('.acquire-*')), 'Unaccepted acquisition directory leaked')
         if expected is not None:
             require(not target.exists(), 'Rejected archive wrote the project')
         return result
+    def verify_concurrent_bootstrap(self):
+        env = self.environment('simultaneous installs')
+        before = len(self.fixture.requests)
+        def install(_):
+            return subprocess.run(['sh', self.script, '--version'], cwd=self.scratch, env=env,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  umask=0o077, timeout=25)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for result in pool.map(install, range(3)):
+                require(result.returncode == 0 and self.version in result.stdout, result.stderr)
+        require(set(self.fixture.requests[before:]) == {self.engine_route},
+                'Cold installers requested another target or release asset')
+        fingerprint = self.index['files'][engine_asset(self.index)]['sha256']
+        cache = Path(env['DEVKIT_CACHE_DIR'])
+        binary = cache / 'engines' / host_target() / self.version / fingerprint / 'devkit'
+        require(digest(binary.read_bytes()) == fingerprint and stat.S_IMODE(binary.stat().st_mode) == 0o755,
+                'Concurrent strict-umask installation did not publish the pinned executable')
+        require(not list(cache.rglob('.engine.*')), 'Concurrent engine installation left partial files')
+        before = len(self.fixture.requests)
+        binary.chmod(0o644)
+        self.boot('refuse-unexecutable-cache', '--version', expected='cached engine integrity differs', env=env)
+        require(len(self.fixture.requests) == before, 'An unusable cache entry was silently refetched')
     def verify_cold_worktree(self, target):
         wt = worktrunk(self.scratch)
         worktrees = self.scratch / 'worktree paths'
@@ -269,7 +301,9 @@ class Harness:
             return None
         before = {path: capture(saved, path) for path in paths}
         after = {path: capture(target, path) for path in paths}
-        require(before['package-lock.json'] is not None and after['pnpm-lock.yaml'] is not None, 'Fixture did not migrate a genuine npm lock')
+        require(before['pnpm-lock.yaml'] is not None and after['pnpm-lock.yaml'] is not None
+                and before['package-lock.json'] is None and after['package-lock.json'] is None,
+                'Expected a genuine pnpm-to-pnpm upgrade')
         def install(root, path, recorded):
             absolute = root / path
             if recorded is None:
@@ -310,6 +344,7 @@ class Harness:
             f'https://github.com{self.base}/v{self.version}/install.sh'])
         require(self.script.read_bytes() == (self.build_set / 'install.sh').read_bytes(), 'Downloaded loader bytes differ')
         self.run('shell-syntax', ['sh', '-n', self.script])
+        self.verify_concurrent_bootstrap()
         target = self.scratch / 'product $(touch injected) with spaces'
         env = self.environment('native-current')
         self.boot('raw-ELF-bootstrap-init', 'init', target, '--app', 'api=rust-api', '--release-root', self.payload,
@@ -319,12 +354,22 @@ class Harness:
         self.boot('cached-bootstrap-offline-metadata', 'describe', '--root', target, env=dict(env, HTTPS_PROXY='http://127.0.0.1:1'))
         self.boot('recover-local-journal-no-cache', 'recover', target, env=self.environment('empty'))
         self.verify_cold_worktree(target)
-        self.cold_old('genuine-baseline-http-init')
+        if host_target() == self.old_index['target']:
+            self.verify_baseline_upgrade()
+        else:
+            before = len(self.fixture.requests)
+            self.cold_init('refuse-unavailable-baseline-target', self.old_version, expected=host_target())
+            require(self.fixture.requests[before:] == [self.old_index_route],
+                    'An incompatible release must be refused from its index before downloading binaries')
+        self.verify_version_floor()
+
+    def verify_baseline_upgrade(self):
+        self.cold_init('genuine-baseline-http-init', self.old_version)
         baseline = self.scratch / 'genuine-baseline-http-init'
         source = baseline / 'apps/api/src/main.rs'
         source.write_text(source.read_text() + '\n// Preserve the product change.\n')
         (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
-        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml')}
+        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml', baseline / 'AGENTS.md', baseline / '.config/wt.toml')}
         self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
         bridge_env = self.environment('genuine-baseline-http-init')
         old_loader = baseline / '.devkit/runtime/devkit.sh'
@@ -337,28 +382,29 @@ class Harness:
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
-        require(not (baseline / 'AGENTS.md').exists() and not (baseline / '.config/wt.toml').exists(), 'Upgrade created project-owned files')
         self.verify_node_recovery()
-        pre_040 = self.scratch / 'pre-040-checkout'
-        (pre_040 / '.devkit').mkdir(parents=True)
-        (pre_040 / '.devkit/manifest.json').write_text(json.dumps({
+
+    def verify_version_floor(self):
+        pre_050 = self.scratch / 'pre-050-checkout'
+        (pre_050 / '.devkit').mkdir(parents=True)
+        (pre_050 / '.devkit/manifest.json').write_text(json.dumps({
             'schemaVersion': 2,
-            'version': '0.3.2',
+            'version': '0.4.1',
             'releaseIdentity': '0' * 64,
             'generation': 'gen-0',
             'packageMode': 'local',
             'managed': {},
             'components': {},
         }))
-        pre_040_before = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        pre_050_before = {str(p.relative_to(pre_050)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_050.rglob('*'))}
         requests_before = len(self.fixture.requests)
-        self.run('refuse-pre-040-project-zero-mutation', [self.engine, 'status', '--root', pre_040], expected='0.4.0')
-        self.run('refuse-pre-040-update-zero-mutation', [self.engine, 'update', pre_040, '--to', self.old_version, '--non-interactive'], expected='0.4.1')
-        require(len(self.fixture.requests) == requests_before, 'Pre-0.4.0 refusal issued unexpected release HTTP requests')
-        pre_040_after = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
-        require(pre_040_after == pre_040_before, 'Pre-0.4.0 refusal mutated project checkout')
-        require(not (self.scratch / 'cache refuse-pre-040-project-zero-mutation').exists(), 'Pre-0.4.0 status refusal created cache directory')
-        require(not (self.scratch / 'cache refuse-pre-040-update-zero-mutation').exists(), 'Pre-0.4.0 update refusal created cache directory')
+        self.run('refuse-pre-050-project-zero-mutation', [self.engine, 'status', '--root', pre_050], expected='0.5.0')
+        self.run('refuse-pre-050-update-zero-mutation', [self.engine, 'update', pre_050, '--to', self.old_version, '--non-interactive'], expected='0.5.1')
+        require(len(self.fixture.requests) == requests_before, 'Pre-0.5.0 refusal issued unexpected release HTTP requests')
+        pre_050_after = {str(p.relative_to(pre_050)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_050.rglob('*'))}
+        require(pre_050_after == pre_050_before, 'Pre-0.5.0 refusal mutated project checkout')
+        require(not (self.scratch / 'cache refuse-pre-050-project-zero-mutation').exists(), 'Pre-0.5.0 status refusal created cache directory')
+        require(not (self.scratch / 'cache refuse-pre-050-update-zero-mutation').exists(), 'Pre-0.5.0 update refusal created cache directory')
     def finish(self, passed):
         self.fixture.close()
         require(self.source_before == {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}, 'Modified source build-set')

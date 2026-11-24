@@ -6,6 +6,48 @@ use devkit::{
 use serde_json::json;
 use std::path::Path;
 
+fn fixture_platform() -> &'static str {
+    match devkit::distribution::Target::host().unwrap() {
+        devkit::distribution::Target::LinuxX64 => "linux/amd64",
+        devkit::distribution::Target::LinuxArm64 | devkit::distribution::Target::DarwinArm64 => {
+            "linux/arm64"
+        }
+    }
+}
+
+// Mock digests refer to the native fixture executable. Every target key still
+// goes through the same parser and selection as a real release.
+fn fixture_engine_pins(sha: &str) -> String {
+    use devkit::distribution::Target;
+    let mut lines = format!(
+        "DEVKIT_ENGINE_TARGET={}\nDEVKIT_ENGINE_SHA256={sha}\n",
+        Target::LinuxX64.triple()
+    );
+    let targets = Target::ALL;
+    lines.push_str(&format!(
+        "DEVKIT_ENGINE_TARGETS={}\n",
+        targets.map(|target| target.triple()).join(",")
+    ));
+    for target in targets {
+        lines.push_str(&format!(
+            "DEVKIT_ENGINE_SHA256_{}={sha}\n",
+            target.key_suffix()
+        ));
+    }
+    lines
+}
+
+fn fixture_pnpm_pins(pin: &devkit::runtime::PnpmPin) -> String {
+    use devkit::distribution::Target;
+    let mut lines = pin.encode();
+    lines.push_str("DEVKIT_PNPM_TARGETS=x86_64-unknown-linux-musl,aarch64-unknown-linux-musl\n");
+    for (target, arch) in [(Target::LinuxX64, "x64"), (Target::LinuxArm64, "arm64")] {
+        let suffix = target.key_suffix();
+        lines.push_str(&format!("DEVKIT_PNPM_PACKAGE_{suffix}=@pnpm/exe.linux-{arch}-musl\nDEVKIT_PNPM_SHA256_{suffix}={}\nDEVKIT_PNPM_TARBALL_SHA256_{suffix}={}\n",pin.binary_sha256,pin.tarball_sha256));
+    }
+    lines
+}
+
 fn modernize_node_fixture(root: &Path, state: &ProjectState) {
     if !root.join("package-lock.json").is_file() {
         return;
@@ -75,8 +117,8 @@ fn compose_selected_profiles_and_optional_dependencies_match_native_reachability
     );
 }
 #[test]
-fn desktop_projection_always_mounts_accepted_native_engine_read_only() {
-    for ver in ["0.4.1", "0.5.0"] {
+fn desktop_projection_always_mounts_the_accepted_linux_helper_read_only() {
+    for ver in ["0.4.1", "0.5.0", "0.6.0"] {
         let rendered = render_app_compose_value(&state(ver)).unwrap();
         assert_eq!(
             rendered["services"]["desktop"]["command"],
@@ -87,18 +129,20 @@ fn desktop_projection_always_mounts_accepted_native_engine_read_only() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|v| v["target"] == "/devkit/devkit" && v["read_only"] == true)
+                .any(|v| v["target"] == "/devkit/devkit"
+                    && v["read_only"] == true
+                    && v["source"] == "${DEVKIT_ENGINE_PATH:?}")
         );
     }
 }
 #[test]
 fn tool_pin_parser_never_evaluates_shell_and_requires_pinned_engine_and_images() {
+    let engine_pins = fixture_engine_pins(&"d".repeat(64));
     let source = format!(
-        "DEVKIT_VERSION=0.5.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
+        "DEVKIT_VERSION=0.5.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\n{engine_pins}",
         "a".repeat(64),
         "b".repeat(64),
-        "c".repeat(64),
-        "d".repeat(64)
+        "c".repeat(64)
     );
     let parsed = ToolPins::parse(source.as_bytes()).unwrap();
     assert_eq!(parsed.engine.version, "0.5.0");
@@ -254,8 +298,9 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
     let recipe_hash = "b".repeat(64);
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
+    let engine_pins = fixture_engine_pins(&engine_sha);
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        "DEVKIT_VERSION={ver}\n{engine_pins}DEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -271,7 +316,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
     };
     write_atomic(
         &root.join(".devkit/runtime/pnpm.env"),
-        pnpm_pin.encode().as_bytes(),
+        fixture_pnpm_pins(&pnpm_pin).as_bytes(),
         0o644,
     )
     .unwrap();
@@ -352,16 +397,18 @@ if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
   exit 0
 fi
 if [ "$1" = "info" ]; then
-  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf 'linux/{arch}\n'
   exit 0
 fi
 if [ "$1" = "container" ] && [ "$2" = "ls" ]; then
   exit 0
 fi
 if [ "$1" = "run" ]; then
+  test -z "${{DOCKER_DEFAULT_PLATFORM:-}}"
   log="{log}"
   printf '%s\n' "$*" >> "$log"
   count=$(wc -l < "$log")
@@ -374,6 +421,7 @@ fi
 printf 'unexpected docker args: %s\n' "$*" >&2
 exit 90
 "#,
+        arch = fixture_platform().strip_prefix("linux/").unwrap(),
         log = run_log.display()
     );
     fs::write(&docker_script, script).unwrap();
@@ -396,6 +444,7 @@ exit 90
         ])
         .env("PATH", path_env)
         .env("DEVKIT_PNPM_BIN_OVERRIDE", exe)
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/s390x")
         .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
         .output()
         .unwrap();
@@ -414,6 +463,11 @@ exit 90
         .map(str::to_owned)
         .collect();
     assert_eq!(lines.len(), 2, "expected 2 docker run attempts: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.contains(&format!("--platform {}", fixture_platform())))
+    );
     assert!(lines[0].contains("--cpus ") && lines[0].contains("--memory "));
     assert!(!lines[0].contains("NODE_OPTIONS="));
     for flag in [
@@ -440,7 +494,7 @@ exit 90
 fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     use devkit::{
         delivery::file_digest,
-        files::{digest, identity, write_atomic, write_json},
+        files::{identity, write_atomic, write_json},
         native::admit_native_components,
         projections::{render_app_compose_value, render_project_make, render_workspace_compose},
         state::{CHECKSUM_PATH, MANIFEST_PATH},
@@ -460,8 +514,9 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     let recipe_hash = "b".repeat(64);
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
+    let engine_pins = fixture_engine_pins(&engine_sha);
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        "DEVKIT_VERSION={ver}\n{engine_pins}DEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -477,7 +532,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     };
     write_atomic(
         &root.join(".devkit/runtime/pnpm.env"),
-        pnpm_pin.encode().as_bytes(),
+        fixture_pnpm_pins(&pnpm_pin).as_bytes(),
         0o644,
     )
     .unwrap();
@@ -590,13 +645,12 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         &serde_json::to_value(&final_state).unwrap(),
     )
     .unwrap();
-    let receipt = digest(format!("{release_id}\n{}", native.node_inputs.digest));
-    write_atomic(
-        &root.join(".devkit/state/node-workspace.lock"),
-        format!("{receipt}\n").as_bytes(),
-        0o644,
-    )
-    .unwrap();
+    let receipt = devkit::doctor::NodeWorkspaceReceipt::new(
+        fixture_platform(),
+        &release_id,
+        &native.node_inputs.digest,
+    );
+    write_json(&root.join(".devkit/state/node-workspace.lock"), &receipt).unwrap();
 
     let fake_bin = temp.path().join("bin");
     fs::create_dir_all(&fake_bin).unwrap();
@@ -654,7 +708,7 @@ if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
 fi
 if [ "$1" = "info" ]; then
   case "$*" in *'.ID'* ) printf 'fixture-daemon\n'; exit 0 ;; esac
-  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
   exit 0
 fi
 if [ "$1" = "context" ]; then
@@ -666,6 +720,7 @@ if [ "$1" = "context" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf 'linux/{arch}\n'
   exit 0
 fi
 if [ "$1" = "ps" ]; then
@@ -719,6 +774,7 @@ fi
 printf 'unexpected docker args: %s\n' "$*" >&2
 exit 90
 "#,
+        arch = fixture_platform().strip_prefix("linux/").unwrap(),
         dir = attempt_dir.display(),
         fixture = temp.path().display(),
     );
@@ -742,6 +798,7 @@ exit 90
         .env("PATH", path_env)
         .env("DEVKIT_PNPM_BIN_OVERRIDE", exe)
         .env("DEVKIT_CACHE_DIR", &cache)
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/s390x")
         .env("DOCKER_HOST", "tcp://127.0.0.1:2375")
         .output()
         .unwrap();
@@ -816,13 +873,14 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     let exe = Path::new(env!("CARGO_BIN_EXE_devkit"));
     let engine_sha = file_digest(exe).unwrap();
     let ver = env!("CARGO_PKG_VERSION");
-    let rust_dockerfile = b"FROM rust:1.99.1-bookworm\n";
+    let rust_dockerfile = include_bytes!("../../../runtime/rust.Dockerfile");
     let rust_recipe = digest(rust_dockerfile);
     let desktop_recipe = "c".repeat(64);
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
+    let engine_pins = fixture_engine_pins(&engine_sha);
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_recipe}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_recipe}\n"
+        "DEVKIT_VERSION={ver}\n{engine_pins}DEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_recipe}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_recipe}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -950,7 +1008,14 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     .unwrap();
 
     let img_id = format!("sha256:{}", "e".repeat(64));
-    let derived_tag = format!("devkit-derived-rust:{rust_recipe}");
+    let platform = fixture_platform();
+    let arch = platform.strip_prefix("linux/").unwrap();
+    let derived_tag = format!("devkit-derived-rust:{arch}-{rust_recipe}");
+    write_json(
+        &root.join(".devkit/state/rust-image.json"),
+        &devkit::doctor::DerivedImageReceipt::new(platform, &img_id, &rust_recipe),
+    )
+    .unwrap();
     write_atomic(
         &root.join(".devkit/state/rust-image"),
         format!("{img_id}\n").as_bytes(),
@@ -973,7 +1038,15 @@ if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
   exit 0
 fi
 if [ "$1" = "info" ]; then
-  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  exit 0
+fi
+if [ "$1" = "context" ]; then
+  case "$2" in
+    show) printf 'default\n' ;;
+    inspect) printf 'unix:///var/run/docker.sock\n' ;;
+    *) exit 90 ;;
+  esac
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "tag" ]; then
@@ -983,19 +1056,21 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   last=""
   for arg in "$@"; do last="$arg"; done
   if [ "$last" = "{img_id}" ]; then
-    printf '{pin}\n'
+    printf '{img_id}\n%s\n{pin}\nlinux/{arch}\n' "${{FIXTURE_IMAGE_PLATFORM:-linux/{arch}}}"
     exit 0
   fi
   if [ "$last" = "{tag}" ]; then
     if [ "$(cat "{mode}")" = "present" ]; then
-      printf '{img_id}\n{pin}\n'
+      printf '{img_id}\nlinux/{arch}\n{pin}\nlinux/{arch}\n'
       exit 0
     fi
     exit 1
   fi
+  printf 'linux/{arch}\n'
   exit 0
 fi
 if [ "$1" = "build" ]; then
+  test "$(sha256sum | cut -d' ' -f1)" = "{pin}"
   prev=""
   for arg in "$@"; do
     if [ "$prev" = "--iidfile" ]; then
@@ -1050,6 +1125,37 @@ exit 0
         "non-prepare tagged image: {log1}"
     );
     assert!(!log1.contains("build "), "non-prepare built image: {log1}");
+
+    let foreign = if platform == "linux/amd64" {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    };
+    fs::write(&docker_log, "").unwrap();
+    let rejected = Command::new(exe)
+        .args([
+            "exec",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("PATH", &path_env)
+        .env("FIXTURE_IMAGE_PLATFORM", foreign)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("accepted rust image is absent/stale")
+    );
+    assert!(
+        !fs::read_to_string(&docker_log)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("run "))
+    );
 
     // 2. Prepare (`task setup`) hits `.devkit/state/rust-image` and idempotently applies `devkit-derived-rust:<pin>`.
     fs::write(&docker_log, "").unwrap();

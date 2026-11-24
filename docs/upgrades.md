@@ -7,13 +7,13 @@ Devkit pins each repository's accepted environment in `.devkit/manifest.json` an
 Run upgrades on a dedicated Git branch:
 
 ```sh
-git switch -c chore/devkit-0.5.1
+git switch -c chore/devkit-0.6.0
 
 # 1. Inspect planned file changes and applicable migration notes without modifying files
-npx @docouno/devkit@0.5.1 update . --to 0.5.1 --preview
+npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview
 
 # 2. Apply the environment update
-npx @docouno/devkit@0.5.1 update . --to 0.5.1
+npx @docouno/devkit@0.6.0 update . --to 0.6.0
 
 # 3. Prepare updated containers/dependencies and run all gates
 make setup
@@ -24,29 +24,19 @@ make build
 
 Review `git diff` and commit the updated `.devkit/*`, component `devDependencies` (`toolDependencies`), and `pnpm-lock.yaml`.
 
-## Supported Upgrade Window and `0.4.1` Bridge
+## Supported Upgrade Window
 
-Devkit `0.5.1` declares `minSupportedFromVersion: "0.4.0"` in `release.json` and supports direct upgrades from `0.4.0`, `0.4.1`, and `0.5.0` checkouts. On checkouts older than `0.4.0` (or when `--to` targets a release below `0.4.0`), `devkit` `0.5.1` refuses before acquiring checkout locks or modifying files on disk.
+Version `0.6.0` accepts checkouts from `0.5.0` onward. On Linux x86-64, update a `0.5.x` checkout with `make update to=0.6.0 preview=1`, then run it again without `preview=1`. On Linux ARM64, use the `0.6.0` npm command above or the versioned installer. The loader checked into a `0.5.x` repository requires x86-64. Create the upgrade branch with `git switch -c` or `wt switch --create --no-hooks` so Worktrunk does not invoke that loader.
 
-To upgrade an archival `0.2.x` or `0.3.x` repository to `0.5.1`, bridge through the immutable `0.4.1` release first:
+For a `0.4.x` repository, run the following on Linux x86-64 before following the standard upgrade flow. A `0.2.x` or `0.3.x` repository must first update to `0.4.1` on that host.
 
 ```sh
-git switch -c chore/devkit-0.5.1
-
-# Step 1: upgrade pre-0.4.0 checkout to 0.4.1
-npx @docouno/devkit@0.4.1 update . --to 0.4.1
-make setup
-make check
-
-# Step 2: upgrade 0.4.1 checkout to 0.5.1
 npx @docouno/devkit@0.5.1 update . --to 0.5.1
 make setup
 make check
 ```
 
-## What `devkit update` Changes vs Preserves
-
-Use `make update to=VERSION preview=1` to review changes from a checkout on `0.5.0` or later. Apply with `make update to=VERSION` and run `make recover` if a local transaction is interrupted. On `0.4.1`, use `sh .devkit/runtime/devkit.sh cli update . --to 0.5.1`. On `0.4.0`, use the [versioned installer](https://github.com/docouno/devkit/releases/download/v0.5.1/install.sh) with `update . --to 0.5.1` or use `npx @docouno/devkit@0.5.1 update . --to 0.5.1`.
+## Files affected by an update
 
 If a `0.4.x` to `0.5.0` update leaves the older loader installed, use the `0.5.0` installer with `recover .` or `npx @docouno/devkit@0.5.0 recover .`. For journals older than `0.5.0` that exceed 4 MiB, run recovery with the pinned release that wrote the journal.
 
@@ -69,7 +59,7 @@ If a managed file under `.devkit/` was edited manually, `devkit update` aborts b
 By default, `devkit update` preserves previously resolved transitive versions in `pnpm-lock.yaml` where compatible. When a jump across `@docouno/env`, TypeScript, Vite, or ESLint majors causes strict peer-dependency conflicts with stale transitive entries in `pnpm-lock.yaml`, re-run with `--reconcile-lock`:
 
 ```sh
-npx @docouno/devkit@0.5.1 update . --to 0.5.1 --reconcile-lock
+npx @docouno/devkit@0.6.0 update . --to 0.6.0 --reconcile-lock
 ```
 
 `--reconcile-lock` executes a three-stage fallback strategy:
@@ -84,24 +74,22 @@ Reconciliation may select different external package versions while retaining di
 
 ## Cumulative Migration Notes
 
-When upgrading across supported releases (for example `0.4.1 -> 0.5.0`), `devkit update` filters `release.json` migration entries by the version range `(old, target]` and your project's registered component profiles, printing short migration notes with both a local offline path (`~/.cache/docouno/devkit/releases/<ver>/<id>/docs/migrations/...`) and a GitHub link.
+When upgrading across supported releases (for example `0.5.1 -> 0.6.0`), `devkit update` filters `release.json` migration entries by the version range `(old, target]` and your project's registered component profiles, printing short migration notes with both a local offline path (`~/.cache/docouno/devkit/releases/<ver>/<id>/docs/migrations/...`) and a GitHub link.
 
 Because Devkit never overwrites product-owned `scripts` or configuration files silently, optional improvements to product-owned files are documented in `docs/migrations/<version>.md` whenever a release introduces them.
 
-## Cross-Release Dispatch (`>= 0.4.0`)
+## Cross-release dispatch
 
-- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.4.x` or `0.5.0+` engine whenever it differs from the running binary.
-- `devkit stand` (`reserve` / `remove`) selects the cached accepted `0.5.0+` engine locally without network access and refuses before locking on checkouts older than `0.5.0`. If another process is installing the accepted engine, retry the stand command once installation finishes.
-- Read-only `devkit describe` and `devkit status` delegate when the accepted engine is already cached locally and remain strictly offline otherwise; `devkit info` uses a cached accepted `0.5.0+` engine offline and returns a local summary if the engine is unavailable or its cache lock is busy, while `devkit doctor` runs lock-free against the host and checkout directly.
-- `devkit init --to <version>` and `devkit update --to <version>` (for `<version> >= 0.4.0`) resolve and verify the target release first; whenever `<version>` differs from the currently running `devkit` binary, execution delegates symmetrically to the verified `<version>` engine.
-- On Linux hosts using a group-writable `umask 0002`, prefer `0.4.1+` (or the checked-in project loader `sh .devkit/runtime/devkit.sh cli <subcommand> ...`) when running daily `0.4.x` commands across releases; `devkit update . --to 0.5.1` works directly from both `0.4.0` and `0.4.1`.
+Daily commands select the checked-in release and verify the engine for the current host. `describe`, `status`, `info`, and stand cleanup operate offline. `info` can report checkout state while the cache is cold or busy. `doctor` inspects the host and checkout without holding the checkout lock.
+
+`init --to VERSION` and `update --to VERSION` resolve the requested release. When that release has no engine for the current host, use a release that provides one. To migrate an x86-64-only `0.5.x` checkout on Linux ARM64, start the update directly with the `0.6.0` CLI.
 
 ## Recovering Interrupted Updates (`devkit recover`)
 
 Updates commit through a crash-safe staging journal (`.devkit/update-pending.json`). If a process crash or power loss interrupts an update mid-commit:
 
 ```sh
-npx @docouno/devkit@0.5.1 recover .
+npx @docouno/devkit@0.6.0 recover .
 ```
 
 `devkit recover` verifies backed-up file digests and rolls the repository back to its exact pre-update state without requiring network access or Docker (for an interrupted pre-`0.4.0` update journal, run `npx @docouno/devkit@0.4.1 recover .`).

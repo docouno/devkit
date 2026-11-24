@@ -1,6 +1,6 @@
 # Continuous Integration
 
-Devkit projects require only Linux `x86_64`, Docker Engine with Docker Compose `5.0.0` or newer, and GNU Make on CI runners — no host Node.js or Rust toolchains are required to run `make setup`, `make check`, `make test`, `make build`, or `make package`.
+Devkit projects require Linux x86-64 or ARM64, Docker Engine with Docker Compose `5.0.0` or newer, and GNU Make on CI runners — no host Node.js or Rust toolchains are required to run `make setup`, `make check`, `make test`, `make build`, or `make package`.
 
 ## GitHub Actions
 
@@ -32,9 +32,9 @@ jobs:
           path: |
             ${{ env.DEVKIT_CACHE_DIR }}
             .devkit/cache
-          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
+          key: devkit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
           restore-keys: |
-            devkit-${{ runner.os }}-
+            devkit-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup pinned environment
         env:
@@ -130,8 +130,8 @@ To run lifecycle commands (`init`, `update`, `sync`) without public internet acc
 1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`) and pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` into the runner's Docker daemon (or mirror them carefully by digest).
 2. Prime the local cache once using `--release-root`:
    ```sh
-   /opt/devkit/releases/0.5.0/devkit sync . \
-     --release-root /opt/devkit/releases/0.5.0 \
+   /opt/devkit/releases/0.6.0/bin/devkit sync . \
+     --release-root /opt/devkit/releases/0.6.0 \
      --cache-dir /var/cache/devkit
    ```
 3. Run subsequent lifecycle commands with `--offline --cache-dir /var/cache/devkit`, and point `.npmrc` to your internal npm mirror.
@@ -143,3 +143,17 @@ Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI
 - **Preflight diagnostics**: Run `devkit doctor . --json` in CI setup jobs to inspect Docker Compose compatibility, cgroup v2 controller delegation, host overcommit ratios, free disk/inodes, bridge MTU mismatches, and storage drivers (`overlay2` vs `vfs`).
 - **Explicit resource overrides**: Export `DEVKIT_CPUS` (for example `DEVKIT_CPUS=2`), `DEVKIT_MEMORY_LIMIT` (for example `DEVKIT_MEMORY_LIMIT=4g`), and `DEVKIT_CARGO_BUILD_JOBS` (for example `DEVKIT_CARGO_BUILD_JOBS=2`) when sharing a runner across concurrent jobs.
 - **Nested cgroup v2 delegation**: If a Docker-in-Docker container keeps entrypoint processes in its root cgroup (`/sys/fs/cgroup/cgroup.procs`), Linux cgroup v2 blocks `+cpu +memory` in `cgroup.subtree_control`. Devkit automatically falls back to in-process toolchain bounds without failing the job; to enable hard container cgroup limits in custom DinD images, move entrypoint processes into a child cgroup (such as `/sys/fs/cgroup/init`) before enabling `+cpu +memory +pids` on `cgroup.subtree_control`.
+
+## Devkit release verification on Apple Silicon
+
+The host-only job on `macos-15` exercises the native CLI and the stock shell and Make entry points. To qualify the Docker path, use an Apple Silicon host with a local Linux VM running Docker Compose 5 or newer, Worktrunk 0.74.0, and Python 3.12 or newer. Download the three-target preview and the checkout bundle prepared from that same preview identity. Provide the SHA-256 of the original preview index from the assembler.
+
+```sh
+python3 test/packaged/darwin_vm.py \
+  --build-set /path/to/preview \
+  --expected-index-sha256 "$preview_sha256" \
+  --checkout-bundle /path/to/checkout.bundle \
+  --docker-context desktop-linux
+```
+
+Use the name of the local Docker context on the machine. Keep the index digest and resulting receipt with the runner and Docker versions. Publication of the Darwin binary requires a successful Docker run on the candidate bytes.

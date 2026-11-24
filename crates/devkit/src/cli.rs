@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86-64 and ARM64 with Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -343,7 +343,8 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         {
             return Err(err);
         }
-        let (result, human, ok) = crate::doctor::run_doctor(&target, runner)?;
+        let (result, human, ok) =
+            crate::doctor::run_doctor_with_cache(&target, runner, globals.cache_dir.as_deref())?;
         if ok {
             globals.emit("doctor", result, &human);
             return Ok(());
@@ -362,7 +363,8 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         ensure!(!globals.interactive, "status does not accept --interactive");
         dispatch_accepted(command, &globals, runner)?;
         let root = project_root(&resolve_metadata_target(&globals.args[1..])?)?;
-        let (result, human) = crate::runtime::inspect_status(&root, runner)?;
+        let (result, human) =
+            crate::runtime::inspect_status_with_cache(&root, runner, globals.cache_dir.as_deref())?;
         globals.emit("status", result, &human);
         return Ok(());
     }
@@ -371,16 +373,21 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         let options = Options::parse(&globals.args[1..], &["--app"], &[], &[])?;
         let target = options.target.clone().unwrap_or(std::env::current_dir()?);
         if let Some((engine, sha256)) = try_dispatch_info(&target, &globals, runner)? {
-            crate::processes::restore_exec_pdeathsig(runner)?;
             let mut command = std::process::Command::new(&engine);
             globals.write_flags(&mut command);
             command
                 .args(&globals.args)
                 .env("DEVKIT_DISPATCHED_ENGINE", &sha256);
             use std::os::unix::process::CommandExt;
+            crate::processes::restore_self_exec(runner, &mut command)?;
             return Err(command.exec()).context("Cannot execute the accepted native engine");
         }
-        let (result, human) = crate::info::inspect(&target, options.value("--app")?, runner)?;
+        let (result, human) = crate::info::inspect(
+            &target,
+            options.value("--app")?,
+            runner,
+            globals.cache_dir.as_deref(),
+        )?;
         globals.emit("info", result, &human);
         return Ok(());
     }
@@ -450,7 +457,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             .context("Missing project manifest")?;
         let state = state::read_project_state(&root)?;
         let full = state::admit_runtime_snapshot(&root, state, manifest)?;
-        let result = crate::runtime::enrich_describe(&full)?;
+        let result = crate::runtime::enrich_describe(&full, globals.cache_dir.as_deref())?;
         full.recheck()?;
         runner.check_cancelled()?;
         if globals.json {
@@ -553,9 +560,6 @@ fn try_dispatch_info(
         }
         return Ok(None);
     }
-    if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some() {
-        return Ok(None);
-    }
     let candidate = (|| -> Result<Option<(PathBuf, String)>> {
         let header = state::parse_accepted_header(&bytes)?;
         if SemVer::parse(&header.version)? < SemVer::parse("0.5.0")? {
@@ -573,12 +577,14 @@ fn try_dispatch_info(
         if !pins_id.matches_git_tracked(expected_pins) {
             return Ok(None);
         }
-        let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+        let pins = crate::runtime::EnginePins::parse(&pins_bytes)?;
         if pins.version != header.version {
             return Ok(None);
         }
-        let pin = pins.engine;
-        if delivery::current_engine_digest()? == pin.sha256 {
+        let pin = pins.for_target(distribution::Target::host()?)?;
+        if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some()
+            || delivery::current_engine_digest()? == pin.sha256
+        {
             return Ok(None);
         }
         let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
@@ -589,7 +595,10 @@ fn try_dispatch_info(
         }
         Ok(Some((engine, pin.sha256)))
     })();
-    Ok(candidate.ok().flatten())
+    match candidate {
+        Err(err) if error_code(&err) == "UNSUPPORTED_HOST_TARGET" => Err(err),
+        other => Ok(other.ok().flatten()),
+    }
 }
 
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
@@ -667,12 +676,12 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         "{}",
         conflict_msg()
     );
-    let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+    let pins = crate::runtime::EnginePins::parse(&pins_bytes)?;
     ensure!(
         pins.version == header.version,
         "Accepted version differs from toolchain pins"
     );
-    let pin = pins.engine;
+    let pin = pins.for_target(distribution::Target::host()?)?;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(
@@ -705,13 +714,13 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
         "Accepted engine dispatch did not converge"
     );
-    crate::processes::restore_exec_pdeathsig(runner)?;
     let mut command = std::process::Command::new(&engine);
     globals.write_flags(&mut command);
     command
         .args(&globals.args)
         .env("DEVKIT_DISPATCHED_ENGINE", &pin.sha256);
     use std::os::unix::process::CommandExt;
+    crate::processes::restore_self_exec(runner, &mut command)?;
     Err(command.exec()).context("Cannot execute the accepted native engine")
 }
 
@@ -734,7 +743,9 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                 .value("--pin-file")?
                 .map(PathBuf::from)
                 .unwrap_or(std::env::current_dir()?.join(".devkit/runtime/pnpm.env"));
-            let pin = crate::runtime::PnpmPin::from_pin_file(&pin_file)?;
+            let daemon =
+                crate::resources::query_docker_info(runner, &mut crate::runtime::docker_command())?;
+            let pin = crate::runtime::PnpmPin::from_pin_file_for_target(&pin_file, daemon.target)?;
             let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
             println!(
                 "{}",
@@ -744,6 +755,17 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
         "build-info" => {
             ensure!(args.len() == 1, "Build-info takes no arguments");
             println!("{}", serde_json::to_string(&distribution::build_info())?);
+        }
+        "probe-hardlinks" => {
+            ensure!(
+                args.len() == 4,
+                "probe-hardlinks requires SOURCE DEST TOKEN"
+            );
+            crate::shared_cache::check_guest_hardlink(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                string(&args[3])?,
+            )?;
         }
         "docker-flags" => {
             let options = Options::parse(
@@ -768,6 +790,10 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                         .context("Invalid --pids-limit integer")
                 })
                 .transpose()?;
+            ensure!(
+                cfg!(target_os = "linux"),
+                "The author docker-flags command requires Linux"
+            );
             let budget = crate::resources::HostResourceBudget::probe_local()?;
             let flags =
                 budget.author_flags(cpus_milli, mem_bytes, pids, options.flag("--node-fallback"));
@@ -789,22 +815,53 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                 options.flag("--allow-loopback-http"),
             )?;
         }
-        "assemble" => {
+        "contribute" => {
             let options = Options::parse(
                 &args[1..],
                 &[
                     "--root",
                     "--engine",
+                    "--notices",
+                    "--notice-set-sha256",
+                    "--build-run",
+                    "--output",
+                    "--host-env",
+                ],
+                &[],
+                &[],
+            )?;
+            ensure!(
+                options.target.is_none(),
+                "Contribute takes named options only"
+            );
+            let receipt = crate::assembler::contribute(
+                &crate::assembler::ProduceOptions {
+                    root: options.required_path("--root")?,
+                    engine: options.required_path("--engine")?,
+                    notices: options.required_path("--notices")?,
+                    notice_set_sha256: options.required("--notice-set-sha256")?.to_owned(),
+                    build_run: options.required("--build-run")?.to_owned(),
+                    output: options.required_path("--output")?,
+                    host_env: options.path("--host-env"),
+                },
+                runner,
+            )?;
+            println!("{receipt}");
+        }
+        "assemble" => {
+            let options = Options::parse(
+                &args[1..],
+                &[
+                    "--root",
+                    "--target-input",
                     "--npm-inputs",
                     "--output",
                     "--source-commit",
                     "--source-tree",
                     "--build-run",
-                    "--notices",
-                    "--notice-set-sha256",
                     "--local",
                 ],
-                &[],
+                &["--target-input"],
                 &["--local"],
             )?;
             ensure!(
@@ -814,11 +871,13 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
             let index = crate::assembler::assemble(
                 &crate::assembler::AssemblyOptions {
                     root: options.required_path("--root")?,
-                    engine: options.required_path("--engine")?,
+                    target_inputs: options
+                        .all("--target-input")?
+                        .iter()
+                        .map(|value| value.parse())
+                        .collect::<Result<_>>()?,
                     npm_inputs: options.required_path("--npm-inputs")?,
                     output: options.required_path("--output")?,
-                    notices: options.required_path("--notices")?,
-                    notice_set_sha256: options.required("--notice-set-sha256")?.to_owned(),
                     source_commit: options.required("--source-commit")?.to_owned(),
                     source_tree: options.required("--source-tree")?.to_owned(),
                     build_run: options.required("--build-run")?.to_owned(),
@@ -854,7 +913,7 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     output: options.required_path("--output")?,
                     target: options
                         .value("--target")?
-                        .unwrap_or(distribution::TARGET)
+                        .unwrap_or(distribution::Target::host()?.triple())
                         .to_owned(),
                     rust_version: options.required("--rust-version")?.to_owned(),
                 },

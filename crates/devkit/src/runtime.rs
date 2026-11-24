@@ -80,172 +80,9 @@ pub struct ExecRequest {
     pub network: String,
     pub prepare: bool,
 }
-#[derive(Clone, Debug)]
-pub struct ToolPins {
-    pub version: String,
-    pub node_image: String,
-    pub node_version: String,
-    pub rust_version: String,
-    pub rust_recipe: String,
-    pub desktop_recipe: String,
-    pub engine: crate::delivery::EnginePin,
-}
-impl ToolPins {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut values = BTreeMap::new();
-        for line in std::str::from_utf8(bytes)?.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (k, v) = line
-                .split_once('=')
-                .context("Invalid toolchains.env record")?;
-            ensure!(
-                k.starts_with("DEVKIT_")
-                    && k.bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
-                    && !v.is_empty()
-                    && !v
-                        .chars()
-                        .any(|c| c.is_whitespace() || ['\'', '"', '\0'].contains(&c))
-                    && values.insert(k, v).is_none(),
-                "Invalid/duplicate toolchain key: {k}"
-            );
-        }
-        let get = |k| -> Result<String> {
-            Ok(values.get(k).context("Missing toolchain pin")?.to_string())
-        };
-        let release_version = get("DEVKIT_VERSION")?;
-        let engine = crate::delivery::EnginePin {
-            version: release_version.clone(),
-            target: get("DEVKIT_ENGINE_TARGET")?,
-            sha256: get("DEVKIT_ENGINE_SHA256")?,
-        };
-        engine.validate()?;
-        let s = Self {
-            version: release_version,
-            node_image: get("DEVKIT_NODE_IMAGE")?,
-            node_version: get("DEVKIT_NODE_VERSION")?,
-            rust_version: get("DEVKIT_RUST_VERSION")?,
-            rust_recipe: get("DEVKIT_RUST_RECIPE_HASH")?,
-            desktop_recipe: get("DEVKIT_DESKTOP_RECIPE_HASH")?,
-            engine,
-        };
-        version(&s.version)?;
-        version(&s.node_version)?;
-        version(&s.rust_version)?;
-        let (name, hash) = s
-            .node_image
-            .rsplit_once("@sha256:")
-            .context("Node image must be digest pinned")?;
-        ensure!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"./:-".contains(&c))
-                && SHA256_RE.is_match(hash)
-                && SHA256_RE.is_match(&s.rust_recipe)
-                && SHA256_RE.is_match(&s.desktop_recipe),
-            "Invalid immutable tool pins"
-        );
-        Ok(s)
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PnpmPin {
-    pub package: String,
-    pub version: String,
-    pub tarball_sha256: String,
-    pub binary_sha256: String,
-}
-impl PnpmPin {
-    fn parse_pins(bytes: &[u8], source: bool) -> Result<Self> {
-        ensure!(
-            bytes.len() <= 64 * 1024,
-            "pnpm pin file exceeds byte budget"
-        );
-        let mut values = BTreeMap::new();
-        for line in std::str::from_utf8(bytes)?.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (key, value) = line.split_once('=').context("Invalid pnpm pin record")?;
-            ensure!(
-                key.starts_with(if source { "DEVKIT_" } else { "DEVKIT_PNPM_" })
-                    && key
-                        .bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
-                    && !value.is_empty()
-                    && !value
-                        .chars()
-                        .any(|c| c.is_whitespace() || ['\'', '"', '\0'].contains(&c))
-                    && values.insert(key, value).is_none(),
-                "Invalid/duplicate pnpm pin: {key}"
-            );
-        }
-        let get = |key| -> Result<String> {
-            Ok(values.get(key).context("Missing pnpm pin")?.to_string())
-        };
-        let pin = Self {
-            package: if source {
-                "@pnpm/exe.linux-x64-musl".into()
-            } else {
-                get("DEVKIT_PNPM_PACKAGE")?
-            },
-            version: get("DEVKIT_PNPM_VERSION")?,
-            tarball_sha256: get("DEVKIT_PNPM_TARBALL_SHA256")?,
-            binary_sha256: get("DEVKIT_PNPM_SHA256")?,
-        };
-        version(&pin.version)?;
-        ensure!(
-            pin.package == "@pnpm/exe.linux-x64-musl"
-                && SHA256_RE.is_match(&pin.tarball_sha256)
-                && SHA256_RE.is_match(&pin.binary_sha256),
-            "Invalid immutable pnpm pins"
-        );
-        Ok(pin)
-    }
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        Self::parse_pins(bytes, false)
-    }
-    pub fn from_source_pins(root: &Path) -> Result<Self> {
-        Self::parse_pins(
-            &Self::read_pin_file(&input_path(root, "toolchains.env")?)?,
-            true,
-        )
-    }
-    pub fn from_release(release: &crate::release::AdmittedRelease) -> Result<Self> {
-        Self::parse(&release.bytes("runtime/pnpm.env")?)
-    }
-    pub fn from_checkout(root: &Path) -> Result<Self> {
-        Self::parse(&Self::read_pin_file(&input_path(
-            root,
-            ".devkit/runtime/pnpm.env",
-        )?)?)
-    }
-    pub fn from_pin_file(path: &Path) -> Result<Self> {
-        let bytes = Self::read_pin_file(path)?;
-        let source = !std::str::from_utf8(&bytes)?
-            .lines()
-            .any(|l| l.starts_with("DEVKIT_PNPM_PACKAGE="));
-        Self::parse_pins(&bytes, source)
-    }
-    fn read_pin_file(path: &Path) -> Result<Vec<u8>> {
-        let path = project_root(path)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        ensure!(
-            metadata.is_file() && metadata.len() <= 64 * 1024,
-            "Invalid or oversized pnpm pin file"
-        );
-        Ok(fs::read(path)?)
-    }
-    pub fn encode(&self) -> String {
-        format!(
-            "DEVKIT_PNPM_PACKAGE={}\nDEVKIT_PNPM_SHA256={}\nDEVKIT_PNPM_TARBALL_SHA256={}\nDEVKIT_PNPM_VERSION={}\n",
-            self.package, self.binary_sha256, self.tarball_sha256, self.version
-        )
-    }
-}
+mod pins;
+pub use pins::{EnginePins, PnpmPin, ToolPins};
+
 /// This admission deliberately does not read native dependency graphs/locks.
 /// It permits service operations and explicit repair of stale native inputs.
 pub struct ToolAdmission {
@@ -305,14 +142,7 @@ impl ToolAdmission {
             // tooling payloads still retain their exact ownership boundary.
             assert_managed(&root, &state)?;
         }
-        let pins = ToolPins::parse(&fs::read(safe_path(
-            &root,
-            ".devkit/runtime/toolchains.env",
-        )?)?)?;
-        ensure!(
-            pins.version == state.version,
-            "Manifest version differs from accepted toolchains.env"
-        );
+        let pins = ToolPins::admit(&root, &state)?;
         if allow_older_accepted {
             ensure!(
                 SemVer::parse(&state.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?,
@@ -419,11 +249,59 @@ struct ContainerTask<'a> {
     access: TaskAccess,
     inputs: Option<&'a InputIdentitySet>,
 }
+pub(crate) fn docker_command() -> Command {
+    let mut command = Command::new("docker");
+    command.env_remove("DOCKER_DEFAULT_PLATFORM");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("COMPOSE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
+/// Confirm the pinned reference resolves to the native daemon image even when
+/// the local image store also contains manifests for another architecture.
+pub(crate) fn ensure_image(
+    runner: &ProcessRunner,
+    image: &str,
+    platform: &str,
+    prepare: bool,
+) -> Result<()> {
+    let matches = || -> Result<bool> {
+        let result = runner.run(
+            docker_command().args([
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}/{{.Architecture}}",
+                image,
+            ]),
+            OutputMode::Capture(1024 * 1024),
+        )?;
+        Ok(result.code == 0 && result.text()?.trim() == platform)
+    };
+    if !matches()? {
+        ensure!(
+            prepare,
+            "accepted image {image} is absent for {platform}; run make setup (or exec --prepare)"
+        );
+        runner.checked(
+            docker_command().args(["pull", "--platform", platform, image]),
+            OutputMode::Inherit,
+        )?;
+        ensure!(matches()?, "Pulled image {image} does not match {platform}");
+    }
+    Ok(())
+}
+
 struct PreparedContext<'a> {
     admission: ToolAdmission,
     runner: &'a ProcessRunner,
     project: String,
-    engine: PathBuf,
+    daemon: std::cell::OnceCell<crate::resources::DockerDaemonInfo>,
+    helper: std::cell::OnceCell<PathBuf>,
+    store: std::cell::OnceCell<crate::shared_cache::UnifiedStorePlan>,
     rust_image: Option<String>,
     desktop_image: Option<String>,
     node_image_verified: std::cell::Cell<bool>,
@@ -441,8 +319,12 @@ impl<'a> PreparedContext<'a> {
     ) -> Result<Self> {
         Self::new_inner(admission, runner, true, cache_dir)
     }
-    fn new_for_status(admission: ToolAdmission, runner: &'a ProcessRunner) -> Result<Self> {
-        Self::new_inner(admission, runner, false, None)
+    fn new_for_status(
+        admission: ToolAdmission,
+        runner: &'a ProcessRunner,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self> {
+        Self::new_inner(admission, runner, false, cache_dir)
     }
     fn new_inner(
         admission: ToolAdmission,
@@ -450,17 +332,17 @@ impl<'a> PreparedContext<'a> {
         verify_pin: bool,
         cache_dir: Option<&Path>,
     ) -> Result<Self> {
-        let engine = if verify_pin {
-            crate::delivery::verify_current_engine(&admission.pins.engine)?
-        } else {
-            crate::delivery::current_engine_path()?
-        };
+        if verify_pin {
+            crate::delivery::verify_current_engine(&admission.pins.engine)?;
+        }
         let project = crate::doctor::compose_project_name(&admission.root);
         Ok(Self {
             admission,
             runner,
             project,
-            engine,
+            daemon: Default::default(),
+            helper: Default::default(),
+            store: Default::default(),
             rust_image: None,
             desktop_image: None,
             node_image_verified: std::cell::Cell::new(false),
@@ -494,11 +376,59 @@ impl<'a> PreparedContext<'a> {
         }
         Ok(path)
     }
+    fn daemon(&self) -> Result<&crate::resources::DockerDaemonInfo> {
+        self.daemon
+            .get()
+            .context("Docker daemon has not been admitted")
+    }
+    fn ensure_linux_helper(&self, allow_network: bool) -> Result<&Path> {
+        if self.helper.get().is_none() {
+            let pin = self
+                .admission
+                .pins
+                .engines
+                .for_target(self.daemon()?.target)?;
+            let cache = crate::cache::ReleaseCache::new(self.cache_dir.as_deref(), self.runner)?;
+            let path = cache.ensure_linux_helper(
+                &pin,
+                &self.admission.state.release_identity,
+                allow_network,
+            )?;
+            self.helper.set(path).expect("first helper resolution");
+        }
+        Ok(self.helper.get().expect("resolved helper"))
+    }
+    fn store_plan(&self) -> Result<&crate::shared_cache::UnifiedStorePlan> {
+        if self.store.get().is_none() {
+            let root = self.cache_root()?;
+            let plan = crate::shared_cache::UnifiedStorePlan::resolve_with_probe(
+                &self.admission.root,
+                &root,
+                |plan| {
+                    if cfg!(target_os = "macos") {
+                        crate::shared_cache::probe_guest_hardlinks(
+                            plan,
+                            &root.join("empty-mask"),
+                            self.docker(),
+                            self.ensure_linux_helper(false)?,
+                            &self.admission.pins.node_image,
+                            self.daemon()?.platform,
+                            self.runner,
+                        )
+                    } else {
+                        Ok(true)
+                    }
+                },
+            )?;
+            self.store.set(plan).expect("first store selection");
+        }
+        Ok(self.store.get().expect("resolved store"))
+    }
     fn pnpm(&self, allow_network: bool) -> Result<PathBuf> {
         if let Some(path) = self.pnpm_path.borrow().as_ref() {
             return Ok(path.clone());
         }
-        let pin = PnpmPin::from_checkout(&self.admission.root)?;
+        let pin = PnpmPin::from_checkout_for_target(&self.admission.root, self.daemon()?.target)?;
         let policy = crate::native::parse_manifest_npmrc_policy(
             &self.admission.root,
             crate::native::NodeLockKind::for_state(&self.admission.state)?,
@@ -513,7 +443,7 @@ impl<'a> PreparedContext<'a> {
         let root = &self.admission.root;
         let package = fs::canonicalize(root.join(path).join("node_modules/electron"))?;
         ensure!(
-            package.starts_with(root.join("node_modules/.pnpm")),
+            package.starts_with(fs::canonicalize(root.join("node_modules/.pnpm"))?),
             "Electron package resolves outside the isolated workspace store"
         );
         let manifest: Value = serde_json::from_slice(
@@ -522,16 +452,21 @@ impl<'a> PreparedContext<'a> {
         )?;
         let version = text(&manifest["version"], "Electron version")?;
         crate::files::version(version)?;
-        let plan = crate::shared_cache::UnifiedStorePlan::resolve(root, &self.cache_root()?)?;
+        let plan = self.store_plan()?;
+        let (arch, machine) = match self.daemon()?.target {
+            crate::distribution::Target::LinuxX64 => ("x64", 62),
+            crate::distribution::Target::LinuxArm64 => ("arm64", 183),
+            _ => anyhow::bail!("Electron requires a Linux daemon"),
+        };
         let locks = plan.store.join(".locks");
         crate::shared_cache::directory(&locks)?;
         let _lock = crate::cache::lock_file(
-            &locks.join(format!("electron-dist-{version}-linux-x64.lock")),
+            &locks.join(format!("electron-dist-{version}-linux-{arch}.lock")),
             self.runner,
         )?;
         let distributions = plan.store.join("electron-dist");
         crate::shared_cache::directory(&distributions)?;
-        let cached = safe_path(&distributions, &format!("{version}-linux-x64"))?;
+        let cached = safe_path(&distributions, &format!("{version}-linux-{arch}"))?;
         ensure_directory(&cached)?;
         let marker = safe_path(&cached, ".complete")?;
         if !exists(&marker)? {
@@ -577,7 +512,7 @@ impl<'a> PreparedContext<'a> {
                 .prefix(".stage-")
                 .tempdir_in(&distributions)?;
             let inventory = distribution_inventory(&package.join("dist"), self.runner)?;
-            ensure_electron_executable(&inventory)?;
+            ensure_electron_executable(&package.join("dist/electron"), &inventory, machine)?;
             hardlink_distribution(
                 &package.join("dist"),
                 &stage.path().join("dist"),
@@ -602,7 +537,7 @@ impl<'a> PreparedContext<'a> {
             receipt.schema_version == 1 && receipt.version == version,
             "Invalid cached Electron distribution marker"
         );
-        ensure_electron_executable(&receipt.entries)?;
+        ensure_electron_executable(&cached.join("dist/electron"), &receipt.entries, machine)?;
         ensure!(
             distribution_inventory(&safe_path(&cached, "dist")?, self.runner)? == receipt.entries,
             "Cached Electron distribution is incomplete or corrupt: {}; remove it and rerun make setup",
@@ -642,13 +577,7 @@ impl<'a> PreparedContext<'a> {
         write_atomic(&package.join("path.txt"), b"electron", 0o644)
     }
     fn docker(&self) -> Command {
-        let mut c = Command::new("docker");
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("COMPOSE_") {
-                c.env_remove(key);
-            }
-        }
-        c
+        docker_command()
     }
     fn env(&self, c: &mut Command) {
         let a = &self.admission;
@@ -674,7 +603,14 @@ impl<'a> PreparedContext<'a> {
                     .unwrap_or_else(|| "devkit-unprepared-desktop".into())
                     .into(),
             ),
-            ("DEVKIT_ENGINE_PATH", self.engine.as_os_str().to_owned()),
+            // The accepted Compose interface names the binary mounted in Linux.
+            (
+                "DEVKIT_ENGINE_PATH",
+                self.helper
+                    .get()
+                    .map(|path| path.as_os_str().to_owned())
+                    .unwrap_or_else(|| "/devkit/unused-engine".into()),
+            ),
             (
                 "DEVKIT_PNPM_PATH",
                 self.pnpm_path
@@ -721,13 +657,8 @@ impl<'a> PreparedContext<'a> {
     }
     fn prerequisite_service(&self) -> Result<()> {
         require_compose(self.runner, &mut self.docker())?;
-        let info = self
-            .runner
-            .capture(self.docker().args(["info", "--format", "{{.OSType}}"]))?;
-        ensure!(
-            info.text()?.trim() == "linux",
-            "A Linux Docker daemon is required"
-        );
+        let info = crate::resources::query_docker_info(self.runner, &mut self.docker())?;
+        self.daemon.set(info).expect("first daemon admission");
         Ok(())
     }
     fn prerequisite(&self) -> Result<()> {
@@ -736,42 +667,24 @@ impl<'a> PreparedContext<'a> {
             self.runner,
             &mut self.docker(),
         )?;
+        let info = budget
+            .daemon_info
+            .clone()
+            .context("Missing Docker daemon information")?;
+        self.daemon.set(info).expect("first daemon admission");
         *self.budget.borrow_mut() = Some(budget);
         Ok(())
     }
-    fn image(&self, image: &str) -> Result<bool> {
-        let result = self.runner.run(
-            self.docker().args(["image", "inspect", image]),
-            OutputMode::Capture(1024 * 1024),
-        )?;
-        if result.code == 0 {
-            return Ok(true);
-        }
-        let info = self
-            .runner
-            .capture(self.docker().args(["info", "--format", "{{.OSType}}"]))?;
-        ensure!(
-            info.text()?.trim() == "linux",
-            "Cannot verify accepted image; Linux Docker daemon is required"
-        );
-        Ok(false)
-    }
     fn node_image(&self, prepare: bool) -> Result<()> {
-        if !prepare && self.node_image_verified.get() {
-            return Ok(());
-        }
-        if !self.image(&self.admission.pins.node_image)? {
-            ensure!(
+        if !self.node_image_verified.get() {
+            ensure_image(
+                self.runner,
+                &self.admission.pins.node_image,
+                self.daemon()?.platform,
                 prepare,
-                "accepted Node image is absent; run make setup (or exec --prepare)"
-            );
-            self.runner.checked(
-                self.docker()
-                    .args(["pull", &self.admission.pins.node_image]),
-                OutputMode::Inherit,
             )?;
+            self.node_image_verified.set(true);
         }
-        self.node_image_verified.set(true);
         Ok(())
     }
     fn derived_image(&mut self, kind: &str, prepare: bool) -> Result<String> {
@@ -788,105 +701,123 @@ impl<'a> PreparedContext<'a> {
         let (recipe, pin, label) = if kind == "rust" {
             (
                 "rust.Dockerfile",
-                &self.admission.pins.rust_recipe,
+                self.admission.pins.rust_recipe.as_str(),
                 "io.docouno.devkit.rust-recipe",
             )
         } else {
             (
                 "desktop.Dockerfile",
-                &self.admission.pins.desktop_recipe,
+                self.admission
+                    .pins
+                    .desktop_recipe
+                    .as_deref()
+                    .context("Missing accepted desktop recipe pin")?,
                 "io.docouno.devkit.desktop-recipe",
             )
         };
         let recipe_path = safe_path(&self.admission.root, &format!(".devkit/runtime/{recipe}"))?;
+        let (recipe_bytes, id) = read_regular_file(&recipe_path, 1024 * 1024, "image recipe")?
+            .context("Missing accepted image recipe")?;
         ensure!(
-            identity(&recipe_path)?.is_some_and(|id| &id.sha256 == pin),
+            id.sha256 == pin,
             "{recipe} differs from the accepted recipe"
         );
-        let derived_tag = format!("devkit-derived-{kind}:{pin}");
+        let platform = self.daemon()?.platform;
+        let arch = platform
+            .strip_prefix("linux/")
+            .context("Expected Linux image platform")?;
+        let derived_tag = format!("devkit-derived-{kind}:{arch}-{pin}");
         let state = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if let Some(id) = identity(&state)? {
-            let recorded = fs::read_to_string(&state)?;
-            let recorded = recorded.trim();
-            if recorded
+        let inspect = |reference: &str| -> Result<Option<String>> {
+            let format = format!(
+                "{{{{.Id}}}}\n{{{{.Os}}}}/{{{{.Architecture}}}}\n{{{{index .Config.Labels \"{label}\"}}}}\n{{{{index .Config.Labels \"io.docouno.devkit.platform\"}}}}"
+            );
+            let output = self.runner.run(
+                self.docker()
+                    .args(["image", "inspect", "--format", &format, reference]),
+                OutputMode::Capture(1024 * 1024),
+            )?;
+            if output.code != 0 {
+                return Ok(None);
+            }
+            let mut lines = output.text()?.lines();
+            let id = lines.next().unwrap_or_default();
+            Ok((id
                 .strip_prefix("sha256:")
                 .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                let inspected = self.runner.run(
-                    self.docker().args([
-                        "image",
-                        "inspect",
-                        "--format",
-                        &format!("{{{{index .Config.Labels \"{label}\"}}}}"),
-                        recorded,
-                    ]),
+                && lines.next() == Some(platform)
+                && lines.next() == Some(pin)
+                && lines.next() == Some(platform)
+                && lines.next().is_none())
+            .then(|| id.to_owned()))
+        };
+        let record = |id: &str| -> Result<()> {
+            self.admission.recheck()?;
+            let receipt = crate::doctor::DerivedImageReceipt::new(platform, id, pin);
+            write_atomic(&state, format!("{id}\n").as_bytes(), 0o644)?;
+            write_json(&state.with_extension("json"), &receipt)
+        };
+        if let Some(receipt) = crate::doctor::read_image_receipt(&self.admission.root, kind, pin)?
+            && receipt.platform == platform
+            && inspect(&receipt.image_id)?.as_ref() == Some(&receipt.image_id)
+        {
+            if prepare {
+                self.runner.checked(
+                    self.docker()
+                        .args(["image", "tag", &receipt.image_id, &derived_tag]),
                     OutputMode::Capture(1024 * 1024),
                 )?;
-                if inspected.code == 0 && inspected.text()?.trim() == pin {
-                    if prepare {
-                        self.runner.checked(
-                            self.docker().args(["image", "tag", recorded, &derived_tag]),
-                            OutputMode::Capture(1024 * 1024),
-                        )?;
-                    }
-                    let result = recorded.to_owned();
-                    self.set_image(kind, result.clone());
-                    return Ok(result);
-                }
             }
-            drop(id);
+            self.set_image(kind, receipt.image_id.clone());
+            return Ok(receipt.image_id);
         }
         ensure!(
             prepare,
             "accepted {kind} image is absent/stale; run make setup (or exec --prepare)"
         );
-        let tag_inspected = self.runner.run(
-            self.docker().args([
-                "image",
-                "inspect",
-                "--format",
-                &format!("{{{{.Id}}}}\n{{{{index .Config.Labels \"{label}\"}}}}"),
-                &derived_tag,
-            ]),
-            OutputMode::Capture(1024 * 1024),
-        )?;
-        if tag_inspected.code == 0
-            && let Ok(text) = tag_inspected.text()
-            && let Some((id_line, label_line)) = text.trim().split_once('\n')
-            && id_line
-                .trim()
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            && label_line.trim() == pin
-        {
-            let image = id_line.trim().to_owned();
-            self.admission.recheck()?;
-            write_atomic(&state, format!("{image}\n").as_bytes(), 0o644)?;
+        if let Some(image) = inspect(&derived_tag)? {
+            record(&image)?;
             self.set_image(kind, image.clone());
             return Ok(image);
         }
+        let base = std::str::from_utf8(&recipe_bytes)?
+            .lines()
+            .find_map(|line| line.strip_prefix("FROM "))
+            .context("Missing pinned base image in accepted recipe")?;
+        ensure!(
+            base.rsplit_once("@sha256:")
+                .is_some_and(|(_, hash)| SHA256_RE.is_match(hash)),
+            "Expected a digest-pinned base image in {recipe}"
+        );
+        ensure_image(self.runner, base, platform, true)?;
         let tmp = tempfile::Builder::new()
             .prefix("image-")
             .tempfile_in(state.parent().context("Image state parent")?)?;
-        self.runner.checked(
-            self.docker()
-                .args([
-                    "build",
-                    "--pull=false",
-                    "--build-arg",
-                    &format!("DEVKIT_RECIPE_SHA={pin}"),
-                    "--label",
-                    &format!("{label}={pin}"),
-                    "--tag",
-                    &derived_tag,
-                    "--iidfile",
-                ])
-                .arg(tmp.path())
-                .arg("--file")
-                .arg(recipe_path)
-                .arg(self.admission.root.join(".devkit/runtime")),
-            OutputMode::Inherit,
-        )?;
+        self.runner
+            .run_with_input(
+                self.docker()
+                    .args([
+                        "build",
+                        "--platform",
+                        platform,
+                        "--pull=false",
+                        "--label",
+                        &format!("io.docouno.devkit.platform={platform}"),
+                        "--build-arg",
+                        &format!("DEVKIT_RECIPE_SHA={pin}"),
+                        "--label",
+                        &format!("{label}={pin}"),
+                        "--tag",
+                        &derived_tag,
+                        "--iidfile",
+                    ])
+                    .arg(tmp.path())
+                    .args(["--file", "-"])
+                    .arg(self.admission.root.join(".devkit/runtime")),
+                OutputMode::Inherit,
+                &recipe_bytes,
+            )?
+            .success("Build accepted tool image")?;
         let image = fs::read_to_string(tmp.path())?.trim().to_owned();
         ensure!(
             image
@@ -894,19 +825,11 @@ impl<'a> PreparedContext<'a> {
                 .is_some_and(|h| SHA256_RE.is_match(h)),
             "Invalid {kind} image identity"
         );
-        let inspected = self.runner.capture(self.docker().args([
-            "image",
-            "inspect",
-            "--format",
-            &format!("{{{{index .Config.Labels \"{label}\"}}}}"),
-            &image,
-        ]))?;
         ensure!(
-            inspected.text()?.trim() == pin,
-            "Invalid {kind} recipe label"
+            inspect(&image)?.as_ref() == Some(&image),
+            "Built {kind} image does not match {platform} and its accepted recipe"
         );
-        self.admission.recheck()?;
-        write_atomic(&state, format!("{image}\n").as_bytes(), 0o644)?;
+        record(&image)?;
         self.set_image(kind, image.clone());
         Ok(image)
     }
@@ -972,44 +895,6 @@ impl<'a> PreparedContext<'a> {
         {
             writes.insert("node_modules".into());
         }
-        self.dirs(writes.iter().cloned())?;
-        let pnpm = if node { Some(self.pnpm(setup)?) } else { None };
-        let cargo_cache = if node {
-            None
-        } else {
-            Some(self.cache_directory("cargo")?)
-        };
-        let pnpm_cache = if node {
-            Some(self.cache_directory("pnpm-cache")?)
-        } else {
-            None
-        };
-        let electron_cache = if node {
-            Some(self.cache_directory("electron")?)
-        } else {
-            None
-        };
-        let unified = if node && (setup || write_root) {
-            let root_cache = self.cache_root()?;
-            let store = safe_path(&root_cache, "pnpm-store")?;
-            ensure_directory(&store)?;
-            Some(crate::shared_cache::UnifiedStorePlan::resolve(
-                root,
-                &root_cache,
-            )?)
-        } else {
-            None
-        };
-        let empty_mask = if unified.is_some() {
-            let empty = self.cache_directory("empty-mask")?;
-            ensure!(
-                fs::read_dir(&empty)?.next().is_none(),
-                "Shared empty-mask directory must be empty"
-            );
-            Some(empty)
-        } else {
-            None
-        };
         let policy = if node {
             let directories = self
                 .admission
@@ -1027,11 +912,41 @@ impl<'a> PreparedContext<'a> {
         } else {
             None
         };
+        let online = network != "none" && forward_npm_secrets;
+        if let Some(policy) = policy.as_ref().filter(|_| online) {
+            crate::native::validate_vm_registries(policy, None)?;
+        }
+        self.dirs(writes.iter().cloned())?;
+        let pnpm = if node { Some(self.pnpm(setup)?) } else { None };
+        let cargo_cache = if node {
+            None
+        } else {
+            Some(self.cache_directory("cargo")?)
+        };
+        let pnpm_cache = if node {
+            Some(self.cache_directory("pnpm-cache")?)
+        } else {
+            None
+        };
+        let electron_cache = if node {
+            Some(self.cache_directory("electron")?)
+        } else {
+            None
+        };
+        let root_cache = self.cache_root()?;
+        let unified = if node && (setup || write_root) {
+            Some(self.store_plan()?)
+        } else {
+            if node {
+                crate::shared_cache::prepare_mount_masks(&root_cache)?;
+            }
+            None
+        };
         let userconfig = if let Some(policy) = &policy {
-            let online = network != "none" && forward_npm_secrets;
+            use std::os::unix::fs::PermissionsExt;
             let mut file = tempfile::Builder::new()
                 .prefix("devkit-npmrc-")
-                .tempfile()?;
+                .tempfile_in(root_cache.join(".tmp"))?;
             use std::io::Write;
             for line in &policy.sanitized_lines {
                 if online || !line.contains("${") {
@@ -1039,13 +954,15 @@ impl<'a> PreparedContext<'a> {
                 }
             }
             file.flush()?;
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o644))?;
             Some(file)
         } else {
             None
         };
         let ca_cert = if node && network != "none" && forward_npm_secrets {
             crate::native::resolve_ca_cert_path()?
-                .map(|p| crate::download::additional_ca_file(&p))
+                .map(|p| crate::download::additional_ca_file_in(&p, &root_cache.join(".tmp")))
                 .transpose()?
         } else {
             None
@@ -1063,6 +980,8 @@ impl<'a> PreparedContext<'a> {
             let mut c = self.docker();
             c.args([
                 "run",
+                "--platform",
+                self.daemon()?.platform,
                 "--pull",
                 "never",
                 "--rm",
@@ -1098,12 +1017,7 @@ impl<'a> PreparedContext<'a> {
                         writable.push(input_path(root, path)?);
                     }
                 }
-                plan.mount(
-                    &mut c,
-                    empty_mask.as_deref().context("Missing empty mask")?,
-                    setup,
-                    &writable,
-                )?;
+                plan.mount(&mut c, &root_cache.join("empty-mask"), setup, &writable)?;
                 if write_root {
                     plan.mask_checkout_files(&mut c, Path::new("/workspace"))?;
                 }
@@ -1171,17 +1085,15 @@ impl<'a> PreparedContext<'a> {
                     true,
                 )?;
             }
-            if node
-                && !setup
-                && !write_root
-                && fs::symlink_metadata(root.join(".npmrc")).is_ok_and(|m| m.is_file())
-            {
-                crate::shared_cache::mount(
-                    &mut c,
-                    Path::new("/dev/null"),
-                    Path::new("/workspace/.npmrc"),
-                    true,
-                )?;
+            if node && !setup && !write_root {
+                for relative in crate::shared_cache::npmrc_targets(root)? {
+                    crate::shared_cache::mount(
+                        &mut c,
+                        &root_cache.join("empty-file-mask"),
+                        &Path::new("/workspace").join(relative),
+                        true,
+                    )?;
+                }
             }
             let work_root = unified
                 .as_ref()
@@ -1189,7 +1101,11 @@ impl<'a> PreparedContext<'a> {
                 .unwrap_or_else(|| PathBuf::from("/workspace"));
             c.args([
                 "--mount",
-                &bind_mount(&self.engine, Path::new("/devkit/devkit"), true)?,
+                &bind_mount(
+                    self.ensure_linux_helper(false)?,
+                    Path::new("/devkit/devkit"),
+                    true,
+                )?,
                 "--workdir",
                 work_root
                     .join(component.unwrap_or(""))
@@ -1333,10 +1249,30 @@ struct ElectronDistributionReceipt {
     entries: BTreeMap<String, DistributionEntry>,
 }
 
-fn ensure_electron_executable(entries: &BTreeMap<String, DistributionEntry>) -> Result<()> {
+fn ensure_electron_executable(
+    path: &Path,
+    entries: &BTreeMap<String, DistributionEntry>,
+    machine: u16,
+) -> Result<()> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
     ensure!(
         matches!(entries.get("electron"), Some(DistributionEntry::File {size, mode, ..}) if *size > 0 && mode & 0o111 != 0),
         "Electron distribution omitted its executable"
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Expected regular Electron executable"
+    );
+    let mut header = [0u8; 20];
+    (&file).read_exact(&mut header)?;
+    ensure!(
+        &header[..7] == b"\x7fELF\x02\x01\x01"
+            && u16::from_le_bytes([header[18], header[19]]) == machine,
+        "Electron executable does not match the Docker daemon architecture"
     );
     Ok(())
 }
@@ -1562,7 +1498,9 @@ fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
     for p in [
         ".devkit/state/node-workspace.lock",
         ".devkit/state/rust-image",
+        ".devkit/state/rust-image.json",
         ".devkit/state/desktop-image",
+        ".devkit/state/desktop-image.json",
     ] {
         identity(&safe_path(&admission.root, p)?)?;
     }
@@ -1576,20 +1514,17 @@ fn runtime_pending(root: &Path) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-fn node_fingerprint(admission: &RuntimeAdmission) -> Result<String> {
-    Ok(digest(format!(
-        "{}\n{}",
-        admission.state.release_identity, admission.native.node_inputs.digest
-    )))
-}
-fn node_ready(ctx: &PreparedContext<'_>, fingerprint: &str) -> Result<()> {
+fn node_ready(ctx: &PreparedContext<'_>, node_inputs_digest: &str) -> Result<()> {
     if ctx.node_ready_verified.get() {
         return Ok(());
     }
-    let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
+    let expected = crate::doctor::NodeWorkspaceReceipt::new(
+        ctx.daemon()?.platform,
+        &ctx.admission.state.release_identity,
+        node_inputs_digest,
+    );
     ensure!(
-        identity(&receipt)?.is_some()
-            && fs::read_to_string(receipt)?.trim() == fingerprint
+        crate::doctor::read_node_receipt(&ctx.admission.root)?.as_ref() == Some(&expected)
             && safe_path(&ctx.admission.root, "node_modules")?.is_dir(),
         "workspace dependencies are absent/stale; run make setup"
     );
@@ -1818,7 +1753,10 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     }
     ctx.prerequisite()?;
     let full = full.context("Missing quality admission")?;
-    let fingerprint = node_fingerprint(&full)?;
+    let node_digest = &full.native.node_inputs.digest;
+    if !full.state.components.is_empty() {
+        ctx.ensure_linux_helper(matches!(request.command.as_str(), "setup" | "setup-node"))?;
+    }
     ctx.dirs(workspace_write_directories(
         &full.state,
         &full.native.inputs,
@@ -1906,7 +1844,14 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         }
         full.recheck()?;
         runner.check_cancelled()?;
-        write_atomic(&receipt, format!("{fingerprint}\n").as_bytes(), 0o644)?;
+        write_json(
+            &receipt,
+            &crate::doctor::NodeWorkspaceReceipt::new(
+                ctx.daemon()?.platform,
+                &full.state.release_identity,
+                node_digest,
+            ),
+        )?;
         return Ok(());
     }
     if command == "doctor" {
@@ -1916,7 +1861,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 ctx.derived_image("rust", false)?;
             } else {
                 ctx.node_image(false)?;
-                node_ready(&ctx, &fingerprint)?;
+                node_ready(&ctx, node_digest)?;
             }
             if c.tooling_profile == ToolingProfile::Electron {
                 ctx.derived_image("desktop", false)?;
@@ -1937,7 +1882,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         .context("Finite/development task must select a registered component through Make")?;
     let component = full.state.components[&target].clone();
     if ["dev", "up"].contains(&command) {
-        run_development(&request, &target, &full, &fingerprint, &mut ctx)?;
+        run_development(&request, &target, &full, node_digest, &mut ctx)?;
         full.recheck()?;
         return Ok(());
     }
@@ -1969,7 +1914,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         })?;
     } else {
         ctx.node_image(false)?;
-        node_ready(&ctx, &fingerprint)?;
+        node_ready(&ctx, node_digest)?;
         let image = if component.tooling_profile == ToolingProfile::Electron {
             ctx.derived_image("desktop", setup)?
         } else {
@@ -2076,12 +2021,14 @@ fn cleanup_without_stand(
             .is_some_and(|id| actual.matches_git_tracked(id)),
         "Managed engine pins changed"
     );
-    let pins = ToolPins::parse(&bytes)?;
+    let pins = EnginePins::parse(&bytes)?;
     ensure!(
         pins.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
         "Accepted engine version differs from its build"
     );
-    crate::delivery::verify_current_engine(&pins.engine)?;
+    crate::delivery::verify_current_engine(
+        &pins.for_target(crate::distribution::Target::host()?)?,
+    )?;
     let mut ports = crate::stand::ports::Ports::read(root)?;
     if let Some(ledger) = &ledger {
         ensure!(
@@ -2170,6 +2117,7 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     };
     let mut ctx = PreparedContext::new(tool, runner, request.runtime.cache_dir.as_deref())?;
     ctx.prerequisite()?;
+    ctx.ensure_linux_helper(request.prepare)?;
     if request.write && toolchain == Toolchain::Node {
         let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
         if identity(&receipt)?.is_some() {
@@ -2733,7 +2681,9 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
         .filter(|c| c.role == Role::App)
         .count()
         > 1;
-    let skip_desktop = multiple && std::env::var_os("DISPLAY").is_none_or(|value| value.is_empty());
+    let skip_desktop = multiple
+        && (cfg!(target_os = "macos")
+            || std::env::var_os("DISPLAY").is_none_or(|value| value.is_empty()));
     let mut selected = BTreeSet::new();
     let mut plans = BTreeMap::new();
     let mut primary = None;
@@ -2922,7 +2872,7 @@ fn run_development(
     request: &RuntimeRequest,
     target: &str,
     full: &RuntimeAdmission,
-    fingerprint: &str,
+    node_inputs_digest: &str,
     ctx: &mut PreparedContext<'_>,
 ) -> Result<()> {
     use std::io::Write;
@@ -2957,7 +2907,7 @@ fn run_development(
         } else {
             ctx.node_image(false)?;
             ctx.pnpm(false)?;
-            node_ready(ctx, fingerprint)?;
+            node_ready(ctx, node_inputs_digest)?;
         }
         if c.tooling_profile == ToolingProfile::Electron {
             ctx.derived_image("desktop", false)?;
@@ -2982,26 +2932,32 @@ fn run_development(
             continue;
         };
         let name = service_name(path, component);
-        if component.toolchain != Toolchain::Node
-            || development.owner != DevelopmentOwner::Managed
-            || !active_services.contains(name)
-        {
+        if development.owner != DevelopmentOwner::Managed || !active_services.contains(name) {
             continue;
         }
-        let mut volumes = Vec::new();
-        if virtual_store.is_dir() {
-            volumes.push(json!({"type":"bind","source":virtual_store,"target":"/workspace/node_modules/.pnpm","read_only":true,"bind":{"create_host_path":false,"selinux":"z"}}));
+        let mut settings = json!({"platform":ctx.daemon()?.platform});
+        if component.toolchain == Toolchain::Node {
+            let mut volumes = Vec::new();
+            if virtual_store.is_dir() {
+                volumes.push(json!({"type":"bind","source":virtual_store,"target":"/workspace/node_modules/.pnpm","read_only":true,"bind":{"create_host_path":false,"selinux":"z"}}));
+            }
+            let targets = crate::shared_cache::npmrc_targets(&ctx.admission.root)?;
+            if !targets.is_empty() {
+                let cache = ctx.cache_root()?;
+                crate::shared_cache::prepare_mount_masks(&cache)?;
+                for relative in targets {
+                    volumes.push(json!({"type":"bind","source":cache.join("empty-file-mask"),"target":Path::new("/workspace").join(relative),"read_only":true,"bind":{"create_host_path":false}}));
+                }
+            }
+            if !volumes.is_empty() {
+                settings["volumes"] = json!(volumes);
+            }
         }
-        if fs::symlink_metadata(ctx.admission.root.join(".npmrc")).is_ok_and(|m| m.is_file()) {
-            volumes.push(json!({"type":"bind","source":"/dev/null","target":"/workspace/.npmrc","read_only":true,"bind":{"create_host_path":false,"selinux":"z"}}));
-        }
-        if !volumes.is_empty() {
-            protected_services.insert(name.to_owned(), json!({"volumes":volumes}));
-        }
+        protected_services.insert(name.to_owned(), settings);
     }
     if !protected_services.is_empty() {
         let mut file = tempfile::Builder::new()
-            .prefix("node-store-")
+            .prefix("managed-services-")
             .suffix(".json")
             .tempfile_in(&state_dir)?;
         file.write_all(&json_bytes(&json!({"services":protected_services}))?)?;
@@ -3587,7 +3543,7 @@ fn app_service_component_map(state: &ProjectState) -> BTreeMap<String, String> {
     map
 }
 
-pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
+pub fn enrich_describe(full: &RuntimeAdmission, cache_dir: Option<&Path>) -> Result<Value> {
     let mut components = serde_json::Map::new();
     for (path, c) in &full.state.components {
         let mut obj = match serde_json::to_value(c)? {
@@ -3625,6 +3581,8 @@ pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
         &full.root,
         &full.state,
         Some(&full.native.node_inputs.digest),
+        None,
+        cache_dir,
     )?;
     Ok(json!({
         "root": full.root,
@@ -3639,13 +3597,20 @@ pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
 }
 
 pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, String)> {
+    inspect_status_with_cache(root, runner, None)
+}
+pub fn inspect_status_with_cache(
+    root: &Path,
+    runner: &ProcessRunner,
+    cache_dir: Option<&Path>,
+) -> Result<(Value, String)> {
     let root = project_root(root)?;
     ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let lock = CheckoutLock::acquire_shared(&root, "status", Some(runner))?;
     let req = RuntimeRequest::new(root.clone(), "status".into());
     let tool = ToolAdmission::capture_status_compat(&req)?;
     runtime_paths(&tool)?;
-    let mut ctx = PreparedContext::new_for_status(tool, runner)?;
+    let mut ctx = PreparedContext::new_for_status(tool, runner, cache_dir)?;
     ctx.prerequisite_service()?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service_to_component = app_service_component_map(&ctx.admission.state);
@@ -3674,7 +3639,13 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
         &mut services,
     )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
-    let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
+    let receipts = crate::doctor::local_receipts(
+        &ctx.admission.root,
+        &ctx.admission.state,
+        None,
+        Some(ctx.daemon()?.platform),
+        ctx.cache_dir.as_deref(),
+    )?;
     ctx.admission.recheck()?;
     runner.check_cancelled()?;
     drop(lock);
@@ -3732,8 +3703,8 @@ pub struct DockerComposeNormalizer {
 }
 impl ComposeNormalizer for DockerComposeNormalizer {
     fn normalize(&self, snapshot: &Path, entrypoints: &[String]) -> Result<Value> {
-        require_compose(&self.runner, &mut Command::new("docker"))?;
-        let mut command = Command::new("docker");
+        require_compose(&self.runner, &mut docker_command())?;
+        let mut command = docker_command();
         command
             .env("DEVKIT_PNPM_PATH", "/devkit/unused-pnpm")
             .env("DEVKIT_CARGO_CACHE_DIR", "/devkit/unused-cargo")
@@ -3747,11 +3718,6 @@ impl ComposeNormalizer for DockerComposeNormalizer {
                 "--env-file",
                 "/dev/null",
             ]);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("COMPOSE_") {
-                command.env_remove(key);
-            }
-        }
         // This query resolves service names, not tool images. Supply inert
         // integration values and never acquire an image during normalization.
         command
@@ -3760,7 +3726,7 @@ impl ComposeNormalizer for DockerComposeNormalizer {
             .env("DEVKIT_UID", "1000")
             .env("DEVKIT_GID", "1000")
             .env("DEVKIT_NODE_IMAGE", "devkit-inventory-node:local")
-            .env("DEVKIT_ENGINE_PATH", "/devkit/inventory-engine");
+            .env("DEVKIT_ENGINE_PATH", "/devkit/unused-engine");
         for p in entrypoints {
             command.arg("--file").arg(snapshot.join(p));
         }
@@ -3913,13 +3879,17 @@ mod electron_cache_tests {
         let temporary = tempfile::TempDir::new().unwrap();
         let source = temporary.path().join("source");
         fs::create_dir_all(source.join("locales")).unwrap();
-        fs::write(source.join("electron"), b"executable").unwrap();
+        let mut elf = [0_u8; 64];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(source.join("electron"), elf).unwrap();
         fs::set_permissions(source.join("electron"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(source.join("icudtl.dat"), b"trusted data").unwrap();
         fs::write(source.join("locales/en.pak"), b"locale").unwrap();
         let runner = ProcessRunner::new().unwrap();
         let expected = distribution_inventory(&source, &runner).unwrap();
-        ensure_electron_executable(&expected).unwrap();
+        ensure_electron_executable(&source.join("electron"), &expected, 183).unwrap();
+        assert!(ensure_electron_executable(&source.join("electron"), &expected, 62).is_err());
         let marker = temporary.path().join(".complete");
         write_json(
             &marker,

@@ -8,7 +8,7 @@ use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     Result, archive, assembler,
-    distribution::{NpmArtifact, ReleaseIndex},
+    distribution::{NpmArtifact, REQUIRED_PUBLISHABLE_TARGETS, ReleaseIndex, checksums},
     files::{self, SHA256_RE},
     processes::ProcessRunner,
 };
@@ -224,7 +224,7 @@ impl FrozenSet {
         );
         let bytes = read_bounded(&root.join("release-index.json"), 4 * 1024 * 1024)?;
         let index: ReleaseIndex = serde_json::from_slice(&bytes)?;
-        index.validate()?;
+        index.validate_publishable_matrix(REQUIRED_PUBLISHABLE_TARGETS)?;
         ensure!(
             index.publication_eligible
                 && source_hash(&index.source_commit)
@@ -244,6 +244,10 @@ impl FrozenSet {
                 "Frozen asset differs: {name}"
             );
         }
+        ensure!(
+            set.asset_bytes("checksums.txt")? == checksums(&set.index.files).as_bytes(),
+            "Frozen checksums.txt differs from the release index"
+        );
         let allowed: BTreeSet<_> = set
             .index
             .files
@@ -295,6 +299,17 @@ impl FrozenSet {
             admitted.identity == self.index.release_identity,
             "Hydrated payload identity differs"
         );
+        for target in REQUIRED_PUBLISHABLE_TARGETS {
+            let asset = self.index.engine_asset(*target)?;
+            let path = payload.join(target.payload_name());
+            devkit::delivery::verify_executable(
+                &path,
+                &self.index.files[asset].sha256,
+                *target,
+                true,
+            )
+            .with_context(|| format!("Hydrated engine differs from its frozen asset: {asset}"))?;
+        }
         Ok(())
     }
     fn asset_names(&self) -> BTreeSet<String> {
@@ -853,8 +868,8 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
                 .context("Performance measurements missing")?;
             ensure!(!measurements.is_empty(), "Performance measurements missing");
             ensure!(
-                value["baseline"]["version"] == "0.4.1",
-                "Performance baseline version must be 0.4.1"
+                value["baseline"]["version"] == "0.5.1",
+                "Performance baseline version must be 0.5.1"
             );
             ensure!(
                 measurements
@@ -1469,7 +1484,7 @@ fn run_args(args: Args) -> Result<()> {
                     "Remote index differs from original contract"
                 );
                 let index: ReleaseIndex = files::read_json(&output.join("release-index.json"))?;
-                index.validate()?;
+                index.validate_publishable_matrix(REQUIRED_PUBLISHABLE_TARGETS)?;
                 index.files.keys().all(|name| output.join(name).exists())
             } else {
                 false
@@ -1514,6 +1529,7 @@ fn run_args(args: Args) -> Result<()> {
         );
         set.hydrate()?;
     } else {
+        set.hydrate()?;
         let c = set.contract(args.previous()?)?;
         args.check_contract(&c)?;
         provider::require_actions(&c.source_commit)?;

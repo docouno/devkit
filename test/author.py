@@ -7,13 +7,39 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
+import sys
 import subprocess
 import tempfile
 import time
 import uuid
 
+from release_targets import engine_asset, executable_header_matches, host_target
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def verify_assembler_handoff(scratch):
+    """A clean assembler runner receives argv and needs no author SDK."""
+    capture = scratch / "assembler with spaces"
+    capture.write_text(f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+    capture.chmod(0o755)
+    inputs = [f"x86_64-unknown-linux-musl:{scratch}/native x64:{'a' * 64}",
+              f"aarch64-unknown-linux-musl:{scratch}/native arm:{'b' * 64}"]
+    npm = scratch / "npm handoff"
+    output = scratch / "new set"
+    result = subprocess.run([
+        "make", "--no-print-directory", "pack", f"DEVKIT_AUTHOR_ENGINE={capture}",
+        f"output={output}", f"npm_inputs={npm}", "target_inputs=" + shlex.join(inputs),
+    ], cwd=ROOT, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = json.loads(result.stdout)
+    assert args[:2] == ["internal", "assemble"]
+    assert args[args.index("--npm-inputs") + 1] == str(npm)
+    assert args[args.index("--output") + 1] == str(output)
+    assert [args[i + 1] for i, arg in enumerate(args) if arg == "--target-input"] == inputs
+    assert "--local" not in args
 
 
 def main():
@@ -26,18 +52,18 @@ def main():
         engine = Path(os.environ['DEVKIT_VERIFY_ENGINE'])
         assert engine.is_file() and not engine.is_symlink() and os.access(engine, os.X_OK), 'Expected a regular executable black-box engine'
         data = engine.read_bytes()
-        assert data[:4] == b'\x7fELF', 'Black-box tests require the native ELF'
+        assert executable_header_matches(data, host_target()), 'Black-box tests require the matching native binary'
         sha = hashlib.sha256(data).hexdigest()
         if os.environ.get('DEVKIT_BUILD_SET'):
             build_set = Path(os.environ['DEVKIT_BUILD_SET'])
             index = json.loads((build_set / 'release-index.json').read_text())
-            identity = index['files'][index['engine']]
+            identity = index['files'][engine_asset(index)]
             assert sha == identity['sha256'] and len(data) == identity['size'], 'Selected black-box engine differs from the frozen build set'
             assert hashlib.sha256((engine.parent / 'release.json').read_bytes()).hexdigest() == index['releaseIdentity'], 'Selected release differs from the frozen build set'
-            assert hashlib.sha256((build_set / index['engine']).read_bytes()).hexdigest() == sha, 'Frozen engine asset differs from its index'
+            assert hashlib.sha256((build_set / engine_asset(index)).read_bytes()).hexdigest() == sha, 'Frozen engine asset differs from its index'
         print('Black-box engine: ' + json.dumps(dict(path=str(engine.resolve()), sha256=sha)))
         return
-    engine = Path(os.environ.get('DEVKIT_AUTHOR_ENGINE', ROOT / '.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit')).resolve()
+    engine = Path(os.environ.get('DEVKIT_AUTHOR_ENGINE', ROOT / '.artifacts/author/target' / host_target() / 'debug/devkit')).resolve()
     assert engine.is_file(), 'Run make setup'
     proof = ROOT / '.artifacts/author/probes' / uuid.uuid4().hex
     proof.mkdir(parents=True)
@@ -52,7 +78,8 @@ def main():
         fields = {'target': 'DEVKIT_INIT_TARGET', 'output': 'DEVKIT_ASSEMBLY_OUTPUT',
             'build_set': 'DEVKIT_BUILD_SET', 'previous': 'DEVKIT_VERIFY_PREVIOUS',
             'release': 'DEVKIT_VERIFY_RELEASE', 'baseline_set': 'DEVKIT_BASELINE_SET',
-            'fixtures': 'DEVKIT_AUTHOR_FIXTURES',
+            'fixtures': 'DEVKIT_AUTHOR_FIXTURES', 'target_inputs': 'DEVKIT_TARGET_INPUTS',
+            'npm_inputs': 'DEVKIT_NPM_INPUTS', 'DEVKIT_AUTHOR_ENGINE': 'DEVKIT_AUTHOR_ENGINE',
             'template': 'DEVKIT_INIT_TEMPLATE', 'version': 'DEVKIT_RELEASE_VERSION',
             'from_version': 'DEVKIT_FROM_VERSION', 'build_id': 'DEVKIT_BUILD_ID',
             'build_run': 'DEVKIT_BUILD_RUN', 'expected_index_sha256': 'DEVKIT_EXPECTED_INDEX_SHA256',
@@ -75,11 +102,13 @@ def main():
             rows.append(dict(name='literal-command-line-data', passed=True, fields=fields))
         finally:
             marker.unlink(missing_ok=True)
+        verify_assembler_handoff(root)
+        rows.append(dict(name='assemble-with-native-contributions', passed=True))
         if args.data_only:
             (proof / 'receipt.json').write_text(json.dumps(dict(passed=True, cases=rows, implicitMakeEvaluation=False), indent=2) + '\n')
             print(f'PASS literal Make operator data; {proof}')
             return
-        local_engine = root / '.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit'
+        local_engine = root / '.artifacts/author/target' / host_target() / 'debug/devkit'
         local_engine.parent.mkdir(parents=True)
         shutil.copy2(engine, local_engine)
         (root / 'packages/env').mkdir(parents=True)

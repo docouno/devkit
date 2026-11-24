@@ -1,0 +1,154 @@
+name: Produce native Linux artifacts
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+      fresh:
+        required: true
+        type: boolean
+    outputs:
+      controller_artifact:
+        description: Controller artifact
+        value: ${{ jobs.build.outputs.controller_artifact }}
+      controller_sha256:
+        description: Controller sha256
+        value: ${{ jobs.build.outputs.controller_sha256 }}
+      fixtures_artifact:
+        description: Fixtures artifact
+        value: ${{ jobs.build.outputs.fixtures_artifact }}
+      fixtures_sha256:
+        description: Fixtures sha256
+        value: ${{ jobs.build.outputs.fixtures_sha256 }}
+      contribution_artifact:
+        description: Contribution artifact
+        value: ${{ jobs.build.outputs.contribution_artifact }}
+      contribution_sha256:
+        description: Contribution sha256
+        value: ${{ jobs.build.outputs.contribution_sha256 }}
+      artifact_digest:
+        description: Artifact digest
+        value: ${{ jobs.build.outputs.artifact_digest }}
+      artifact_id:
+        description: Artifact id
+        value: ${{ jobs.build.outputs.artifact_id }}
+      npm_inputs_artifact:
+        description: Npm inputs artifact
+        value: ${{ jobs.build.outputs.npm_inputs_artifact }}
+      npm_inputs_sha256:
+        description: Npm inputs sha256
+        value: ${{ jobs.build.outputs.npm_inputs_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    outputs:
+      controller_artifact: ${{ steps.handoff.outputs.controller_artifact }}
+      controller_sha256: ${{ steps.handoff.outputs.controller_sha256 }}
+      fixtures_artifact: ${{ steps.handoff.outputs.fixtures_artifact }}
+      fixtures_sha256: ${{ steps.handoff.outputs.fixtures_sha256 }}
+      contribution_artifact: ${{ steps.handoff.outputs.contribution_artifact }}
+      contribution_sha256: ${{ steps.handoff.outputs.contribution_sha256 }}
+      artifact_digest: ${{ steps.handoff.outputs.artifact_digest }}
+      artifact_id: ${{ steps.handoff.outputs.artifact_id }}
+      npm_inputs_artifact: ${{ steps.handoff.outputs.npm_inputs_artifact }}
+      npm_inputs_sha256: ${{ steps.handoff.outputs.npm_inputs_sha256 }}
+    env:
+      PLATFORM: ${{ inputs.platform }}
+      BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify source admission and performance failure guards
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
+      - uses: ./.github/actions/setup-compose
+      - uses: ./.github/actions/author-sdk
+        with:
+          mode: ${{ inputs.fresh && inputs.platform == 'amd64' && 'full' || 'bootstrap' }}
+      - name: Produce immutable native contribution and verification tools
+        if: inputs.fresh
+        run: make build-target output="$PWD/.artifacts/contribution" build_id=ci build_run="$BUILD_RUN"
+      - name: Rebuild only native verification tools for restored bytes
+        if: '!inputs.fresh'
+        run: make build-controller build-fixtures
+      - name: Produce shared npm inputs
+        if: inputs.fresh && inputs.platform == 'amd64'
+        run: make npm-inputs build_id=ci
+      - name: Stage native verification fixtures
+        run: |
+          set -euo pipefail
+          case "$PLATFORM:$(uname -m)" in amd64:x86_64|arm64:aarch64) ;; *) exit 1;; esac
+          mkdir -p .artifacts/author-fixtures
+          fixtures=".artifacts/author/target/$(uname -m)-unknown-linux-musl/debug/examples"
+          cp "$fixtures"/{runtime_fixture,registry_fixture} .artifacts/author-fixtures/
+          (cd .artifacts/author-fixtures && sha256sum runtime_fixture registry_fixture > checksums.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: devkit-controller-${{ inputs.platform }}-${{ github.run_attempt }}
+          path: .artifacts/release-ops/devkit-release
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: devkit-fixtures-${{ inputs.platform }}-${{ github.run_attempt }}
+          path: .artifacts/author-fixtures/
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: contribution
+        if: inputs.fresh
+        with:
+          include-hidden-files: true
+          name: devkit-contribution-${{ inputs.platform }}-${{ github.run_attempt }}
+          path: .artifacts/contribution/
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: inputs.fresh && inputs.platform == 'amd64'
+        with:
+          include-hidden-files: true
+          name: devkit-npm-inputs-${{ github.run_attempt }}
+          path: .artifacts/author/ci-npm/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Export exact producer identities
+        id: handoff
+        env:
+          FRESH: ${{ inputs.fresh }}
+          ARTIFACT_ID: ${{ steps.contribution.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.contribution.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          sha() { sha256sum "$1" | cut -d ' ' -f 1; }
+          {
+            echo "controller_artifact=devkit-controller-$PLATFORM-$GITHUB_RUN_ATTEMPT"
+            echo "controller_sha256=$(sha .artifacts/release-ops/devkit-release)"
+            echo "fixtures_artifact=devkit-fixtures-$PLATFORM-$GITHUB_RUN_ATTEMPT"
+            echo "fixtures_sha256=$(sha .artifacts/author-fixtures/checksums.txt)"
+            if test "$FRESH" = true; then
+              echo "contribution_artifact=devkit-contribution-$PLATFORM-$GITHUB_RUN_ATTEMPT"
+              echo "contribution_sha256=$(sha .artifacts/contribution/producer.json)"
+              echo "artifact_id=$ARTIFACT_ID"
+              echo "artifact_digest=$ARTIFACT_DIGEST"
+              if test "$PLATFORM" = amd64; then
+                echo "npm_inputs_artifact=devkit-npm-inputs-$GITHUB_RUN_ATTEMPT"
+                echo "npm_inputs_sha256=$(sha .artifacts/author/ci-npm/inputs.json)"
+              fi
+            fi
+          } >> "$GITHUB_OUTPUT"

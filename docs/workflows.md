@@ -1,6 +1,6 @@
 # Daily Workflows
 
-This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.5.1`.
+This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.6.0`.
 
 ## 1. Create a New Repository
 
@@ -9,19 +9,19 @@ This guide covers day-to-day repository creation, component wiring, dependency m
 Initialize a single-app or multi-app workspace:
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-product --app web=react-web
+npx @docouno/devkit@0.6.0 init my-product --app web=react-web
 ```
 
 For a web-only fullstack stand (`apps/api` Rust API + `apps/web` React SPA):
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-web --preset fullstack-web
+npx @docouno/devkit@0.6.0 init my-web --preset fullstack-web
 ```
 
 Or scaffold the fullstack preset (`apps/api` Rust API + `apps/web` React SPA + `apps/desktop` Electron app + `packages/client` shared React library):
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-suite --preset fullstack-desktop
+npx @docouno/devkit@0.6.0 init my-suite --preset fullstack-desktop
 ```
 
 ### Standalone Libraries (Zero-App Workspace)
@@ -29,13 +29,13 @@ npx @docouno/devkit@0.5.1 init my-suite --preset fullstack-desktop
 Create a package-only repository without scaffolding a dummy runnable application:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-sdk --package sdk=ts-library
+npx @docouno/devkit@0.6.0 init acme-sdk --package sdk=ts-library
 ```
 
 Create a React component library repository:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-ui --package ui=react-ui
+npx @docouno/devkit@0.6.0 init acme-ui --package ui=react-ui
 ```
 
 ### Design System with Interactive Playground
@@ -43,7 +43,7 @@ npx @docouno/devkit@0.5.1 init acme-ui --package ui=react-ui
 Scaffold `packages/ui` (`react-ui`) pre-wired to `apps/playground` (`react-web`) with instant source HMR:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-design --preset design-system
+npx @docouno/devkit@0.6.0 init acme-design --preset design-system
 ```
 
 After initialization, prepare pinned toolchains and workspace dependencies:
@@ -100,7 +100,7 @@ make sync reconcile=1
 make setup
 ```
 
-You can also invoke `npx @docouno/devkit@0.5.1 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
+You can also invoke `npx @docouno/devkit@0.6.0 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
 
 ## 5. Run Daily Gates and Development Services
 

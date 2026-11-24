@@ -37,6 +37,12 @@ Local directory snapshots retain their exact artifact and peer-context identitie
 
 pnpm YAML acquisition is limited to 32 MiB before allocation throughout admission, source snapshots, staging, and transaction recovery. Saved transaction files retain the policy of their original target path. Git worktree pointers used to select a shared store are regular files limited to 16 KiB before reading or hashing.
 
+## Host and container binaries
+
+A release has one identity across architectures. The installer and npm launcher select a host binary by operating system and CPU and verify its SHA-256 before execution. The release index maps target triples to binary assets. The x86-64 binary retains its historical path, `devkit`, inside the release payload.
+
+Docker tasks execute a static Linux helper selected for the local daemon's platform. On Linux x86-64 and ARM64, the same verified executable can serve both roles when the targets match. Tool images and standalone pnpm follow the daemon architecture. Platform-specific readiness records and caches belong to the checkout's ignored state or to the host cache.
+
 ## Container Isolation and Security Model
 
 Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, `DEVKIT_RUST_IMAGE`, `DEVKIT_DESKTOP_IMAGE`) with dropped capabilities (`--cap-drop ALL`), `no-new-privileges:true`, `--init`, and host UID/GID mapping:
@@ -72,7 +78,7 @@ Containerized builds and test suites frequently run on shared CI runners or nest
 
 - **Lock-free**: `devkit doctor`, `devkit info`, `make info` (and its quiet `make status` alias, which performs only a non-blocking `LOCK_NB` probe), `make help`, `devkit catalog`, `devkit --version`, and `devkit --help` never hold `task.lock`.
 - **Shared lock (`LOCK_SH`)**: `devkit describe`, `devkit status`, `make doctor`, `make logs` (releasing the lock before `follow=1` / `--follow` begins streaming), and read-only `make exec` / `devkit exec` run concurrently across terminals and automation agents.
-- **Exclusive lock (`LOCK_EX`)**: Mutating and build tasks write `.devkit/state/task.owner.json` (`pid`, `/proc/<pid>/stat` start ticks, operation name) so concurrent invocations wait adaptively up to `DEVKIT_LOCK_TIMEOUT_MS` (default `120000` ms) while detecting recursive self-deadlocks immediately.
+- **Exclusive lock (`LOCK_EX`)**: Mutating and build tasks write `.devkit/state/task.owner.json` (PID, process start time and operation name) so concurrent invocations wait adaptively up to `DEVKIT_LOCK_TIMEOUT_MS` (default `120000` ms) while detecting recursive self-deadlocks immediately.
 
 ## Host-local development stand authority
 

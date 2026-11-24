@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.6.0]
+
+### Added
+
+- Run the same checkout on Linux x86-64 and Linux ARM64. The versioned installer and npm launcher select a SHA-256-pinned native CLI. Container helpers, pnpm, and Linux Electron packages follow the local Docker daemon's architecture.
+
+### Breaking
+
+- The minimum checkout version is `0.5.0`. Upgrade `0.4.x` projects through `0.5.1` on Linux x86-64 before adopting `0.6.0`.
+
 ## [0.5.1]
 
 ### Fixed

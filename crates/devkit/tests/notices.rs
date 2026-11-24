@@ -1,5 +1,5 @@
 use devkit::{
-    distribution::{TARGET, build_info},
+    distribution::{Target, build_info},
     files::{digest, file_map, write_atomic, write_json},
     notices::{
         NoticeSet, NoticeSource, PackageNotices, read_crate_notices, resolved_packages,
@@ -10,6 +10,10 @@ use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path};
 use tempfile::TempDir;
+
+fn target() -> &'static str {
+    Target::host().unwrap().triple()
+}
 
 #[test]
 fn cargo_resolution_walk_keeps_normal_and_build_edges_without_dev_or_disconnected_targets() {
@@ -127,7 +131,7 @@ fn notice_fixture(root: &Path) -> std::path::PathBuf {
     let id = "registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0".to_owned();
     let receipt = NoticeSet {
         schema_version: 1,
-        target: TARGET.to_owned(),
+        target: target().to_owned(),
         rust_version: "1.99.1".to_owned(),
         source_cargo_lock_sha256: digest(fs::read(root.join("Cargo.lock")).unwrap()),
         generator: build_info(),
@@ -168,7 +172,7 @@ fn bundle_verification_rejects_missing_resolved_package_even_when_remaining_file
     let temp = TempDir::new().unwrap();
     let output = notice_fixture(temp.path());
     let producer_digest = digest(fs::read(output.join("notice-set.json")).unwrap());
-    verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest).unwrap();
+    verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest).unwrap();
     let path = output.join("notice-set.json");
     let mut receipt: NoticeSet = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     receipt.packages.clear();
@@ -176,7 +180,7 @@ fn bundle_verification_rejects_missing_resolved_package_even_when_remaining_file
     receipt.files.remove("cargo/fixture/notice-001.txt");
     write_json(&path, &receipt).unwrap();
     assert!(
-        verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest)
+        verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest)
             .unwrap_err()
             .to_string()
             .contains("producer notice-set digest")
@@ -192,21 +196,25 @@ fn bundle_verification_binds_bytes_lock_target_and_standard_library_files() {
         verify_notice_set(
             &output,
             temp.path(),
-            "aarch64-unknown-linux-musl",
+            if target() == Target::LinuxX64.triple() {
+                Target::LinuxArm64.triple()
+            } else {
+                Target::LinuxX64.triple()
+            },
             "1.99.1",
             &producer_digest
         )
         .is_err()
     );
     fs::write(output.join("cargo/fixture/notice-001.txt"), "changed").unwrap();
-    assert!(verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest).is_err());
+    assert!(verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest).is_err());
     fs::write(
         output.join("cargo/fixture/notice-001.txt"),
         "Original crate license\n",
     )
     .unwrap();
     fs::write(temp.path().join("Cargo.lock"), "changed lock").unwrap();
-    assert!(verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest).is_err());
+    assert!(verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest).is_err());
 }
 
 #[test]
@@ -231,7 +239,7 @@ fn actual_pinned_cargo_and_standard_library_notice_collection() {
         cargo_home: std::env::var_os("CARGO_HOME").unwrap().into(),
         rust_docs: docs,
         output: temp.path().join("collected"),
-        target: TARGET.to_owned(),
+        target: target().to_owned(),
         rust_version: "1.99.1".to_owned(),
     };
     let receipt = collect_notices(&options, &runner).unwrap();
@@ -244,7 +252,7 @@ fn actual_pinned_cargo_and_standard_library_notice_collection() {
     let stored: Value =
         serde_json::from_slice(&fs::read(options.output.join("notice-set.json")).unwrap()).unwrap();
     assert!(stored.get("noticeSetSha256").is_none());
-    verify_notice_set(&options.output, &root, TARGET, "1.99.1", producer_digest).unwrap();
+    verify_notice_set(&options.output, &root, target(), "1.99.1", producer_digest).unwrap();
 }
 
 #[test]
@@ -255,7 +263,7 @@ fn producer_digest_refuses_coordinated_omission_and_receipt_field_edits() {
         let path = output.join("notice-set.json");
         let producer_bytes = fs::read(&path).unwrap();
         let producer_digest = digest(&producer_bytes);
-        verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest).unwrap();
+        verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest).unwrap();
         let mut receipt: NoticeSet = serde_json::from_slice(&producer_bytes).unwrap();
         match change {
             "omit-package" => {
@@ -285,7 +293,7 @@ fn producer_digest_refuses_coordinated_omission_and_receipt_field_edits() {
             }
         }
         assert!(
-            verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest)
+            verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest)
                 .unwrap_err()
                 .to_string()
                 .contains("producer notice-set digest"),
@@ -308,7 +316,7 @@ fn producer_digest_does_not_replace_existing_missing_mode_and_rust_identity_chec
             _ => fs::write(&path, "Changed Rust license\n").unwrap(),
         }
         assert!(
-            verify_notice_set(&output, temp.path(), TARGET, "1.99.1", &producer_digest)
+            verify_notice_set(&output, temp.path(), target(), "1.99.1", &producer_digest)
                 .unwrap_err()
                 .to_string()
                 .contains("file set/hash/mode differs"),
@@ -318,6 +326,6 @@ fn producer_digest_does_not_replace_existing_missing_mode_and_rust_identity_chec
     let temp = TempDir::new().unwrap();
     let output = notice_fixture(temp.path());
     for invalid in ["", "invalid", &"a".repeat(64)] {
-        assert!(verify_notice_set(&output, temp.path(), TARGET, "1.99.1", invalid).is_err());
+        assert!(verify_notice_set(&output, temp.path(), target(), "1.99.1", invalid).is_err());
     }
 }

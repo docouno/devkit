@@ -1,13 +1,14 @@
 //! Container resource budgeting, cgroup v2/DinD delegation detection, and toolchain concurrency.
-use crate::{Result, model::*, processes::ProcessRunner};
+use crate::{Result, distribution::Target, model::*, processes::ProcessRunner};
 use anyhow::{Context, ensure};
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use std::os::{fd::AsRawFd, unix::net::UnixStream};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
-    os::{fd::AsRawFd, unix::net::UnixStream},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -23,6 +24,7 @@ pub enum DelegationState {
     RootCgroupHasProcesses,
     RootlessUndelegated,
     RemoteDaemon,
+    VmDaemon,
     UnverifiedMock,
 }
 
@@ -75,6 +77,8 @@ impl CgroupCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DockerDaemonInfo {
     pub os_type: String,
+    pub platform: &'static str,
+    pub target: Target,
     pub ncpu: Option<u32>,
     pub mem_total: Option<u64>,
     pub memory_limit: bool,
@@ -86,29 +90,11 @@ pub struct DockerDaemonInfo {
     pub cgroup_driver: Option<String>,
     pub cgroup_version: Option<String>,
     pub rootless: bool,
-    pub is_mock_text: bool,
 }
 
 impl DockerDaemonInfo {
     pub fn parse(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
-        if trimmed == "linux" {
-            return Ok(Self {
-                os_type: "linux".into(),
-                ncpu: None,
-                mem_total: None,
-                memory_limit: true,
-                swap_limit: true,
-                cpu_cfs_quota: true,
-                cpu_shares: true,
-                pids_limit: true,
-                driver: None,
-                cgroup_driver: None,
-                cgroup_version: None,
-                rootless: false,
-                is_mock_text: true,
-            });
-        }
         let v: Value =
             serde_json::from_str(trimmed).context("Cannot parse Docker daemon info JSON")?;
         let os_type = v
@@ -118,6 +104,12 @@ impl DockerDaemonInfo {
             .trim()
             .to_owned();
         ensure!(os_type == "linux", "A Linux Docker daemon is required");
+        let arch = v.get("Architecture").and_then(Value::as_str).unwrap_or("");
+        let (platform, target) = match arch {
+            "amd64" | "x86_64" => ("linux/amd64", Target::LinuxX64),
+            "arm64" | "aarch64" => ("linux/arm64", Target::LinuxArm64),
+            _ => anyhow::bail!("Unsupported Linux Docker daemon architecture: {arch:?}"),
+        };
         let rootless = v
             .get("SecurityOptions")
             .and_then(Value::as_array)
@@ -128,6 +120,8 @@ impl DockerDaemonInfo {
             });
         Ok(Self {
             os_type,
+            platform,
+            target,
             ncpu: v
                 .get("NCPU")
                 .and_then(Value::as_u64)
@@ -137,14 +131,14 @@ impl DockerDaemonInfo {
             memory_limit: v
                 .get("MemoryLimit")
                 .and_then(Value::as_bool)
-                .unwrap_or(true),
-            swap_limit: v.get("SwapLimit").and_then(Value::as_bool).unwrap_or(true),
+                .unwrap_or(false),
+            swap_limit: v.get("SwapLimit").and_then(Value::as_bool).unwrap_or(false),
             cpu_cfs_quota: v
                 .get("CpuCfsQuota")
                 .and_then(Value::as_bool)
-                .unwrap_or(true),
-            cpu_shares: v.get("CPUShares").and_then(Value::as_bool).unwrap_or(true),
-            pids_limit: v.get("PidsLimit").and_then(Value::as_bool).unwrap_or(true),
+                .unwrap_or(false),
+            cpu_shares: v.get("CPUShares").and_then(Value::as_bool).unwrap_or(false),
+            pids_limit: v.get("PidsLimit").and_then(Value::as_bool).unwrap_or(false),
             driver: v.get("Driver").and_then(Value::as_str).map(str::to_owned),
             cgroup_driver: v
                 .get("CgroupDriver")
@@ -155,13 +149,16 @@ impl DockerDaemonInfo {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             rootless,
-            is_mock_text: false,
         })
     }
 }
 
 pub fn query_docker_info(runner: &ProcessRunner, docker: &mut Command) -> Result<DockerDaemonInfo> {
-    let output = runner.capture(docker.args(["info", "--format", "{{json .}}"]))?;
+    let output = runner.capture(docker.env_remove("DOCKER_DEFAULT_PLATFORM").args([
+        "info",
+        "--format",
+        "{{json .}}",
+    ]))?;
     DockerDaemonInfo::parse(output.text()?)
 }
 
@@ -175,6 +172,8 @@ pub struct PeerCred {
 pub struct ProbeEnvironment {
     pub cgroup_root: PathBuf,
     pub docker_host: Option<String>,
+    pub docker_context: Option<String>,
+    pub vm_host: bool,
     pub peer_cred: std::result::Result<PeerCred, std::io::ErrorKind>,
     pub daemon_cgroup_text: Option<String>,
     pub self_cgroup_text: Option<String>,
@@ -372,6 +371,7 @@ pub fn is_compose_cgroup_delegation_failure(exit_code: u8, stderr: &[u8]) -> boo
     (exit_code == 1 || (125..=127).contains(&exit_code)) && matches_cgroup_delegation_stderr(stderr)
 }
 
+#[cfg(target_os = "linux")]
 fn socket_peer_cred(path: &Path) -> std::result::Result<PeerCred, std::io::ErrorKind> {
     let stream = UnixStream::connect(path).map_err(|e| e.kind())?;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -395,6 +395,45 @@ fn socket_peer_cred(path: &Path) -> std::result::Result<PeerCred, std::io::Error
     })
 }
 
+#[cfg(target_os = "macos")]
+fn socket_peer_cred(_: &Path) -> std::result::Result<PeerCred, std::io::ErrorKind> {
+    // The socket peer is the VM frontend, outside the daemon's cgroup hierarchy.
+    Err(std::io::ErrorKind::Unsupported)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_bytes<const N: usize>(name: &std::ffi::CStr) -> Option<[u8; N]> {
+    let mut result = [0u8; N];
+    let mut len = N;
+    // SAFETY: result is writable for len bytes; this is a read-only sysctl.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            result.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == N).then_some(result)
+}
+
+#[cfg(target_os = "macos")]
+fn sched_affinity_cpus() -> u32 {
+    sysctl_bytes(c"hw.ncpu")
+        .map(u32::from_ne_bytes)
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+#[cfg(target_os = "macos")]
+fn read_proc_meminfo_total() -> Option<u64> {
+    sysctl_bytes(c"hw.memsize")
+        .map(u64::from_ne_bytes)
+        .filter(|n| *n > 0)
+}
+
+#[cfg(target_os = "linux")]
 fn sched_affinity_cpus() -> u32 {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     // SAFETY: set is properly sized for sched_getaffinity on the calling process (pid 0).
@@ -418,6 +457,7 @@ fn sched_affinity_cpus() -> u32 {
         .max(1)
 }
 
+#[cfg(target_os = "linux")]
 fn read_proc_meminfo_total() -> Option<u64> {
     let content = fs::read_to_string("/proc/meminfo").ok()?;
     for line in content.lines() {
@@ -524,11 +564,63 @@ fn read_inactive_file_bytes(stat_path: &Path) -> u64 {
     0
 }
 
+fn effective_docker_endpoint(
+    host: Option<&str>,
+    context: Option<&str>,
+    mut query: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<(String, Option<String>)> {
+    // With both overrides present, let the installed CLI identify the endpoint it uses.
+    if context.is_none_or(str::is_empty)
+        && let Some(host) = host.filter(|s| !s.is_empty())
+    {
+        return Ok((host.to_owned(), None));
+    }
+    let context = query(&["context", "show"])?;
+    ensure!(
+        !context.is_empty() && context.len() <= 256 && !context.starts_with('-'),
+        "Invalid Docker context"
+    );
+    let host = query(&[
+        "context",
+        "inspect",
+        "--format",
+        "{{.Endpoints.docker.Host}}",
+        &context,
+    ])?;
+    ensure!(
+        !host.is_empty() && !host.contains(['\n', '\r']),
+        "Docker context has no valid endpoint"
+    );
+    Ok((host, Some(context)))
+}
+
 impl ProbeEnvironment {
     pub fn capture_host() -> Self {
         let docker_host = std::env::var("DOCKER_HOST")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        Self::from_endpoint(docker_host, None)
+    }
+
+    pub fn capture_with_docker(runner: &ProcessRunner) -> Result<Self> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let (host, context) = effective_docker_endpoint(
+            std::env::var("DOCKER_HOST").ok().as_deref(),
+            std::env::var("DOCKER_CONTEXT").ok().as_deref(),
+            |args| {
+                let result = runner.capture_before(
+                    Command::new("docker")
+                        .env_remove("DOCKER_DEFAULT_PLATFORM")
+                        .args(args),
+                    deadline,
+                )?;
+                Ok(result.text()?.trim().to_owned())
+            },
+        )?;
+        Ok(Self::from_endpoint(Some(host), context))
+    }
+
+    fn from_endpoint(docker_host: Option<String>, docker_context: Option<String>) -> Self {
         let unix_sock = match docker_host.as_deref() {
             None => Some(PathBuf::from("/var/run/docker.sock")),
             Some(h) => h
@@ -553,6 +645,8 @@ impl ProbeEnvironment {
         Self {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             docker_host,
+            docker_context,
+            vm_host: cfg!(target_os = "macos"),
             peer_cred,
             daemon_cgroup_text,
             self_cgroup_text: fs::read_to_string("/proc/self/cgroup").ok(),
@@ -572,7 +666,7 @@ impl ProbeEnvironment {
 impl HostResourceBudget {
     pub fn probe_with_docker(runner: &ProcessRunner, docker: &mut Command) -> Result<Self> {
         let info = query_docker_info(runner, docker)?;
-        let env = ProbeEnvironment::capture_host();
+        let env = ProbeEnvironment::capture_with_docker(runner)?;
         let (budget, warnings) = Self::evaluate(&env, Some(info))?;
         for w in warnings {
             eprintln!("devkit: warning: {w}");
@@ -594,7 +688,6 @@ impl HostResourceBudget {
         daemon_info: Option<DockerDaemonInfo>,
     ) -> Result<(Self, Vec<String>)> {
         let mut warnings = Vec::new();
-        let is_mock_text = daemon_info.as_ref().is_some_and(|d| d.is_mock_text);
         let is_remote_host = env.docker_host.as_deref().is_some_and(|h| {
             !h.trim().is_empty() && !h.starts_with("unix://") && !h.starts_with("unix:")
         });
@@ -631,10 +724,13 @@ impl HostResourceBudget {
         let mut working_set_bytes: Option<u64> = None;
         let mut cg_pids_max: Option<u64> = None;
 
-        let capabilities = if is_mock_text {
-            CgroupCapabilities::unverified_mock()
-        } else if is_remote_host {
+        let capabilities = if is_remote_host {
             daemon_caps_from_info(DelegationState::RemoteDaemon, daemon_info.as_ref())
+        } else if env.vm_host {
+            daemon_info.as_ref().map_or_else(
+                || CgroupCapabilities::undelegated(DelegationState::VmDaemon),
+                |d| daemon_caps_from_info(DelegationState::VmDaemon, Some(d)),
+            )
         } else {
             match env.peer_cred {
                 Err(_) => CgroupCapabilities::unverified_mock(),
@@ -779,7 +875,8 @@ impl HostResourceBudget {
             .map(|n| n.saturating_mul(1000));
         let daemon_mem = daemon_info.as_ref().and_then(|d| d.mem_total);
 
-        let hard_cpu_ceiling_millicores = if same_hierarchy {
+        let shared_limits = same_hierarchy || capabilities.state == DelegationState::VmDaemon;
+        let hard_cpu_ceiling_millicores = if shared_limits {
             [
                 Some(env.affinity_cpus.max(1).saturating_mul(1000)),
                 cg_quota_milli,
@@ -797,7 +894,7 @@ impl HostResourceBudget {
                 .max(10)
         };
 
-        let hard_mem_ceiling_bytes = if same_hierarchy {
+        let hard_mem_ceiling_bytes = if shared_limits {
             [env.proc_meminfo_total, hard_cg_mem, daemon_mem]
                 .into_iter()
                 .flatten()
@@ -1769,6 +1866,8 @@ mod tests {
         ProbeEnvironment {
             cgroup_root: cgroup_root.to_path_buf(),
             docker_host: None,
+            docker_context: None,
+            vm_host: false,
             peer_cred: Ok(PeerCred { pid: 252, uid: 0 }),
             daemon_cgroup_text: Some("0::/init\n".into()),
             self_cgroup_text: Some("0::/init\n".into()),
@@ -1781,6 +1880,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn conflicting_host_and_context_overrides_follow_the_cli_selected_endpoint() {
+        let local = "unix:///Users/example/.colima/default/docker.sock";
+        let remote = "ssh://other-daemon";
+        for (selected, endpoint) in [("colima", local), ("default", remote)] {
+            let (host, name) =
+                effective_docker_endpoint(Some(remote), Some("colima"), |args| match args {
+                    ["context", "show"] => Ok(selected.into()),
+                    [
+                        "context",
+                        "inspect",
+                        "--format",
+                        "{{.Endpoints.docker.Host}}",
+                        name,
+                    ] if *name == selected => Ok(endpoint.into()),
+                    _ => anyhow::bail!("unexpected Docker query"),
+                })
+                .unwrap();
+            assert_eq!(host, endpoint);
+            assert_eq!(name.as_deref(), Some(selected));
+        }
+        assert_eq!(
+            effective_docker_endpoint(Some(local), None, |_| anyhow::bail!(
+                "unexpected Docker query"
+            ))
+            .unwrap(),
+            (local.into(), None)
+        );
+    }
+
+    #[test]
+    fn docker_platforms_and_vm_budgets_follow_daemon_capabilities() {
+        for (arch, platform) in [
+            ("amd64", "linux/amd64"),
+            ("x86_64", "linux/amd64"),
+            ("aarch64", "linux/arm64"),
+            ("arm64", "linux/arm64"),
+        ] {
+            let raw = json!({"OSType":"linux", "Architecture":arch, "NCPU":4, "MemTotal":2*GIB, "MemoryLimit":true, "CpuCfsQuota":false});
+            let info = DockerDaemonInfo::parse(&raw.to_string()).unwrap();
+            assert_eq!(info.platform, platform);
+            let mut env = base_probe(Path::new("/unused-sysfs"));
+            env.vm_host = true;
+            env.docker_host = Some("unix:///Users/me/.docker/run/docker.sock".into());
+            env.affinity_cpus = 2;
+            let (budget, _) = HostResourceBudget::evaluate(&env, Some(info.clone())).unwrap();
+            assert_eq!(budget.capabilities.state, DelegationState::VmDaemon);
+            assert!(!budget.same_hierarchy);
+            assert!(budget.capabilities.can_memory);
+            assert!(!budget.capabilities.can_cpus);
+            assert!(!budget.capabilities.can_swap);
+            assert_eq!(budget.hard_cpu_ceiling_millicores, 2000);
+            assert_eq!(budget.hard_mem_ceiling_bytes, 2 * GIB);
+            env.docker_host = Some("ssh://docker.example".into());
+            let (remote, _) = HostResourceBudget::evaluate(&env, Some(info)).unwrap();
+            assert_eq!(remote.capabilities.state, DelegationState::RemoteDaemon);
+            assert_eq!(remote.hard_cpu_ceiling_millicores, 4000);
+        }
+        for raw in [
+            r#"{"OSType":"linux"}"#,
+            r#"{"OSType":"linux","Architecture":"ppc64le"}"#,
+            r#"{"OSType":"windows","Architecture":"amd64"}"#,
+            "linux",
+        ] {
+            assert!(DockerDaemonInfo::parse(raw).is_err());
+        }
+    }
     #[test]
     fn ancestor_walk_on_evacuated_init_cgroup_detects_root_quota_and_delegation() {
         let tmp = tempfile::tempdir().unwrap();

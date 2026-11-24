@@ -27,3 +27,6 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 webpki-root-certs = "=1.0.11"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5.8"
+
+[build-dependencies]
+cc = "1"

@@ -2,6 +2,10 @@
 
 This repository uses a pinned Devkit development environment. Daily commands run inside digest-pinned containers so builds, checks, tests, and packages remain identical across workstations and CI runners without host language SDKs.
 
+## Moving a checkout between architectures
+
+The same project commit works on Linux x86-64 and ARM64. Run `make setup` on the destination host to prepare images, the Linux container helper, and any pnpm or Electron downloads for the local Docker daemon. Each host keeps its own ignored build outputs. Electron packaging produces a Linux bundle for the daemon architecture.
+
 ## Repository Layout
 
 - `apps/<name>` (`0..N`): Runnable product entry points (`node-api`, `react-web`, `electron-react`, `rust-api`). Libraries-only repositories may have zero applications.

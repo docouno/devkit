@@ -1,0 +1,68 @@
+name: Build and test the Apple Silicon host
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      fresh:
+        required: true
+        type: boolean
+    outputs:
+      contribution_artifact:
+        description: Contribution artifact
+        value: ${{ jobs.host.outputs.contribution_artifact }}
+      contribution_sha256:
+        description: Contribution sha256
+        value: ${{ jobs.host.outputs.contribution_sha256 }}
+      artifact_id:
+        description: Artifact id
+        value: ${{ jobs.host.outputs.artifact_id }}
+      artifact_digest:
+        description: Artifact digest
+        value: ${{ jobs.host.outputs.artifact_digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      contribution_artifact: ${{ steps.handoff.outputs.contribution_artifact }}
+      contribution_sha256: ${{ steps.handoff.outputs.contribution_sha256 }}
+      artifact_id: ${{ steps.contribution.outputs.artifact-id }}
+      artifact_digest: ${{ steps.contribution.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build the native host and exercise stock macOS primitives
+        env:
+          FRESH: ${{ inputs.fresh }}
+          BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          if test "$FRESH" = true; then
+            tooling/darwin-producer.sh "$PWD/.artifacts/contribution"
+          else
+            tooling/darwin-producer.sh --test-only
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: contribution
+        if: inputs.fresh
+        with:
+          include-hidden-files: true
+          name: devkit-contribution-darwin-${{ github.run_attempt }}
+          path: .artifacts/contribution/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Identify the host-only contribution
+        if: inputs.fresh
+        id: handoff
+        run: |
+          echo "contribution_sha256=$(shasum -a 256 .artifacts/contribution/producer.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "contribution_artifact=devkit-contribution-darwin-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"

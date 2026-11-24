@@ -5,9 +5,12 @@ use crate::{
     files::*,
     processes::{OutputMode, ProcessRunner},
 };
-use anyhow::{Context, ensure};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs,
     io::{Read, Seek, SeekFrom},
@@ -20,6 +23,9 @@ use std::{
     sync::Mutex,
 };
 
+mod executable;
+use executable::verify_format;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePin {
     pub version: String,
@@ -29,11 +35,7 @@ pub struct EnginePin {
 impl EnginePin {
     pub fn validate(&self) -> Result<()> {
         version(&self.version)?;
-        ensure!(
-            self.target == TARGET,
-            "Unsupported native target: {}",
-            self.target
-        );
+        Target::parse(&self.target)?;
         ensure!(
             SHA256_RE.is_match(&self.sha256),
             "Invalid native engine SHA256"
@@ -69,14 +71,15 @@ fn hash_reader(file: &mut fs::File) -> Result<String> {
 
 pub fn verify_engine(path: &Path, pin: &EnginePin) -> Result<()> {
     pin.validate()?;
-    verify_static_elf_file(path, &pin.sha256, false)
+    verify_executable(path, &pin.sha256, Target::parse(&pin.target)?, false)
 }
 
 /// Verify an executable without retaining its contents in memory. Open once so
-/// the checksum and ELF inspection always refer to the same inode.
-pub fn verify_static_elf_file(
+/// the checksum and format inspection always refer to the same inode.
+pub fn verify_executable(
     path: &Path,
     expected_sha256: &str,
+    target: Target,
     require_mode_0755: bool,
 ) -> Result<()> {
     ensure!(
@@ -99,7 +102,13 @@ pub fn verify_static_elf_file(
         hash_reader(&mut file)? == expected_sha256,
         "Native engine checksum differs from accepted pin"
     );
-    verify_elf_reader(&mut file)
+    verify_format(&mut file, target)?;
+    ensure!(
+        executable_stamp(&fs::symlink_metadata(&path)?) == executable_stamp(&metadata)
+            && executable_stamp(&file.metadata()?) == executable_stamp(&metadata),
+        "Native executable changed while verifying"
+    );
+    Ok(())
 }
 fn executable_access(path: &Path) -> Result<()> {
     let encoded = CString::new(path.as_os_str().as_bytes())?;
@@ -118,62 +127,29 @@ fn executable_access(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn verify_elf_reader(file: &mut fs::File) -> Result<()> {
-    let metadata = file.metadata()?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = [0_u8; 64];
-    file.read_exact(&mut bytes)
-        .context("Truncated native ELF header")?;
-    ensure!(
-        bytes.len() >= 64
-            && &bytes[..7] == b"\x7fELF\x02\x01\x01"
-            && u16::from_le_bytes([bytes[18], bytes[19]]) == 62,
-        "Native engine must be a Linux x86_64 ELF"
-    );
-    let offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    let entry_size = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as u64;
-    let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as u64;
-    ensure!(
-        entry_size >= 56 && count <= 128,
-        "Invalid native ELF program headers"
-    );
-    for n in 0..count {
-        let start = offset
-            .checked_add(n * entry_size)
-            .context("ELF header overflow")?;
-        file.seek(SeekFrom::Start(start))?;
-        let mut record = [0_u8; 56];
-        file.read_exact(&mut record)
-            .context("Truncated native ELF")?;
-        let kind = u32::from_le_bytes(record[..4].try_into().unwrap());
-        ensure!(kind != 3, "Native engine has a dynamic program interpreter");
-        if kind == 2 {
-            let start = u64::from_le_bytes(record[8..16].try_into().unwrap());
-            let length = u64::from_le_bytes(record[32..40].try_into().unwrap());
-            let end = start
-                .checked_add(length)
-                .context("ELF dynamic segment overflow")?;
-            ensure!(
-                end <= metadata.len() && length % 16 == 0,
-                "Truncated ELF dynamic segment"
-            );
-            file.seek(SeekFrom::Start(start))?;
-            for _ in 0..length / 16 {
-                let mut item = [0_u8; 16];
-                file.read_exact(&mut item)?;
-                ensure!(
-                    u64::from_le_bytes(item[..8].try_into().unwrap()) != 1,
-                    "Native engine requires a dynamic library"
-                );
-            }
-        }
-    }
-    Ok(())
+#[cfg(target_os = "linux")]
+fn mapped_executable_identity() -> Result<(u64, u64)> {
+    let executable = fs::metadata("/proc/self/exe")?;
+    Ok((executable.dev(), executable.ino()))
 }
 
-// This authority lives only in the executing process. The descriptor pins the
-// inode and every reuse checks its physical identity and timestamps, the path,
-// and /proc/self/exe. No environment flag or persistent stat cache grants trust.
+#[cfg(target_os = "macos")]
+fn mapped_executable_identity() -> Result<(u64, u64)> {
+    unsafe extern "C" {
+        fn devkit_mapped_executable_identity(device: *mut u32, inode: *mut u64) -> libc::c_int;
+    }
+    let (mut device, mut inode) = (0, 0);
+    // SAFETY: the SDK adapter writes to two caller-owned valid integers.
+    let error = unsafe { devkit_mapped_executable_identity(&mut device, &mut inode) };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error))
+            .context("Cannot identify the mapped native executable");
+    }
+    Ok((u64::from(device), inode))
+}
+
+// The descriptor pins the inode. Every reuse checks its physical identity
+// and timestamps against the file on disk and the executable mapped by the OS.
 #[derive(Debug, PartialEq, Eq)]
 struct ExecutableStamp(u64, u64, u64, i64, i64, i64, i64);
 fn executable_stamp(m: &fs::Metadata) -> ExecutableStamp {
@@ -211,7 +187,7 @@ fn with_current<T>(read: impl FnOnce(&CurrentExecutable) -> Result<T>) -> Result
         );
         let stamp = executable_stamp(&metadata);
         let sha256 = hash_reader(&mut file)?;
-        verify_elf_reader(&mut file)?;
+        verify_format(&mut file, Target::host()?)?;
         *cached = Some(CurrentExecutable {
             file,
             path,
@@ -221,12 +197,12 @@ fn with_current<T>(read: impl FnOnce(&CurrentExecutable) -> Result<T>) -> Result
     }
     let current = cached.as_ref().expect("verified executable");
     let path = fs::symlink_metadata(&current.path)?;
-    let executing = fs::metadata("/proc/self/exe")?;
+    let executing = mapped_executable_identity()?;
     ensure!(
         path.is_file()
             && executable_stamp(&path) == current.stamp
             && executable_stamp(&current.file.metadata()?) == current.stamp
-            && (executing.dev(), executing.ino()) == (path.dev(), path.ino()),
+            && executing == (path.dev(), path.ino()),
         "Current native engine changed during operation"
     );
     executable_access(&current.path)?;
@@ -240,6 +216,10 @@ pub fn current_engine_path() -> Result<PathBuf> {
 }
 pub fn verify_current_engine(pin: &EnginePin) -> Result<PathBuf> {
     pin.validate()?;
+    ensure!(
+        pin.target == Target::host()?.triple(),
+        "Accepted native target does not match this host"
+    );
     with_current(|current| {
         ensure!(
             current.sha256 == pin.sha256,
@@ -252,13 +232,8 @@ pub fn verify_current_engine(pin: &EnginePin) -> Result<PathBuf> {
 /// Engine-cache files are published with one canonical mode. Unlike a source
 /// npm tree, this private copy is never restricted by npm's install umask.
 pub fn verify_cached_engine(path: &Path, pin: &EnginePin) -> Result<()> {
-    let path = project_root(path)?;
-    let metadata = fs::symlink_metadata(&path)?;
-    ensure!(
-        metadata.is_file() && metadata.permissions().mode() & 0o7777 == 0o755,
-        "Cached native engine mode differs from canonical 0755; restore the accepted executable before retrying"
-    );
-    verify_engine(&path, pin)
+    pin.validate()?;
+    verify_executable(path, &pin.sha256, Target::parse(&pin.target)?, true)
 }
 
 pub fn engine_build_info(path: &Path, runner: &ProcessRunner) -> Result<BuildInfo> {
@@ -269,60 +244,72 @@ pub fn engine_build_info(path: &Path, runner: &ProcessRunner) -> Result<BuildInf
     )?;
     let info: BuildInfo = serde_json::from_slice(&result.stdout)?;
     ensure!(
-        info.schema_version == 1 && info.target == TARGET,
+        info.schema_version == 1 && info.target == Target::host()?.triple(),
         "Unsupported native engine build"
     );
     version(&info.version)?;
     Ok(info)
 }
 
-fn render(
-    source: &str,
-    mode: &str,
-    version: &str,
-    engine_sha: &str,
-    target: &str,
-) -> Result<String> {
-    EnginePin {
-        version: version.to_owned(),
-        target: target.to_owned(),
-        sha256: engine_sha.to_owned(),
-    }
-    .validate()?;
-    let mut result = source.to_owned();
-    for (token, value) in [
-        ("@@DEVKIT_MODE@@", mode),
-        ("@@DEVKIT_VERSION@@", version),
-        ("@@DEVKIT_ENGINE_SHA256@@", engine_sha),
-        ("@@DEVKIT_ENGINE_TARGET@@", target),
-    ] {
-        ensure!(
-            result.matches(token).count() == 1,
-            "Invalid loader placeholder count: {token}"
-        );
-        result = result.replace(token, value);
+fn render_host_selection(source: &str, pins: &BTreeMap<String, String>) -> Result<String> {
+    let mut cases = Vec::new();
+    for target in Target::ALL {
+        if let Some(sha256) = pins.get(target.triple()) {
+            ensure!(SHA256_RE.is_match(sha256), "Invalid loader engine SHA256");
+            let pattern = match target {
+                Target::LinuxX64 => "Linux:x86_64",
+                Target::LinuxArm64 => "Linux:aarch64|Linux:arm64",
+                Target::DarwinArm64 => "Darwin:arm64",
+            };
+            cases.push(format!(
+                "{pattern}) target={}; sha256={sha256}; payload={} ;;",
+                target.triple(),
+                target.payload_name()
+            ));
+        }
     }
     ensure!(
-        !result.contains("@@"),
+        !cases.is_empty() && cases.len() == pins.len(),
+        "Invalid loader target set"
+    );
+    let token = "# @@DEVKIT_ENGINE_PINS@@";
+    ensure!(
+        source.matches(token).count() == 1,
+        "Invalid loader placeholder count: {token}"
+    );
+    let script = source.replace(token, &cases.join("\n"));
+    ensure!(
+        !script.contains("@@"),
         "Unresolved native loader placeholder"
     );
-    Ok(result)
+    Ok(script)
 }
-pub fn render_project_loader(version: &str, engine_sha: &str, target: &str) -> Result<String> {
-    render(
-        include_str!("../../../runtime/devkit.sh"),
-        "project",
-        version,
-        engine_sha,
-        target,
-    )
+
+fn render(mode: &str, release_version: &str, pins: &BTreeMap<String, String>) -> Result<String> {
+    version(release_version)?;
+    let mut script = include_str!("../../../runtime/devkit.sh").to_owned();
+    for (token, value) in [
+        ("@@DEVKIT_MODE@@", mode),
+        ("@@DEVKIT_VERSION@@", release_version),
+    ] {
+        ensure!(
+            script.matches(token).count() == 1,
+            "Invalid loader placeholder count: {token}"
+        );
+        script = script.replace(token, value);
+    }
+    render_host_selection(&script, pins)
 }
-pub fn render_bootstrap(version: &str, engine_sha: &str, target: &str) -> Result<String> {
-    render(
-        include_str!("../../../runtime/devkit.sh"),
-        "bootstrap",
-        version,
-        engine_sha,
-        target,
-    )
+
+pub fn render_project_loader_pins(
+    version: &str,
+    pins: &BTreeMap<String, String>,
+) -> Result<String> {
+    render("project", version, pins)
+}
+pub fn render_bootstrap_pins(version: &str, pins: &BTreeMap<String, String>) -> Result<String> {
+    render("bootstrap", version, pins)
+}
+pub fn render_npm_launcher(pins: &BTreeMap<String, String>) -> Result<String> {
+    render_host_selection(include_str!("../../../runtime/npm-launcher.sh"), pins)
 }

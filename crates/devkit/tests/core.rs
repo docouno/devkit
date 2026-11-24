@@ -32,9 +32,12 @@ fn sri(bytes: &[u8]) -> String {
 fn seal(root: &Path, version: &str) {
     remove_file(&root.join("release.json")).unwrap();
     let archive = format!("npm/env-{version}.tgz");
-    let min_supported_from_version = (SemVer::parse(version).unwrap()
-        >= SemVer::parse("0.5.0").unwrap())
-    .then(|| "0.4.0".to_string());
+    let parsed = SemVer::parse(version).unwrap();
+    let min_supported_from_version = if parsed >= SemVer::parse("0.6.0").unwrap() {
+        Some("0.5.0".to_owned())
+    } else {
+        (parsed >= SemVer::parse("0.5.0").unwrap()).then(|| "0.4.0".to_owned())
+    };
     write_json(
         &root.join("release.json"),
         &Release {
@@ -1216,8 +1219,8 @@ fn unknown_new_component_source_blocks_all_rollback_writes() {
 #[test]
 fn accepted_release_policy_and_registration_preserve_native_manifests() {
     let f = TempDir::new().unwrap();
-    let old = fixture_release(f.path(), "0.4.1");
-    let new = fixture_release(f.path(), "0.5.0");
+    let old = fixture_release(f.path(), "0.5.1");
+    let new = fixture_release(f.path(), "0.6.0");
     let target = f.path().join("consumer");
     init(&old, &target, "rust", PackageMode::Registry);
     copy_tree(
@@ -1264,7 +1267,7 @@ fn accepted_release_policy_and_registration_preserve_native_manifests() {
     let duplicate = f.path().join("different-same-version");
     copy_tree(&new, &duplicate, &|_| false, false).unwrap();
     put(&duplicate, "runtime/devkit.mk", b"different release");
-    seal(&duplicate, "0.5.0");
+    seal(&duplicate, "0.6.0");
     assert!(
         update_project(&duplicate, &target, &UpdateOptions::default(), &NoResolver)
             .unwrap_err()
@@ -1701,7 +1704,7 @@ fn accepted_legacy_default_ignore_blocks_only_unsafe_new_sources_without_writes(
         "348c45ac15b10cd537bea277b83411de9885329b6aa53570b04c42590c2e4a92"
     );
     let f = TempDir::new().unwrap();
-    let release = fixture_release(f.path(), "0.4.1");
+    let release = fixture_release(f.path(), "0.5.1");
     let target = f.path().join("legacy");
     let initial = init(&release, &target, "rust", PackageMode::Registry);
     put(&target, ".gitignore", legacy);
@@ -1955,10 +1958,17 @@ fn successful_sync(line: &str, path: &str) -> bool {
         && line.contains(&format!("<{path}>)"))
         && line.trim_end().ends_with("= 0")
 }
+fn successful_unlink(line: &str, path: &str) -> bool {
+    (line.contains("unlink(") || line.contains("unlinkat("))
+        && line.contains(&format!("\"{path}\""))
+        && line.trim_end().ends_with("= 0")
+}
 fn assert_durable_transaction_trace(trace: &str) {
     let lines = trace.lines().collect::<Vec<_>>();
-    let rename = regex::Regex::new(r#"rename\("([^"]+)", "([^"]+)"\)\s+= 0"#).unwrap();
-    let mkdir = regex::Regex::new(r#"mkdir\("([^"]+)", [0-7]+\)\s+= 0"#).unwrap();
+    let rename = regex::Regex::new(r#"rename(?:at2?)?\((?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)", (?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)"(?:, [^)]*)?\)\s+= 0"#).unwrap();
+    let mkdir =
+        regex::Regex::new(r#"mkdir(?:at)?\((?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)", [0-7]+\)\s+= 0"#)
+            .unwrap();
     let publications = lines
         .iter()
         .enumerate()
@@ -2023,9 +2033,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             .iter()
             .enumerate()
             .skip(published + 1)
-            .find(|(_, line)| {
-                line.contains(&format!("unlink(\"{pending}\")")) && line.trim_end().ends_with("= 0")
-            })
+            .find(|(_, line)| successful_unlink(line, &pending))
             .map(|(i, _)| i)
             .expect("Pending marker was not removed");
         let discarded = lines
@@ -2061,10 +2069,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             let deleted = format!("{devkit}/runtime/obsolete-helper.sh");
             let deletion = lines[published + 1..manifest]
                 .iter()
-                .position(|line| {
-                    line.contains(&format!("unlink(\"{deleted}\")"))
-                        && line.trim_end().ends_with("= 0")
-                })
+                .position(|line| successful_unlink(line, &deleted))
                 .map(|i| i + published + 1)
                 .expect("Expected managed deletion before manifest");
             assert!(
@@ -2098,16 +2103,14 @@ fn assert_durable_transaction_trace(trace: &str) {
 fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
     let f = TempDir::new().unwrap();
     let trace = f.path().join("durability.trace");
+    // AArch64 implements the *at syscall family and has no mkdir/rename/unlink opcodes.
+    let calls = if cfg!(target_arch = "aarch64") {
+        "trace=mkdirat,renameat,renameat2,fsync,fdatasync,unlinkat"
+    } else {
+        "trace=mkdir,mkdirat,rename,renameat,renameat2,fsync,fdatasync,unlink,unlinkat,rmdir"
+    };
     let status = Command::new("strace")
-        .args([
-            "-f",
-            "-yy",
-            "-s",
-            "4096",
-            "-e",
-            "trace=mkdir,mkdirat,rename,renameat,renameat2,fsync,fdatasync,unlink,unlinkat,rmdir",
-            "-o",
-        ])
+        .args(["-f", "-yy", "-s", "4096", "-e", calls, "-o"])
         .arg(&trace)
         .arg(std::env::current_exe().unwrap())
         .args([
@@ -3210,7 +3213,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
     use std::os::unix::net::UnixListener;
 
     let temp = TempDir::new().unwrap();
-    let release = fixture_release(temp.path(), "0.4.1");
+    let release = fixture_release(temp.path(), "0.5.1");
     let proj = temp.path().join("umask-proj");
     init_project(
         &release,
@@ -3259,7 +3262,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
         }
 
         // Admission succeeds despite non-0644/0755 modes when sha256 + exec class match.
-        admit_runtime_project(&proj, "0.4.1").unwrap();
+        admit_runtime_project(&proj, "0.5.1").unwrap();
 
         // Untouched sync is a true no-op (does not mint a new generation or rewrite files).
         let noop = sync_project(&release, &proj, &UpdateOptions::default(), &NoResolver).unwrap();
@@ -3272,7 +3275,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
     // Flipping executable class on a managed file MUST still fail with Managed file conflict.
     let tc_path = proj.join(".devkit/runtime/toolchains.env");
     fs::set_permissions(&tc_path, fs::Permissions::from_mode(0o755)).unwrap();
-    let err = match admit_runtime_project(&proj, "0.4.1") {
+    let err = match admit_runtime_project(&proj, "0.5.1") {
         Ok(_) => panic!("expected Managed file conflict when executable bit flips"),
         Err(err) => err,
     };
@@ -3329,7 +3332,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
     let applied =
         sync_project(&release, &proj, &UpdateOptions::default(), &FixtureResolver).unwrap();
     assert!(applied.applied);
-    admit_runtime_project(&proj, "0.4.1").unwrap();
+    admit_runtime_project(&proj, "0.5.1").unwrap();
 }
 
 #[test]
@@ -3337,12 +3340,13 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
     use devkit::cli::error_code;
 
     let temp = TempDir::new().unwrap();
-    let rel_050 = fixture_release(temp.path(), "0.5.0");
+    let rel_060 = fixture_release(temp.path(), "0.6.0");
 
     for (label, manifest_val) in [
         ("schema1", json!({"schemaVersion": 1, "version": "0.1.0"})),
         ("v021", json!({"schemaVersion": 2, "version": "0.2.1"})),
         ("v032", json!({"schemaVersion": 2, "version": "0.3.2"})),
+        ("v041", json!({"schemaVersion": 2, "version": "0.4.1"})),
     ] {
         let proj = temp.path().join(label);
         fs::create_dir_all(proj.join(".devkit")).unwrap();
@@ -3350,20 +3354,20 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
         let snapshot = file_map(&proj).unwrap();
 
         let upd_err =
-            update_project(&rel_050, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
+            update_project(&rel_060, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
         assert_eq!(error_code(&upd_err), "UNSUPPORTED_UPGRADE_PATH");
         assert!(
             upd_err
                 .to_string()
-                .contains("npx @docouno/devkit@0.4.1 update . --to 0.4.1")
+                .contains("npx @docouno/devkit@0.5.1 update . --to 0.5.1")
         );
 
         let sync_err =
-            sync_project(&rel_050, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
+            sync_project(&rel_060, &proj, &UpdateOptions::default(), &NoResolver).unwrap_err();
         assert_eq!(error_code(&sync_err), "UNSUPPORTED_PROJECT_VERSION");
 
         let add_err = add_project_component(
-            &rel_050,
+            &rel_060,
             &proj,
             Role::App,
             ComponentSpec {
@@ -3378,7 +3382,7 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
         assert_eq!(error_code(&add_err), "UNSUPPORTED_PROJECT_VERSION");
 
         let reg_err = register_project_component(
-            &rel_050,
+            &rel_060,
             &proj,
             Role::Library,
             "shared".into(),
@@ -3393,28 +3397,28 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
         assert_eq!(file_map(&proj).unwrap(), snapshot, "{label}");
     }
 
-    // Also verify release.manifest.min_supported_from_version higher than 0.4.0 (e.g. 0.4.1) rejects 0.4.0 before CheckoutLock.
-    let rel_strict = fixture_release(temp.path(), "0.5.1");
+    // An individual release can require a newer starting point than the CLI floor.
+    let rel_strict = fixture_release(temp.path(), "0.6.1");
     let mut strict_json: Value = read_json(&rel_strict.join("release.json")).unwrap();
-    strict_json["minSupportedFromVersion"] = json!("0.4.1");
+    strict_json["minSupportedFromVersion"] = json!("0.5.1");
     put_json(&rel_strict, "release.json", &strict_json);
 
-    let proj_040 = temp.path().join("proj-040");
-    fs::create_dir_all(proj_040.join(".devkit")).unwrap();
+    let proj_050 = temp.path().join("proj-050");
+    fs::create_dir_all(proj_050.join(".devkit")).unwrap();
     put_json(
-        &proj_040,
+        &proj_050,
         MANIFEST_PATH,
-        &json!({"schemaVersion": 2, "version": "0.4.0"}),
+        &json!({"schemaVersion": 2, "version": "0.5.0"}),
     );
     let strict_err = update_project(
         &rel_strict,
-        &proj_040,
+        &proj_050,
         &UpdateOptions::default(),
         &NoResolver,
     )
     .unwrap_err();
     assert_eq!(error_code(&strict_err), "UNSUPPORTED_UPGRADE_PATH");
-    assert!(!proj_040.join(".devkit/state").exists());
+    assert!(!proj_050.join(".devkit/state").exists());
 }
 
 #[test]

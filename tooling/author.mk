@@ -1,5 +1,14 @@
 # Docker argv and mounts only. Process ownership/cancellation stays in native Rust.
 # Freeze operator data before Make exports command-line variables to $(shell).
+ifneq ($(origin target_inputs),undefined)
+override target_inputs := $(value target_inputs)
+endif
+ifneq ($(origin npm_inputs),undefined)
+override npm_inputs := $(value npm_inputs)
+endif
+ifneq ($(origin DEVKIT_AUTHOR_ENGINE),undefined)
+override DEVKIT_AUTHOR_ENGINE := $(value DEVKIT_AUTHOR_ENGINE)
+endif
 ifneq ($(origin target),undefined)
 override target := $(value target)
 endif
@@ -51,6 +60,9 @@ endif
 ifneq ($(origin DEVKIT_AUTHOR_PNPM_CACHE),undefined)
 override DEVKIT_AUTHOR_PNPM_CACHE := $(value DEVKIT_AUTHOR_PNPM_CACHE)
 endif
+override export DEVKIT_AUTHOR_TRIPLE := $(filter x86_64 aarch64,$(shell uname -m))-unknown-linux-musl
+# The host SDK and local Linux daemon must use their native platform.
+unexport DOCKER_DEFAULT_PLATFORM
 export DEVKIT_AUTHOR_ROOT := $(CURDIR)
 export DEVKIT_AUTHOR_UID := $(shell id -u)
 export DEVKIT_AUTHOR_GID := $(shell id -g)
@@ -67,10 +79,13 @@ export DEVKIT_AUTHOR_RUST_IMAGE
 override DEVKIT_AUTHOR_CARGO_HOME := $(if $(filter undefined,$(origin DEVKIT_AUTHOR_CARGO_HOME)),$(CURDIR)/.artifacts/author/cargo-home,$(value DEVKIT_AUTHOR_CARGO_HOME))
 export DEVKIT_AUTHOR_CARGO_HOME
 export DEVKIT_AUTHOR_TARGET := $(CURDIR)/.artifacts/author/target
-export DEVKIT_AUTHOR_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit
+override DEVKIT_AUTHOR_ENGINE := $(if $(filter undefined,$(origin DEVKIT_AUTHOR_ENGINE)),$(CURDIR)/.artifacts/author/target/$(DEVKIT_AUTHOR_TRIPLE)/debug/devkit,$(value DEVKIT_AUTHOR_ENGINE))
+export DEVKIT_AUTHOR_ENGINE
+export DEVKIT_TARGET_INPUTS := $(value target_inputs)
 export DEVKIT_RELEASE_VERSION := $(if $(filter undefined,$(origin version)),$(strip $(file <VERSION)),$(value version))
-export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.4.1,$(value from_version))
+export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.5.1,$(value from_version))
 export DEVKIT_BUILD_ID := $(if $(filter undefined,$(origin build_id)),$(shell cat /proc/sys/kernel/random/uuid),$(value build_id))
+export DEVKIT_NPM_INPUTS := $(if $(filter undefined,$(origin npm_inputs)),$(CURDIR)/.artifacts/author/$(DEVKIT_BUILD_ID)-npm,$(value npm_inputs))
 export DEVKIT_BUILD_RUN := $(if $(filter undefined,$(origin build_run)),local-author,$(value build_run))
 export DEVKIT_ASSEMBLY_OUTPUT := $(value output)
 export DEVKIT_BUILD_SET := $(value build_set)
@@ -84,14 +99,14 @@ ifneq ($(origin fixtures),undefined)
 export DEVKIT_AUTHOR_FIXTURES := $(value fixtures)
 author_fixtures_build :=
 else
-export DEVKIT_AUTHOR_FIXTURES := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/examples
+export DEVKIT_AUTHOR_FIXTURES := $(CURDIR)/.artifacts/author/target/$(DEVKIT_AUTHOR_TRIPLE)/debug/examples
 author_fixtures_build := build-fixtures
 endif
 
 ifneq ($(origin release),undefined)
-export DEVKIT_VERIFY_ENGINE := $(value release)/devkit
+export DEVKIT_VERIFY_ENGINE := $(value release)/$(if $(filter x86_64-unknown-linux-musl,$(DEVKIT_AUTHOR_TRIPLE)),devkit,devkit-$(DEVKIT_AUTHOR_TRIPLE))
 else
-export DEVKIT_VERIFY_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/release/devkit
+export DEVKIT_VERIFY_ENGINE := $(CURDIR)/.artifacts/author/target/$(DEVKIT_AUTHOR_TRIPLE)/release/devkit
 author_blackbox_build := build
 endif
 
@@ -197,15 +212,11 @@ define author_rust
 	    "$$DEVKIT_AUTHOR_RUST_IMAGE" $(1)
 endef
 
-define assemble
-	@test -n "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Set output=/absolute/new/build-set; existing outputs are never replaced.' >&2; exit 1; }
-	@set -eu; source_commit=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse HEAD); \
-	source_tree=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse 'HEAD^{tree}'); \
-	notice_sha=$$(python3 -c 'import json,sys; print(json.load(sys.stdin)["noticeSetSha256"])' < "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notice-producer.json"); \
-	exec "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/release/devkit" internal assemble \
-	  --root "$$DEVKIT_AUTHOR_ROOT" --engine "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/release/devkit" \
-	  --npm-inputs "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-npm" \
+# collect-notices attests the exact native executable and its toolchain.
+define contribute
+	@set -eu; notice_sha=$$(python3 -c 'import json,sys; print(json.load(sys.stdin)["noticeSetSha256"])' < "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notice-producer.json"); \
+	exec "$$DEVKIT_AUTHOR_TARGET/$$DEVKIT_AUTHOR_TRIPLE/release/devkit" internal contribute \
+	  --root "$$DEVKIT_AUTHOR_ROOT" --engine "$$DEVKIT_AUTHOR_TARGET/$$DEVKIT_AUTHOR_TRIPLE/release/devkit" \
 	  --notices "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notices" --notice-set-sha256 "$$notice_sha" \
-	  --output "$$DEVKIT_ASSEMBLY_OUTPUT" --source-commit "$$source_commit" --source-tree "$$source_tree" \
-	  --build-run "$$DEVKIT_BUILD_RUN" $${DEVKIT_ASSEMBLE_LOCAL:-}
+	  --build-run "$$DEVKIT_BUILD_RUN" --output "$(1)"
 endef

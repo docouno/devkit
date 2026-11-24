@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate a frozen Linux release with paired public-0.4.1/native warm benchmarks.
+"""Gate a frozen Linux release with paired public-0.5.1/native warm benchmarks.
 
 Usage: python3 test/performance/verify.py --build-set DIR --output receipt.json
 Requires Docker Compose and the built tooling/native.Dockerfile image in
@@ -32,10 +32,10 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "test") not in sys.path:
     sys.path.insert(0, str(REPO / "test"))
 from docker_flags import author_docker_flags  # noqa: E402
-BASELINE_VERSION = "0.4.1"
-BASELINE_RELEASE_IDENTITY = "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
-BASELINE_ARCHIVE_SHA256 = "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a"
-BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz"
+BASELINE_VERSION = "0.5.1"
+BASELINE_RELEASE_IDENTITY = "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
+BASELINE_ARCHIVE_SHA256 = "f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b"
+BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.5.1/devkit-0.5.1.tar.gz"
 LARGE_CRATES = 80
 SHAPES = (("one", 1, 0), ("five", 5, 0), ("large-closure", 1, LARGE_CRATES))
 RELATIVE_FACTOR = 1.20
@@ -190,7 +190,7 @@ class Gate:
     def baseline(self):
         source = self.args.baseline_release
         if source is None:
-            source = self.scratch / "devkit-0.4.1.tar.gz"
+            source = self.scratch / "devkit-0.5.1.tar.gz"
             with urllib.request.urlopen(BASELINE_URL, timeout=60) as response, source.open("wb") as output:
                 require(response.status == 200, "Public baseline download failed")
                 total = 0
@@ -199,14 +199,14 @@ class Gate:
                     require(total <= 128 * 1024**2, "Public baseline exceeds budget")
                     output.write(chunk)
         if source.is_file():
-            require(sha256(source) == BASELINE_ARCHIVE_SHA256, "Public 0.4.1 archive identity mismatch")
+            require(sha256(source) == BASELINE_ARCHIVE_SHA256, "Public 0.5.1 archive identity mismatch")
             release = extract_release(source, self.scratch / "baseline release")
         else:
             verify_payload(source)
             release = self.scratch / "baseline release"
             shutil.copytree(source, release)
         require(sha256(release / "release.json") == BASELINE_RELEASE_IDENTITY,
-                "Baseline must be the exact immutable public 0.4.1 payload")
+                "Baseline must be the exact immutable public 0.5.1 payload")
         require((release / "devkit").read_bytes()[:4] == b"\x7fELF",
                 "Baseline release must ship a native Linux ELF engine")
         self.receipt["baseline"] = {"version": BASELINE_VERSION, "source": str(source),
@@ -524,7 +524,7 @@ class Gate:
             self.receipt.setdefault("fixtureDifferences", {})[shape] = {
                 "identicalProductSourceAndNativeLocks": True,
                 "releaseManagedAndRootFilesDifferent": fixture_difference,
-                "reason": "Actual public 0.4.1 and indexed native factories intentionally ship different controller/runtime/version files."}
+                "reason": "Actual public 0.5.1 and indexed native factories intentionally ship different controller/runtime/version files."}
             self.benchmark(shape, roots, snapshots, count)
             if closure:
                 self.admission(roots["native"], snapshots["native"])
@@ -540,7 +540,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.4.1 extracted directory or archive")
+    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.5.1 extracted directory or archive")
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmups", type=int, default=2)
     args = parser.parse_args()

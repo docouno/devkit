@@ -3,7 +3,7 @@ use crate::{
     Result,
     doctor::ComposeServiceStatus,
     files::*,
-    model::{DevelopmentKind, Role, Toolchain, ToolingProfile},
+    model::{DevelopmentKind, Role},
     processes::ProcessRunner,
     runtime::ToolPins,
     stand::{epoch::Physical, ledger, ports::Ports, preview},
@@ -244,36 +244,47 @@ fn observe_stand(
     Ok((known, services, stopped_services))
 }
 
-fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'static str> {
+fn local_readiness(
+    root: &Path,
+    state: &crate::model::ProjectState,
+    cache_dir: Option<&Path>,
+) -> Result<(&'static str, Value)> {
     let native = match crate::native::inspect_native_components(root, state) {
         Ok(native) => native,
         Err(error) => {
             let exceeds_budget = error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge);
-            return Ok(if exceeds_budget {
-                "unknown"
-            } else {
-                "setup-required"
-            });
+            return Ok((
+                if exceeds_budget {
+                    "unknown"
+                } else {
+                    "setup-required"
+                },
+                Value::Null,
+            ));
         }
     };
-    let receipts = crate::doctor::local_receipts(root, state, Some(&native.node_inputs.digest))?;
-    let ready = state.components.values().all(|c| match c.toolchain {
-        Toolchain::Rust => receipts["rustImageReady"] == true,
-        Toolchain::Node => {
-            receipts["nodeWorkspaceReady"] == true
-                && (c.tooling_profile != ToolingProfile::Electron
-                    || receipts["desktopImageReady"] == true)
-        }
-    });
-    Ok(if ready { "ready" } else { "setup-required" })
+    let receipts = crate::doctor::local_receipts(
+        root,
+        state,
+        Some(&native.node_inputs.digest),
+        None,
+        cache_dir,
+    )?;
+    let readiness = if receipts["ready"] == true {
+        "ready"
+    } else {
+        "setup-required"
+    };
+    Ok((readiness, receipts))
 }
 
 pub(crate) fn inspect(
     root: &Path,
     app: Option<&str>,
     runner: &ProcessRunner,
+    cache_dir: Option<&Path>,
 ) -> Result<(Value, String)> {
     let root = project_root(root)?;
     ensure!(root.is_dir(), "Checkout does not exist");
@@ -331,6 +342,7 @@ pub(crate) fn inspect(
     let mut apps = Vec::new();
     let mut packages = Vec::new();
     let mut readiness = "unknown";
+    let mut receipts = Value::Null;
     let mut condition = "unknown";
     let mut services = Vec::new();
     let mut reservations = Vec::new();
@@ -383,7 +395,7 @@ pub(crate) fn inspect(
             && state.version == env!("CARGO_PKG_VERSION")
         {
             if !busy {
-                readiness = local_readiness(&root, state)?;
+                (readiness, receipts) = local_readiness(&root, state, cache_dir)?;
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
@@ -429,6 +441,7 @@ pub(crate) fn inspect(
         && state::assert_no_pending(&root).is_ok();
     if !stable {
         readiness = "unknown";
+        receipts = Value::Null;
         condition = "unknown";
         apps.clear();
         packages.clear();
@@ -474,6 +487,7 @@ pub(crate) fn inspect(
     lines.extend(preview::reservation_lines(&reservations, &services));
     Ok((
         json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,
+        "hostTarget":crate::distribution::Target::host()?.triple(),"preparedPlatform":receipts["preparedPlatform"],"helperReady":receipts["helperReady"],
         "lock":{"state":lock_state,"owner":owner},"apps":apps,"packages":packages,
         "standState":condition,"services":services,"standPorts":reservations}),
         lines.join("\n"),

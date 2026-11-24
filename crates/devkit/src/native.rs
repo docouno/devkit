@@ -2509,6 +2509,39 @@ pub struct NpmrcPolicy {
     pub authentication: Vec<NpmAuthentication>,
 }
 
+fn registry_targets_loopback(value: &str) -> Result<bool> {
+    let url = url::Url::parse(value).context("Invalid registry URL")?;
+    Ok(match url.host().context("Missing registry hostname")? {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+    })
+}
+
+/// A bridge-mode Linux VM cannot reach the macOS host via its own loopback.
+pub(crate) fn validate_vm_registries(policy: &NpmrcPolicy, registry: Option<&str>) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        for url in policy
+            .default_registry
+            .iter()
+            .chain(policy.scoped_registries.values())
+            .map(String::as_str)
+            .chain(registry)
+        {
+            ensure!(
+                !registry_targets_loopback(url)?,
+                "A macOS host loopback registry is unreachable inside Docker. Use a registry URL reachable from the Linux VM."
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NpmAuthKind {
     Basic,
@@ -2888,6 +2921,19 @@ pub fn resolve_ca_cert_path() -> Result<Option<std::path::PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_registry_admission_recognizes_ipv4_ipv6_and_localhost() -> Result<()> {
+        for url in [
+            "https://LOCALHOST.:8100/registry/",
+            "http://127.0.0.1:8100/",
+            "http://[::1]:8100/",
+        ] {
+            assert!(registry_targets_loopback(url)?);
+        }
+        assert!(!registry_targets_loopback("https://registry.npmjs.org/")?);
+        Ok(())
+    }
 
     #[test]
     fn bounded_recheck_rejects_a_dependency_that_has_grown() -> Result<()> {

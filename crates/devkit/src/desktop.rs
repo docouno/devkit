@@ -9,6 +9,10 @@ use std::{fs, path::Path, process::Command};
 pub fn display_overlay(service: &str, headless: bool) -> Result<Value> {
     let mut spec = json!({"environment":{"DEVKIT_HEADLESS":if headless {"1"} else {"0"}}});
     if !headless {
+        ensure!(
+            !cfg!(target_os = "macos"),
+            "Electron on macOS requires headless=1 to run inside the Linux VM"
+        );
         let display = std::env::var("DISPLAY").unwrap_or_default();
         let valid = regex::Regex::new(r"^:[0-9]+(?:\.[0-9]+)?$")?;
         let authority = std::env::var_os("XAUTHORITY")

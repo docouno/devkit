@@ -19,6 +19,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import tarfile
 import time
@@ -28,6 +29,9 @@ import uuid
 
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "test"))
+from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, linux_arch, payload_engine  # noqa: E402
+
 OWNERSHIP = "io.docouno.devkit.packaged-test"
 
 
@@ -41,8 +45,8 @@ def sha256(data):
 
 
 def native_release(release):
-    with (release / "devkit").open("rb") as stream:
-        return stream.read(4) == b"\x7fELF"
+    with payload_engine(release).open("rb") as stream:
+        return executable_header_matches(stream.read(64), host_target())
 
 
 def semver_tuple(value):
@@ -116,11 +120,13 @@ def changed_files(changes):
 
 class Verification:
     def __init__(self, release, next_release=None, *, package_source="local",
-                 public_bootstrap=None):
+                 public_bootstrap=None, daemon_arch=None, scratch_parent=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
-        self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-"))
+        self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-", dir=scratch_parent))
+        self.daemon_arch = daemon_arch or linux_arch()
+        self.linux_target = {"amd64": LINUX_X64, "arm64": LINUX_ARM64}[self.daemon_arch]
         self.release = self.copy_release(release, "release")
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
@@ -128,8 +134,8 @@ class Verification:
         self.next_release_identity = (
             sha256((self.next_release / "release.json").read_bytes()) if self.next_release else None
         )
-        require(native_release(self.release) and semver_tuple(self.version) >= (0, 4, 0),
-                "The baseline release must be a supported native release (>= 0.4.0)")
+        require(native_release(self.release) and semver_tuple(self.version) >= (0, 5, 0),
+                "The baseline release must be a supported native release (>= 0.5.0)")
         if self.next_release is not None:
             next_version = json.loads((self.next_release / "release.json").read_text())["version"]
             require(self.version != next_version and self.release_identity != self.next_release_identity,
@@ -168,8 +174,8 @@ class Verification:
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
         self.environment["DEVKIT_CACHE_DIR"] = str(self.scratch / "native cache")
         self.environment["CI"] = "true"
-        if (self.manager / "runtime/pnpm.env").is_file():
-            selected = subprocess.check_output([str(self.manager / 'devkit'), 'internal', 'ensure-pnpm', '--pin-file', str(self.manager / 'runtime/pnpm.env')], text=True).strip()
+        if host_target() != DARWIN_ARM64 and (self.manager / "runtime/pnpm.env").is_file():
+            selected = subprocess.check_output([str(payload_engine(self.manager)), 'internal', 'ensure-pnpm', '--pin-file', str(self.manager / 'runtime/pnpm.env')], text=True).strip()
             self.environment['DEVKIT_PNPM_BIN_OVERRIDE'] = selected
         print(f"Receipt directory: {self.receipt}", flush=True)
         print(f"Consumer scratch: {self.scratch}", flush=True)
@@ -180,10 +186,10 @@ class Verification:
         # directly by its actual released native binary; public_bootstrap exercises
         # cross-version init delegation through the target bootstrap script.
         if operation == "init" and release == self.release and not self.public_bootstrap:
-            return [release / "devkit", "--non-interactive", "init", root,
+            return [payload_engine(release), "--non-interactive", "init", root,
                     "--to", version, "--release-root", release, *arguments]
         command = (["sh", self.public_bootstrap] if self.public_bootstrap
-                   else [self.manager / "devkit"])
+                   else [payload_engine(self.manager)])
         command += ["--non-interactive", operation, root]
         if operation in ("init", "update"):
             command += ["--to", version]
@@ -193,7 +199,7 @@ class Verification:
 
     def exec_cli(self, root, component, *argv, write=False):
         command = (["sh", self.public_bootstrap] if self.public_bootstrap
-                   else [self.manager / "devkit"])
+                   else [payload_engine(self.manager)])
         command += ["exec", "--root", root, "--component", component]
         if write:
             command.append("--write")
@@ -754,7 +760,9 @@ class Verification:
                 for entry in tar.getmembers():
                     require(not entry.name.startswith("/") and ".." not in Path(entry.name).parts, "Unsafe archive member")
                 tar.extractall(extracted, filter="data")
-            require((extracted / "app").read_bytes()[:4] == b"\x7fELF", "Packaged app is not an ELF executable")
+            with (extracted / "app").open("rb") as executable:
+                require(executable_header_matches(executable.read(64), self.linux_target),
+                        "Packaged Electron executable has the wrong Linux architecture")
             asar = extracted / "resources/app.asar"
             require(asar.is_file(), "Packaged app has no ASAR payload")
             require(not (extracted / "src").exists(), "Raw application source leaked outside ASAR")
@@ -819,7 +827,7 @@ class Verification:
         package = root / component / "node_modules/electron"
         version = json.loads((package / "package.json").read_text())["version"]
         cached = (Path(self.environment["DEVKIT_CACHE_DIR"]) / "pnpm-store/electron-dist"
-                  / (version + "-linux-x64") / "dist/icudtl.dat")
+                  / (version + "-linux-" + {"amd64": "x64", "arm64": "arm64"}[self.daemon_arch]) / "dist/icudtl.dat")
         local = package / "dist/icudtl.dat"
         require(cached.is_file() and local.is_file(), "Electron ICU resource is absent before corruption proof")
         require((cached.stat().st_dev, cached.stat().st_ino) ==
@@ -1175,6 +1183,44 @@ class Verification:
                         errors.append(f"Could not remove owned container {name}: {result.stderr}")
         require(not errors, "\n".join(errors))
 
+    def cross_host_checkout(self, *, export=None, imported=None):
+        if not (export or imported):
+            return
+        require(not (export and imported), "Select one cross-host checkout operation")
+        if export:
+            root = self.create("fullstack-web", "cross-host-export", release=self.manager)
+            self.run("cross-host-init", ["git", "init", "-b", "main"], cwd=root)
+            self.run("cross-host-add", ["git", "add", "."], cwd=root)
+            self.run("cross-host-commit", ["git", "-c", "user.name=Fixture", "-c",
+                     "user.email=fixture@example.invalid", "commit", "-m", "Create cross-host project"], cwd=root)
+        else:
+            root = self.scratch / "cross-host-import"
+            self.run("cross-host-clone", ["git", "clone", "--branch", "main", imported, root])
+            self.projects.append(root)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(state["releaseIdentity"] == sha256((self.manager / "release.json").read_bytes()),
+                "Cross-host checkout belongs to another frozen release")
+        revision = self.run("cross-host-revision", ["git", "rev-parse", "HEAD"], cwd=root).strip()
+        # A caller's default build platform cannot select the task's executable.
+        opposite = "linux/amd64" if self.daemon_arch == "arm64" else "linux/arm64"
+        environment = dict(self.environment, DOCKER_DEFAULT_PLATFORM=opposite)
+        helper = self.make(root, "exec", "app=web", "prepare=1", "command=/devkit/devkit internal build-info",
+                           label="cross-host-linux-helper", environment=environment)
+        info = next(json.loads(line) for line in helper.splitlines() if line.startswith("{"))
+        require(info["target"] == self.linux_target and info["version"] == state["version"],
+                "Wrong release helper executed in the native Linux container")
+        self.healthy(root, "cross-host")
+        require(not self.run("cross-host-status", ["git", "status", "--porcelain"], cwd=root).strip(),
+                "Platform-specific preparation changed the shared checkout")
+        if export:
+            destination = Path(export).resolve()
+            require(not destination.exists(), "Cross-host bundle already exists")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.run("cross-host-bundle", ["git", "bundle", "create", destination, "refs/heads/main"], cwd=root)
+        self.results.append({"label": "cross-host-checkout", "commit": revision, "target": host_target(),
+                             "helper": info, "releaseIdentity": state["releaseIdentity"], "passed": True})
+        return root
+
     def verify(self):
         failure = None
         try:
@@ -1211,6 +1257,8 @@ class Verification:
             if semver_tuple(json.loads((self.manager / "release.json").read_text())["version"]) >= (0, 5, 0):
                 self.fullstack_web()
             self.electron_cache_corruption(fullstack)
+            self.cross_host_checkout(export=os.environ.get("DEVKIT_VERIFY_EXPORT_CHECKOUT"),
+                                     imported=os.environ.get("DEVKIT_VERIFY_IMPORT_CHECKOUT"))
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error
@@ -1227,7 +1275,7 @@ class Verification:
                        "createdVersions": self.created_versions,
                        "publicBootstrapSha256": sha256(self.public_bootstrap.read_bytes()) if self.public_bootstrap else None,
                        "nativeManagerVersion": json.loads((self.manager / "release.json").read_text())["version"],
-                       "nativeManagerSha256": sha256((self.manager / "devkit").read_bytes()),
+                       "nativeManagerSha256": sha256((payload_engine(self.manager)).read_bytes()),
                        "nativeCacheIsolated": True,
                        "harnessIdentity": self.harness_identity,
                        "passed": failure is None, "error": str(failure) if failure else None,

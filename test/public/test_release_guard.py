@@ -97,6 +97,27 @@ class HiddenArtifactGuard(unittest.TestCase):
         self.assertEqual(missing_hidden_upload_flags(template.format("|\n        reports/receipt.json\n        !.private/**")), [])
 
 
+class RequiredNativeCheckGuard(unittest.TestCase):
+    def test_each_required_check_rejects_an_unsuccessful_or_skipped_worker(self):
+        source = (REPO / ".github/workflows/verify.yml").read_text()
+        for group in ("source", "runtime", "delivery", "packaged", "registry"):
+            job = re.search(r"(?ms)^  " + group + r":\n(.*?)(?=^  [\w-]+:|\Z)", source).group(1)
+            self.assertIn(f"    name: {group}\n", job)
+            self.assertIn("    if: always()\n", job)
+            dependencies = re.search(r"(?m)^    needs: \[(.+)\]$", job).group(1).split(", ")
+            expected = [group + "-linux-amd64", group + "-linux-arm64"]
+            if group == "source":
+                expected.append("darwin-host")
+            self.assertCountEqual(dependencies, expected)
+            predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
+            for status in ("success", "failure", "cancelled", "skipped"):
+                results = {worker: {"result": "success"} for worker in dependencies}
+                results[dependencies[-1]]["result"] = status
+                probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
+                                       capture_output=True, text=True, timeout=5)
+                self.assertEqual(probe.returncode == 0, status == "success", (group, status, probe.stderr))
+
+
 class EventSourceGuard(unittest.TestCase):
     def probe(self, event, status="identical"):
         with tempfile.TemporaryDirectory(prefix="release-admission-") as directory:
@@ -161,6 +182,7 @@ REQUIRED_DOCS = (
     "docs/upgrades.md",
     "docs/migrations/index.json",
     "docs/migrations/0.5.0.md",
+    "docs/migrations/0.6.0.md",
 )
 
 

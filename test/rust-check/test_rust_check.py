@@ -8,12 +8,15 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
-HELPER = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
+sys.path.insert(0, str(REPO / "test"))
+from release_targets import host_target, linux_arch  # noqa: E402
+HELPER = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/author/target" / host_target() / "debug/devkit")).resolve()
 RECIPE = REPO / "runtime/rust.Dockerfile"
 LABEL = "io.docouno.devkit.invocation"
 RECIPE_LABEL = "io.docouno.devkit.rust-recipe"
@@ -71,11 +74,15 @@ class RustCheckTests(unittest.TestCase):
         cls.commands = []
         cls.recipe_sha = hashlib.sha256(RECIPE.read_bytes()).hexdigest()
         cls.image = None
-        derived_tag = f"devkit-derived-rust:{cls.recipe_sha}"
+        platform = "linux/" + linux_arch()
+        platform_label = "io.docouno.devkit.platform"
+        derived_tag = f"devkit-derived-rust:{linux_arch()}-{cls.recipe_sha}"
         inspected = run("docker", "image", "inspect", derived_tag)
         if inspected.returncode == 0:
             loaded = json.loads(inspected.stdout)
-            if loaded and loaded[0].get("Config", {}).get("Labels", {}).get(RECIPE_LABEL) == cls.recipe_sha:
+            if (loaded and loaded[0].get("Os") == "linux" and loaded[0].get("Architecture") == linux_arch()
+                    and loaded[0]["Config"]["Labels"].get(platform_label) == platform
+                    and loaded[0]["Config"]["Labels"].get(RECIPE_LABEL) == cls.recipe_sha):
                 cls.image = loaded[0]["Id"]
                 (cls.artifacts / "rust-image.id").write_text(cls.image + "\n")
                 (cls.artifacts / "build.stdout").write_text(f"reused {derived_tag} -> {cls.image}\n")
@@ -84,7 +91,7 @@ class RustCheckTests(unittest.TestCase):
             # Acquisition is explicit and uses the actual shipping recipe. Docker may
             # reuse build cache; all subsequent native probes have network disabled.
             iidfile = cls.artifacts / "rust-image.id"
-            build_args = ["docker", "build", "--file", str(RECIPE), "--iidfile", str(iidfile),
+            build_args = ["docker", "build", "--platform", platform, "--label", f"{platform_label}={platform}", "--file", str(RECIPE), "--iidfile", str(iidfile),
                           "--tag", derived_tag,
                           "--build-arg", "DEVKIT_RECIPE_SHA=" + cls.recipe_sha,
                           str(REPO / "runtime")]
@@ -96,7 +103,9 @@ class RustCheckTests(unittest.TestCase):
                 raise AssertionError(f"shipping Rust image build failed: {build.stderr}")
             cls.image = iidfile.read_text().strip()
         image = json.loads(checked("docker", "image", "inspect", cls.image).stdout)[0]
-        if image["Id"] != cls.image or image["Config"]["Labels"].get(RECIPE_LABEL) != cls.recipe_sha:
+        if (image["Id"] != cls.image or image["Os"] != "linux" or image["Architecture"] != linux_arch()
+                or image["Config"]["Labels"].get(RECIPE_LABEL) != cls.recipe_sha
+                or image["Config"]["Labels"].get(platform_label) != platform):
             raise AssertionError("derived image does not match the shipping recipe identity")
         cls.baseline = cls.base / "baseline"
         (cls.baseline / "src").mkdir(parents=True)

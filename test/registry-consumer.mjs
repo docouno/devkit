@@ -10,9 +10,9 @@ import { npmEnvironment } from '../tooling/npm-inputs/npm.mjs';
 const read = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const sri = (bytes) => `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
 const mode = process.argv[2];
-const releases = ['/release-v1', '/release-v2'];
+const releases = ['/release-old', '/release-current'].filter(existsSync);
 const metadata = releases.map((root) => read(join(root, 'release.json')));
-assert.notEqual(metadata[0].version, metadata[1].version);
+const current = metadata.at(-1);
 const proof = '/proof';
 if (mode === 'serve') {
   const entries = releases.map((root, index) => {
@@ -74,11 +74,11 @@ if (mode === 'serve') {
           path === '/@docouno/env'
             ? {
                 name: '@docouno/env',
-                'dist-tags': { latest: metadata[1].version },
+                'dist-tags': { latest: current.version },
                 versions,
                 time: {
                   [metadata[0].version]: '2020-01-01T00:00:00Z',
-                  [metadata[1].version]: published,
+                  [current.version]: published,
                 },
               }
             : versions[path.slice('/@docouno/env/'.length)],
@@ -120,9 +120,8 @@ if (mode === 'serve') {
   const target = '/consumer';
   const env = npmEnvironment(join(proof, `npm-${mode}`), registry);
   delete env.npm_config_workspaces;
-  const binary = mode === 'first' ? 'npm' : 'pnpm';
-  function npm(args, cwd = target, expected) {
-    const result = spawnSync(binary, args, {
+  function pnpm(args, cwd = target, expected) {
+    const result = spawnSync('pnpm', args, {
       cwd,
       env,
       encoding: 'utf8',
@@ -130,7 +129,7 @@ if (mode === 'serve') {
       maxBuffer: 8 * 1024 * 1024,
     });
     process.stdout.write(
-      `${binary} ${args.join(' ')}: ${result.status}\n${result.stdout}${result.stderr}\n`,
+      `pnpm ${args.join(' ')}: ${result.status}\n${result.stdout}${result.stderr}\n`,
     );
     if (expected) {
       assert.notEqual(result.status, 0);
@@ -140,8 +139,8 @@ if (mode === 'serve') {
     }
     return result.stdout + result.stderr;
   }
-  const lock = join(target, mode === 'first' ? 'package-lock.json' : 'pnpm-lock.yaml');
-  if (mode === 'second') {
+  const lock = join(target, 'pnpm-lock.yaml');
+  if (mode === 'first' || mode === 'second') {
     // Public v9 packages need only SRI; remove the exact local fixture tarball URL.
     const text = readFileSync(lock, 'utf8').replace(/,? ?tarball: ([^,}\n]+)/gu, (match, url) => {
       const value = url.trim().replace(/^['"]|['"]$/gu, '');
@@ -159,27 +158,19 @@ if (mode === 'serve') {
   const original = readFileSync(lock);
   assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|\bfile:|\/workspace\//);
   if (mode === 'first' || mode === 'second') {
-    if (mode === 'first') {
-      npm(['ci', '--include=dev', '--strict-peer-deps']);
-    } else {
-      assert(!existsSync(join(target, 'package-lock.json')));
-      assert(existsSync(join(target, 'pnpm-workspace.yaml')));
-      npm([
-        'install',
-        '--frozen-lockfile',
-        '--ignore-scripts',
-        '--trust-lockfile',
-        '--store-dir',
-        '/proof/pnpm-store',
-      ]);
-    }
+    assert(!existsSync(join(target, 'package-lock.json')));
+    assert(existsSync(join(target, 'pnpm-workspace.yaml')));
+    pnpm([
+      'install',
+      '--frozen-lockfile',
+      '--ignore-scripts',
+      '--trust-lockfile',
+      '--store-dir',
+      '/proof/pnpm-store',
+    ]);
     assert.deepEqual(readFileSync(lock), original);
     for (const task of ['check', 'build']) {
-      npm(
-        mode === 'first'
-          ? ['run', '--workspace=apps/main', task]
-          : ['--dir', 'apps/main', 'run', task],
-      );
+      pnpm(['--dir', 'apps/main', 'run', task]);
     }
     const probe = spawnSync(
       'node',
@@ -191,11 +182,14 @@ if (mode === 'serve') {
       { cwd: target, env, encoding: 'utf8', timeout: 10000 },
     );
     assert.equal(probe.status, 0, probe.stderr);
-    assert.equal(JSON.parse(probe.stdout).version, metadata[mode === 'first' ? 0 : 1].version);
+    assert.equal(
+      JSON.parse(probe.stdout).version,
+      mode === 'first' ? metadata[0].version : current.version,
+    );
   } else if (mode === 'release-day') {
     const workspace = join(target, 'pnpm-workspace.yaml');
     const settings = readFileSync(workspace, 'utf8');
-    const selected = `@docouno/env@${metadata[1].environment.version}`;
+    const selected = `@docouno/env@${current.environment.version}`;
     assert(
       settings.includes(selected),
       'Generated workspace must select the exact environment version',
@@ -208,18 +202,18 @@ if (mode === 'serve') {
     // Check that the fresh release blocks this edit without its exact exception.
     writeFileSync(workspace, settings.replace(selected, 'other-package@1.0.0'));
     try {
-      const rejected = npm(add, app, /minimumReleaseAge|minimum release age/iu);
+      const rejected = pnpm(add, app, /minimumReleaseAge|minimum release age/iu);
       assert(rejected.includes(selected), 'The fresh environment version must trigger the failure');
     } finally {
       writeFileSync(workspace, settings);
     }
     assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
     assert.deepEqual(readFileSync(lock), original);
-    npm(add, app);
+    pnpm(add, app);
     assert(read(manifest).dependencies.clsx);
     assert.notDeepEqual(readFileSync(lock), original);
   } else if (mode === 'negative') {
-    const selected = `@docouno/env@${metadata[1].version}`;
+    const selected = `@docouno/env@${current.version}`;
     const lines = original.toString().split('\n');
     let inside = false,
       changed = false;
@@ -238,7 +232,7 @@ if (mode === 'serve') {
     }
     assert(changed, 'Missing env integrity');
     writeFileSync(lock, lines.join('\n'));
-    npm(
+    pnpm(
       [
         'install',
         '--frozen-lockfile',
@@ -252,7 +246,7 @@ if (mode === 'serve') {
       /ERR_PNPM_TARBALL_INTEGRITY|EINTEGRITY/,
     );
     writeFileSync(lock, original);
-    npm(
+    pnpm(
       [
         'add',
         '--lockfile-only',

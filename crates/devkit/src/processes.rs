@@ -14,13 +14,19 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
-static INITIAL_PPID: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+static INITIAL_PPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(target_os = "macos")]
+mod darwin;
+#[cfg(target_os = "macos")]
+pub use darwin::{PARENT_HANDOFF, run_watcher, watch_cli_parent};
 
 #[derive(Debug)]
 pub struct CommandFailure {
@@ -120,6 +126,8 @@ impl Drop for Signals {
 #[derive(Clone)]
 pub struct ProcessRunner {
     signals: Arc<Signals>,
+    #[cfg(target_os = "macos")]
+    watcher: Arc<darwin::GroupWatcher>,
 }
 #[derive(Clone, Debug)]
 pub struct OwnedContainer {
@@ -186,6 +194,7 @@ impl ProcessRunner {
             }?;
             signals.registrations.push(id);
         }
+        #[cfg(target_os = "linux")]
         {
             let cancelled = cancelled.clone();
             // SAFETY: getppid() and lock-free atomic operations are async-signal-safe.
@@ -208,14 +217,40 @@ impl ProcessRunner {
         }
         // Orphaned ordinary creator descendants remain our responsibility.
         // SAFETY: prctl accepts these scalar arguments, with no borrowed pointers.
+        #[cfg(target_os = "linux")]
         ensure!(
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0,
             "Cannot enable child reaping"
         );
         Ok(Self {
             signals: Arc::new(signals),
+            #[cfg(target_os = "macos")]
+            watcher: Arc::default(),
         })
     }
+    #[cfg(target_os = "macos")]
+    pub fn enable_group_watcher(&self, executable: std::path::PathBuf) -> Result<()> {
+        self.watcher.enable(executable)
+    }
+
+    fn spawn_creator(&self, command: &mut Command) -> Result<Creator> {
+        if std::path::Path::new(command.get_program())
+            .file_name()
+            .is_some_and(|p| p == "docker")
+        {
+            command.env_remove("DOCKER_DEFAULT_PLATFORM");
+        }
+        command.process_group(0);
+        #[cfg(target_os = "macos")]
+        {
+            let mut creator = Creator::new(self.watcher.spawn(command)?);
+            creator.watcher = Some(self.watcher.clone());
+            Ok(creator)
+        }
+        #[cfg(target_os = "linux")]
+        Ok(Creator::new(command.spawn()?))
+    }
+
     pub(crate) fn cancel(&self, sig: i32) {
         let _ = self.signals.cancelled.compare_exchange(
             0,
@@ -359,7 +394,7 @@ impl ProcessRunner {
             }
             return Err(error);
         }
-        command.process_group(0).stdin(if input.is_some() {
+        command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -378,8 +413,8 @@ impl ProcessRunner {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
-        let child = match command.spawn() {
-            Ok(child) => child,
+        let mut creator = match self.spawn_creator(command) {
+            Ok(creator) => creator,
             Err(error) => {
                 if let Some(flag) = reaped.as_deref_mut() {
                     *flag = true;
@@ -389,7 +424,6 @@ impl ProcessRunner {
                 });
             }
         };
-        let mut creator = Creator::new(child);
         let readers_done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_failed = Arc::new(AtomicBool::new(false));
@@ -567,13 +601,10 @@ impl ProcessRunner {
             .args(["cp", &format!("{id}:{path}"), "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut creator = Creator::new(
-            command
-                .spawn()
-                .context("Cannot start image metadata query")?,
-        );
+            .stderr(Stdio::piped());
+        let mut creator = self
+            .spawn_creator(&mut command)
+            .context("Cannot start image metadata query")?;
         let mut stdout = creator
             .child
             .stdout
@@ -1071,6 +1102,8 @@ struct Creator {
     child: Child,
     pid: i32,
     finished: bool,
+    #[cfg(target_os = "macos")]
+    watcher: Option<Arc<darwin::GroupWatcher>>,
 }
 impl Creator {
     fn new(child: Child) -> Self {
@@ -1079,6 +1112,8 @@ impl Creator {
             child,
             pid,
             finished: false,
+            #[cfg(target_os = "macos")]
+            watcher: None,
         }
     }
     fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
@@ -1169,6 +1204,12 @@ impl Drop for Creator {
         {
             eprintln!("devkit: Cannot reap creator: {error:#}");
         }
+        #[cfg(target_os = "macos")]
+        if let Some(watcher) = &self.watcher
+            && let Err(error) = watcher.disarm(self.pid)
+        {
+            eprintln!("devkit: Cannot release group watch: {error:#}");
+        }
     }
 }
 fn signal_group(pid: i32, signal: i32) {
@@ -1205,6 +1246,7 @@ fn reap_available(pid: i32) -> Result<()> {
 }
 /// The CLI dies with its invoking Make/shell; its installed handlers still get
 /// to clean up. Install ProcessRunner before calling this, before any spawn.
+#[cfg(target_os = "linux")]
 pub fn watch_parent(runner: &ProcessRunner) -> Result<()> {
     // SAFETY: getppid and scalar prctl arguments contain no borrowed pointers.
     let parent = unsafe { libc::getppid() };
@@ -1223,6 +1265,7 @@ pub fn watch_parent(runner: &ProcessRunner) -> Result<()> {
 
 /// Restore SIGTERM parent-death notification before replacing this image via execve,
 /// while guarding against a parent exit in the transition window.
+#[cfg(target_os = "linux")]
 pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
     runner.check_cancelled()?;
     let initial = INITIAL_PPID.load(Ordering::SeqCst);
@@ -1237,4 +1280,19 @@ pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
         runner.check_cancelled()?;
     }
     Ok(())
+}
+
+/// Prepare a CLI-to-CLI exec, preserving the original parent across image replacement.
+pub fn restore_self_exec(runner: &ProcessRunner, command: &mut Command) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    darwin::set_handoff(command)?;
+    #[cfg(target_os = "linux")]
+    let _ = command;
+    restore_exec_pdeathsig(runner)
+}
+
+#[cfg(target_os = "macos")]
+pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
+    runner.watcher.shutdown()?;
+    runner.check_cancelled()
 }

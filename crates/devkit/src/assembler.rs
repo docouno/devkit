@@ -3,8 +3,8 @@ use crate::{
     Result,
     archive::{create_archive, extract_archive, publish_new_directory},
     delivery::{
-        EnginePin, engine_build_info, file_digest, render_bootstrap, render_project_loader,
-        verify_engine,
+        engine_build_info, file_digest, render_bootstrap_pins, render_npm_launcher,
+        render_project_loader_pins,
     },
     distribution::{AssetIdentity, ENGINE_ASSET, NpmArtifact, ReleaseIndex, TARGET},
     files::*,
@@ -32,6 +32,9 @@ use std::{
     process::Command,
     time::Duration,
 };
+
+mod contribution;
+pub use contribution::{ProduceOptions, TargetInput, contribute};
 
 const NODE_TEMPLATES: [&str; 6] = [
     "node-api",
@@ -84,11 +87,9 @@ pub fn verify_migration_index(root: &Path, version: &str) -> Result<Vec<Migratio
 
 pub struct AssemblyOptions {
     pub root: PathBuf,
-    pub engine: PathBuf,
+    pub target_inputs: Vec<TargetInput>,
     pub npm_inputs: PathBuf,
     pub output: PathBuf,
-    pub notices: PathBuf,
-    pub notice_set_sha256: String,
     pub source_commit: String,
     pub source_tree: String,
     pub build_run: String,
@@ -701,23 +702,32 @@ fn pins(root: &Path) -> Result<BTreeMap<String, String>> {
             .split_once('=')
             .context("Invalid source toolchain pin")?;
         ensure!(
-            [
+            ([
                 "DEVKIT_NODE_IMAGE",
                 "DEVKIT_NODE_VERSION",
-                "DEVKIT_PNPM_VERSION",
-                "DEVKIT_PNPM_TARBALL_SHA256",
-                "DEVKIT_PNPM_SHA256",
                 "DEVKIT_RUST_VERSION"
             ]
             .contains(&key)
+                || (key.starts_with("DEVKIT_PNPM_")
+                    && key
+                        .bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')))
                 && !value.is_empty()
                 && !value.chars().any(char::is_whitespace)
                 && pins.insert(key.to_owned(), value.to_owned()).is_none(),
             "Unexpected/duplicate source toolchain pin"
         );
     }
-    ensure!(pins.len() == 6, "Incomplete source toolchains.env");
-    crate::runtime::PnpmPin::from_source_pins(root)?;
+    ensure!(
+        [
+            "DEVKIT_NODE_IMAGE",
+            "DEVKIT_NODE_VERSION",
+            "DEVKIT_RUST_VERSION"
+        ]
+        .iter()
+        .all(|k| pins.contains_key(*k)),
+        "Incomplete source toolchains.env"
+    );
     let (_, hash) = pins["DEVKIT_NODE_IMAGE"]
         .rsplit_once("@sha256:")
         .context("Node image is not digest-pinned")?;
@@ -932,7 +942,7 @@ fn npm_pack(
         let spec = budget.for_npm_pack();
         let env_plan = budget.toolchain_env_for_resolver(&spec);
         let mut command = Command::new("docker");
-        command.args([
+        command.env_remove("DOCKER_DEFAULT_PLATFORM").args([
             "run",
             "--pull",
             "never",
@@ -1019,9 +1029,7 @@ fn asset(path: &Path) -> Result<AssetIdentity> {
 pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<ReleaseIndex> {
     runner.check_cancelled()?;
     let root = project_root(&options.root)?;
-    let engine = project_root(&options.engine)?;
     let npm_inputs = project_root(&options.npm_inputs)?;
-    let notices = project_root(&options.notices)?;
     let output = project_root(&options.output)?;
     ensure!(
         !exists(&output)? && output.parent().is_some_and(Path::is_dir),
@@ -1029,30 +1037,22 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     );
     ensure!(
         !root.starts_with(&output)
-            && !engine.starts_with(&output)
             && !npm_inputs.starts_with(&output)
-            && !notices.starts_with(&output),
+            && !output.starts_with(&npm_inputs)
+            && options
+                .target_inputs
+                .iter()
+                .all(|i| !output.starts_with(&i.directory) && !i.directory.starts_with(&output)),
         "Assembly output overlaps its inputs"
     );
     verify_git(options, &root, runner)?;
     let source_before = source_snapshot(&root)?;
     verify_runtime_notices(&root)?;
     let mut settings = pins(&root)?;
-    verify_notice_set(
-        &notices,
-        &root,
-        TARGET,
-        &settings["DEVKIT_RUST_VERSION"],
-        &options.notice_set_sha256,
-    )?;
+    let pnpm_env = crate::runtime::PnpmPin::release_env_from_source(&root)?;
+    let contributions =
+        contribution::read_inputs(options, &root, &settings["DEVKIT_RUST_VERSION"])?;
     let npm_before = file_map(&npm_inputs)?;
-    let notices_before = file_map(&notices)?;
-    ensure!(
-        notices_before
-            .get("notice-set.json")
-            .is_some_and(|file| file.sha256 == options.notice_set_sha256),
-        "Notice bundle changed after producer verification"
-    );
     let inputs = verify_npm_inputs(&root, &npm_inputs)?;
     let version = inputs.version.clone();
     verify_rust_template(&root, &settings["DEVKIT_RUST_VERSION"])?;
@@ -1074,32 +1074,19 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
             "Release source versions are not coordinated"
         );
     }
-    let engine_sha = file_digest(&engine)?;
-    let pin = EnginePin {
-        version: version.clone(),
-        target: TARGET.to_owned(),
-        sha256: engine_sha.clone(),
-    };
-    verify_engine(&engine, &pin)?;
-    let build = engine_build_info(&engine, runner)?;
-    ensure!(
-        build.schema_version == 1 && build.version == version && build.target == TARGET,
-        "ELF build version/target differs from release"
-    );
-    if !options.local {
+    let mut engine_pins = BTreeMap::new();
+    let mut engines = BTreeMap::new();
+    let mut triples = Vec::new();
+    for contribution in &contributions {
+        let target = contribution.target();
         ensure!(
-            build.source_commit.as_deref() == Some(&options.source_commit)
-                && build.source_tree.as_deref() == Some(&options.source_tree),
-            "ELF source attribution differs from assembly source"
+            contribution.version() == version,
+            "Native build version differs for {}",
+            target.triple()
         );
-    }
-    if !options.local {
-        let receipt: crate::notices::NoticeSet =
-            read_json(&safe_path(&notices, "notice-set.json")?)?;
-        ensure!(
-            receipt.generator == build,
-            "Notice collector source/build identity differs from the assembled engine"
-        );
+        engine_pins.insert(target.triple().to_owned(), contribution.sha256().to_owned());
+        engines.insert(target.triple().to_owned(), target.asset().to_owned());
+        triples.push(target.triple());
     }
     let stage = tempfile::Builder::new()
         .prefix(".devkit-build-set-")
@@ -1123,7 +1110,22 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     fs::create_dir(&build_set)?;
     let payload = build_set.join("payload");
     fs::create_dir(&payload)?;
-    write_atomic(&payload.join("devkit"), &fs::read(&engine)?, 0o755)?;
+    let mut notices_index = String::from("Third-party notices by native target\n\n");
+    for contribution in &contributions {
+        contribution.import(&payload, &root, &settings["DEVKIT_RUST_VERSION"])?;
+        let target = contribution.target().triple();
+        notices_index.push_str(&format!("{target}/NOTICE.txt\n"));
+    }
+    write_atomic(
+        &payload.join("notices/NOTICE.txt"),
+        notices_index.as_bytes(),
+        0o644,
+    )?;
+    write_atomic(
+        &payload.join("bin/devkit"),
+        render_npm_launcher(&engine_pins)?.as_bytes(),
+        0o755,
+    )?;
     for file in RUNTIME_FILES {
         if file == "devkit.sh" {
             continue;
@@ -1137,7 +1139,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     verify_runtime_notices(&payload)?;
     write_atomic(
         &safe_path(&payload, "runtime/devkit.sh")?,
-        render_project_loader(&version, &engine_sha, TARGET)?.as_bytes(),
+        render_project_loader_pins(&version, &engine_pins)?.as_bytes(),
         0o755,
     )?;
     write_atomic(
@@ -1145,10 +1147,9 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &fs::read(safe_path(&root, "LICENSE")?)?,
         0o644,
     )?;
-    let pnpm_pin = crate::runtime::PnpmPin::from_source_pins(&root)?;
     write_atomic(
         &safe_path(&payload, "runtime/pnpm.env")?,
-        pnpm_pin.encode().as_bytes(),
+        pnpm_env.as_bytes(),
         0o644,
     )?;
     settings.retain(|key, _| !key.starts_with("DEVKIT_PNPM_"));
@@ -1161,12 +1162,26 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         "DEVKIT_DESKTOP_RECIPE_HASH".to_owned(),
         file_digest(&safe_path(&payload, "runtime/desktop.Dockerfile")?)?,
     );
-    settings.insert("DEVKIT_ENGINE_SHA256".to_owned(), engine_sha.clone());
+    settings.insert("DEVKIT_ENGINE_TARGETS".to_owned(), triples.join(","));
+    for contribution in &contributions {
+        settings.insert(
+            format!(
+                "DEVKIT_ENGINE_SHA256_{}",
+                contribution.target().key_suffix()
+            ),
+            contribution.sha256().to_owned(),
+        );
+    }
+    settings.insert(
+        "DEVKIT_ENGINE_SHA256".to_owned(),
+        engine_pins[TARGET].clone(),
+    );
     settings.insert("DEVKIT_ENGINE_TARGET".to_owned(), TARGET.to_owned());
     let encoded_pins = settings
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))
         .collect::<String>();
+    crate::runtime::ToolPins::parse_release(encoded_pins.as_bytes())?;
     write_atomic(
         &safe_path(&payload, "runtime/toolchains.env")?,
         encoded_pins.as_bytes(),
@@ -1191,7 +1206,6 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
             0o644,
         )?;
     }
-    copy_tree(&notices, &payload.join("notices"), &|_| false, false)?;
     copy_tree(
         &safe_path(&root, "docs")?,
         &payload.join("docs"),
@@ -1205,9 +1219,29 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
             0o644,
         )?;
     }
+    let mut package_files = vec![
+        "bin",
+        "runtime",
+        "templates",
+        "npm",
+        "notices",
+        "docs",
+        "release.json",
+        "README.md",
+        "LICENSE",
+    ];
+    package_files.extend(contributions.iter().map(|c| c.target().payload_name()));
+    let mut os = vec!["linux"];
+    if engine_pins.contains_key(crate::distribution::Target::DarwinArm64.triple()) {
+        os.push("darwin");
+    }
+    let mut cpu = vec!["x64"];
+    if contributions.len() > 1 {
+        cpu.push("arm64");
+    }
     write_json(
         &payload.join("package.json"),
-        &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":["linux"],"cpu":["x64"],"bin":{"devkit":"devkit"},"files":["devkit","runtime","templates","npm","notices","docs","release.json","README.md","LICENSE"],"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
+        &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":os,"cpu":cpu,"bin":{"devkit":"bin/devkit"},"files":package_files,"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
     )?;
     for (name, file) in file_map(&payload)? {
         assert_shippable_path(&name)?;
@@ -1290,13 +1324,20 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &environment_bytes,
         0o644,
     )?;
-    write_atomic(&build_set.join(ENGINE_ASSET), &fs::read(&engine)?, 0o755)?;
+    for contribution in &contributions {
+        let target = contribution.target();
+        write_atomic(
+            &build_set.join(target.asset()),
+            &fs::read(payload.join(target.payload_name()))?,
+            0o755,
+        )?;
+    }
     write_atomic(
         &build_set.join("release.json"),
         &fs::read(payload.join("release.json"))?,
         0o644,
     )?;
-    let bootstrap = render_bootstrap(&version, &engine_sha, TARGET)?;
+    let bootstrap = render_bootstrap_pins(&version, &engine_pins)?;
     for name in ["install.sh", "bootstrap.sh"] {
         write_atomic(&build_set.join(name), bootstrap.as_bytes(), 0o755)?;
     }
@@ -1313,10 +1354,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
             asset(&entry.path())?,
         );
     }
-    let checksums = assets
-        .iter()
-        .map(|(name, identity)| format!("{}  {name}\n", identity.sha256))
-        .collect::<String>();
+    let checksums = crate::distribution::checksums(&assets);
     write_atomic(
         &build_set.join("checksums.txt"),
         checksums.as_bytes(),
@@ -1336,6 +1374,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         publication_eligible: !options.local,
         release_identity: admitted.identity.clone(),
         engine: ENGINE_ASSET.to_owned(),
+        engines: Some(engines),
         archive: release_archive,
         packages: BTreeMap::from([
             ("cli".to_owned(), cli),
@@ -1344,16 +1383,17 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         files: assets,
     };
     index.validate()?;
+    if !options.local {
+        index.validate_publishable_matrix(crate::distribution::REQUIRED_PUBLISHABLE_TARGETS)?;
+    }
     runner.check_cancelled()?;
     admitted.recheck()?;
     ensure!(
-        source_snapshot(&root)? == source_before
-            && file_map(&npm_inputs)? == npm_before
-            && file_map(&notices)? == notices_before
-            && file_digest(&engine)? == engine_sha,
+        source_snapshot(&root)? == source_before && file_map(&npm_inputs)? == npm_before,
         "Assembly inputs changed while staging"
     );
     verify_git(options, &root, runner)?;
+    contribution::read_inputs(options, &root, &settings["DEVKIT_RUST_VERSION"])?;
     // Written last, outside the payload and both package archives.
     write_json(&build_set.join("release-index.json"), &index)?;
     runner.check_cancelled()?;

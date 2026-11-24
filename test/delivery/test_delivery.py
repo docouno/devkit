@@ -31,10 +31,11 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "test") not in sys.path:
     sys.path.insert(0, str(REPO / "test"))
 from docker_flags import author_docker_flags  # noqa: E402
+from release_targets import LINUX_X64, host_target, payload_engine, payload_name  # noqa: E402
 DEFAULT_SET = REPO / ".artifacts/native/p3/local-artifact-proof/build-set"
 BUILD_SET = Path(os.environ.get("DEVKIT_TEST_BUILD_SET", DEFAULT_SET)).resolve()
 RELEASE = Path(os.environ.get("DEVKIT_TEST_RELEASE", BUILD_SET / "payload")).resolve()
-ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", RELEASE / "devkit")).resolve()
+ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", payload_engine(RELEASE))).resolve()
 DOCKER_ENABLED = os.environ.get("DEVKIT_TEST_DOCKER") == "1"
 PROOF = Path(os.environ.get("DEVKIT_DELIVERY_PROOF_DIR",
                            REPO / ".artifacts/native/p3/delivery-tests")) / uuid.uuid4().hex
@@ -43,30 +44,35 @@ RESULTS = []
 EVIDENCE = []
 
 WT_VERSION = "0.74.0"
-WT_TARGET = "worktrunk-x86_64-unknown-linux-musl"
-WT_ARCHIVE_SHA = "28392033912ab0a9027192d9975284787b29f080b4f2fd6298c89fffecf34c1f"
-WT_ENGINE_SHA = "a950f2f9838f06d169a39c0d91f0c80c72890794a9235203c070050b3cb10d1c"
+WT_PINS = {
+    "x86_64-unknown-linux-musl": ("28392033912ab0a9027192d9975284787b29f080b4f2fd6298c89fffecf34c1f",
+                                  "a950f2f9838f06d169a39c0d91f0c80c72890794a9235203c070050b3cb10d1c"),
+    "aarch64-unknown-linux-musl": ("24ad091af9fa3020b54101a4e0dc4ba17870d7e3da11d20f543b1ebd87c730ce",
+                                   "cfb5d8e63d7c38be090f183edfb41cc9d52f85566c05bf33c035e35ab0b10d48"),
+}
 
 
 def worktrunk(directory):
+    target = "worktrunk-" + host_target()
+    archive_sha, engine_sha = WT_PINS[host_target()]
     installed = shutil.which("wt")
-    if installed and digest(installed) == WT_ENGINE_SHA:
+    if installed and digest(installed) == engine_sha:
         return installed
-    url = f"https://github.com/max-sixty/worktrunk/releases/download/v{WT_VERSION}/{WT_TARGET}.tar.xz"
+    url = f"https://github.com/max-sixty/worktrunk/releases/download/v{WT_VERSION}/{target}.tar.xz"
     archive = directory / "worktrunk.tar.xz"
     limit = 32 * 1024 * 1024
     with urllib.request.urlopen(url, timeout=30) as response:
         data = response.read(limit + 1)
-    if len(data) > limit or hashlib.sha256(data).hexdigest() != WT_ARCHIVE_SHA:
+    if len(data) > limit or hashlib.sha256(data).hexdigest() != archive_sha:
         raise AssertionError("Pinned Worktrunk archive integrity differs")
     archive.write_bytes(data)
     with tarfile.open(archive) as source:
-        member = source.getmember(f"{WT_TARGET}/wt")
+        member = source.getmember(f"{target}/wt")
         if not member.isfile() or member.size > limit:
             raise AssertionError("Invalid Worktrunk executable member")
         executable = directory / "wt"
         executable.write_bytes(source.extractfile(member).read())
-    if digest(executable) != WT_ENGINE_SHA:
+    if digest(executable) != engine_sha:
         raise AssertionError("Pinned Worktrunk executable integrity differs")
     executable.chmod(0o755)
     return executable
@@ -234,10 +240,13 @@ class HttpsFixture:
         self.root.mkdir()
         env = environment(self.root)
         common = ["openssl", "req", "-newkey", "rsa:2048", "-nodes"]
+        (self.root / "ca.cnf").write_text(
+            "[req]\ndistinguished_name=subject\n[subject]\n[ca]\n"
+            "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+            "subjectKeyIdentifier=hash\n")
         execute([*common, "-x509", "-days", "1", "-subj", "/CN=Devkit temporary test CA",
-                 "-keyout", "ca.key", "-out", "ca.pem", "-addext",
-                 "basicConstraints=critical,CA:TRUE", "-addext",
-                 "keyUsage=critical,keyCertSign,cRLSign"], cwd=self.root, env=env)
+                 "-keyout", "ca.key", "-out", "ca.pem", "-config", "ca.cnf", "-extensions", "ca"],
+                cwd=self.root, env=env)
         execute([*common, "-subj", "/CN=github.com", "-keyout", "server.key",
                  "-out", "server.csr"], cwd=self.root, env=env)
         (self.root / "extensions").write_text(
@@ -408,7 +417,7 @@ class ReleaseFixture:
 
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
-    @unittest.skipUnless(DOCKER_ENABLED and os.environ.get("DEVKIT_BASELINE_SET"), "Requires the real baseline and Docker")
+    @unittest.skipUnless(DOCKER_ENABLED and host_target() == LINUX_X64 and os.environ.get("DEVKIT_BASELINE_SET"), "Requires the real baseline and Docker")
     def test_legacy_volume_survives_native_update_and_git_delivery(self):
         baseline = Path(os.environ["DEVKIT_BASELINE_SET"]) / "payload"
         old_engine = baseline / "devkit"
@@ -592,8 +601,8 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
 
     def test_cached_engine_permissions_refuse_before_lifecycle_writes(self):
         self.create()
-        accepted = self.manifest["files"]["devkit"]["sha256"]
-        cached = self.root / "cache/engines/x86_64-unknown-linux-musl" / self.version / accepted / "devkit"
+        accepted = self.manifest["files"][payload_name(host_target())]["sha256"]
+        cached = self.root / "cache/engines" / host_target() / self.version / accepted / "devkit"
         before = digest(cached)
         for mode in (0o644, 0o645):
             with self.subTest(mode=oct(mode)):
@@ -631,7 +640,7 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         self.assertEqual((target / ".devkit/manifest.json").read_bytes(), manifest_before)
         cached = self.root / "cache/releases" / self.version / self.identity
         self.assertEqual(file_map(cached), self.source_before)
-        self.assertEqual(digest(cached / "devkit"), digest(ENGINE))
+        self.assertEqual(digest(payload_engine(cached)), digest(ENGINE))
 
     def test_source_and_cached_corruption_refuse_without_creating_a_project(self):
         self.create()
@@ -679,8 +688,8 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
     def test_initial_loader_empty_engine_directory_can_be_completed(self):
         first = self.create()
         before = (first / ".devkit/manifest.json").read_bytes()
-        engine_sha = self.manifest["files"]["devkit"]["sha256"]
-        cached = self.root / "cache/engines/x86_64-unknown-linux-musl" / self.version / engine_sha / "devkit"
+        engine_sha = self.manifest["files"][payload_name(host_target())]["sha256"]
+        cached = self.root / "cache/engines" / host_target() / self.version / engine_sha / "devkit"
         self.assertEqual(digest(cached), engine_sha)
         cached.unlink()
         self.assertTrue(cached.parent.is_dir())
@@ -700,8 +709,8 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
 
     def test_existing_corrupt_engine_is_refused_without_overwriting_it(self):
         self.create()
-        engine_sha = self.manifest["files"]["devkit"]["sha256"]
-        cached = self.root / "cache/engines/x86_64-unknown-linux-musl" / self.version / engine_sha / "devkit"
+        engine_sha = self.manifest["files"][payload_name(host_target())]["sha256"]
+        cached = self.root / "cache/engines" / host_target() / self.version / engine_sha / "devkit"
         with cached.open("ab") as output:
             output.write(b"damaged-cache")
         corrupt = digest(cached)
@@ -877,30 +886,30 @@ class NpxTests(ReleaseFixture, unittest.TestCase):
         readme = adjacent / "README.md"
         readme.write_bytes(readme.read_bytes() + b"\nLocal same-version preview marker.\n")
         manifest = json.loads((adjacent / "release.json").read_text())
-        old_engine_sha = manifest["files"]["devkit"]["sha256"]
+        old_engine_sha = manifest["files"][payload_name(host_target())]["sha256"]
         caller_engine_sha = digest(ENGINE)
-        shutil.copy2(ENGINE, adjacent / "devkit")
+        shutil.copy2(ENGINE, payload_engine(adjacent))
         for name in ("runtime/devkit.sh", "runtime/toolchains.env"):
             path = adjacent / name
             path.write_text(path.read_text().replace(old_engine_sha, caller_engine_sha))
             manifest["files"][name]["sha256"] = digest(path)
-        manifest["files"]["devkit"]["sha256"] = caller_engine_sha
+        manifest["files"][payload_name(host_target())]["sha256"] = caller_engine_sha
         manifest["files"]["README.md"]["sha256"] = digest(readme)
         (adjacent / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
         new_identity = digest(adjacent / "release.json")
         self.assertNotEqual(new_identity, self.identity)
-        self.assertEqual(digest(adjacent / "devkit"), caller_engine_sha)
-        implicit = execute([adjacent / "devkit", "add-app", target, "--name", "extra",
+        self.assertEqual(digest(payload_engine(adjacent)), caller_engine_sha)
+        implicit = execute([payload_engine(adjacent), "add-app", target, "--name", "extra",
                             "--template", "rust-api", "--json"],
                            cwd=self.root, env=self.env, check=False)
-        explicit = execute([adjacent / "devkit", "add-app", target, "--name", "wrong",
+        explicit = execute([payload_engine(adjacent), "add-app", target, "--name", "wrong",
                             "--template", "rust-api", "--release-root", adjacent, "--json"],
                            cwd=self.root, env=self.env, check=False)
         EVIDENCE.append({"case": "accepted-data-before-implicit-adjacent-preview",
                          "acceptedReleaseIdentity": self.identity,
                          "adjacentPreviewIdentity": new_identity,
                          "cachedReleasePresent": True,
-                         "callerElfSha256": digest(adjacent / "devkit"),
+                         "callerElfSha256": digest(payload_engine(adjacent)),
                          "implicitCode": implicit.returncode, "implicitResult": json.loads(implicit.stdout),
                          "explicitWrongCode": explicit.returncode,
                          "explicitWrongResult": json.loads(explicit.stdout)})
@@ -1007,6 +1016,15 @@ export HTTPS_PROXY
         self.assertEqual(version.stdout.strip(), "devkit " + self.version)
         installed = list((output / "npm-cache/_npx").glob("*/node_modules/@docouno/devkit"))
         self.assertEqual(len(installed), 1)
+        # npm's real .bin link must pass the controlling terminal and process
+        # identity through to the bundled engine, including under a strict umask.
+        command = [installed[0].parent.parent / ".bin/devkit", "init"]
+        with Terminal(command, cwd=self.root, env=dict(self.env, CI="")) as terminal:
+            terminal.until("Project directory")
+            self.assertTrue(Path(f"/proc/{terminal.child.pid}/exe").samefile(payload_engine(installed[0])))
+            terminal.child.send_signal(signal.SIGTERM)
+            code, output_text = terminal.wait(timeout=5)
+            self.assertEqual(code, 143, output_text)
         before = file_map(installed[0])
         self.assertEqual(set(before), set(self.source_before))
         for name, identity in before.items():
@@ -1021,19 +1039,19 @@ export HTTPS_PROXY
         self.assertEqual(file_map(installed[0]), before, "Canonical import mutated npm's source tree")
         canonical = output / "native-cache/releases" / self.version / self.identity
         self.assertEqual(file_map(canonical), self.source_before)
-        self.assertEqual(digest(canonical / "devkit"), digest(ENGINE))
+        self.assertEqual(digest(payload_engine(canonical)), digest(ENGINE))
         self.assertFalse((output / "network.log").exists(), "Same-version native acquisition contacted the proxy")
         EVIDENCE.append({"case": "actual-npx", "umask": mask,
                          "cliArchiveSha256": digest(BUILD_SET / cli_archive),
                          "installedFiles": len(before), "sourceUnchanged": True,
                          "canonicalReleaseIdentity": self.identity,
-                         "canonicalElfSha256": digest(canonical / "devkit"),
+                         "canonicalElfSha256": digest(payload_engine(canonical)),
                          "proxyConnections": 0, "network": "none", "ignoreScripts": True})
 
-    def test_npx_direct_elf_with_ignore_scripts_umask_022(self):
+    def test_npx_native_launcher_with_ignore_scripts_umask_022(self):
         self.npx_mode("022")
 
-    def test_npx_direct_elf_with_ignore_scripts_umask_077(self):
+    def test_npx_native_launcher_with_ignore_scripts_umask_077(self):
         self.npx_mode("077")
 
 
