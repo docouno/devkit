@@ -285,7 +285,7 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
 }
 
 #[test]
-fn first_electron_requires_a_complete_release_with_a_matching_recipe() {
+fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
     for (case, path) in [
         ("missing", "runtime/licenses/moby-profiles.NOTICE"),
         ("mismatch", "runtime/desktop.Dockerfile"),
@@ -307,30 +307,166 @@ fn first_electron_requires_a_complete_release_with_a_matching_recipe() {
             }
         }
         seal(&release, "0.6.0");
-        let root = temp.path().join("consumer");
-        let error = init_project(
-            &release,
-            &root,
-            &InitOptions {
-                template: Some(
-                    if case == "no-pin" {
-                        "rust"
-                    } else {
-                        "electron-react"
-                    }
-                    .into(),
-                ),
-                ..Default::default()
-            },
-            &FixtureResolver,
-        )
-        .unwrap_err();
         let expected = if case == "missing" {
             path
         } else {
             "DEVKIT_DESKTOP_RECIPE_HASH"
         };
+        for template in ["rust", "electron-react"] {
+            let root = temp.path().join(template);
+            let error = init_project(
+                &release,
+                &root,
+                &InitOptions {
+                    template: Some(template.into()),
+                    ..Default::default()
+                },
+                &FixtureResolver,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(!root.exists());
+        }
+    }
+}
+
+#[test]
+fn preview_and_apply_preserve_excluded_entries_in_retiring_licenses() {
+    let temp = TempDir::new().unwrap();
+    let old = fixture_release(temp.path(), "0.5.1");
+    let new = fixture_release(temp.path(), "0.6.0");
+    for hidden in [".artifacts", ".git"] {
+        let root = temp.path().join(&hidden[1..]);
+        init(&old, &root, "rust", PackageMode::Registry);
+        let child = format!(".devkit/runtime/licenses/{hidden}");
+        fs::create_dir(root.join(&child)).unwrap();
+        let before = author_port_payload(&root);
+        for preview in [true, false] {
+            let error = update_project(
+                &new,
+                &root,
+                &UpdateOptions {
+                    preview,
+                    ..Default::default()
+                },
+                &NoResolver,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(&child), "{error:#}");
+            assert_eq!(author_port_payload(&root), before);
+            assert!(root.join(&child).is_dir());
+            assert!(!root.join(PENDING_PATH).exists());
+        }
+    }
+}
+
+#[test]
+fn newly_arrived_license_content_rolls_back_the_migration() {
+    const OWNER_FILE: &str = ".devkit/runtime/licenses/.git/owner";
+    struct OwnerWrite<'a> {
+        root: &'a Path,
+        after: &'a str,
+    }
+    impl MutationHooks for OwnerWrite<'_> {
+        fn after_write(&self, _: usize, path: &str) -> Result<()> {
+            if path == self.after {
+                put(self.root, OWNER_FILE, b"owned locally");
+            }
+            Ok(())
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let old = fixture_release(temp.path(), "0.5.1");
+    let new = fixture_release(temp.path(), "0.6.0");
+    for (i, after) in [DESKTOP_FILES[2], DESKTOP_FILES[3]].into_iter().enumerate() {
+        let root = temp.path().join(format!("consumer-{i}"));
+        init(&old, &root, "rust", PackageMode::Registry);
+        let before = author_port_payload(&root);
+        let error = update_project(
+            &new,
+            &root,
+            &UpdateOptions {
+                hooks: Some(&OwnerWrite { root: &root, after }),
+                ..Default::default()
+            },
+            &NoResolver,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(".devkit/runtime/licenses"),
+            "{error:#}"
+        );
+        assert!(!root.join(PENDING_PATH).exists());
+        assert_eq!(fs::read(root.join(OWNER_FILE)).unwrap(), b"owned locally");
+        let mut restored = author_port_payload(&root);
+        restored.remove(OWNER_FILE);
+        assert_eq!(restored, before);
+    }
+}
+
+#[test]
+fn idempotent_add_and_register_admit_the_accepted_runtime() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    for register in [true, false] {
+        let root = temp.path().join(format!("consumer-{register}"));
+        init(&release, &root, "rust", PackageMode::Registry);
+        if register {
+            copy_tree(
+                &release.join("templates/rust-api"),
+                &root.join("apps/extra"),
+                &|_| false,
+                false,
+            )
+            .unwrap();
+        }
+        let apply = || -> Result<MutationOutcome> {
+            let inventory = capture_compose_inputs(&root)?;
+            let options = UpdateOptions {
+                idempotent: true,
+                compose_inventory: Some(&inventory),
+                ..Default::default()
+            };
+            if register {
+                register_project_component(
+                    &release,
+                    &root,
+                    Role::App,
+                    "extra".into(),
+                    ToolingProfile::Rust,
+                    &options,
+                    &NoResolver,
+                )
+            } else {
+                add_project_component(
+                    &release,
+                    &root,
+                    Role::App,
+                    ComponentSpec {
+                        name: "extra".into(),
+                        template: "rust-api".into(),
+                        uses: vec![],
+                    },
+                    &options,
+                    &NoResolver,
+                )
+            }
+        };
+        assert!(apply().unwrap().applied);
+        assert!(apply().unwrap().no_op);
+        let expected = if register {
+            fs::create_dir(root.join(".devkit/runtime/licenses")).unwrap();
+            ".devkit/runtime/licenses"
+        } else {
+            let path = ".devkit/runtime/toolchains.env";
+            fs::copy(release.join("runtime/toolchains.env"), root.join(path)).unwrap();
+            let mut state = read_project_state(&root).unwrap();
+            record_managed_change(&root, &mut state, path, true);
+            "DEVKIT_DESKTOP_RECIPE_HASH"
+        };
+        let before = author_port_payload(&root);
+        let error = apply().unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
-        assert!(!root.exists());
+        assert_eq!(author_port_payload(&root), before);
     }
 }

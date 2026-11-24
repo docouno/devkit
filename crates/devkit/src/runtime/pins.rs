@@ -3,7 +3,7 @@
 use crate::{
     Result,
     delivery::EnginePin,
-    files::{SHA256_RE, read_regular_file, safe_path, version},
+    files::{SHA256_RE, TOOLCHAIN_PINS_MAX_BYTES, read_regular_file, safe_path, version},
     model::ProjectState,
     state::{has_electron, uses_profile_scoped_runtime},
 };
@@ -17,7 +17,10 @@ struct Records<'a>(BTreeMap<&'a str, &'a str>);
 
 impl<'a> Records<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self> {
-        ensure!(bytes.len() <= 65536, "Toolchain pins exceed byte budget");
+        ensure!(
+            bytes.len() <= TOOLCHAIN_PINS_MAX_BYTES,
+            "Toolchain pins exceed byte budget"
+        );
         let mut values = BTreeMap::new();
         for line in std::str::from_utf8(bytes)?.lines() {
             if line.is_empty() || line.starts_with('#') {
@@ -109,8 +112,12 @@ impl CheckoutToolPins {
     }
 
     pub fn admit(root: &Path, state: &ProjectState) -> Result<Self> {
-        let (bytes, id) = read_regular_file(&safe_path(root, PINS_PATH)?, 65536, "toolchain pins")?
-            .with_context(|| format!("Missing {PINS_PATH}"))?;
+        let (bytes, id) = read_regular_file(
+            &safe_path(root, PINS_PATH)?,
+            TOOLCHAIN_PINS_MAX_BYTES as u64,
+            "toolchain pins",
+        )?
+        .with_context(|| format!("Missing {PINS_PATH}"))?;
         ensure!(
             state
                 .managed

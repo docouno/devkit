@@ -13,6 +13,7 @@ pub const PENDING_PATH: &str = ".devkit/update-pending.json";
 pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
 pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const RUNTIME_LICENSES: &str = ".devkit/runtime/licenses";
 
 // Paths within a release payload. The seccomp notices travel with the profile.
 pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
@@ -408,7 +409,7 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         }
         if !electron {
             ensure!(
-                !exists(&safe_path(root, ".devkit/runtime/licenses")?)?,
+                !exists(&safe_path(root, RUNTIME_LICENSES)?)?,
                 "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
             );
         }

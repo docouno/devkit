@@ -565,8 +565,11 @@ fn try_dispatch_info(
         let Some(expected_pins) = header.managed.get(pins_name) else {
             return Ok(None);
         };
-        let Some((pins_bytes, pins_id)) =
-            read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
+        let Some((pins_bytes, pins_id)) = read_regular_file(
+            &safe_path(&root, pins_name)?,
+            TOOLCHAIN_PINS_MAX_BYTES as u64,
+            "toolchain pins",
+        )?
         else {
             return Ok(None);
         };
@@ -660,7 +663,8 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     };
     let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
     let (pins_bytes, pins_id) =
-        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
+        read_regular_file(&path, TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins")?
+            .with_context(conflict_msg)?;
     ensure!(
         pins_id.matches_git_tracked(expected_pins),
         "{}",

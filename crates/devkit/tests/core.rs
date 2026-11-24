@@ -273,8 +273,12 @@ fn release_admission_is_exact_and_npm_import_normalizes_only_modes() {
     fs::remove_file(release.join("extra")).unwrap();
     let source = f.path().join("npm");
     copy_tree(&release, &source, &|_| false, false).unwrap();
-    for name in file_map(&source).unwrap().keys() {
-        fs::set_permissions(source.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    for (name, id) in file_map(&source).unwrap() {
+        fs::set_permissions(
+            source.join(name),
+            fs::Permissions::from_mode(id.mode & 0o700),
+        )
+        .unwrap();
     }
     assert!(admit_release(&source).is_err());
     let canonical = f.path().join("canonical");
@@ -687,6 +691,24 @@ fn sync_resolves_new_ranges_aliases_and_sections_without_changing_preview_inputs
     sync_project(&release, &target, &UpdateOptions::default(), &resolver).unwrap();
     assert_eq!(resolver.0.get(), 3);
     read_runtime_project(&target, "0.5.0").unwrap();
+}
+
+#[test]
+fn sync_preserves_the_original_yaml_of_an_equivalent_pnpm_lock() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("consumer");
+    let initial = init(&release, &root, "node", PackageMode::Local);
+    let path = root.join("pnpm-lock.yaml");
+    let original = format!(
+        "# Project-owned lockfile\nx-metadata: {{enabled: true}}\n\n{}",
+        fs::read_to_string(&path).unwrap()
+    );
+    fs::write(&path, &original).unwrap();
+    let result = sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap();
+    assert!(result.no_op && result.files.is_empty());
+    assert_eq!(result.state.generation, initial.generation);
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]

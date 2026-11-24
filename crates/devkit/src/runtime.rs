@@ -2022,8 +2022,12 @@ fn cleanup_without_stand(
     }
     let state = read_accepted_header(root)?;
     let pin_path = safe_path(root, ".devkit/runtime/toolchains.env")?;
-    let (bytes, actual) = read_regular_file(&pin_path, 65536, "accepted engine pins")?
-        .context("Missing accepted engine pins")?;
+    let (bytes, actual) = read_regular_file(
+        &pin_path,
+        TOOLCHAIN_PINS_MAX_BYTES as u64,
+        "accepted engine pins",
+    )?
+    .context("Missing accepted engine pins")?;
     ensure!(
         state
             .managed

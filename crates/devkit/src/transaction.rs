@@ -302,6 +302,7 @@ fn sync_stage_ancestry(root: &Path, stage: &str) -> Result<()> {
 }
 pub struct PreparedTransaction {
     pub journal: UpdateJournal,
+    retire_runtime_licenses: bool,
 }
 impl PreparedTransaction {
     pub fn prepare(
@@ -385,7 +386,48 @@ impl PreparedTransaction {
             created_directories: created,
         };
         validate_journal(&journal)?;
-        Ok(Self { journal })
+        let retire_runtime_licenses = journal.files.iter().any(|file| {
+            file.after.is_none() && Path::new(&file.path).starts_with(RUNTIME_LICENSES)
+        }) && !exists(&safe_path(staged_root, RUNTIME_LICENSES)?)?;
+        Ok(Self {
+            journal,
+            retire_runtime_licenses,
+        })
+    }
+
+    /// Staging skips Git metadata and build outputs. Before retiring the notices,
+    /// account for every live entry, including empty or excluded directories.
+    pub(crate) fn check_runtime_removals(&self, root: &Path) -> Result<()> {
+        if !self.retire_runtime_licenses {
+            return Ok(());
+        }
+        let directory = safe_path(root, RUNTIME_LICENSES)?;
+        let allowed: BTreeSet<_> = self
+            .journal
+            .files
+            .iter()
+            .filter(|file| {
+                file.after.is_none() && Path::new(&file.path).starts_with(RUNTIME_LICENSES)
+            })
+            .flat_map(|file| Path::new(&file.path).ancestors())
+            .collect();
+        let mut directories = vec![directory];
+        while let Some(parent) = directories.pop() {
+            for entry in fs::read_dir(parent)? {
+                let entry = entry?;
+                let path = entry.path();
+                let name = path.strip_prefix(root)?;
+                ensure!(
+                    allowed.contains(name),
+                    "Unexpected runtime entry: {}",
+                    name.display()
+                );
+                if entry.file_type()?.is_dir() {
+                    directories.push(path);
+                }
+            }
+        }
+        Ok(())
     }
     pub fn commit(
         &self,
@@ -426,6 +468,12 @@ impl PreparedTransaction {
                     file.path
                 );
                 verify_saved(root, file)?;
+                if file.path == MANIFEST_PATH && self.retire_runtime_licenses {
+                    ensure!(
+                        !exists(&safe_path(root, RUNTIME_LICENSES)?)?,
+                        "Cannot accept headless runtime while {RUNTIME_LICENSES} exists"
+                    );
+                }
                 if let Some(staged) = &file.staged {
                     write_atomic(
                         &p,

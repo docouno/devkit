@@ -818,9 +818,8 @@ fn stage_runtime_files(
 ) -> Result<BTreeMap<String, FileIdentity>> {
     let mut managed = BTreeMap::new();
     let scoped = uses_profile_scoped_runtime(&state.version)?;
-    let electron = has_electron(state);
-    let omit_desktop = scoped && !electron;
-    if scoped && electron {
+    let omit_desktop = scoped && !has_electron(state);
+    if scoped {
         for name in DESKTOP_RUNTIME_FILES {
             ensure!(
                 release.manifest.files.contains_key(name),
@@ -841,18 +840,16 @@ fn stage_runtime_files(
                 pins.engine.version == state.version,
                 "Release toolchain version differs from manifest"
             );
+            ensure!(
+                pins.desktop_recipe == release.manifest.files["runtime/desktop.Dockerfile"].sha256,
+                "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
+            );
             if omit_desktop {
                 bytes = std::str::from_utf8(&bytes)?
                     .split_inclusive('\n')
                     .filter(|line| !line.starts_with("DEVKIT_DESKTOP_RECIPE_HASH="))
                     .collect::<String>()
                     .into_bytes();
-            } else {
-                ensure!(
-                    pins.desktop_recipe
-                        == release.manifest.files["runtime/desktop.Dockerfile"].sha256,
-                    "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
-                );
             }
         } else if omit_desktop && name == "runtime/compose.tools.yaml" {
             bytes = render_headless_tool_compose(&bytes)?;
@@ -1497,6 +1494,8 @@ fn mutate(
             matched,
             "Component {path} already exists with different or unverified registration options; use make sync reconcile=1 to reconcile its lock"
         );
+        verify_managed_set(root, old)?;
+        CheckoutToolPins::admit(root, old)?;
         release.recheck()?;
         snapshot.recheck()?;
         return Ok(MutationOutcome {
@@ -1915,6 +1914,7 @@ fn mutate(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
+            tx.check_runtime_removals(root)?;
             if let Some(inventory) = compose_inventory {
                 assert_compose_inventory(root, inventory)?;
             }
@@ -2460,6 +2460,7 @@ pub fn sync_project(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
+            tx.check_runtime_removals(root)?;
             Ok(())
         };
         if options.preview {

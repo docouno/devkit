@@ -529,6 +529,15 @@ pub(crate) fn seed_workspace_lock_with_reconciliation(
     }
     crate::pnpm::refresh_importers(root, state, &mut lock)?;
     crate::files::remove_file(&input_path(root, "package-lock.json")?)?;
+    // pnpm and the Rust emitter format the same v9 lock differently. Preserve
+    // the project's bytes, including comments, when the seed adds no changes.
+    let path = input_path(root, "pnpm-lock.yaml")?;
+    if let Some((current, identity)) = crate::pnpm::read_yaml_file(&path)?
+        && identity.mode & 0o111 == 0
+        && crate::pnpm::parse_yaml::<Value>(&current)? == serde_json::to_value(&lock)?
+    {
+        return Ok(());
+    }
     lock.write(root)
 }
 

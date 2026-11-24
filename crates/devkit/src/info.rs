@@ -340,7 +340,7 @@ pub(crate) fn inspect(
         None => safe_path(&root, ".devkit/runtime/toolchains.env")
             .ok()
             .and_then(|path| {
-                read_regular_file(&path, 65536, "toolchain pins")
+                read_regular_file(&path, TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins")
                     .ok()
                     .flatten()
             })
