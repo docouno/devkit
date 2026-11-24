@@ -73,6 +73,30 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+const MAX_METADATA_TIME: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct MetadataDeadline {
+    read_until: Instant,
+    finish_by: Instant,
+}
+
+impl MetadataDeadline {
+    fn before(deadline: Instant) -> Result<Self> {
+        let now = Instant::now();
+        let finish_by = deadline.min(now + MAX_METADATA_TIME);
+        // Leave time to stop the read-only group and drain its bounded pipes.
+        let read_until = finish_by
+            .checked_sub(Duration::from_millis(60))
+            .filter(|at| *at > now)
+            .context("Metadata query deadline exceeded")?;
+        Ok(Self {
+            read_until,
+            finish_by,
+        })
+    }
+}
+
 type MetadataRead = (Option<Box<[u8; 512]>>, Option<ExitStatus>);
 pub enum CpMetadata {
     Header(Box<[u8; 512]>),
@@ -313,27 +337,8 @@ impl ProcessRunner {
         command: &mut Command,
         deadline: Instant,
     ) -> Result<ProcessOutput> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .context("Metadata query deadline exceeded")?;
-        let deadline = Instant::now() + remaining.min(Duration::from_secs(3));
-        let run_until = deadline
-            .checked_sub(Duration::from_millis(60))
-            .context("Metadata query deadline exceeded")?;
-        let timeout = run_until
-            .checked_duration_since(Instant::now())
-            .context("Metadata query deadline exceeded")?;
-        self.run_input_inner(
-            command,
-            OutputMode::Capture(16 * 1024 * 1024),
-            false,
-            Some(timeout),
-            None,
-            None,
-            Some(deadline),
-        )?
-        .success(&command.get_program().to_string_lossy())
+        self.read_before(command, deadline, 16 * 1024 * 1024, false)?
+            .success(&command.get_program().to_string_lossy())
     }
     /// Reconcile already accepted writes after cancellation, within one deadline.
     pub fn capture_recovery_before(
@@ -341,16 +346,25 @@ impl ProcessRunner {
         command: &mut Command,
         deadline: Instant,
     ) -> Result<ProcessOutput> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("Creator recovery deadline exceeded")?;
-        self.run_inner(
+        self.read_before(command, deadline, 16 * 1024 * 1024, true)?
+            .success("Creator recovery query")
+    }
+    fn read_before(
+        &self,
+        command: &mut Command,
+        deadline: Instant,
+        max_bytes: usize,
+        ignore_cancellation: bool,
+    ) -> Result<ProcessOutput> {
+        self.run_input_inner(
             command,
-            OutputMode::Capture(16 * 1024 * 1024),
-            true,
-            Some(remaining.min(Duration::from_secs(3))),
-        )?
-        .success("Creator recovery query")
+            OutputMode::Capture(max_bytes),
+            ignore_cancellation,
+            None,
+            None,
+            None,
+            Some(MetadataDeadline::before(deadline)?),
+        )
     }
     fn run_inner(
         &self,
@@ -396,7 +410,7 @@ impl ProcessRunner {
         timeout: Option<Duration>,
         input: Option<&[u8]>,
         mut reaped: Option<&mut bool>,
-        metadata_deadline: Option<Instant>,
+        metadata_deadline: Option<MetadataDeadline>,
     ) -> Result<ProcessOutput> {
         if !cleanup && let Err(error) = self.check_cancelled() {
             if let Some(flag) = reaped.as_deref_mut() {
@@ -423,18 +437,18 @@ impl ProcessRunner {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
-        let metadata_started = metadata_deadline.map(|_| Instant::now());
-        let mut creator = match self.spawn_creator(command, metadata_deadline) {
-            Ok(creator) => creator,
-            Err(error) => {
-                if let Some(flag) = reaped.as_deref_mut() {
-                    *flag = true;
+        let mut creator =
+            match self.spawn_creator(command, metadata_deadline.map(|at| at.read_until)) {
+                Ok(creator) => creator,
+                Err(error) => {
+                    if let Some(flag) = reaped.as_deref_mut() {
+                        *flag = true;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("Cannot start {}", command.get_program().to_string_lossy())
+                    });
                 }
-                return Err(error).with_context(|| {
-                    format!("Cannot start {}", command.get_program().to_string_lossy())
-                });
-            }
-        };
+            };
         let readers_done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_failed = Arc::new(AtomicBool::new(false));
@@ -454,6 +468,7 @@ impl ProcessRunner {
                 readers_done.clone(),
                 overflow.clone(),
                 reader_failed.clone(),
+                metadata_deadline.map(|at| at.finish_by),
             )
         });
         let stderr = creator.child.stderr.take().map(|stream| {
@@ -463,15 +478,16 @@ impl ProcessRunner {
                 readers_done.clone(),
                 overflow.clone(),
                 reader_failed.clone(),
+                metadata_deadline.map(|at| at.finish_by),
             )
         });
-        let started = metadata_started.unwrap_or_else(Instant::now);
+        let started = Instant::now();
         let status = loop {
             if !cleanup && let Err(error) = self.check_cancelled() {
                 break Err(error);
             }
             if timeout.is_some_and(|t| started.elapsed() >= t)
-                || metadata_deadline.is_some_and(|at| Instant::now() >= at)
+                || metadata_deadline.is_some_and(|at| Instant::now() >= at.read_until)
             {
                 break Err(anyhow::anyhow!("Process exceeded its deadline"));
             }
@@ -495,7 +511,7 @@ impl ProcessRunner {
         // This happens on every path, including wait/read errors. Do not let an
         // early ? bypass termination and reaping of the exact creator PGID.
         let stopped = match metadata_deadline {
-            Some(deadline) => creator.finish_metadata(deadline),
+            Some(deadline) => creator.finish_metadata(deadline.finish_by),
             None => creator.finish(),
         };
         if stopped.is_ok()
@@ -556,16 +572,8 @@ impl ProcessRunner {
         Ok(output)
     }
     fn query(&self, command: &mut Command, deadline: Instant) -> Result<ProcessOutput> {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .context("Container cleanup deadline exceeded")?;
-        self.run_inner(
-            command,
-            OutputMode::Capture(1024 * 1024),
-            true,
-            Some(timeout.min(Duration::from_secs(3))),
-        )?
-        .success("Docker ownership query")
+        self.read_before(command, deadline, 1024 * 1024, true)?
+            .success("Docker ownership query")
     }
     fn named_ids(&self, owned: &OwnedContainer, deadline: Instant) -> Result<Vec<String>> {
         let output = self
@@ -609,6 +617,7 @@ impl ProcessRunner {
             "Invalid image metadata query"
         );
         self.check_cancelled()?;
+        let deadline = MetadataDeadline::before(Instant::now() + timeout.min(MAX_METADATA_TIME))?;
         let mut command = Command::new("docker");
         command
             .args(["cp", &format!("{id}:{path}"), "-"])
@@ -616,13 +625,8 @@ impl ProcessRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut creator = self
-            .spawn_creator(&mut command, None)
+            .spawn_creator(&mut command, Some(deadline.read_until))
             .context("Cannot start image metadata query")?;
-        let mut stdout = creator
-            .child
-            .stdout
-            .take()
-            .context("Missing metadata stream")?;
         let done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
@@ -633,9 +637,15 @@ impl ProcessRunner {
                 done.clone(),
                 overflow.clone(),
                 failed.clone(),
+                Some(deadline.finish_by),
             )
         });
         let result = (|| -> Result<MetadataRead> {
+            let mut stdout = creator
+                .child
+                .stdout
+                .take()
+                .context("Missing metadata stream")?;
             let fd = stdout.as_raw_fd();
             // SAFETY: this is the live, owned pipe descriptor.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -644,13 +654,12 @@ impl ProcessRunner {
                     && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
                 "Cannot configure metadata pipe"
             );
-            let deadline = Instant::now() + timeout.min(Duration::from_secs(3));
             let mut header = Box::new([0; 512]);
             let mut count = 0;
             loop {
                 self.check_cancelled()?;
                 ensure!(
-                    Instant::now() < deadline,
+                    Instant::now() < deadline.read_until,
                     "Image metadata query exceeded deadline"
                 );
                 ensure!(
@@ -676,8 +685,7 @@ impl ProcessRunner {
                 thread::sleep(Duration::from_millis(2));
             }
         })();
-        drop(stdout);
-        let stopped = creator.finish();
+        let stopped = creator.finish_metadata(deadline.finish_by);
         done.store(true, Ordering::SeqCst);
         let stderr = join_reader(stderr);
         stopped?;
@@ -1041,6 +1049,7 @@ fn reader(
     done: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Reader {
     thread::spawn(move || {
         let result = (|| {
@@ -1055,6 +1064,12 @@ fn reader(
             let mut block = [0; 8192];
             let mut finished_at = None;
             loop {
+                if deadline.is_some_and(|at| Instant::now() >= at) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Metadata output exceeded its deadline",
+                    ));
+                }
                 if done.load(Ordering::SeqCst) {
                     let at = finished_at.get_or_insert_with(Instant::now);
                     if at.elapsed() >= Duration::from_millis(100) {

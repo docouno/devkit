@@ -206,6 +206,77 @@ fn native_process_probe() {
             .unwrap();
     }
     let owned = OwnedContainer::new("devkit-process-test".into(), "accepted-token".into());
+    if scenario.starts_with("metadata-") {
+        #[cfg(target_os = "macos")]
+        if scenario == "metadata-handshake" {
+            runner
+                .enable_group_watcher(
+                    Path::new(&std::env::var_os("DEVKIT_PROCESS_FIXTURE").unwrap())
+                        .join("observer"),
+                )
+                .unwrap();
+        }
+        if scenario == "metadata-results" {
+            use devkit::processes::CpMetadata;
+            let budget = Duration::from_secs(2);
+            let CpMetadata::Header(bytes) = runner.cp_metadata(ID, "/file", budget).unwrap() else {
+                panic!("Expected the first tar header");
+            };
+            assert_eq!(*bytes, [0; 512]);
+            assert!(matches!(
+                runner.cp_metadata(ID, "/missing", budget).unwrap(),
+                CpMetadata::Missing
+            ));
+            assert!(runner.cp_metadata(ID, "/oversize", budget).is_err());
+            return;
+        }
+        if scenario == "metadata-cancelled" {
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            assert!(runner.check_cancelled().is_err());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            assert!(
+                runner
+                    .capture_before(&mut Command::new("true"), deadline)
+                    .is_err()
+            );
+            assert!(
+                runner
+                    .cp_metadata(ID, "/file", Duration::from_secs(2))
+                    .is_err()
+            );
+            runner
+                .capture_recovery_before(&mut Command::new("true"), deadline)
+                .unwrap();
+            assert!(
+                runner
+                    .inspection_snapshot(&owned, &Default::default(), deadline)
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+        for operation in ["capture", "recovery", "snapshot", "cp"] {
+            let timeout = Duration::from_millis(300);
+            let start = Instant::now();
+            let deadline = start + timeout;
+            let mut command = Command::new("docker");
+            let error = match operation {
+                "capture" => runner.capture_before(&mut command, deadline).err(),
+                "recovery" => runner.capture_recovery_before(&mut command, deadline).err(),
+                "snapshot" => runner
+                    .inspection_snapshot(&owned, &Default::default(), deadline)
+                    .err(),
+                _ => runner.cp_metadata(ID, "/file", timeout).err(),
+            }
+            .expect("Stalled metadata query succeeded");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{operation} took {:?}: {error:#}",
+                start.elapsed()
+            );
+        }
+        return;
+    }
     let mut command = Command::new("sh");
     let source = match scenario.as_str() {
         "exit42" => "exit 42",
@@ -737,26 +808,85 @@ fn killed_controller_releases_descendants_and_captured_pipes() {
     }
 }
 
+#[test]
+fn metadata_reads_share_the_reap_deadline_and_stop_term_ignoring_descendants() {
+    let fixture = Fixture::new();
+    script(
+        &fixture.root().join("docker"),
+        r#"#!/bin/sh
+trap '' TERM
+sleep 25 &
+printf '%s\n%s\n' "$$" "$!" >> "$DEVKIT_PROCESS_FIXTURE/pids"
+wait
+"#,
+    );
+    let output = wait(fixture.start("metadata-stalled"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pids = fs::read_to_string(fixture.root().join("pids")).unwrap();
+    assert_eq!(pids.lines().count(), 8);
+    for pid in pids.lines() {
+        assert!(
+            descendant_stopped(pid.parse().unwrap()),
+            "Metadata process {pid} survived"
+        );
+    }
+}
+
+#[test]
+fn image_metadata_stops_at_the_first_header_and_bounds_diagnostics() {
+    let fixture = Fixture::new();
+    script(
+        &fixture.root().join("docker"),
+        r#"#!/bin/sh
+set -eu
+case "${2#*:}" in
+    /file) trap '' TERM; dd if=/dev/zero bs=512 count=1 2>/dev/null; exec sleep 25 ;;
+    /missing) printf 'Error response from daemon: Could not find the file /missing in container %s\n' "${2%%:*}" >&2; exit 1 ;;
+    /oversize) dd if=/dev/zero bs=8193 count=1 >&2 2>/dev/null; dd if=/dev/zero bs=512 count=1 2>/dev/null ;;
+esac
+"#,
+    );
+    let output = wait(fixture.start("metadata-results"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn recovery_observations_can_finish_after_cancellation() {
+    let output = wait(Fixture::new().start("metadata-cancelled"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn metadata_deadline_bounds_an_unresponsive_observer_handshake() {
-    let t = TempDir::new().unwrap();
-    let path = t.path().join("observer");
-    script(&path, "#!/bin/sh\nexec /bin/sleep 25\n");
-    let runner = ProcessRunner::new().unwrap();
-    runner.enable_group_watcher(path).unwrap();
-    let start = Instant::now();
-    let marker = t.path().join("started");
-    assert!(
-        runner
-            .capture_before(
-                Command::new("touch").arg(&marker),
-                start + Duration::from_millis(300)
-            )
-            .is_err()
+    let fixture = Fixture::new();
+    script(
+        &fixture.root().join("docker"),
+        "#!/bin/sh\ntouch \"$DEVKIT_PROCESS_FIXTURE/started\"\n",
     );
-    assert!(start.elapsed() < Duration::from_secs(2));
-    assert!(!marker.exists());
+    script(
+        &fixture.root().join("observer"),
+        "#!/bin/sh\nexec /bin/sleep 25\n",
+    );
+    let output = wait(fixture.start("metadata-handshake"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.root().join("started").exists());
 }
 
 #[cfg(target_os = "macos")]

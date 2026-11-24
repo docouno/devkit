@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO / "test"))
 from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, linux_arch, payload_engine, payload_name  # noqa: E402
 
 OWNERSHIP = "io.docouno.devkit.packaged-test"
+COMMAND_TIMEOUT_SECONDS = 600
 
 
 def require(condition, message):
@@ -277,7 +278,7 @@ class Verification:
                 check_payload_path(entry.name)
         return destination
 
-    def run(self, label, argv, *, expected=None, timeout=600, cwd=None, environment=None):
+    def run(self, label, argv, *, expected=None, timeout=COMMAND_TIMEOUT_SECONDS, cwd=None, environment=None):
         sequence = len(self.results) + 1
         logfile = self.receipt / f"{sequence:03d}-{label}.log"
         started = time.monotonic()
@@ -644,6 +645,8 @@ class Verification:
         self.make(root, "setup", label="fullstack-web-setup")
         self.make(root, "up", "app=web", label="fullstack-web-selected-start")
         api, web = self.service(root, "api"), self.service(root, "web")
+        # The first cargo run compiles the API before its HTTP listener opens.
+        self.http(self.port(api, 8080), "/health", {"status": "ok"}, timeout=COMMAND_TIMEOUT_SECONDS)
         self.http(self.port(web, 5173), "/api/greeting?name=Connected", {"message": "Hello, Connected!"})
         self.preview_host_wire(root)
         self.make(root, "down", label="fullstack-web-stop")

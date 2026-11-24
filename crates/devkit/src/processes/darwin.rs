@@ -280,6 +280,20 @@ fn bound_handshake(channel: &UnixStream, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+fn read_handshake(channel: &mut UnixStream, mut frame: &mut [u8], deadline: Instant) -> Result<()> {
+    // SO_RCVTIMEO bounds each read. Partial frames share the startup deadline.
+    while !frame.is_empty() {
+        bound_handshake(channel, deadline)?;
+        match channel.read(frame) {
+            Ok(0) => anyhow::bail!("Observer closed its startup socket"),
+            Ok(count) => frame = &mut frame[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 impl Observer {
     fn start(image: &WatcherImage, startup_deadline: Instant) -> Result<Self> {
         image.check_path()?;
@@ -315,17 +329,14 @@ impl Observer {
             admitted: false,
             startup_deadline,
         };
-        bound_handshake(&observer.channel, startup_deadline)?;
         let mut header = [0; size_of::<usize>()];
-        observer.channel.read_exact(&mut header)?;
+        read_handshake(&mut observer.channel, &mut header, startup_deadline)?;
         image.check_mapping(observer.child.id() as i32, usize::from_ne_bytes(header))?;
         bound_handshake(&observer.channel, startup_deadline)?;
         observer.channel.write_all(&[READY])?;
         observer.admitted = true;
         let mut bytes = [0; 4];
-        observer
-            .channel
-            .read_exact(&mut bytes)
+        read_handshake(&mut observer.channel, &mut bytes, startup_deadline)
             .context("Creator group observer failed to initialize")?;
         observer.pgid = i32::from_ne_bytes(bytes);
         ensure!(observer.pgid > 1, "Invalid creator group acknowledgement");
@@ -727,6 +738,29 @@ pub fn run_watcher(args: &[OsString]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_observer_frame_shares_one_deadline() {
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            for _ in 0..8 {
+                if sender.write_all(&[READY]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        assert!(
+            read_handshake(
+                &mut receiver,
+                &mut [0; 8],
+                Instant::now() + Duration::from_millis(200)
+            )
+            .is_err()
+        );
+        drop(receiver);
+        writer.join().unwrap();
+    }
 
     #[test]
     fn wrong_mapped_image_fails_observer_admission() {
