@@ -16,9 +16,9 @@ help:
 	  'make build          Build the attributed static release ELF, offline' \
 	  'make pack output=/absolute/new/build-set  Assemble clean committed source' \
 	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished preview' \
-	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.4.1/payload baseline_set=/absolute/v0.4.1' \
-	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.4.1' \
-	  'make verify-public from_version=0.4.1 version=0.6.0 expected_index_sha256=SHA256' \
+	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.5.1/payload baseline_set=/absolute/v0.5.1' \
+	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.5.1' \
+	  'make verify-public from_version=0.5.1 version=0.6.0 expected_index_sha256=SHA256' \
 	  'make init release=/absolute/set/payload target=/absolute/new/project' \
 	  'Ordinary checks use cached SDKs. Only setup prepares images and dependencies.'
 setup: bootstrap
@@ -96,8 +96,10 @@ test: test-native test-special test-env test-npm-inputs
 test-native:
 	$(call author_rust,cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl -- --test-threads=1)
 test-special:
+	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --lib pinned_cargo_metadata -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core git_tracks_output_named_component_sources_and_ignores_scoped_outputs -- --ignored --exact --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test native pinned_cargo_metadata -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core pinned_cargo_metadata -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test assembler -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test notices -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core linux_strace_checks_actual_commit_and_recovery_durability_order -- --ignored --exact --test-threads=1)
@@ -145,7 +147,7 @@ verify-delivery:
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
 	@DEVKIT_TEST_BUILD_SET="$$DEVKIT_BUILD_SET" DEVKIT_TEST_DOCKER=1 python3 test/delivery/test_delivery.py < /dev/null
 verify-bootstrap:
-	@test -n "$$DEVKIT_BASELINE_SET" || { printf '%s\n' 'Set baseline_set=/absolute/v0.4.1.' >&2; exit 1; }
+	@test -n "$$DEVKIT_BASELINE_SET" || { printf '%s\n' 'Set baseline_set=/absolute/v0.5.1.' >&2; exit 1; }
 	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
 	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --baseline-set "$$DEVKIT_BASELINE_SET" < /dev/null

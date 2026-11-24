@@ -59,6 +59,8 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(before, snapshot(root))
             (root / "apps/api/target").mkdir()
             (root / "apps/api/target/output").write_text("native output")
+            (root / "target").mkdir()
+            (root / "target/output").write_text("workspace output")
             self.assertEqual(before, snapshot(root))
 
     def test_index_bytes_not_a_self_consistent_changed_asset(self):
@@ -176,10 +178,11 @@ finally:
             app = root / "apps/app001"
             (app / "src").mkdir(parents=True)
             (app / "tests").mkdir()
-            (app / "Cargo.lock").write_text("original template lock\n")
+            lock = root / "Cargo.lock" if side == "native" else app / "Cargo.lock"
+            lock.write_text("original template lock\n")
             if side == "baseline":
                 (app / "README.md").write_text("Historical template instructions\n")
-            gate.edit_product(root, 1, 0)
+            gate.edit_product(root, 1, 0, side == "native")
             readme = app / "README.md"
             readmes.append((readme.read_bytes(), readme.stat().st_mode & 0o777))
         self.assertEqual(readmes[0], readmes[1])

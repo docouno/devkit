@@ -328,7 +328,7 @@ jobs:
           root = Path.cwd()
           command = ['python3', 'test/public/readme.py', '--build-set', str(root / '.artifacts/frozen'), '--output', str(root / '.artifacts/release-proof/readme.json')]
           previous = os.environ['PREVIOUS_ENV']
-          if tuple(map(int, previous.split('.'))) >= (0, 4, 0):
+          if tuple(map(int, previous.split('.'))) >= (0, 5, 0):
               command += ['--previous-native', previous]
           subprocess.run(command, check=True, timeout=3600)
           PY

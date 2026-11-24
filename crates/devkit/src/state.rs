@@ -11,7 +11,7 @@ use std::{
 pub const MANIFEST_PATH: &str = ".devkit/manifest.json";
 pub const PENDING_PATH: &str = ".devkit/update-pending.json";
 pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
-pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
+pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.5.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const RUNTIME_LICENSES: &str = ".devkit/runtime/licenses";
 
@@ -70,7 +70,12 @@ struct MinimalManifestFloor {
     version: Option<String>,
 }
 
-fn unsupported_floor_error(is_update: bool, found: &str, min_from: &str) -> anyhow::Error {
+fn unsupported_floor_error(
+    is_update: bool,
+    found: &str,
+    min_from: &str,
+    advice: &str,
+) -> anyhow::Error {
     let code = if is_update {
         "UNSUPPORTED_UPGRADE_PATH"
     } else {
@@ -79,7 +84,7 @@ fn unsupported_floor_error(is_update: bool, found: &str, min_from: &str) -> anyh
     crate::cli::error(
         code,
         format!(
-            "Project uses Devkit {found}, which is older than the minimum supported version {min_from}. Upgrade through the 0.4.1 bridge release first: npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check (append --reconcile-lock if transitive npm peer dependencies conflict)."
+            "Project uses Devkit {found}, which is older than the minimum supported version {min_from}. {advice}"
         ),
     )
 }
@@ -109,8 +114,9 @@ pub(crate) fn ensure_supported_manifest_bytes(
     if raw.schema_version == 1 {
         return Err(unsupported_floor_error(
             is_update,
-            "schemaVersion 1 (< 0.2.0)",
+            "schemaVersion 1",
             min_from,
+            r#"Download bootstrap.sh from release v0.2.1 and run bash bootstrap.sh update "$PWD" --version 0.2.1 to migrate to schema 2. Then upgrade through 0.4.1 and 0.5.1."#,
         ));
     }
     ensure!(
@@ -119,8 +125,20 @@ pub(crate) fn ensure_supported_manifest_bytes(
     );
     let ver = raw.version.context("Missing project manifest version")?;
     version(&ver)?;
-    if SemVer::parse(&ver)? < SemVer::parse(min_from)? {
-        return Err(unsupported_floor_error(is_update, &ver, min_from));
+    let found = SemVer::parse(&ver)?;
+    if found < SemVer::parse(min_from)? {
+        let advice = match (found.major, found.minor, found.prerelease.is_empty()) {
+            (0, 2 | 3, true) => {
+                "Upgrade first with npx @docouno/devkit@0.4.1 update . --to 0.4.1 && make setup && make check. Then upgrade through 0.5.1."
+            }
+            (0, 4, true) => {
+                "Upgrade first with npx @docouno/devkit@0.5.1 update . --to 0.5.1 && make setup && make check."
+            }
+            _ => {
+                "Consult the target release's supported upgrade window to select a compatible intermediate release."
+            }
+        };
+        return Err(unsupported_floor_error(is_update, &ver, min_from, advice));
     }
     Ok(ver)
 }
@@ -169,6 +187,7 @@ pub fn managed_path(name: &str) -> Result<&str> {
     ensure!(
         name.starts_with(".devkit/runtime/")
             || [
+                "rust-toolchain.toml",
                 ".devkit/project.mk",
                 ".devkit/compose.apps.yaml",
                 ".devkit/compose.workspace.json",
@@ -195,6 +214,67 @@ pub fn validate_project_state(s: &ProjectState) -> Result<()> {
     for (name, id) in &s.managed {
         managed_path(name)?;
         validate_identity(id)?;
+    }
+    let root_workspace =
+        crate::native::CargoWorkspaceKind::for_state(s)? == crate::native::CargoWorkspaceKind::Root;
+    let rust = s
+        .components
+        .values()
+        .any(|c| c.toolchain == Toolchain::Rust);
+    ensure!(
+        s.managed.contains_key("rust-toolchain.toml") == (root_workspace && rust),
+        "Invalid managed root rust-toolchain.toml for the accepted Cargo layout"
+    );
+    ensure!(
+        !root_workspace || !s.managed.keys().any(|path| MANAGED_RUST_RE.is_match(path)),
+        "Root Cargo workspace cannot have a managed component rust-toolchain.toml"
+    );
+    if let Some(resolution) = &s.cargo_resolution {
+        ensure!(
+            root_workspace && rust,
+            "Unexpected cargoResolution for a project without a root Cargo workspace"
+        );
+        ensure!(
+            resolution.version == 1,
+            "Unsupported cargoResolution schema version: {}",
+            resolution.version
+        );
+        ensure!(
+            SHA256_RE.is_match(&resolution.lock)
+                && SHA256_RE.is_match(&resolution.inputs.digest)
+                && SHA256_RE.is_match(&resolution.inputs.policy)
+                && SHA256_RE.is_match(&resolution.inputs.locals),
+            "Invalid cargoResolution digest"
+        );
+        for (member, hash) in &resolution.inputs.members {
+            let safe_segments = !member.is_empty()
+                && !member.starts_with('/')
+                && !member.ends_with('/')
+                && member.split('/').all(|seg| {
+                    !matches!(seg, "" | "." | "..")
+                        && !seg.contains(['\\', '\0'])
+                        && !seg.chars().any(char::is_control)
+                });
+            ensure!(
+                safe_segments && SHA256_RE.is_match(hash),
+                "Invalid cargoResolution member entry: {member}"
+            );
+        }
+        if let Some(selections) = &resolution.inputs.local_selections {
+            for dir in selections {
+                ensure!(
+                    !dir.is_empty()
+                        && !dir.starts_with('/')
+                        && !dir.ends_with('/')
+                        && dir.split('/').all(|seg| {
+                            !matches!(seg, "" | "." | "..")
+                                && !seg.contains(['\\', '\0'])
+                                && !seg.chars().any(char::is_control)
+                        }),
+                    "Invalid cargoResolution local selection path: {dir}"
+                );
+            }
+        }
     }
     for required in [
         CHECKSUM_PATH,
@@ -327,22 +407,64 @@ pub fn excluded_snapshot_path(name: &str) -> bool {
 pub fn snapshot_excluded(state: &ProjectState, name: &str) -> bool {
     excluded_snapshot_path(name)
         || state.components.iter().any(|(p, c)| {
+            if c.toolchain == Toolchain::Rust {
+                return Path::new(name).starts_with(Path::new(p).join("target"));
+            }
             profile_outputs(c.tooling_profile)
                 .iter()
                 .any(|o| name == format!("{p}/{o}") || name.starts_with(&format!("{p}/{o}/")))
         })
 }
+/// Nested or excluded Cargo crates can retain their own build outputs. Exclude
+/// any `<crate>/target` at a crate boundary (regular non-symlink Cargo.toml)
+/// so product `src/target` directories stay copied while legacy/adopting targets
+/// are never staged or hashed.
+pub fn snapshot_excluded_at(root: &Path, state: &ProjectState, name: &str) -> bool {
+    if snapshot_excluded(state, name) {
+        return true;
+    }
+    let mut prefix = std::path::PathBuf::new();
+    for component in Path::new(name).components() {
+        let std::path::Component::Normal(part) = component else {
+            return false;
+        };
+        if part == "target" && !prefix.as_os_str().is_empty() {
+            let manifest = root.join(&prefix).join("Cargo.toml");
+            if fs::symlink_metadata(&manifest)
+                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+            {
+                return true;
+            }
+        }
+        prefix.push(part);
+    }
+    false
+}
 pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<String> {
+    source_signature_with_extra(root, state, None)
+}
+pub(crate) fn source_signature_with_extra(
+    root: &Path,
+    state: Option<&ProjectState>,
+    extra_excluded_dir: Option<&str>,
+) -> Result<String> {
     fn visit(
         root: &Path,
         dir: &Path,
         state: Option<&ProjectState>,
+        extra_excluded_dir: Option<&str>,
         rows: &mut Vec<Value>,
     ) -> Result<()> {
         for e in sorted_entries(dir)? {
             let p = e.path();
             let n = relative_name(root, &p)?;
-            if state.map_or_else(|| excluded_snapshot_path(&n), |s| snapshot_excluded(s, &n)) {
+            if extra_excluded_dir
+                .is_some_and(|prefix| n == prefix || n.starts_with(&format!("{prefix}/")))
+                || state.map_or_else(
+                    || excluded_snapshot_path(&n),
+                    |s| snapshot_excluded_at(root, s, &n),
+                )
+            {
                 continue;
             }
             let m = fs::symlink_metadata(&p)?;
@@ -354,7 +476,7 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
                 ]));
             } else if m.is_dir() {
                 rows.push(json!([n, "directory"]));
-                visit(root, &p, state, rows)?;
+                visit(root, &p, state, extra_excluded_dir, rows)?;
             } else if m.is_file() {
                 let identity = identity(&p)?.context("Project source disappeared")?;
                 rows.push(json!([n, identity.mode, identity.sha256]));
@@ -367,7 +489,7 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
         Ok(())
     }
     let mut rows = vec![];
-    visit(root, root, state, &mut rows)?;
+    visit(root, root, state, extra_excluded_dir, &mut rows)?;
     Ok(digest(serde_json::to_vec(&json!([
         "devkit-source-v1",
         rows
@@ -578,7 +700,12 @@ pub(crate) fn admit_runtime_snapshot_with_pins(
         None => crate::runtime::CheckoutToolPins::admit(root, &s)?,
     };
     let native = crate::native::admit_native_components(root, &s)?;
-    crate::projections::assert_projections(root, &s, &native.inputs)?;
+    crate::projections::assert_projections(
+        root,
+        &s,
+        &native.inputs,
+        native.cargo_workspace.as_ref(),
+    )?;
     let snapshot = RuntimeAdmission {
         root: root.to_path_buf(),
         state: s,

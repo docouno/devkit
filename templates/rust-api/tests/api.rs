@@ -1,3 +1,5 @@
+use devkit_api::router;
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 async fn get_json(uri: &str) -> (StatusCode, Value) {
-    let response = devkit_api::router()
+    let response = router()
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -46,7 +48,7 @@ async fn greeting_uses_default_and_decodes_names() {
 
 #[tokio::test]
 async fn rejects_duplicate_name_parameters() {
-    let response = devkit_api::router()
+    let response = router()
         .oneshot(
             Request::builder()
                 .uri("/api/greeting?name=Ada&name=Bob")
@@ -60,7 +62,7 @@ async fn rejects_duplicate_name_parameters() {
 
 #[tokio::test]
 async fn rejects_unknown_routes_and_unsupported_methods() {
-    let not_found = devkit_api::router()
+    let not_found = router()
         .oneshot(
             Request::builder()
                 .uri("/missing")
@@ -71,7 +73,7 @@ async fn rejects_unknown_routes_and_unsupported_methods() {
         .unwrap();
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 
-    let method = devkit_api::router()
+    let method = router()
         .oneshot(
             Request::builder()
                 .method("POST")

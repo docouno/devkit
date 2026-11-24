@@ -5,24 +5,24 @@ This repository uses a pinned Devkit development environment. Daily commands run
 ## Repository Layout
 
 - `apps/<name>` (`0..N`): Runnable product entry points (`node-api`, `react-web`, `electron-react`, `rust-api`). Libraries-only repositories may have zero applications.
-- `packages/<name>` (`1..M`): Reusable workspace libraries (`ts-library`, `react-ui`, `react-client`).
+- `packages/<name>` (`1..M`): Reusable workspace libraries (`ts-library`, `react-ui`, `react-client`, `rust-library`).
 - `.devkit/`: Pinned runtime scripts, Docker/Compose definitions, `.devkit/manifest.json`, and generated Make/Compose projections.
 
 From Devkit `0.6.0`, adding or registering the first Electron app installs `.devkit/runtime/desktop.Dockerfile`, `desktop-seccomp.json`, their `licenses/` attributions and the desktop tool service. Headless projects omit these files and the desktop recipe pin. Use Make, the checkout loader or CLI `0.6.0+` for these projects. Older external CLI versions require the desktop pin.
 
 ## File Ownership Boundaries
 
-- **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/compose.workspace.json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and `{rust-component}/rust-toolchain.toml`.
+- **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/compose.workspace.json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and the root `rust-toolchain.toml` for Rust workspaces.
 - **Shared native manifests**:
   - In `apps/*/package.json` and `packages/*/package.json`, Devkit manages only the `toolDependencies` entries inside `devDependencies` (recorded in `.devkit/manifest.json`). Product `name`, `version`, `private`, `exports`, `files`, `publishConfig`, `scripts`, `dependencies`, `peerDependencies`, and extra `devDependencies` belong to the project.
   - Root `pnpm-workspace.yaml` and `pnpm-lock.yaml` represent the unified Node workspace graph; `package.json` has no `workspaces` field.
-- **Owned by the project**: Component `src/**` and `test/**`, Rust `Cargo.toml` and `Cargo.lock`, root `Makefile`, `compose.yaml`, `AGENTS.md`, `.npmrc`, and `.env` files.
+- **Owned by the project**: Component `src/**` and `test/**`, crate manifests, the virtual root `Cargo.toml`, root `Cargo.lock` and `rustfmt.toml`, root `Makefile`, `compose.yaml`, `AGENTS.md`, `.npmrc`, and `.env` files.
 
 ## Toolchain Rules
 
 1. Use `make exec` to run dependency tools inside the pinned containers.
 2. **Read-only gates**: `make check`, `make test`, `make build`, and `make package` mount source and lockfiles read-only with `--network none`. Only `make fix` writes formatting changes back to source files.
-3. **Syncing manual manifest edits**: After editing `package.json` metadata (`name`, `"private": false`, `exports`, `files`, `publishConfig`) or `.npmrc`, run:
+3. **Syncing manual manifest edits**: After editing Cargo dependencies or membership, `package.json` metadata (`name`, `"private": false`, `exports`, `files`, `publishConfig`) or `.npmrc`, run:
    ```sh
    make sync
    make setup
@@ -36,18 +36,18 @@ From Devkit `0.6.0`, adding or registering the first Electron app installs `.dev
 | `make help` | List available commands and registered components without fetching the engine |
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
 | `make info [app=NAME] [json=1]` | Show checkout identity, readiness, registered components and stand addresses |
-| `make sync [reconcile=1] [preview=1]` | Synchronize workspace projections and `pnpm-lock.yaml` after manual `package.json` or `.npmrc` edits |
+| `make sync [reconcile=1] [preview=1]` | Synchronize workspace lockfiles and build order after native manifest edits |
 | `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |
 | `make test` | Run native unit and integration test suites offline |
-| `make build` | Produce component build artifacts (`dist/` or `target/`) |
+| `make build` | Produce Node build artifacts in component outputs or Cargo artifacts under the root `target/` |
 | `make package` | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) into `release/` |
 | `make dev [app=<name>]` | Start runnable application services and print published `http://127.0.0.1:<port>` URLs |
 | `make logs [app=<name>] [follow=1] [tail=100]` | Inspect or stream service logs (`follow=1` releases the checkout lock before streaming) |
 | `make up [app=NAME]` | Start the stand in the background |
 | `make down [cleanup=1]` | Stop services and optionally release leases while preserving data |
-| `make exec [app=NAME \| package=NAME \| component=PATH] command=ARGV` | Run a command in the root Node workspace or a component |
+| `make exec [app=NAME \| package=NAME \| component=PATH] command=ARGV` | Run a command in a component or root workspace (use `toolchain=rust` for Cargo in a mixed repository) |
 | `make add-app`, `make add-package`, `make register` | Generate or register components |
 | `make update to=VERSION [preview=1] [reconcile=1]`, `make recover` | Update the accepted release or recover an interrupted update |
 
@@ -77,6 +77,32 @@ make add-package name=sdk template=ts-library
 make add-app name=web template=react-web use=sdk
 make setup
 ```
+
+### Share a Rust library
+
+```sh
+make add-package name=protocol template=rust-library
+make add-app name=server template=rust-api use=protocol
+make add-app name=worker template=rust-api use=protocol
+make setup
+make test app=server
+```
+
+Rust components use one virtual root `Cargo.toml` with explicit member paths, one root `Cargo.lock` and one build directory per checkout. Setup fetches locked dependencies once. Library and application gates reuse matching artifacts from `target/` and run tests for the selected component. `make fix app=server` formats the server's crates. Cargo and rustfmt configuration belong at the checkout root. To adopt an existing package, run `make register package=NAME profile=rust`.
+
+Root exec selects Rust in Rust-only projects and Node in mixed projects. A component selector runs the tool in that component. Read-only Rust exec uses a temporary build directory. `write=1` allows changes to the checkout, including the shared lock.
+
+```sh
+make exec toolchain=rust command='cargo metadata --no-deps'
+make exec app=server write=1 network=bridge command='cargo add anyhow'
+make exec toolchain=rust write=1 network=bridge command='cargo update -p tokio'
+make sync
+make setup
+```
+
+For offline Cargo resolution during add, register or sync, cache the registry or Git data and the exact base image from `.devkit/runtime/rust.Dockerfile`. `make setup` prepares the derived image for daily gates. Check the base image separately before disconnecting.
+
+Run `make sync` after changing manifests or dependency features. The pinned resolver handles changes that affect the wider graph. To require offline resolution, use `sh .devkit/runtime/devkit.sh cli --offline sync .`. To recreate a missing root lock, run `make exec toolchain=rust write=1 network=bridge command='cargo generate-lockfile'` and review the resulting diff. `make info json=1` reports `rustWorkspaceReady` for the workspace.
 
 ### Publishable npm libraries (`ts-library`, `react-ui`)
 
@@ -113,7 +139,9 @@ make update to=<version>
 make setup && make check
 ```
 
-Pass `reconcile=1` when transitive locks need to be regenerated. If an update is interrupted, run `make recover`. For a mixed `0.4.x` to `0.5.0` checkout whose loader still comes from `0.4.x`, use the versioned `0.5.0` installer with `recover .` or `npx @docouno/devkit@0.5.0 recover .`.
+For the `0.5.x` Rust migration, both preview and apply verify the merged lock in staging. Devkit can verify known template and simple local dependency graphs before setup. Other graphs require Docker to run the target release's pinned Cargo. For offline validation, cache the target release, the base image in its `runtime/rust.Dockerfile` and the required Cargo dependency data.
+
+Pass `reconcile=1` for pnpm transitive re-resolution. After an interrupted update, `make recover` restores the previous checkout offline from the local journal without Docker. If the loader still comes from `0.5.x`, run the cached target engine at `${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/docouno/devkit}/engines/x86_64-unknown-linux-musl/0.6.0/<sha256>/devkit recover .`.
 
 ### Shared caches
 

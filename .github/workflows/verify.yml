@@ -177,8 +177,8 @@ jobs:
           make "$VERIFY_TARGET" \
             build_set="$PWD/.artifacts/frozen" \
             release="$PWD/.artifacts/frozen/payload" \
-            previous="$PWD/.artifacts/baseline/v0.4.1/payload" \
-            baseline_set="$PWD/.artifacts/baseline/v0.4.1" \
+            previous="$PWD/.artifacts/baseline/v0.5.1/payload" \
+            baseline_set="$PWD/.artifacts/baseline/v0.5.1" \
             "${extra[@]}"
       - name: Stage consumer Rust image for runtime cache
         if: matrix.group == 'runtime' && steps.runtime_consumer_cache.outputs.cache-hit != 'true'
@@ -258,7 +258,7 @@ jobs:
           recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
           export DEVKIT_PERFORMANCE_TRACE_IMAGE
           DEVKIT_PERFORMANCE_TRACE_IMAGE=$(docker image inspect --format '{{.Id}}' "devkit-author-rust:$recipe_sha")
-          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/baseline/v0.4.1/payload" --output "$PWD/.artifacts/release-ops/performance.json"
+          python3 test/performance/verify.py --build-set "$PWD/.artifacts/frozen" --baseline-release "$PWD/.artifacts/baseline/v0.5.1/payload" --output "$PWD/.artifacts/release-ops/performance.json"
       - name: Preserve the exact successful performance receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

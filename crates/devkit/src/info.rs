@@ -249,40 +249,46 @@ fn local_readiness(
     root: &Path,
     state: &crate::model::ProjectState,
     pins: &CheckoutToolPins,
-) -> &'static str {
+    cache_dir: Option<&Path>,
+) -> (&'static str, Option<Value>) {
     let native = match crate::native::inspect_native_components(root, state) {
         Ok(native) => native,
         Err(error) => {
             let exceeds_budget = error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge);
-            return if exceeds_budget {
-                "unknown"
-            } else {
-                "setup-required"
-            };
+            return (
+                if exceeds_budget {
+                    "unknown"
+                } else {
+                    "setup-required"
+                },
+                None,
+            );
         }
     };
-    let receipts = crate::doctor::local_receipts_with_pins(
-        root,
-        state,
-        pins,
-        Some(&native.node_inputs.digest),
-    );
+    let receipts =
+        crate::doctor::local_receipts_with_pins(root, state, pins, Some(&native), cache_dir);
     let ready = state.components.values().all(|c| match c.toolchain {
-        Toolchain::Rust => receipts["rustImageReady"] == true,
+        Toolchain::Rust => {
+            receipts["rustImageReady"] == true && receipts["rustWorkspaceReady"] == true
+        }
         Toolchain::Node => {
             receipts["nodeWorkspaceReady"] == true
                 && (c.tooling_profile != ToolingProfile::Electron
                     || receipts["desktopImageReady"] == true)
         }
     });
-    if ready { "ready" } else { "setup-required" }
+    (
+        if ready { "ready" } else { "setup-required" },
+        Some(receipts),
+    )
 }
 
 pub(crate) fn inspect(
     root: &Path,
     app: Option<&str>,
+    cache_dir: Option<&Path>,
     runner: &ProcessRunner,
 ) -> Result<(Value, String)> {
     let root = project_root(root)?;
@@ -341,6 +347,7 @@ pub(crate) fn inspect(
     let mut apps = Vec::new();
     let mut packages = Vec::new();
     let mut readiness = "unknown";
+    let mut receipts = None;
     let mut condition = "unknown";
     let mut services = Vec::new();
     let mut reservations = Vec::new();
@@ -387,7 +394,7 @@ pub(crate) fn inspect(
             && let Ok(pins) = CheckoutToolPins::admit(&root, state)
         {
             if !busy {
-                readiness = local_readiness(&root, state, &pins);
+                (readiness, receipts) = local_readiness(&root, state, &pins, cache_dir);
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
@@ -433,6 +440,7 @@ pub(crate) fn inspect(
         && state::assert_no_pending(&root).is_ok();
     if !stable {
         readiness = "unknown";
+        receipts = None;
         condition = "unknown";
         apps.clear();
         packages.clear();
@@ -477,7 +485,7 @@ pub(crate) fn inspect(
     }
     lines.extend(preview::reservation_lines(&reservations, &services));
     Ok((
-        json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,
+        json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,"receipts":receipts,
         "lock":{"state":lock_state,"owner":owner},"apps":apps,"packages":packages,
         "standState":condition,"services":services,"standPorts":reservations}),
         lines.join("\n"),

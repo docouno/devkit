@@ -4,6 +4,7 @@ use crate::{
     compose::{MAX_YAML_BYTES, parse_compose},
     files::*,
     model::*,
+    native::{CargoMember, CargoWorkspaceKind, CargoWorkspaceModel},
     state::{has_electron, uses_profile_scoped_runtime},
 };
 use anyhow::{Context, ensure};
@@ -54,9 +55,18 @@ pub fn render_project_make(state: &ProjectState) -> String {
             })
         );
     }
+    let root_cargo =
+        CargoWorkspaceKind::for_state(state).is_ok_and(|kind| kind == CargoWorkspaceKind::Root);
     for (path, c) in &state.components {
-        if c.toolchain == Toolchain::Node {
-            result += &format!("{}: setup-node-workspace\n", target("setup", path, c.role));
+        if root_cargo || c.toolchain == Toolchain::Node {
+            let setup = if root_cargo
+                && matches!(path.as_str(), "apps/node-workspace" | "apps/rust-workspace")
+            {
+                format!("setup/{path}")
+            } else {
+                target("setup", path, c.role)
+            };
+            result += &format!("{setup}: setup-{}-workspace\n", c.toolchain);
         }
         for command in ["check", "test", "build", "dev"] {
             if c.role == Role::Library && command == "dev" {
@@ -131,7 +141,29 @@ fn project_volume(path: &str) -> Value {
         false,
     )
 }
-pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
+pub(crate) fn cargo_run_command(member: Option<&CargoMember>) -> Result<Vec<String>> {
+    let mut command = [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/Cargo.toml",
+        "--locked",
+        "--offline",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    if let Some(member) = member {
+        // Compose interpolates dollar signs even in list-form command arguments.
+        command.extend(["-p".into(), member.pkgid()?.replace('$', "$$")]);
+    }
+    Ok(command)
+}
+
+pub fn render_app_compose_value(
+    state: &ProjectState,
+    cargo: Option<&CargoWorkspaceModel>,
+) -> Result<Value> {
+    let root_cargo = CargoWorkspaceKind::for_state(state)? == CargoWorkspaceKind::Root;
     let modern = SemVer::parse(&state.version)? >= SemVer::parse("0.5.0")?;
     // Insertion order is part of the accepted0.2 JS runtime projection wire
     // format. New native output uses this same deterministic serializer.
@@ -201,7 +233,11 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
                 ("CARGO_HOME".to_string(), json!("/cache/cargo")),
                 (
                     "CARGO_TARGET_DIR".to_string(),
-                    json!(format!("/workspace/{path}/target")),
+                    if root_cargo {
+                        json!("/workspace/target")
+                    } else {
+                        json!(format!("/workspace/{path}/target"))
+                    },
                 ),
                 ("RUSTUP_AUTO_INSTALL".to_string(), json!("0")),
             ]);
@@ -212,7 +248,11 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
             true,
         )];
         if rust {
-            volumes.push(project_volume(&format!("{path}/target")));
+            volumes.push(if root_cargo {
+                project_volume("target")
+            } else {
+                project_volume(&format!("{path}/target"))
+            });
             volumes.push(volume(
                 if modern {
                     "${DEVKIT_CARGO_CACHE_DIR:?}"
@@ -221,7 +261,7 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
                 }
                 .to_string(),
                 "/cache/cargo".to_string(),
-                false,
+                root_cargo,
             ));
         } else {
             volumes.extend(node_volumes.clone());
@@ -242,16 +282,22 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
                 ]);
             }
         }
-        let command = if rust {
-            vec!["cargo", "run", "--locked", "--offline"]
+        let command = if rust && root_cargo {
+            let members = cargo.map(|workspace| workspace.members(path)).transpose()?;
+            json!(cargo_run_command(match members {
+                Some([member]) => Some(member),
+                _ => None,
+            })?)
+        } else if rust {
+            json!(["cargo", "run", "--locked", "--offline"])
         } else if desktop {
-            vec!["/devkit/devkit", "internal", "desktop"]
+            json!(["/devkit/devkit", "internal", "desktop"])
         } else {
-            vec![
+            json!([
                 if modern { "/devkit/bin/pnpm" } else { "npm" },
                 "run",
-                "dev",
-            ]
+                "dev"
+            ])
         };
         let mut service = json!({"image":if rust{"${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"}else if desktop{"${DEVKIT_DESKTOP_IMAGE:-devkit-unprepared-desktop}"}else{"${DEVKIT_NODE_IMAGE:?}"},"init":true,"user":"${DEVKIT_UID:?}:${DEVKIT_GID:?}","working_dir":format!("/workspace/{path}"),"command":command,"environment":env,"volumes":volumes});
         if modern
@@ -308,8 +354,11 @@ pub fn render_app_compose_value(state: &ProjectState) -> Result<Value> {
     }
     Ok(json!({"services":services}))
 }
-pub fn render_app_compose(state: &ProjectState) -> Result<Vec<u8>> {
-    json_bytes(&render_app_compose_value(state)?)
+pub fn render_app_compose(
+    state: &ProjectState,
+    cargo: Option<&CargoWorkspaceModel>,
+) -> Result<Vec<u8>> {
+    json_bytes(&render_app_compose_value(state, cargo)?)
 }
 pub fn workspace_write_directories(
     state: &ProjectState,
@@ -493,6 +542,7 @@ pub fn assert_projections(
     root: &Path,
     state: &ProjectState,
     inputs: &InputIdentitySet,
+    cargo: Option<&CargoWorkspaceModel>,
 ) -> Result<()> {
     ensure!(
         fs::read(safe_path(root, ".devkit/project.mk")?)? == render_project_make(state).as_bytes(),
@@ -500,7 +550,7 @@ pub fn assert_projections(
     );
     let apps: Value = read_json(&safe_path(root, ".devkit/compose.apps.yaml")?)?;
     ensure!(
-        apps == render_app_compose_value(state)?,
+        apps == render_app_compose_value(state, cargo)?,
         "Development integration projection is stale; run devkit sync"
     );
     let workspace: Value = read_json(&safe_path(root, ".devkit/compose.workspace.json")?)?;

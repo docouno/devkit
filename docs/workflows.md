@@ -64,7 +64,33 @@ make add-app name=docs template=react-web use='tokens ui'
 make setup
 ```
 
-`use=` adds `"<pkgName>": "workspace:*"` to the consumer's `package.json`, updates `pnpm-lock.yaml`, and derives the build/check DAG in `.devkit/manifest.json` and `.devkit/project.mk`.
+For Node components, `use=` adds `"<pkgName>": "workspace:*"` to the consumer's `package.json`, updates `pnpm-lock.yaml`, and derives the build/check DAG in `.devkit/manifest.json` and `.devkit/project.mk`.
+
+### Rust workspaces
+
+Start with a library, then share it between applications or other libraries.
+
+```sh
+npx @docouno/devkit@0.6.0 init services --package protocol=rust-library
+cd services
+make add-package name=storage template=rust-library use=protocol
+make add-app name=server template=rust-api use=storage
+make add-app name=worker template=rust-api use=protocol
+make setup
+make check package=protocol
+make test app=server
+make build
+```
+
+The generated crates are named `lib-protocol`, `lib-storage`, `app-server` and `app-worker`. `use=` takes a registered package slug and writes a Cargo path dependency. The root lock and Make dependency graph update in the same operation. Use `make register package=NAME profile=rust` to adopt an existing Rust library, including its standalone lock if present. To register a group of crates, list its member directories in the root workspace and remove any nested `[workspace]`. Use explicit member paths and keep `.cargo/config.toml`, `rustfmt.toml` and `rust-toolchain.toml` at the checkout root.
+
+To move a crate, edit its entry in `workspace.members` in the root `Cargo.toml` and run `make sync`. If all entries for a registered component disappear, sync can restore its previously accepted paths while the manifests still exist. If the checkout has no saved membership record, list every intended crate directory for that component in `workspace.members` and run `make sync`, including the component directory itself if it is a member.
+
+After setup, Clippy, formatting, test discovery and builds operate on the selected component's members offline. The public Make DAG builds required libraries first. `make fix app=server` formats the server's crates. All Rust gates and development services reuse `target/` in this checkout.
+
+A cold service start and a concurrent Rust gate share Cargo's build-directory lock in this worktree. One build waits for the other. `make down` also waits for an active checkout gate. If the checkout lock times out, retry after the gate finishes.
+
+A managed Rust app starts in its component directory, so the program and Compose command overrides can open app-relative files. For managed apps that group several crates, Devkit reads the binary targets from Cargo at launch. When a group has several runnable crates or its only runnable crate has several binaries without `default-run`, copy the desired command from the diagnostic into the service's `command:` in `compose.yaml`. Each command includes that binary's required Cargo features. To select a particular bin in one crate, use an override such as `["cargo", "run", "--offline", "--locked", "-p", "app-server", "--bin", "server"]`.
 
 ## 3. Add or Update Third-Party Dependencies
 
@@ -77,11 +103,17 @@ make exec package=ui write=1 network=bridge command='pnpm add clsx --lockfile-on
 # Root Node workspace (pass -w when omitting app= / package=)
 make exec write=1 network=bridge command='pnpm add -D -w vitest --lockfile-only --ignore-scripts'
 
-# A Rust app
-make exec app=api write=1 network=bridge command='cargo update --manifest-path Cargo.toml'
+# A Rust app's manifest and its workspace lock
+make exec app=server write=1 network=bridge command='cargo add anyhow'
+make exec app=server write=1 network=bridge command='cargo remove anyhow'
+
+# Update one locked dependency from the root of a mixed workspace
+make exec toolchain=rust write=1 network=bridge command='cargo update -p tokio'
 ```
 
-Follow dependency mutations with `make setup` to refresh the verified workspace lock receipt.
+Root exec selects Rust in Rust-only projects and Node in mixed projects. Use `toolchain=rust` to select Cargo in a mixed checkout and `prepare=1` when the SDK image has yet to be prepared. Read-only Rust exec keeps the checkout read-only and uses a temporary target directory.
+
+After dependency edits, run `make sync` to refresh the component graph, then `make setup` to refresh the workspace readiness receipt. Rust readiness also checks the active Cargo cache under `DEVKIT_CACHE_DIR`. Run `make setup` after selecting an empty cache. If the root `Cargo.lock` is missing, recreate it with `make exec toolchain=rust write=1 network=bridge command='cargo generate-lockfile'` and review the selected versions.
 
 ## 4. Edit Native Manifests and Synchronize (`make sync` / `devkit sync`)
 
@@ -94,13 +126,17 @@ make sync preview=1
 # Apply fast offline JSON sync (or online resolution when registry packages changed)
 make sync
 
-# Reconcile drifted peer/transitive locks across the 3-stage ladder when needed
+# Reconcile drifted pnpm peer/transitive locks across the 3-stage ladder when needed
 make sync reconcile=1
 
 make setup
 ```
 
 For headless projects on `0.6.0` or newer, use Make, the checkout loader, or CLI `0.6.0+`. Older external engines require a desktop recipe pin.
+
+An unchanged Cargo workspace, release-template additions, and simple local library dependencies can be synchronized before setup. A local manifest edit can also change the features or versions selected for other crates. When the new selection requires Cargo, Devkit runs the pinned resolver against a staged copy of the project. It commits the lock and the component graph together after validation. To require offline resolution, use `sh .devkit/runtime/devkit.sh cli --offline sync .`.
+
+If adding or registering a component or running `sync` requires Cargo resolution, `--offline` runs the resolver with `--pull never --network none`. Before going offline, pull the digest-pinned base image from the `FROM` line of `.devkit/runtime/rust.Dockerfile` and populate the shared Cargo cache with the required registry or Git data. `make setup` prepares the derived image used by daily gates. Verify the base image separately with `docker image inspect <pinned-base-image>`.
 
 You can also invoke `npx @docouno/devkit@0.6.0 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
 

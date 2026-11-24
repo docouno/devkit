@@ -23,8 +23,8 @@ TARGET = "x86_64-unknown-linux-musl"
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-z0-9][a-z0-9.-]*)?")
 STABLE_VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 HEX256 = re.compile(r"[a-f0-9]{64}")
-BASELINE_041_INDEX_SHA256 = "0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa"
-BASELINE_041_RELEASE_IDENTITY = "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+BASELINE_051_INDEX_SHA256 = "c55c5b5e0457f5c934079a8bbce272545b1cdbc2b7da25061bd7a95d2780d08a"
+BASELINE_051_RELEASE_IDENTITY = "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
 
 
 def stable_tuple(value):
@@ -129,13 +129,13 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True, help="Published baseline version (>= 0.4.0)")
+    parser.add_argument("--version", required=True, help="Published baseline version (>= 0.5.0)")
     parser.add_argument("--next-version", required=True)
     parser.add_argument("--expected-index-sha256", required=True,
                         help="Digest of the frozen build-set index before publication")
     parser.add_argument("--output", type=Path, help="Optional path for atomic receipt output")
     args = parser.parse_args()
-    require(stable_tuple(args.version) >= (0, 4, 0), "Public baseline version must be >= 0.4.0")
+    require(stable_tuple(args.version) >= (0, 5, 0), "Public baseline version must be >= 0.5.0")
     require(VERSION.fullmatch(args.next_version) and args.version != args.next_version,
             "Use an exact, distinct native target version")
     require(HEX256.fullmatch(args.expected_index_sha256), "Use a frozen SHA256 index identity")
@@ -190,16 +190,16 @@ def main():
         old_archive = scratch / old_name
         raw_old_index = download(f"{BASE}/v{old}/release-index.json",
                                  scratch / f"release-index-{old}.json", 4 * 1024 * 1024)
-        if old == "0.4.1":
-            require(sha256(raw_old_index) == BASELINE_041_INDEX_SHA256,
-                    "Genuine v0.4.1 baseline release-index.json SHA256 changed")
+        if old == "0.5.1":
+            require(sha256(raw_old_index) == BASELINE_051_INDEX_SHA256,
+                    "Genuine v0.5.1 baseline release-index.json SHA256 changed")
         old_index = json.loads(raw_old_index)
         require(old_index["schemaVersion"] == 1 and old_index["version"] == old
                 and old_index["target"] == TARGET and old_index["publicationEligible"] is True,
                 "Public baseline is not a publication-eligible native build-set")
-        if old == "0.4.1":
-            require(old_index["releaseIdentity"] == BASELINE_041_RELEASE_IDENTITY,
-                    "Genuine v0.4.1 baseline releaseIdentity changed")
+        if old == "0.5.1":
+            require(old_index["releaseIdentity"] == BASELINE_051_RELEASE_IDENTITY,
+                    "Genuine v0.5.1 baseline releaseIdentity changed")
         old_release = json.loads(download(
             f"https://api.github.com/repos/docouno/devkit/releases/tags/v{old}",
             scratch / f"github-release-{old}.json", 4 * 1024 * 1024))

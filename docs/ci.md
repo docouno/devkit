@@ -32,7 +32,7 @@ jobs:
           path: |
             ${{ env.DEVKIT_CACHE_DIR }}
             .devkit/cache
-          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
+          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', 'Cargo.lock') }}
           restore-keys: |
             devkit-${{ runner.os }}-
 
@@ -75,6 +75,7 @@ cache:
     files:
       - .devkit/manifest.json
       - pnpm-lock.yaml
+      # Add Cargo.lock for repositories with Rust components
   paths:
     - .devkit/cache/
 
@@ -127,7 +128,7 @@ publish_packages:
 
 To run lifecycle commands (`init`, `update`, `sync`) without public internet access:
 
-1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`) and pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` into the runner's Docker daemon (or mirror them carefully by digest).
+1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`), pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` (and the digest-pinned Rust base image in `.devkit/runtime/rust.Dockerfile` for Rust projects) into the runner's Docker daemon, and populate the Cargo cache under `DEVKIT_CACHE_DIR/cargo` when offline Cargo resolution is needed.
 2. Prime the local cache once using `--release-root`:
    ```sh
    /opt/devkit/releases/0.6.0/devkit sync . \

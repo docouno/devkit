@@ -49,6 +49,16 @@ fn main() -> Result<()> {
         state.components.get_mut(&path).unwrap().dependencies = deps;
     }
     let inputs = collect_native_input_closure(&root, &state)?;
+    let cargo = if CargoWorkspaceKind::for_state(&state)? == CargoWorkspaceKind::Root
+        && state
+            .components
+            .values()
+            .any(|c| c.toolchain == Toolchain::Rust)
+    {
+        Some(CargoWorkspaceModel::read(&root, &state)?)
+    } else {
+        None
+    };
     write_atomic(
         &root.join(".devkit/project.mk"),
         render_project_make(&state).as_bytes(),
@@ -56,7 +66,7 @@ fn main() -> Result<()> {
     )?;
     write_atomic(
         &root.join(".devkit/compose.apps.yaml"),
-        &render_app_compose(&state)?,
+        &render_app_compose(&state, cargo.as_ref())?,
         0o644,
     )?;
     write_atomic(

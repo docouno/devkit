@@ -136,14 +136,16 @@ fn recorded_derived_image_ready(root: &Path, kind: &str, recipe: &str, pin: &str
 pub fn local_receipts(
     root: &Path,
     project_state: &ProjectState,
-    node_inputs_digest: Option<&str>,
+    admitted: Option<&crate::native::NativeAdmission>,
+    cache_dir: Option<&Path>,
 ) -> Result<Value> {
     let pins = CheckoutToolPins::admit(root, project_state)?;
     Ok(local_receipts_with_pins(
         root,
         project_state,
         &pins,
-        node_inputs_digest,
+        admitted,
+        cache_dir,
     ))
 }
 
@@ -151,30 +153,22 @@ pub(crate) fn local_receipts_with_pins(
     root: &Path,
     project_state: &ProjectState,
     pins: &CheckoutToolPins,
-    node_inputs_digest: Option<&str>,
+    admitted: Option<&crate::native::NativeAdmission>,
+    cache_dir: Option<&Path>,
 ) -> Value {
-    let computed_node_digest = match node_inputs_digest {
-        Some(d) => Some(d.to_owned()),
-        None => crate::native::admit_native_components(root, project_state)
-            .ok()
-            .map(|n| n.node_inputs.digest),
+    let computed;
+    let native = match admitted {
+        Some(native) => Some(native),
+        None => {
+            computed = crate::native::inspect_native_components(root, project_state).ok();
+            computed.as_ref()
+        }
     };
-    let node_workspace_ready = if let Some(d) = computed_node_digest {
-        let expected = digest(format!("{}\n{}", project_state.release_identity, d));
-        let lock_ok = safe_path(root, ".devkit/state/node-workspace.lock")
-            .ok()
-            .and_then(|p| {
-                let (bytes, _) = read_regular_file(&p, 4096, "Node workspace receipt").ok()??;
-                String::from_utf8(bytes).ok()
-            })
-            .is_some_and(|s| s.trim() == expected);
-        let nm_ok = safe_path(root, "node_modules")
-            .ok()
-            .and_then(|p| fs::symlink_metadata(p).ok())
-            .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
-        lock_ok && nm_ok
-    } else {
-        false
+    let ready = |toolchain| {
+        native.is_some_and(|n| {
+            crate::runtime::workspace_ready(root, project_state, n, toolchain, cache_dir)
+                .unwrap_or(false)
+        })
     };
 
     let rust_image_ready =
@@ -185,8 +179,9 @@ pub(crate) fn local_receipts_with_pins(
         });
 
     json!({
-        "nodeWorkspaceReady": node_workspace_ready,
+        "nodeWorkspaceReady": ready(Toolchain::Node),
         "rustImageReady": rust_image_ready,
+        "rustWorkspaceReady": ready(Toolchain::Rust),
         "desktopImageReady": desktop_image_ready,
     })
 }
@@ -398,7 +393,11 @@ fn detect_uplink_mtu() -> Option<(String, u32)> {
     best
 }
 
-pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, String, bool)> {
+pub fn run_doctor(
+    target: &Path,
+    cache_dir: Option<&Path>,
+    runner: &ProcessRunner,
+) -> Result<(Value, String, bool)> {
     let abs_target = if target.is_absolute() {
         target.to_path_buf()
     } else {
@@ -740,7 +739,7 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
         }
     }
 
-    if let Ok(cache_root) = crate::cache::cache_root(None) {
+    if let Ok(cache_root) = crate::cache::cache_root(cache_dir) {
         let cache_probe = nearest_existing_dir(&cache_root);
         let target_probe = nearest_existing_dir(&resolved_target);
         use std::os::unix::fs::MetadataExt;
@@ -838,7 +837,7 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
             remediation: None,
         });
     } else {
-        checks.push(inspect_checkout_lockfree(&resolved_target));
+        checks.push(inspect_checkout_lockfree(&resolved_target, cache_dir));
     }
 
     runner.check_cancelled()?;
@@ -864,7 +863,7 @@ pub fn run_doctor(target: &Path, runner: &ProcessRunner) -> Result<(Value, Strin
     Ok((result, human, overall_ok))
 }
 
-fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
+fn inspect_checkout_lockfree(target: &Path, cache_dir: Option<&Path>) -> DoctorCheck {
     let root = match project_root(target) {
         Ok(r) => r,
         Err(err) => {
@@ -907,7 +906,8 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
             &root,
             &full.state,
             &full.pins,
-            Some(&full.native.node_inputs.digest),
+            Some(&full.native),
+            cache_dir,
         );
         Ok((full.state, receipts))
     })();
@@ -915,7 +915,7 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
     match admitted {
         Err(err) => {
             let msg = format!("{err:#}");
-            let rem = ["restore it with '", "Run '", "run '"]
+            let rem = ["restore with '", "restore it with '", "Run '", "run '"]
                 .iter()
                 .find_map(|prefix| {
                     let rest = msg.split_once(prefix)?.1;
@@ -923,10 +923,17 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                     (!cmd.is_empty()).then(|| cmd.to_owned())
                 })
                 .unwrap_or_else(|| {
-                    if msg.contains("Managed file conflict") {
-                        "git checkout -- .devkit && make sync".into()
-                    } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
-                        "make setup".into()
+                    let has_root_manifest = fs::symlink_metadata(root.join("Cargo.toml"))
+                        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
+                    let has_root_lock = fs::symlink_metadata(root.join("Cargo.lock")).is_ok();
+                    if msg.contains("Competing Cargo workspace input") {
+                        "remove the competing component Cargo file and run make sync".into()
+                    } else if msg.contains("Invalid root Cargo.lock") && has_root_manifest {
+                        "restore Cargo.lock from Git or remove it and run make exec toolchain=rust write=1 network=bridge command='cargo generate-lockfile', then make sync".into()
+                    } else if msg.contains("Cargo.lock") && !has_root_lock && has_root_manifest {
+                        "make exec toolchain=rust write=1 network=bridge command='cargo generate-lockfile', then make sync".into()
+                    } else if msg.contains("Cargo.lock") && has_root_manifest {
+                        "make sync or make exec toolchain=rust write=1 network=bridge command='cargo update --workspace'".into()
                     } else {
                         "make sync".into()
                     }
@@ -961,10 +968,10 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
             let rust_ok = !need_rust
-                || receipts
-                    .get("rustImageReady")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                || (receipts["rustImageReady"] == true
+                    && (crate::native::CargoWorkspaceKind::for_state(&project_state)
+                        .is_ok_and(|kind| kind == crate::native::CargoWorkspaceKind::Component)
+                        || receipts["rustWorkspaceReady"] == true));
             let desktop_ok = !need_desktop
                 || receipts
                     .get("desktopImageReady")

@@ -120,7 +120,8 @@ if (mode === 'serve') {
   const target = '/consumer';
   const env = npmEnvironment(join(proof, `npm-${mode}`), registry);
   delete env.npm_config_workspaces;
-  const binary = mode === 'first' ? 'npm' : 'pnpm';
+  const legacyNpm = mode === 'first' && /^0\.[0-4]\./u.test(metadata[0].version);
+  const binary = legacyNpm ? 'npm' : 'pnpm';
   function npm(args, cwd = target, expected) {
     const result = spawnSync(binary, args, {
       cwd,
@@ -140,7 +141,7 @@ if (mode === 'serve') {
     }
     return result.stdout + result.stderr;
   }
-  const lock = join(target, mode === 'first' ? 'package-lock.json' : 'pnpm-lock.yaml');
+  const lock = join(target, legacyNpm ? 'package-lock.json' : 'pnpm-lock.yaml');
   const selected = `@docouno/env@${metadata[1].environment.version}`;
   if (mode === 'second' || mode === 'release-day') {
     assert(
@@ -148,7 +149,7 @@ if (mode === 'serve') {
       'Generated workspace must select the exact environment version',
     );
   }
-  if (mode === 'second') {
+  if (!legacyNpm && (mode === 'first' || mode === 'second')) {
     // Public v9 packages need only SRI; remove the exact local fixture tarball URL.
     const text = readFileSync(lock, 'utf8').replace(/,? ?tarball: ([^,}\n]+)/gu, (match, url) => {
       const value = url.trim().replace(/^['"]|['"]$/gu, '');
@@ -166,7 +167,7 @@ if (mode === 'serve') {
   const original = readFileSync(lock);
   assert.doesNotMatch(original.toString(), /127\.0\.0\.1|localhost|\bfile:|\/workspace\//);
   if (mode === 'first' || mode === 'second') {
-    if (mode === 'first') {
+    if (legacyNpm) {
       npm(['ci', '--include=dev', '--strict-peer-deps']);
     } else {
       assert(!existsSync(join(target, 'package-lock.json')));
@@ -182,11 +183,7 @@ if (mode === 'serve') {
     }
     assert.deepEqual(readFileSync(lock), original);
     for (const task of ['check', 'build']) {
-      npm(
-        mode === 'first'
-          ? ['run', '--workspace=apps/main', task]
-          : ['--dir', 'apps/main', 'run', task],
-      );
+      npm(legacyNpm ? ['run', '--workspace=apps/main', task] : ['--dir', 'apps/main', 'run', task]);
     }
     const probe = spawnSync(
       'node',
@@ -247,6 +244,8 @@ if (mode === 'serve') {
         '--trust-lockfile',
         '--store-dir',
         '/proof/pnpm-neg-store',
+        // Keep the cold downloads below the loopback registry's connection limit.
+        '--config.network-concurrency=4',
         '--config.fetch-retries=0',
       ],
       target,

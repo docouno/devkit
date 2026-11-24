@@ -4,6 +4,15 @@
 
 ## [0.6.0]
 
+### Breaking
+
+- Move registered Rust components into one virtual root Cargo workspace with a single lockfile, toolchain pin and formatter configuration. Preview the transactional migration from `0.5.x` with `make update to=0.6.0 preview=1`. Preview and apply use pinned Cargo in Docker when Devkit cannot verify the merged lock directly. Older checkouts bridge through `0.5.1`.
+
+### Added
+
+- Create Rust libraries with `rust-library` and wire them to Rust applications or libraries with `use=`. Run `make sync` after manual Cargo manifest edits to update the lockfile and build graph.
+- Fetch Rust dependencies once per workspace setup and reuse compiled artifacts in the checkout's root `target/` across component gates and managed development services. Select Cargo at the root of a mixed workspace with `make exec toolchain=rust`.
+
 ### Changed
 
 - Install the desktop runtime, seccomp notices and Compose tool service only in projects with a registered Electron component. Upgrading a headless checkout removes its old desktop assets. Use Make, the checked-in loader or CLI `0.6.0+` with the new headless format.

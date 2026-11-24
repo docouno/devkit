@@ -996,6 +996,32 @@ impl HostResourceBudget {
         )
     }
 
+    pub fn for_cargo_resolver(&self) -> ContainerResourceSpec {
+        let target_mem = self.compute_pool_target_memory(4 * GIB);
+        let target_milli = if self.cpus_override_millicores.is_some() {
+            self.effective_millicores
+        } else {
+            self.effective_millicores.min(8_000)
+        }
+        .max(10);
+        let implied_jobs = (target_milli / 1000).max(1) as usize;
+        let tmpfs_size = ((target_mem / 4)
+            .clamp(256 * MIB, 768 * MIB)
+            .min(target_mem / 2)
+            / MIB)
+            .max(1);
+        let tmpfs_mount = format!("/tmp:rw,noexec,nosuid,nodev,mode=1777,size={tmpfs_size}m");
+        self.finish_spec(
+            target_milli,
+            implied_jobs,
+            target_mem,
+            self.pids_for_heavy(),
+            tmpfs_mount,
+            None,
+            self.task_oom_score_adj(),
+        )
+    }
+
     pub fn for_npm_resolver(&self) -> ContainerResourceSpec {
         let target_mem = self.compute_pool_target_memory(3 * GIB);
         let target_milli = if self.cpus_override_millicores.is_some() {
@@ -2035,6 +2061,7 @@ mod tests {
                 package_mode: PackageMode::Local,
                 managed: BTreeMap::new(),
                 components,
+                cargo_resolution: None,
                 extra: BTreeMap::new(),
             };
             let model = json!({

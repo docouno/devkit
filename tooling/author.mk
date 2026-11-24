@@ -69,7 +69,7 @@ export DEVKIT_AUTHOR_CARGO_HOME
 export DEVKIT_AUTHOR_TARGET := $(CURDIR)/.artifacts/author/target
 export DEVKIT_AUTHOR_ENGINE := $(CURDIR)/.artifacts/author/target/x86_64-unknown-linux-musl/debug/devkit
 export DEVKIT_RELEASE_VERSION := $(if $(filter undefined,$(origin version)),$(strip $(file <VERSION)),$(value version))
-export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.4.1,$(value from_version))
+export DEVKIT_FROM_VERSION := $(if $(filter undefined,$(origin from_version)),0.5.1,$(value from_version))
 export DEVKIT_BUILD_ID := $(if $(filter undefined,$(origin build_id)),$(shell cat /proc/sys/kernel/random/uuid),$(value build_id))
 export DEVKIT_BUILD_RUN := $(if $(filter undefined,$(origin build_run)),local-author,$(value build_run))
 export DEVKIT_ASSEMBLY_OUTPUT := $(value output)

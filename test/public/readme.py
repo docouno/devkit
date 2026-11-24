@@ -33,9 +33,9 @@ def add_readme_components(make, root):
     make("add-app", "name=desktop", "template=electron-react", "use=client", label="readme-add-desktop")
     worker = root / "apps/worker"
     shutil.copytree(root / "apps/api", worker, ignore=shutil.ignore_patterns("target"))
-    for name in ("Cargo.toml", "Cargo.lock"):
+    for name in ("Cargo.toml", "src/lib.rs", "src/main.rs", "tests/api.rs"):
         path = worker / name
-        path.write_text(path.read_text().replace('name = "api"', 'name = "worker"'))
+        path.write_text(path.read_text().replace("app-api", "app-worker").replace("app_api", "app_worker"))
     make("register", "app=worker", "profile=rust", label="readme-register-app")
     make("register", "app=worker", "profile=rust", label="readme-register-repeat")
     make("setup", label="readme-added-components-setup")
@@ -107,7 +107,12 @@ def main():
                     "make exec app=web write=1 network=bridge command='pnpm add zod --lockfile-only --ignore-scripts'",
                     "make add-app name=api template=rust-api",
                     "make add-package name=client template=react-client",
-                    "make add-app name=desktop template=electron-react use=client"):
+                    "make add-app name=desktop template=electron-react use=client",
+                    f"npx {package} init services --package protocol=rust-library",
+                    "make add-app name=server template=rust-api use=protocol",
+                    "make add-app name=worker template=rust-api use=protocol",
+                    "make test app=server",
+                    "make exec toolchain=rust command='cargo metadata --no-deps'"):
         require(example in readme, "Principal README commands differ; update the named executable examples")
     spec = importlib.util.spec_from_file_location("readme_packaged_helper", REPO / "test/packaged/verify.py")
     module = importlib.util.module_from_spec(spec)
@@ -186,6 +191,14 @@ def main():
         helper.projects.append(preset)
         preset_state = json.loads((preset / ".devkit/manifest.json").read_text())
         require(set(preset_state["components"]) == {"apps/api", "apps/web", "apps/desktop", "packages/client"}, "README preset graph differs")
+        services = products / "services"
+        cli("readme-rust-workspace-init", "init", "services", "--package", "protocol=rust-library", cwd=products)
+        helper.projects.append(services)
+        helper.make(services, "add-app", "name=server", "template=rust-api", "use=protocol", label="readme-rust-add-server")
+        helper.make(services, "add-app", "name=worker", "template=rust-api", "use=protocol", label="readme-rust-add-worker")
+        helper.make(services, "setup", label="readme-rust-setup")
+        helper.make(services, "test", "app=server", label="readme-rust-test-server")
+        helper.make(root, "exec", "toolchain=rust", "command=cargo metadata --no-deps", label="readme-mixed-cargo-metadata")
         helper.run("readme-product-git-init", ["git", "init", "--quiet"], cwd=root)
         helper.run("readme-update-branch", ["git", "switch", "-c", "chore/devkit-" + index["version"]], cwd=root)
         before = module.source_snapshot(root)

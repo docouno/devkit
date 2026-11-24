@@ -1,5 +1,5 @@
 use crate::{Result, files::slug, model::*};
-use anyhow::{bail, ensure};
+use anyhow::{Context, bail, ensure};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Template {
@@ -19,6 +19,12 @@ pub fn template(value: &str) -> Result<Template> {
         "rust" | "rust-app" | "rust-api" => {
             ("rust-api", Role::App, Toolchain::Rust, ToolingProfile::Rust)
         }
+        "rust-library" => (
+            "rust-library",
+            Role::Library,
+            Toolchain::Rust,
+            ToolingProfile::Rust,
+        ),
         "electron-react" => (
             "electron-react",
             Role::App,
@@ -114,4 +120,40 @@ pub fn profile_outputs(profile: ToolingProfile) -> &'static [&'static str] {
         }
         _ => &["dist"],
     }
+}
+
+/// Select the pinned Cargo resolver image from the same recipe used for Rust gates.
+pub fn rust_base_image(recipe: &str, rust_version: &str) -> Result<String> {
+    let mut stages = recipe.lines().map(str::trim).filter(|line| {
+        line.split_ascii_whitespace()
+            .next()
+            .is_some_and(|instruction| instruction.eq_ignore_ascii_case("FROM"))
+    });
+    let from = stages
+        .next()
+        .context("Missing FROM in runtime/rust.Dockerfile")?;
+    let mut words = from.split_ascii_whitespace().skip(1).peekable();
+    while words.peek().is_some_and(|word| word.starts_with("--")) {
+        let flag = words.next().expect("checked flag");
+        ensure!(
+            flag.starts_with("--platform=") && flag.len() > "--platform=".len(),
+            "Unsupported FROM flag in runtime/rust.Dockerfile: {flag}"
+        );
+    }
+    let image = words.next().context("Missing Rust base image")?;
+    if let Some(alias_kw) = words.next() {
+        ensure!(
+            alias_kw.eq_ignore_ascii_case("AS") && words.next().is_some() && words.next().is_none(),
+            "Unexpected trailing tokens in runtime/rust.Dockerfile FROM instruction"
+        );
+    }
+    let prefix = format!("rust:{rust_version}-slim-bookworm@sha256:");
+    ensure!(
+        stages.next().is_none()
+            && image
+                .strip_prefix(&prefix)
+                .is_some_and(|digest| crate::files::SHA256_RE.is_match(digest)),
+        "Expected a single digest-pinned {prefix}<digest> base image in runtime/rust.Dockerfile"
+    );
+    Ok(image.to_owned())
 }
