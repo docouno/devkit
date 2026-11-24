@@ -447,14 +447,15 @@ fn transfer(size: usize, mut syscall: impl FnMut() -> isize) -> io::Result<()> {
 /// Observe status without collecting the direct child. In the standalone
 /// library path that child itself pins the group's numeric identity.
 pub(super) fn poll_creator(child: &Child) -> io::Result<Option<ExitStatus>> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
+        // Darwin can leave siginfo untouched when no child event is ready.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let rc = unsafe {
             libc::waitid(
                 libc::P_PID,
                 child.id(),
                 &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
         if rc == 0 {
@@ -465,7 +466,18 @@ pub(super) fn poll_creator(child: &Child) -> io::Result<Option<ExitStatus>> {
                 libc::CLD_EXITED => (info.si_status & 255) << 8,
                 libc::CLD_KILLED => info.si_status,
                 libc::CLD_DUMPED => info.si_status | 0x80,
-                _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED => return Ok(None),
+                code => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Unexpected waitid event for child {}: si_pid={}, si_code={code}, si_status={}",
+                            child.id(),
+                            info.si_pid,
+                            info.si_status
+                        ),
+                    ));
+                }
             };
             return Ok(Some(ExitStatus::from_raw(status)));
         }

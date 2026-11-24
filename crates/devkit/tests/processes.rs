@@ -545,10 +545,18 @@ fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() 
 #[test]
 fn stopped_creator_group_wakes_and_terminates_without_sigkill_delay() {
     let runner = ProcessRunner::new().unwrap();
+    let temp = TempDir::new().unwrap();
+    let continued = temp.path().join("continued");
     let started = Instant::now();
     let error = runner
         .checked_with_timeout(
-            Command::new("sh").args(["-c", "kill -STOP $$"]),
+            Command::new("sh")
+                .args([
+                    "-c",
+                    r#"trap '' TERM; trap 'echo continued > "$1"' CONT; kill -STOP "$$"; test -s "$1""#,
+                    "sh",
+                ])
+                .arg(&continued),
             OutputMode::Capture(4096),
             Duration::from_millis(100),
         )
@@ -557,6 +565,10 @@ fn stopped_creator_group_wakes_and_terminates_without_sigkill_delay() {
     assert!(
         error.to_string().contains("exceeded its deadline"),
         "{error:#}"
+    );
+    assert!(
+        continued.is_file(),
+        "Stopped creator did not receive SIGCONT"
     );
     assert!(
         started.elapsed() < Duration::from_millis(1500),
