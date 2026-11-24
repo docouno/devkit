@@ -174,6 +174,8 @@ fn init_legacy_registry(release: &Path, target: &Path, registry: &str) -> Result
         "npm",
         "install",
         "--package-lock-only",
+        // The migrated graph must clear pnpm's one-day cutoff before testing the fresh env release.
+        "--min-release-age=1",
         "--ignore-scripts",
         "--include=dev",
         "--strict-peer-deps",

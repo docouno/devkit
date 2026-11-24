@@ -83,7 +83,11 @@ if (mode === 'serve') {
               }
             : versions[path.slice('/@docouno/env/'.length)],
         );
-      } else if (path.startsWith('/@docouno/')) {
+      } else if (
+        path.startsWith('/@docouno/') ||
+        path.startsWith('/-/npm/v1/attestations/@docouno/')
+      ) {
+        // The fixture releases have no public provenance. Let pnpm read their local publish times.
         res.writeHead(404).end();
         return;
       } else {
@@ -199,7 +203,7 @@ if (mode === 'serve') {
     const app = join(target, 'apps/main');
     const manifest = join(app, 'package.json');
     assert(!Object.hasOwn(read(manifest).dependencies, 'clsx'));
-    const add = ['add', 'clsx', '--lockfile-only', '--ignore-scripts'];
+    const add = ['add', 'clsx@2.1.1', '--lockfile-only', '--ignore-scripts'];
 
     // Check that the fresh release blocks this edit without its exact exception.
     writeFileSync(workspace, settings.replace(selected, 'other-package@1.0.0'));
@@ -262,6 +266,10 @@ if (mode === 'serve') {
     );
     const unknown = await fetch(registry + '@docouno/unsupplied');
     assert.equal(unknown.status, 404);
+    const attestation = await fetch(`${registry}-/npm/v1/attestations/${selected}`, {
+      redirect: 'manual',
+    });
+    assert.equal(attestation.status, 404, 'Fixture provenance must stay local');
     const requests = read(join(proof, 'requests.json'));
     for (const item of metadata) {
       assert(requests.includes(`/@docouno/env/-/env-${item.version}.tgz`));
