@@ -332,10 +332,8 @@ def seal_runtime(root):
         projection.write_bytes(rules + token + plan + b"\n")
     for name in ("project.mk", "compose.apps.yaml", "compose.workspace.json", "tooling-profiles.json"):
         managed[".devkit/" + name] = identity(root / ".devkit" / name)
-    for component, info in state["components"].items():
-        if info["toolchain"] == "rust":
-            pin = root / component / "rust-toolchain.toml"
-            managed[str(pin.relative_to(root))] = identity(pin)
+    if any(info["toolchain"] == "rust" for info in state["components"].values()):
+        managed["rust-toolchain.toml"] = identity(root / "rust-toolchain.toml")
     checksum = root / ".devkit/runtime.sha256"
     checksum.write_text("".join(f"{value['sha256']}  {name}\n" for name, value in sorted(managed.items())))
     managed[str(checksum.relative_to(root))] = identity(checksum)
@@ -418,9 +416,17 @@ def accept_runtime(root, native=False, package_profiles=None):
     seal_runtime(root)
 
 
+def install_rust_workspace(root, component):
+    for name in ("Cargo.lock", "rustfmt.toml", "rust-toolchain.toml"):
+        (root / component / name).rename(root / name)
+    (root / "Cargo.toml").write_text(
+        f'[workspace]\nresolver = "3"\nmembers = ["{component}"]\n')
+
+
 def write_rust_fixture(root):
     write_fixture_runtime(root)
     shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
+    install_rust_workspace(root, "apps/api")
     accept_runtime(root, native=True)
     return hashlib.sha256((root / ".devkit/runtime/rust.Dockerfile").read_bytes()).hexdigest()
 
@@ -439,17 +445,49 @@ class EngineVersionAdmissionTests(unittest.TestCase):
                 self.assertEqual(output.stdout.strip(), value)
                 self.assertEqual(output.stderr, "")
 
+    def test_setup_dispatches_apps_named_like_workspace_targets(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-setup-names-") as temporary:
+            root = Path(temporary) / "project"
+            write_fixture(root, ("node-workspace",))
+            shutil.copytree(REPO / "templates/rust-api", root / "apps/rust-workspace")
+            install_rust_workspace(root, "apps/rust-workspace")
+            accept_runtime(root)
+            loader = Path(temporary) / "trace-setup.sh"
+            loader.write_text('printf "%s %s\\n" "$1" "${DEVKIT_TARGET_COMPONENT:-root}"\n')
+            make = ["make", "--no-print-directory", "-C", str(root), f"devkit_loader={loader}"]
+            for toolchain in ("node", "rust"):
+                app = f"{toolchain}-workspace"
+                workspace_setup = f"setup-{toolchain} root"
+                selected = run(*make, "setup", f"app={app}")
+                self.assertEqual(selected.stderr, "")
+                self.assertEqual(selected.stdout.splitlines(),
+                                 [workspace_setup, f"setup apps/{app}", "snapshot root"])
+                standalone = run(*make, f"setup-{app}")
+                self.assertEqual(standalone.stderr, "")
+                self.assertEqual(standalone.stdout.splitlines(), [workspace_setup])
+            aggregate = run(*make, "setup")
+            self.assertEqual(aggregate.stderr, "")
+            self.assertEqual(aggregate.stdout.splitlines(),
+                             ["setup-node root", "setup apps/node-workspace", "setup-rust root",
+                              "setup apps/rust-workspace", "snapshot root"])
+
     def test_make_rejects_projection_replaced_after_parsing(self):
         with tempfile.TemporaryDirectory(prefix="devkit-make-plan-") as temporary:
             base = Path(temporary)
             root, next_root = base / "project", base / "next"
             write_rust_fixture(root)
             shutil.copytree(root, next_root)
-            shutil.copytree(next_root / "apps/api", next_root / "apps/extra")
+            extra = next_root / "apps/extra"
+            (extra / "src").mkdir(parents=True)
+            (extra / "Cargo.toml").write_text('[package]\nname="extra"\nversion="1.0.0"\nedition="2024"\n')
+            (extra / "src/main.rs").write_text("fn main() {}\n")
+            (next_root / "Cargo.toml").write_text('[workspace]\nresolver="3"\nmembers=["apps/api","apps/extra"]\n')
+            with (next_root / "Cargo.lock").open("a") as lock:
+                lock.write('\n[[package]]\nname="extra"\nversion="1.0.0"\n')
             accept_runtime(next_root, native=True)
             shutil.copytree(next_root / "apps/extra", root / "apps/extra")
             local = root / "Makefile"
-            local.write_text(local.read_text() + "\nsetup-api: replace-projection\n"
+            local.write_text(local.read_text() + "\nsetup-rust-workspace: replace-projection\n"
                              "replace-projection:\n\t@cp -a ../next/.devkit/. .devkit/\n")
             failed = run("make", "--no-print-directory", "-C", str(root), "setup", check=False, timeout=10)
             self.assertNotEqual(failed.returncode, 0)
@@ -937,13 +975,17 @@ elif argv[:2] == ['image', 'inspect']:
                 sys.exit(89)
             time.sleep(.01)
     print(os.environ['DOCTOR_SNAPSHOT_RECIPE'])
+elif argv[:2] in (["image", "tag"], ["container", "ls"]) or argv[0] == "run":
+    pass
 else:
     print('unexpected Docker query: '+repr(argv), file=sys.stderr)
     sys.exit(90)
 ''')
             docker.chmod(0o755)
             environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
+                               DEVKIT_CACHE_DIR=str(base / "cache"),
                                DOCTOR_SNAPSHOT_BASE=str(base), DOCTOR_SNAPSHOT_RECIPE=recipe)
+            run(str(ENGINE), "task", "setup-rust", "--root", str(root), env=environment, timeout=12)
             argv = [str(ENGINE), "task", "doctor", "--root", str(root)]
             baseline = run(*argv, env=environment, timeout=12)
             self.assertIn("accepted components verified", baseline.stdout)
@@ -954,7 +996,7 @@ else:
                     for name in ("ready", "go"):
                         (base / name).unlink(missing_ok=True)
                     (base / "armed").touch()
-                    path = root / ("apps/api/Cargo.lock" if mutation == "native-lock" else ".devkit/manifest.json")
+                    path = root / ("Cargo.lock" if mutation == "native-lock" else ".devkit/manifest.json")
                     original = path.read_bytes()
                     child = subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     try:
@@ -2366,6 +2408,7 @@ build: simulate-update
         shutil.rmtree(self.root / "apps/main")
         shutil.copytree(REPO / "templates/rust-api", self.root / "apps/main",
                         ignore=shutil.ignore_patterns("target"))
+        install_rust_workspace(self.root, "apps/main")
         runtime = self.root / ".devkit/runtime"
         recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
         accept_runtime(self.root, native=True)
@@ -2384,15 +2427,52 @@ build: simulate-update
         self.assertEqual(hashes, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
         self.assertEqual((self.root / ".devkit/state/rust-image").read_text().strip(), image_id)
 
+        cold = self.base / "unused-cache"
+        cold_env = dict(env(), DEVKIT_CACHE_DIR=str(cold))
+        for command in ("info", "describe", "status", "doctor"):
+            result = run(str(ENGINE), "--cache-dir", str(cold), command, str(self.root), "--json", check=False)
+            data = json.loads(result.stdout)["result"]
+            receipt = (next(c for c in data["checks"] if c["id"] == "checkout_state")["details"]["receipts"]
+                       if command == "doctor" else data["receipts"])
+            self.assertTrue(receipt["rustImageReady"])
+            self.assertFalse(receipt["rustWorkspaceReady"], command)
+        self.assertFalse(cold.exists(), "read-only queries populated the alternate cache")
+        denied = self.make("build", env=cold_env, check=False)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("workspace dependencies are absent/stale", denied.stderr)
+        self.make("setup", "app=main", env=cold_env, timeout=180)
+        prepared = json.loads(self.make("info", "json=1", env=cold_env).stdout)["result"]
+        self.assertTrue(prepared["receipts"]["rustWorkspaceReady"])
+
+        pin = self.root / "rust-toolchain.toml"
+        pin.write_bytes(pin.read_bytes() + b"\n")
+        damaged = run(str(ENGINE), "doctor", str(self.root), "--json", check=False)
+        check = next(c for c in json.loads(damaged.stdout)["result"]["checks"] if c["id"] == "checkout_state")
+        self.assertEqual(check["remediation"], "git checkout -- rust-toolchain.toml")
+
     def test_development_admits_compose_dependencies_before_start(self):
         write_fixture(self.root, ("web", "api"))
         api = self.root / "apps/api"
         shutil.rmtree(api)
         (api / "src").mkdir(parents=True)
-        (api / "Cargo.toml").write_text('[package]\nname="runtime-api"\nversion="0.1.0"\nedition="2024"\n')
+        (api / "Cargo.toml").write_text('[package]\nname="runtime-api"\nversion="0.1.0"\nedition="2024"\n'
+                                        '[[bin]]\nname="app-server"\npath="src/main.rs"\n')
         (api / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "runtime-api"\nversion = "0.1.0"\n')
         (api / "rust-toolchain.toml").write_text('[toolchain]\nchannel="1.99.1"\n')
         (api / "rustfmt.toml").write_text('edition="2024"\nstyle_edition="2024"\n')
+        install_rust_workspace(self.root, "apps/api")
+        shared = api / "nested$LIB"
+        (shared / "src").mkdir(parents=True)
+        (shared / "Cargo.toml").write_text('[package]\nname="shared"\nversion="0.1.0"\nedition="2024"\n')
+        (shared / "src/lib.rs").write_text('pub fn answer() -> u8 { 42 }\n')
+        # Cargo omits hidden files and hidden directories during autobin discovery.
+        (shared / "src/bin/.scratch").mkdir(parents=True)
+        (shared / "src/bin/.editor.rs").write_text("fn main() {}\n")
+        (shared / "src/bin/.scratch/main.rs").write_text("fn main() {}\n")
+        (shared / "src/bin/README.md").symlink_to("../lib.rs")
+        (self.root / "Cargo.toml").write_text('[workspace]\nresolver="3"\nmembers=["apps/api","apps/api/nested$LIB"]\n')
+        with (self.root / "Cargo.lock").open("a") as lock:
+            lock.write('\n[[package]]\nname="shared"\nversion="0.1.0"\n')
         (api / "src/main.rs").write_text('fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(1)); } }\n')
         package_path = self.root / "apps/web/package.json"
         package = json.loads(package_path.read_text())
@@ -2412,8 +2492,10 @@ build: simulate-update
         self.projects.append((project, self.root, "unused-volume-" + self.token))
         labels = {LABEL: self.token}
 
-        def compose(dependent=None, profiled=False):
+        def compose(dependent=None, profiled=False, api_command=None):
             services = {name: {"labels": labels} for name in names}
+            if api_command is not None:
+                services["api"]["command"] = api_command
             if dependent == "api":
                 services["api"]["depends_on"] = ["web"]
             if dependent == "web":
@@ -2434,6 +2516,34 @@ build: simulate-update
         self.make("setup", "app=web")
         self.make("up", "app=api")
         self.assertTrue(all(container(name)["State"]["Running"] for name in names.values()))
+        run_command = container(names["api"])["Config"]["Cmd"]
+        self.assertEqual(run_command[-2:], ["-p", "path+file:///workspace/apps/api#runtime-api@0.1.0"])
+        self.assertTrue((self.root / "target").is_dir())
+        self.assertFalse((api / "target").exists())
+        self.make("down")
+
+        shutil.copyfile(api / "src/main.rs", shared / "src/main.rs")
+        self.make("build", "app=api", timeout=180)
+        with (shared / "Cargo.toml").open("a") as manifest:
+            manifest.write('[features]\nadmin=[]\nqueue=[]\n[[bin]]\nname="shared"\npath="src/main.rs"\n'
+                           'required-features=["admin", "queue"]\n')
+        (api / "launch.txt").write_text("GATED_READY")
+        (shared / "src/main.rs").write_text(
+            'fn main() { println!("{}", std::fs::read_to_string("launch.txt").unwrap()); '
+            'loop { std::thread::sleep(std::time::Duration::from_secs(1)); } }\n')
+        self.make("setup", "app=api", timeout=180)
+        ambiguous = self.make("up", "app=api", check=False)
+        self.assertNotEqual(ambiguous.returncode, 0)
+        self.assertIn("services.api.command in compose.yaml", ambiguous.stderr)
+        choices = [json.loads(line) for line in ambiguous.stderr.splitlines() if line.startswith('["cargo",')]
+        self.assertCountEqual([argv[-1] for argv in choices], ["--bin=app-server", "--bin=shared"])
+        shared_command = next(argv for argv in choices if argv[-1] == "--bin=shared")
+        self.assertEqual(shared_command[-4:], ["path+file:///workspace/apps/api/nested$$LIB#shared@0.1.0",
+                                              "--features", "admin,queue", "--bin=shared"])
+        compose("api", api_command=shared_command)
+        self.make("up", "app=api")
+        self.assertEqual(container(names["api"])["Config"]["Cmd"], [word.replace("$$", "$") for word in shared_command])
+        wait_until(lambda: "GATED_READY" in run("docker", "logs", names["api"]).stdout, timeout=30)
         self.make("down")
 
         recipe = self.root / ".devkit/runtime/rust.Dockerfile"
@@ -2502,7 +2612,7 @@ build: simulate-update
         directories = [".devkit", ".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store",
                        "node_modules", "apps/main/node_modules", "apps/main/dist"]
         directories += [str(self.base / "cache" / name) for name in ("pnpm-store", "pnpm-cache", "cargo", "electron", "tools", "empty-mask")]
-        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock", ".devkit/state/rust-image", ".devkit/state/desktop-image"]
+        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock", ".devkit/state/rust-workspace.lock", ".devkit/state/rust-image", ".devkit/state/desktop-image"]
         dist_occurrence = 0
         for relative in directories + files + ["apps/main/dist"]:
             with self.subTest(path=relative):
@@ -2782,16 +2892,19 @@ build: simulate-update
         (app / "Cargo.toml").write_text('[package]\nname="exec-api"\nversion="0.1.0"\nedition="2024"\n')
         (app / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname="exec-api"\nversion="0.1.0"\n')
         (app / "src/main.rs").write_text('fn main() { println!("native exec"); }\n')
-        accept_runtime(self.root, native=True)
-        (app / "Cargo.lock").unlink()
-        helper = app / "vendor helper"
+        install_rust_workspace(self.root, "apps/main")
+        helper = self.root / "vendor" / "helper"
         (helper / "src").mkdir(parents=True)
         (helper / "Cargo.toml").write_text('[package]\nname="exec-helper"\nversion="0.1.0"\nedition="2024"\n')
         (helper / "src/lib.rs").write_text('pub fn value() -> u8 { 1 }\n')
+        with (self.root / "Cargo.toml").open("a") as workspace:
+            workspace.write('exclude = ["vendor"]\n')
+        accept_runtime(self.root, native=True)
         before = (self.root / ".devkit/manifest.json").read_bytes()
-        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--prepare", "--", "cargo", "add", "--offline", "--path", "vendor helper", timeout=180)
+        (self.root / "Cargo.lock").unlink()
+        run(str(ENGINE), "exec", "--root", str(self.root), "--component", "apps/main", "--write", "--prepare", "--", "cargo", "add", "--offline", "--path", "../../vendor/helper", timeout=180)
         self.assertIn("exec-helper", (app / "Cargo.toml").read_text())
-        self.assertTrue((app / "Cargo.lock").exists())
+        self.assertTrue((self.root / "Cargo.lock").exists())
         self.assertEqual((self.root / ".devkit/manifest.json").read_bytes(), before)
         self.make("setup", timeout=180)
         self.make("build", timeout=180)
@@ -2800,13 +2913,40 @@ build: simulate-update
         write_fixture(self.root, ("main", "api"))
         shutil.rmtree(self.root / "apps/api")
         shutil.copytree(REPO / "templates/rust-api", self.root / "apps/api", ignore=shutil.ignore_patterns("target"))
+        install_rust_workspace(self.root, "apps/api")
         accept_runtime(self.root, native=True)
+        resolution = self.make("exec", "toolchain=rust", "prepare=1",
+            """command=sh -ec 'test "$PWD" = /workspace; test "$CARGO_TARGET_DIR" = /tmp/cargo-target; ! touch /workspace/write-probe; ! mkdir /workspace/target'""",
+            timeout=180)
+        self.assertEqual(resolution.returncode, 0)
+        self.assertFalse((self.root / "target").exists())
+        def receipts():
+            return json.loads(self.make("info", "json=1").stdout)["result"]["receipts"]
+
+        initial = receipts()
+        self.assertTrue(initial["rustImageReady"])
+        self.assertFalse(initial["rustWorkspaceReady"])
+        for opts in ([], ["write=1", "network=bridge"]):
+            missing = self.make("exec", "prepare=1", *opts, "command=cargo --version", check=False)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("toolchain=rust", missing.stderr)
+        node = self.make("exec", "toolchain=node", "command=cargo --version", check=False)
+        self.assertNotEqual(node.returncode, 0)
+        self.assertNotIn("toolchain=rust", node.stderr)
+        conflict = self.make("exec", "app=api", "toolchain=rust", "command=cargo --version", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        explicit = self.make("exec", "toolchain=node", "command=node --version")
+        self.assertIn(NODE_VERSION, explicit.stdout)
+        self.make("setup", "app=api", timeout=180)
+        self.assertTrue(receipts()["rustWorkspaceReady"])
+        self.make("exec", "toolchain=rust", "write=1", "command=cargo update --workspace --offline")
+        self.assertFalse(receipts()["rustWorkspaceReady"])
         self.make("setup", "app=main")
         receipt = self.root / ".devkit/state/node-workspace.lock"
         before = receipt.read_bytes()
-        config = self.root / "apps/api/rustfmt.toml"
+        config = self.root / "rustfmt.toml"
         config.write_text(config.read_text()+"\nmax_width=90\n")
-        cargo = self.root / "apps/api/.cargo"
+        cargo = self.root / ".cargo"
         cargo.mkdir(exist_ok=True)
         (cargo / "config.toml").write_text("[build]\njobs=1\n")
         self.assertIn("GATE main check", self.make("check", "app=main").stdout)
@@ -3227,6 +3367,7 @@ waitForCerts();
         # Build project with BOTH Node (apps/main) and Rust (apps/api) components.
         write_fixture(self.root, apps=("main",))
         shutil.copytree(REPO / "templates/rust-api", self.root / "apps/api", ignore=shutil.ignore_patterns("target"))
+        install_rust_workspace(self.root, "apps/api")
         (self.root / "apps/api/tests/secret_isolation.rs").write_text(
             "#[test]\n"
             "fn private_npm_tokens_and_ca_never_enter_rust_containers() {\n"
@@ -3392,6 +3533,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
         self.assertEqual(desc["receipts"], {
             "nodeWorkspaceReady": True,
             "rustImageReady": False,
+            "rustWorkspaceReady": False,
             "desktopImageReady": False,
         })
 

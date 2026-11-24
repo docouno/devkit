@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Extras = BTreeMap<String, Value>;
 
@@ -119,6 +119,31 @@ pub struct ProjectState {
     pub package_mode: PackageMode,
     pub managed: BTreeMap<String, FileIdentity>,
     pub components: BTreeMap<String, ComponentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_resolution: Option<CargoResolution>,
+    #[serde(flatten)]
+    pub extra: Extras,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CargoResolutionInputs {
+    pub digest: String,
+    pub policy: String,
+    pub members: BTreeMap<String, String>,
+    pub locals: String,
+    /// Local directories disambiguated by pinned Cargo when identical lock IDs
+    /// have more than one source path in the same dependency declaration set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_selections: Option<BTreeSet<String>>,
+    #[serde(flatten)]
+    pub extra: Extras,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CargoResolution {
+    pub version: u32,
+    pub lock: String,
+    pub inputs: CargoResolutionInputs,
     #[serde(flatten)]
     pub extra: Extras,
 }

@@ -1,5 +1,6 @@
 use std::io;
 
+use devkit_api::router;
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
@@ -44,9 +45,11 @@ async fn main() -> io::Result<()> {
         }
     };
     let listener = TcpListener::bind((host.as_str(), port)).await?;
-    println!("devkit-api listening on http://{}", listener.local_addr()?);
+    let name = env!("CARGO_PKG_NAME");
+    let address = listener.local_addr()?;
+    println!("{name} listening on http://{address}");
 
-    axum::serve(listener, devkit_api::router())
+    axum::serve(listener, router())
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = interrupt.recv() => {},

@@ -703,7 +703,7 @@ fn native_upgrade_from(c: &Contract) -> Option<&str> {
     c.previous
         .environment
         .as_deref()
-        .filter(|previous| stable(previous).is_ok_and(|version| version >= [0, 4, 0]))
+        .filter(|previous| stable(previous).is_ok_and(|version| version >= [0, 5, 0]))
 }
 fn validate_native_upgrade(
     readme: &Value,
@@ -853,8 +853,8 @@ fn validate_gate(name: &str, value: &Value, c: &Contract) -> Result<()> {
                 .context("Performance measurements missing")?;
             ensure!(!measurements.is_empty(), "Performance measurements missing");
             ensure!(
-                value["baseline"]["version"] == "0.4.1",
-                "Performance baseline version must be 0.4.1"
+                value["baseline"]["version"] == "0.5.1",
+                "Performance baseline version must be 0.5.1"
             );
             ensure!(
                 measurements

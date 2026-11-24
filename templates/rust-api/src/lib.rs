@@ -21,8 +21,10 @@ struct Health {
 /// Build a greeting from an optional human-provided name.
 ///
 /// ```
-/// assert_eq!(devkit_api::greeting(Some(" Ada ")), "Hello, Ada!");
-/// assert_eq!(devkit_api::greeting(None), "Hello, world!");
+/// use devkit_api::greeting;
+///
+/// assert_eq!(greeting(Some(" Ada ")), "Hello, Ada!");
+/// assert_eq!(greeting(None), "Hello, world!");
 /// ```
 pub fn greeting(name: Option<&str>) -> String {
     let name = name.map(str::trim).filter(|value| !value.is_empty());

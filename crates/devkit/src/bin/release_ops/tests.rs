@@ -29,7 +29,7 @@ fn release_notes_select_only_the_requested_version() {
 fn release_body_uses_changelog_and_collapses_only_verification() {
     let f = Fixture::native_update();
     let body = f.contract.body().unwrap();
-    assert!(body.contains("Raise the minimum supported project checkout"));
+    assert!(body.contains("Move registered Rust components into one virtual root Cargo workspace"));
     assert!(!body.contains("Compare Git-tracked managed files"));
     assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
     let set = f.set();
@@ -47,7 +47,7 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     assert!(
         details
             > saved
-                .find("Raise the minimum supported project checkout")
+                .find("Move registered Rust components into one virtual root Cargo workspace")
                 .unwrap()
     );
     assert!(saved.find("Public verification: passed.").unwrap() > details);
@@ -70,11 +70,11 @@ impl Fixture {
         Self::with_version("0.3.0")
     }
     fn native_update() -> Self {
-        let mut fixture = Self::with_version("0.5.0");
+        let mut fixture = Self::with_version("0.6.0");
         fixture.contract.previous = Selectors {
-            environment: Some("0.4.1".into()),
-            cli: Some("0.4.1".into()),
-            github: Some("v0.4.1".into()),
+            environment: Some("0.5.1".into()),
+            cli: Some("0.5.1".into()),
+            github: Some("v0.5.1".into()),
         };
         fixture
     }
@@ -385,7 +385,7 @@ impl Fake {
                 summary["umasks"] = json!(["022", "077"]);
             }
             if name == "performance" {
-                summary["baseline"] = json!({"version": "0.4.1"});
+                summary["baseline"] = json!({"version": "0.5.1"});
                 summary["comparisons"] =
                     json!([{"shape":"one","operation":"doctor","nonRegressionPassed":true}]);
                 summary["measurements"] = json!([{"case":"warm","sampleCount":30}]);
@@ -918,8 +918,8 @@ fn native_upgrade_target_binding_blocks_proof_and_promotion_before_writes() {
     .unwrap();
     record_proof(&mut remote, &set, &fixture.contract, &proof).unwrap();
     promote(&mut remote, &set, &fixture.contract).unwrap();
-    assert_eq!(remote.selectors.environment.as_deref(), Some("0.5.0"));
-    assert_eq!(remote.selectors.cli.as_deref(), Some("0.5.0"));
+    assert_eq!(remote.selectors.environment.as_deref(), Some("0.6.0"));
+    assert_eq!(remote.selectors.cli.as_deref(), Some("0.6.0"));
 }
 
 #[test]
@@ -1349,8 +1349,8 @@ fn generated_performance(c: &Contract) -> Value {
         "sourceTree": c.source_tree,
         "indexSha256": c.index_sha256,
         "baseline": {
-            "version": "0.4.1",
-            "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+            "version": "0.5.1",
+            "releaseIdentity": "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
         },
         "comparisons": [
             {
@@ -1756,11 +1756,11 @@ fn varied_performance(c: &Contract) -> Value {
     raw["buildRun"] = json!(c.build_run);
     raw["releaseIdentity"] = json!("e".repeat(64));
     raw["baseline"] = json!({
-        "version": "0.4.1",
-        "source": "/home/runner/work/project/project/.artifacts/baseline/v0.4.1/payload",
-        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz",
-        "archiveSha256": "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a",
-        "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
+        "version": "0.5.1",
+        "source": "/home/runner/work/project/project/.artifacts/baseline/v0.5.1/payload",
+        "publicArchiveUrl": "https://github.com/docouno/devkit/releases/download/v0.5.1/devkit-0.5.1.tar.gz",
+        "archiveSha256": "f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b",
+        "releaseIdentity": "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
     });
     raw
 }
@@ -1792,7 +1792,7 @@ fn public_baseline_and_performance_contract_reject_stale_versions_and_under_samp
     legacy_key.gates.insert("public-0.2.1".into(), gate);
     assert!(legacy_key.validate(c).is_err());
 
-    // Performance receipt with non-0.4.1 baseline, < 30 samples, or failed non-regression is rejected.
+    // Performance receipt with non-0.5.1 baseline, < 30 samples, or failed non-regression is rejected.
     let perf = varied_performance(c);
     let perf_bytes = serde_json::to_vec(&perf).unwrap();
     gate_from_receipt("performance", &perf_bytes, perf.clone(), c).unwrap();
@@ -1861,7 +1861,7 @@ fn complete_generated_proof_compacts_latest_and_retains_all_required_facts_with_
         identity["tarAndNpmCanonicalPayloadEqual"] = json!(true);
         identity["packages"] = json!([ENVIRONMENT,CLI].map(|name| json!({"name":name,"version":c.version,"integrity":format!("sha512-{}", "a".repeat(88)),"shasum":"b".repeat(40)})));
         summary["limits"] = json!([
-            "Actual public v0.4.1 baseline factory; source and complete package identities verified",
+            "Actual public v0.5.1 baseline factory; source and complete package identities verified",
             "No host language SDK and no authenticated downloads"
         ]);
         summary["consumerReceiptSha256"] = json!("c".repeat(64));

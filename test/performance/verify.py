@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate a frozen Linux release with paired public-0.4.1/native warm benchmarks.
+"""Gate a frozen Linux release with paired public-0.5.1/native warm benchmarks.
 
 Usage: python3 test/performance/verify.py --build-set DIR --output receipt.json
 Requires Docker Compose and the built tooling/native.Dockerfile image in
@@ -21,6 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.request
 import uuid
 
@@ -32,10 +33,10 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "test") not in sys.path:
     sys.path.insert(0, str(REPO / "test"))
 from docker_flags import author_docker_flags  # noqa: E402
-BASELINE_VERSION = "0.4.1"
-BASELINE_RELEASE_IDENTITY = "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a"
-BASELINE_ARCHIVE_SHA256 = "4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a"
-BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.4.1/devkit-0.4.1.tar.gz"
+BASELINE_VERSION = "0.5.1"
+BASELINE_RELEASE_IDENTITY = "870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c"
+BASELINE_ARCHIVE_SHA256 = "f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b"
+BASELINE_URL = "https://github.com/docouno/devkit/releases/download/v0.5.1/devkit-0.5.1.tar.gz"
 LARGE_CRATES = 80
 SHAPES = (("one", 1, 0), ("five", 5, 0), ("large-closure", 1, LARGE_CRATES))
 RELATIVE_FACTOR = 1.20
@@ -190,7 +191,7 @@ class Gate:
     def baseline(self):
         source = self.args.baseline_release
         if source is None:
-            source = self.scratch / "devkit-0.4.1.tar.gz"
+            source = self.scratch / "devkit-0.5.1.tar.gz"
             with urllib.request.urlopen(BASELINE_URL, timeout=60) as response, source.open("wb") as output:
                 require(response.status == 200, "Public baseline download failed")
                 total = 0
@@ -199,14 +200,14 @@ class Gate:
                     require(total <= 128 * 1024**2, "Public baseline exceeds budget")
                     output.write(chunk)
         if source.is_file():
-            require(sha256(source) == BASELINE_ARCHIVE_SHA256, "Public 0.4.1 archive identity mismatch")
+            require(sha256(source) == BASELINE_ARCHIVE_SHA256, "Public 0.5.1 archive identity mismatch")
             release = extract_release(source, self.scratch / "baseline release")
         else:
             verify_payload(source)
             release = self.scratch / "baseline release"
             shutil.copytree(source, release)
         require(sha256(release / "release.json") == BASELINE_RELEASE_IDENTITY,
-                "Baseline must be the exact immutable public 0.4.1 payload")
+                "Baseline must be the exact immutable public 0.5.1 payload")
         require((release / "devkit").read_bytes()[:4] == b"\x7fELF",
                 "Baseline release must ship a native Linux ELF engine")
         self.receipt["baseline"] = {"version": BASELINE_VERSION, "source": str(source),
@@ -259,7 +260,12 @@ class Gate:
         self.logger.mkdir()
         docker_logger(self.logger / "docker", self.docker)
 
-    def edit_product(self, root, count, closure):
+    def edit_product(self, root, count, closure, root_workspace):
+        if root_workspace:
+            (root / "Cargo.lock").unlink()
+            if closure:
+                manifest = root / "Cargo.toml"
+                manifest.write_text(manifest.read_text().replace("[workspace]", "[workspace]\nexclude = [\"vendor\"]", 1))
         for number in range(1, count + 1):
             app = root / "apps" / f"app{number:03}"
             manifest = app / "Cargo.toml"
@@ -270,7 +276,7 @@ class Gate:
             (app / "src").chmod(0o755)
             dependencies = ""
             if closure:
-                vendor = app / "vendor"
+                vendor = root / "vendor"
                 vendor.mkdir(exist_ok=True)
                 vendor.chmod(0o755)
                 for index in range(closure):
@@ -287,7 +293,7 @@ class Gate:
                     crate_lib = crate / "src/lib.rs"
                     crate_lib.write_text(f"pub fn value() -> usize {{\n    {expression}\n}}\n")
                     crate_lib.chmod(0o644)
-                dependencies = f'dep{closure-1:03} = {{ path = "vendor/dep{closure-1:03}" }}\n'
+                dependencies = f'dep{closure-1:03} = {{ path = "../../vendor/dep{closure-1:03}" }}\n'
             expression = f"dep{closure-1:03}::value()" if closure else "1"
             manifest.write_text(
                 f'[package]\nname = "bench-app{number:03}"\nversion = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n[dependencies]\n{dependencies}')
@@ -296,14 +302,29 @@ class Gate:
             app_lib.write_text(
                 f"pub fn value() -> usize {{\n    {expression}\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn value_is_expected() {{\n        assert_eq!(super::value(), {closure or 1});\n    }}\n}}\n")
             app_lib.chmod(0o644)
-            (app / "Cargo.lock").unlink()
+            if not root_workspace:
+                (app / "Cargo.lock").unlink()
             # Historical template prose differs; compare identical fixture inputs.
             readme = app / "README.md"
             readme.write_text("# Matched Rust performance fixture\n")
             readme.chmod(0o644)
 
     def product_inputs(self, root):
-        return {name: value for name, value in snapshot(root).items() if name.startswith("apps/")}
+        legacy_files = {"Cargo.lock", "rustfmt.toml", "rust-toolchain.toml"}
+        return {name: value for name, value in snapshot(root).items()
+                if name.startswith(("apps/", "vendor/"))
+                and not (len(Path(name).parts) == 3 and Path(name).name in legacy_files)}
+
+    def resolved_packages(self, root):
+        locks = [root / "Cargo.lock"] if (root / "Cargo.lock").exists() else sorted(root.glob("apps/*/Cargo.lock"))
+        resolved = {}
+        for lock in locks:
+            with lock.open("rb") as source:
+                for package in tomllib.load(source)["package"]:
+                    key = (package["name"], package["version"], package.get("source"))
+                    require(key not in resolved or resolved[key] == package, f"Inconsistent benchmark input in {lock}")
+                    resolved[key] = package
+        return resolved
 
     def make(self, root, target, *, label=None, expected=0):
         return self.run(label or target, ["make", "--no-print-directory", target], cwd=root,
@@ -319,17 +340,21 @@ class Gate:
             argv += ["--app", f"app{number:03}=rust-api"]
         argv += ["--to", expected_version, "--release-root", release]
         self.run(f"init-{shape}-{side}", argv, timeout=600)
-        self.edit_product(root, count, closure)
+        self.edit_product(root, count, closure, side == "native")
         # Cargo itself resolves every lock. No fabricated accepted state or lock.
         script = "set -eu\n" + "\n".join(
             f"cd /workspace/apps/app{number:03}; cargo generate-lockfile --offline"
             for number in range(1, count + 1))
+        if side == "native":
+            script = "cd /workspace && cargo generate-lockfile --offline"
         self.run(f"resolve-{shape}-{side}", [
             self.docker, "run", "--rm", "--pull", "never", "--network", "none",
             *author_docker_flags(2, 2048, pids_limit=256), "--user", f"{os.getuid()}:{os.getgid()}",
             "--volume", f"{root}:/workspace", "--env", "HOME=/tmp", "--env", "CARGO_HOME=/tmp/cargo",
             "--env", "CARGO_BUILD_JOBS=1", "--env", "RUSTUP_AUTO_INSTALL=0", self.sdk,
             "sh", "-c", script], timeout=600)
+        if side == "native":
+            self.make(root, "sync", label=f"sync-{shape}-{side}")
         before = snapshot(root)
         self.make(root, "setup", label=f"setup-{shape}-{side}")
         self.make(root, "check", label=f"check-{shape}-{side}")
@@ -480,7 +505,7 @@ class Gate:
             self.save()
 
     def admission(self, root, before):
-        lock = root / "apps/app001/Cargo.lock"
+        lock = root / "Cargo.lock"
         original = lock.read_bytes()
         try:
             lock.write_text('version = 4\n\n[[package]]\nname = "wrong"\nversion = "0.0.0"\n')
@@ -518,13 +543,16 @@ class Gate:
             for side, release in (("baseline", self.baseline_release), ("native", self.native_release)):
                 roots[side], snapshots[side] = self.create(release, side, shape, count, closure)
             require(self.product_inputs(roots["baseline"]) == self.product_inputs(roots["native"]),
-                    f"Paired product source/locks/config/modes differ: {shape}")
+                    f"Paired product sources/manifests/modes differ: {shape}")
+            require(self.resolved_packages(roots["baseline"]) == self.resolved_packages(roots["native"]),
+                    f"Paired Cargo package IDs or selected edges differ: {shape}")
             fixture_difference = sorted(name for name in set(snapshots["baseline"]) | set(snapshots["native"])
                                         if snapshots["baseline"].get(name) != snapshots["native"].get(name))
             self.receipt.setdefault("fixtureDifferences", {})[shape] = {
-                "identicalProductSourceAndNativeLocks": True,
+                "identicalProductSourcesAndManifests": True,
+                "identicalResolvedPackages": True,
                 "releaseManagedAndRootFilesDifferent": fixture_difference,
-                "reason": "Actual public 0.4.1 and indexed native factories intentionally ship different controller/runtime/version files."}
+                "reason": "Actual public 0.5.1 and indexed native factories intentionally ship different managed files and store Cargo locks and configuration at different paths."}
             self.benchmark(shape, roots, snapshots, count)
             if closure:
                 self.admission(roots["native"], snapshots["native"])
@@ -540,7 +568,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.4.1 extracted directory or archive")
+    parser.add_argument("--baseline-release", type=Path, help="Exact public 0.5.1 extracted directory or archive")
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmups", type=int, default=2)
     args = parser.parse_args()

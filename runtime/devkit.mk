@@ -25,11 +25,12 @@ devkit_cmd_present := $(if $(filter undefined,$(origin cmd)),,1)
 export DEVKIT_EXEC_CONFLICT := $(and $(devkit_command_present),$(devkit_cmd_present))
 export DEVKIT_EXEC_COMMAND := $(if $(devkit_command_present),$(value command),$(value cmd))
 export DEVKIT_EXEC_COMPONENT := $(value component)
+export DEVKIT_EXEC_TOOLCHAIN := $(value toolchain)
 export DEVKIT_EXEC_WRITE := $(or $(value write),0)
 export DEVKIT_EXEC_NETWORK := $(or $(value network),none)
 export DEVKIT_EXEC_PREPARE := $(or $(value prepare),0)
 unexport app package follow tail headless cleanup reconcile preview json
-unexport name template api use profile to command cmd component write network prepare
+unexport name template api use profile to command cmd component write network prepare toolchain
 
 devkit_loader := .devkit/runtime/devkit.sh
 devkit_projection := $(shell test -d .devkit && test ! -L .devkit && test -f .devkit/project.mk && test ! -L .devkit/project.mk && test -r .devkit/project.mk && printf yes)
@@ -47,10 +48,13 @@ devkit_dev_selectors_valid := $(if $(DEVKIT_PACKAGE),,$(devkit_app_valid))
 devkit_dev_aggregate := $(if $(DEVKIT_APP),0,$(if $(word 2,$(DEVKIT_REGISTERED_APPS)),1,0))
 devkit_skipped_desktop := $(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(if $(DISPLAY),,$(DEVKIT_DESKTOP_APPS))))
 devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(DEVKIT_APP),$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS)),$(filter-out $(devkit_skipped_desktop),$(DEVKIT_REGISTERED_APPS))),)
-devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(addprefix $(1)-,$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(DEVKIT_REGISTERED_PACKAGES))),$(addprefix $(1)-,$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
-devkit_app_targets := $(foreach command,setup check fix test build dev package,$(addprefix $(command)-,$(DEVKIT_REGISTERED_APPS)))
+# Keep the public workspace setup targets distinct from apps with the same suffix.
+devkit_workspace_names := node-workspace rust-workspace
+devkit_app_leaves = $(foreach name,$(2),$(if $(and $(filter setup,$(1)),$(filter $(devkit_workspace_names),$(name))),setup/apps/$(name),$(1)-$(name)))
+devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(call devkit_app_leaves,$(1),$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(DEVKIT_REGISTERED_PACKAGES))),$(call devkit_app_leaves,$(1),$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
+devkit_app_targets := $(foreach command,setup check fix test build dev package,$(call devkit_app_leaves,$(command),$(DEVKIT_REGISTERED_APPS)))
 devkit_package_targets := $(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))
-devkit_dag := setup check fix test build dev up package setup-node-workspace $(devkit_app_targets) $(devkit_package_targets)
+devkit_dag := setup check fix test build dev up package setup-node-workspace setup-rust-workspace $(devkit_app_targets) $(devkit_package_targets)
 
 .PHONY: help info status doctor down logs sync add-app add-package register update recover $(devkit_dag)
 # One Make invocation shares dependencies/output paths, even when -j is inherited.
@@ -87,7 +91,9 @@ package: $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),$(call devkit_targets,package),$(ad
 	@$(devkit_task) package-snapshot
 setup-node-workspace:
 	@$(devkit_task) setup-node
-setup-node-workspace: export DEVKIT_TARGET_COMPONENT :=
+setup-rust-workspace:
+	@$(devkit_task) setup-rust
+setup-node-workspace setup-rust-workspace: export DEVKIT_TARGET_COMPONENT :=
 
 ifneq ($(devkit_app_targets),)
 $(devkit_app_targets): export DEVKIT_TARGET_COMPONENT = apps/$*
@@ -96,7 +102,9 @@ ifneq ($(devkit_package_targets),)
 $(devkit_package_targets): export DEVKIT_TARGET_COMPONENT = packages/$*
 endif
 
-$(addprefix setup-,$(DEVKIT_REGISTERED_APPS)): setup-%:
+$(addprefix setup/apps/,$(filter $(devkit_workspace_names),$(DEVKIT_REGISTERED_APPS))): setup/apps/%:
+	@$(devkit_task) setup
+$(addprefix setup-,$(filter-out $(devkit_workspace_names),$(DEVKIT_REGISTERED_APPS))): setup-%:
 	@$(devkit_task) setup
 $(addprefix check-,$(DEVKIT_REGISTERED_APPS)): check-%:
 	@$(devkit_task) check

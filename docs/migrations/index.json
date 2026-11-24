@@ -40,6 +40,16 @@
       "profiles": [],
       "docPath": "docs/migrations/0.6.0.md",
       "anchor": "profile-scoped-desktop-runtime"
+    },
+    {
+      "id": "root-cargo-workspace",
+      "version": "0.6.0",
+      "severity": "recommended",
+      "title": "Adopt the root Cargo workspace",
+      "summary": "Preview the migration of Rust manifests, lockfiles and formatting settings. Resolve package name or dependency conflicts before applying the update.",
+      "profiles": ["rust"],
+      "docPath": "docs/migrations/0.6.0.md",
+      "anchor": "adopt-the-root-cargo-workspace"
     }
   ]
 }

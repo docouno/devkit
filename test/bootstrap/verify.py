@@ -10,7 +10,7 @@ from support import Harness
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-set', type=Path, required=True)
-    parser.add_argument('--baseline-set', type=Path, required=True, help='Preserved public v0.4.1 baseline directory')
+    parser.add_argument('--baseline-set', type=Path, required=True, help='Preserved public v0.5.1 baseline directory')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--safety-only', action='store_true')
     mode.add_argument('--skip-safety', action='store_true')

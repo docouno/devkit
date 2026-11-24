@@ -10,7 +10,41 @@ pub trait MutationHooks {
         Ok(())
     }
 }
+fn nested_manifest(name: &str) -> bool {
+    let parts: Vec<_> = name.split('/').collect();
+    parts.len() > 3
+        && parts.last() == Some(&"Cargo.toml")
+        && valid_component_path(&format!("{}/{}", parts[0], parts[1])).is_ok()
+        && parts[2..parts.len() - 1].iter().all(|part| {
+            ![
+                "",
+                ".",
+                "..",
+                ".git",
+                ".devkit",
+                "target",
+                "node_modules",
+                "__proto__",
+                "prototype",
+                "constructor",
+            ]
+            .contains(part)
+                && !part.contains(['\\', '\0'])
+                && !part.chars().any(char::is_control)
+        })
+}
+
 pub fn transaction_path<'a>(name: &'a str, created: &[String]) -> Result<&'a str> {
+    if (name.starts_with("apps/") || name.starts_with("packages/"))
+        && name.ends_with("/Cargo.toml")
+        && name.split('/').nth(3).is_some()
+    {
+        ensure!(
+            nested_manifest(name),
+            "Unsafe nested Cargo manifest: {name}"
+        );
+        return Ok(name);
+    }
     relative_path(name)?;
     if name == MANIFEST_PATH
         || [
@@ -19,13 +53,26 @@ pub fn transaction_path<'a>(name: &'a str, created: &[String]) -> Result<&'a str
             "pnpm-workspace.yaml",
             "pnpm-lock.yaml",
             ".npmrc",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
         ]
         .contains(&name)
         || {
             let parts = name.split('/').collect::<Vec<_>>();
             parts.len() == 3
                 && valid_component_path(&format!("{}/{}", parts[0], parts[1])).is_ok()
-                && ["package.json", "package-lock.json", "pnpm-lock.yaml"].contains(&parts[2])
+                && [
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    "rustfmt.toml",
+                    "rust-toolchain.toml",
+                ]
+                .contains(&parts[2])
         }
         || created.iter().any(|d| name.starts_with(&format!("{d}/")))
     {
@@ -222,7 +269,7 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
     verify_new_sources(root, &tx)?;
     for file in &tx.files {
         verify_saved(root, file)?;
-        let actual = identity(&safe_path(root, &file.path)?)?;
+        let actual = identity(&input_path(root, &file.path)?)?;
         ensure!(
             actual == file.before || actual == file.after,
             "Recovery conflict: {}; restore a known before/after state",
@@ -235,7 +282,7 @@ pub(crate) fn recover_locked(root: &Path) -> Result<bool> {
     );
     crate::stand::epoch::recovery_transfer(root, &bytes)?;
     for file in tx.files.iter().rev() {
-        let p = safe_path(root, &file.path)?;
+        let p = input_path(root, &file.path)?;
         let actual = identity(&p)?;
         if actual == file.before {
             continue;
@@ -312,21 +359,19 @@ impl PreparedTransaction {
         created: Vec<String>,
     ) -> Result<Self> {
         let mut paths = paths.iter().cloned().collect::<Vec<_>>();
-        paths.sort_by(|a, b| {
-            if a == MANIFEST_PATH {
-                std::cmp::Ordering::Greater
-            } else if b == MANIFEST_PATH {
-                std::cmp::Ordering::Less
-            } else {
-                a.cmp(b)
-            }
+        // Install the new recovery-capable loader before any new-format slots.
+        // The accepted manifest is the commit marker and always moves last.
+        paths.sort_by_key(|name| match name.as_str() {
+            ".devkit/runtime/devkit.sh" => 0,
+            MANIFEST_PATH => 2,
+            _ => 1,
         });
         let mut files = vec![];
         let mut created_parents = BTreeSet::new();
         for name in paths {
             transaction_path(&name, &created)?;
-            let before = identity(&safe_path(root, &name)?)?;
-            let after = identity(&safe_path(staged_root, &name)?)?;
+            let before = identity(&input_path(root, &name)?)?;
+            let after = identity(&input_path(staged_root, &name)?)?;
             if before == after
                 || FileIdentity::matches_git_tracked_opt(before.as_ref(), after.as_ref())
             {
@@ -338,14 +383,14 @@ impl PreparedTransaction {
             if let Some(p) = &backup {
                 write_atomic(
                     &safe_path(root, p)?,
-                    &read_input_bytes(&safe_path(root, &name)?)?,
+                    &read_input_bytes(&input_path(root, &name)?)?,
                     before.as_ref().unwrap().mode,
                 )?;
             }
             if let Some(p) = &staged {
                 write_atomic(
                     &safe_path(root, p)?,
-                    &read_input_bytes(&safe_path(staged_root, &name)?)?,
+                    &read_input_bytes(&input_path(staged_root, &name)?)?,
                     after.as_ref().unwrap().mode,
                 )?;
                 let mut parent = Path::new(&name).parent();
@@ -354,7 +399,7 @@ impl PreparedTransaction {
                     if n.is_empty() {
                         break;
                     }
-                    if !exists(&safe_path(root, n)?)? {
+                    if !exists(&input_path(root, n)?)? {
                         created_parents.insert(n.to_string());
                     }
                     parent = p.parent();
@@ -409,7 +454,7 @@ impl PreparedTransaction {
         preflight()?;
         for file in &self.journal.files {
             ensure!(
-                identity(&safe_path(root, &file.path)?)? == file.before,
+                identity(&input_path(root, &file.path)?)? == file.before,
                 "Concurrent update conflict: {}",
                 file.path
             );
@@ -429,7 +474,7 @@ impl PreparedTransaction {
         let result = (|| {
             crate::stand::epoch::begin_transfer(root, &bytes, epoch_transfer)?;
             for (i, file) in self.journal.files.iter().enumerate() {
-                let p = safe_path(root, &file.path)?;
+                let p = input_path(root, &file.path)?;
                 ensure!(
                     identity(&p)? == file.before,
                     "Concurrent update conflict: {}",
@@ -464,6 +509,76 @@ impl PreparedTransaction {
                     "{error}; automatic rollback was blocked: {rollback}. Run devkit recover."
                 ),
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cargo_tests {
+    use super::*;
+
+    #[test]
+    fn only_component_authorities_and_nested_manifests_can_be_journaled() {
+        for name in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
+            "apps/server/Cargo.lock",
+            "packages/core/rustfmt.toml",
+            "apps/server/rust-toolchain.toml",
+            "packages/core/crates/fast parser/Cargo.toml",
+        ] {
+            transaction_path(name, &[]).unwrap();
+        }
+        for name in [
+            "Cargo.bak",
+            ".cargo/config.toml",
+            "apps/Not-a-slug/crates/foo/Cargo.toml",
+            "apps/server/crates/../Cargo.toml",
+            "apps/server//Cargo.toml",
+            "apps/server/crates/.git/Cargo.toml",
+            "apps/server/target/debug/Cargo.toml",
+            "apps/server/node_modules/lib/Cargo.toml",
+            "apps/server/crates/lib/Cargo.lock",
+            "packages/core/crates/lib/src/lib.rs",
+        ] {
+            assert!(transaction_path(name, &[]).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_new_component_cannot_journal_a_manifest_inside_its_build_output() {
+        assert!(
+            transaction_path("apps/server/target/Cargo.toml", &["apps/server".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn cargo_backup_slots_inherit_the_native_read_bound() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let slot = temp.path().join("0");
+        std::fs::File::create(&slot)?.set_len(32 * 1024 * 1024 + 1)?;
+        for name in [
+            "Cargo.lock",
+            "apps/a/Cargo.toml",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
+        ] {
+            let original = Path::new(name);
+            assert!(
+                identity_for(&slot, original)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("byte budget")
+            );
+            assert!(
+                read_input_bytes_for(&slot, original)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("byte budget")
+            );
         }
         Ok(())
     }

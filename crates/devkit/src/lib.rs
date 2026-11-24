@@ -1,5 +1,7 @@
 //! Native project management. Ecosystem resolvers select versions; this crate
 //! admits their exact inputs and preserves the product graph transactionally.
+pub mod cargo_lock;
+mod cargo_migration;
 pub mod catalog;
 pub mod compose;
 pub mod files;

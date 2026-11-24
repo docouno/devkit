@@ -41,10 +41,11 @@ const NODE_TEMPLATES: [&str; 6] = [
     "ts-library",
     "react-ui",
 ];
-const TEMPLATES: [&str; 7] = [
+const TEMPLATES: [&str; 8] = [
     "node-api",
     "react-web",
     "rust-api",
+    "rust-library",
     "electron-react",
     "react-client",
     "ts-library",
@@ -739,6 +740,77 @@ pub fn verify_rust_template(root: &Path, rust_version: &str) -> Result<()> {
         channel == Some(rust_version),
         "Rust template channel differs from the release toolchain"
     );
+    let fmt_path = safe_path(root, "templates/rust-api/rustfmt.toml")?;
+    let _: toml::Value = toml::from_str(&fs::read_to_string(&fmt_path)?)
+        .context("Invalid templates/rust-api/rustfmt.toml")?;
+    let recipe = fs::read_to_string(safe_path(root, "runtime/rust.Dockerfile")?)?;
+    crate::catalog::rust_base_image(&recipe, rust_version)?;
+    ensure!(
+        recipe.contains(&format!("--toolchain {rust_version}")),
+        "runtime/rust.Dockerfile must install rustfmt and clippy for --toolchain {rust_version}"
+    );
+    for template in ["rust-api", "rust-library"] {
+        let read_toml = |file: &str| -> Result<toml::Value> {
+            let path = format!("templates/{template}/{file}");
+            toml::from_str(&fs::read_to_string(safe_path(root, &path)?)?)
+                .with_context(|| format!("Invalid {path}"))
+        };
+        let manifest = read_toml("Cargo.toml")?;
+        let package = manifest
+            .get("package")
+            .context("Missing template package")?;
+        ensure!(
+            package.get("rust-version").and_then(toml::Value::as_str) == Some(rust_version)
+                && package.get("edition").and_then(toml::Value::as_str) == Some("2024")
+                && package.get("publish").and_then(toml::Value::as_bool) == Some(false),
+            "Expected a private edition-2024 {template} crate pinned to Rust {rust_version}"
+        );
+        if template == "rust-library" {
+            let has_deps = [
+                "dependencies",
+                "dev-dependencies",
+                "build-dependencies",
+                "dev_dependencies",
+                "build_dependencies",
+                "target",
+            ]
+            .into_iter()
+            .any(|section| {
+                manifest
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|deps| !deps.is_empty())
+            });
+            ensure!(
+                !has_deps,
+                "templates/rust-library/Cargo.toml must remain zero-dependency"
+            );
+        }
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .context("Missing template package name")?;
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .context("Missing template package version")?;
+        let lock = read_toml("Cargo.lock")?;
+        let packages = lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .context("Missing template lock packages")?;
+        ensure!(
+            lock.get("version").and_then(toml::Value::as_integer) == Some(4)
+                && packages
+                    .iter()
+                    .any(
+                        |entry| entry.get("name").and_then(toml::Value::as_str) == Some(name)
+                            && entry.get("version").and_then(toml::Value::as_str) == Some(version)
+                            && entry.get("source").is_none()
+                    ),
+            "templates/{template}/Cargo.lock must seed the local crate {name} {version}"
+        );
+    }
     Ok(())
 }
 

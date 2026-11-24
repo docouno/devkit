@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.4.1 baseline."""
+"""Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.5.1 baseline."""
 from __future__ import annotations
 import hashlib
 import http.server
@@ -24,15 +24,15 @@ AUTHOR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHOR / 'test/delivery'))
 from test_delivery import HttpsFixture, worktrunk  # noqa: E402
 
-BASELINE_VERSION = '0.4.1'
-BASELINE_INDEX_SHA256 = '0f95ce2c5a51c9f17e6439f7e2c5cf6bc185ed5657aba5a676a558d9806389aa'
-BASELINE_INDEX_SIZE = 2255
-BASELINE_RELEASE_IDENTITY = '0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a'
-BASELINE_RELEASE_SIZE = 58547
-BASELINE_ARCHIVE_SHA256 = '4c76c7ffd0ab48c710512af9874f8a1bc189bb663b939daa6ddc76522511143a'
-BASELINE_ARCHIVE_SIZE = 4003689
-BASELINE_ENGINE_SHA256 = '206f66322e7ae009bc9368a05df64cfef0285ec30e32e9b9dbf0ffbe1069f929'
-BASELINE_ENGINE_SIZE = 7960008
+BASELINE_VERSION = '0.5.1'
+BASELINE_INDEX_SHA256 = 'c55c5b5e0457f5c934079a8bbce272545b1cdbc2b7da25061bd7a95d2780d08a'
+BASELINE_INDEX_SIZE = 2258
+BASELINE_RELEASE_IDENTITY = '870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c'
+BASELINE_RELEASE_SIZE = 65946
+BASELINE_ARCHIVE_SHA256 = 'f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b'
+BASELINE_ARCHIVE_SIZE = 5145930
+BASELINE_ENGINE_SHA256 = '8388c1c2105b7f4b952277922ecb82747ab81d506a66d6d439258ae8196ef479'
+BASELINE_ENGINE_SIZE = 10589864
 
 
 def require(value, message):
@@ -243,25 +243,24 @@ class Harness:
         require(worktree['standState'] == 'stopped' and len(worktree['standPorts']) == 1, 'Cold Worktrunk reservation was not available on return')
         run('worktrunk-remove-cold', [wt, 'remove', '--foreground', '--yes', 'approved'])
         require(not approved.exists(), 'Worktrunk did not complete removal')
-    def verify_node_recovery(self):
-        target = self.scratch / 'genuine-node-migration'
-        env = self.environment('genuine-node-migration')
-        sdk_env = {key: value for key, value in env.items() if key not in ('HTTPS_PROXY', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE')}
-        self.run('prime-genuine-node-pnpm', [self.engine, 'internal', 'ensure-pnpm', '--pin-file', self.payload / 'runtime/pnpm.env'], env=sdk_env, timeout=150)
-        self.run('genuine-node-init', [self.engine, 'init', target, '--to', self.old_version,
-                                     '--app', 'web=react-web', '--package-source', 'local', '--non-interactive'], env=env, timeout=360)
-        saved = self.scratch / 'genuine-node-before'
+    def verify_rust_recovery(self):
+        target = self.scratch / 'genuine-rust-migration'
+        env = self.environment('genuine-rust-migration')
+        self.run('genuine-rust-init', [self.engine, 'init', target, '--to', self.old_version,
+                                     '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], env=env)
+        saved = self.scratch / 'genuine-rust-before'
         shutil.copytree(target, saved)
         loader = '.devkit/runtime/devkit.sh'
-        projection = '.devkit/runtime/devkit.mk'
         manifest = '.devkit/manifest.json'
-        self.run('genuine-node-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive'],
+        self.run('genuine-rust-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive'],
                  cwd=target, env=env, timeout=360)
         old = json.loads((saved / manifest).read_bytes())
         new = json.loads((target / manifest).read_bytes())
-        require(old['version'] == self.old_version and new['version'] == self.version, 'Unexpected Node migration fixture pins')
-        paths = sorted(set(old['managed']) | set(new['managed']) | {
-            'package.json', 'apps/web/package.json', 'package-lock.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc'}) + [manifest]
+        require(old['version'] == self.old_version and new['version'] == self.version, 'Unexpected Rust migration fixture pins')
+        cargo_paths = ('Cargo.toml', 'Cargo.lock', 'rustfmt.toml', 'rust-toolchain.toml')
+        paths = sorted((set(old['managed']) | set(new['managed']) | set(cargo_paths)
+                        | {'apps/api/' + name for name in cargo_paths}) - {loader})
+        paths = [loader, *paths, manifest]
         def capture(root, path):
             absolute = root / path
             if absolute.is_file():
@@ -269,7 +268,13 @@ class Harness:
             return None
         before = {path: capture(saved, path) for path in paths}
         after = {path: capture(target, path) for path in paths}
-        require(before['package-lock.json'] is not None and after['pnpm-lock.yaml'] is not None, 'Fixture did not migrate a genuine npm lock')
+        require(before['apps/api/Cargo.lock'] and not before['Cargo.lock']
+                and after['Cargo.lock'] and not after['apps/api/Cargo.lock'],
+                'Fixture did not migrate a genuine component lockfile')
+        pins = dict(line.split('=', 1) for line in (target / '.devkit/runtime/toolchains.env').read_text().splitlines() if '=' in line)
+        engine = Path(env['DEVKIT_CACHE_DIR']) / 'engines' / pins['DEVKIT_ENGINE_TARGET'] / self.version / pins['DEVKIT_ENGINE_SHA256'] / 'devkit'
+        require(engine.is_file(), 'Update did not prime the target engine before commit')
+        offline = dict(env, HTTPS_PROXY='http://127.0.0.1:1', DOCKER_HOST='unix:///unavailable.sock')
         def install(root, path, recorded):
             absolute = root / path
             if recorded is None:
@@ -280,8 +285,11 @@ class Harness:
             absolute.write_bytes(data)
             absolute.chmod(mode)
             return {'sha256': digest(data), 'mode': mode}
-        for variant, new_make, new_loader in [('old-old', False, False), ('new-old', True, False), ('new-new', True, True)]:
-            root = self.scratch / ('mixed-node-' + variant)
+        for variant, cutoff in [('old-old', -1), ('after-lock', paths.index('Cargo.lock')),
+                                ('before-lock-removal', paths.index('apps/api/Cargo.lock') - 1),
+                                ('after-lock-removal', paths.index('apps/api/Cargo.lock')),
+                                ('new-old', None), ('new-new', len(paths))]:
+            root = self.scratch / ('mixed-rust-' + variant)
             shutil.copytree(target, root)
             stage = '.devkit/state/update-' + str(uuid.uuid4())
             journal = {'schemaVersion': 2, 'stage': stage, 'files': [], 'createdDirectories': [], 'createdParents': []}
@@ -294,16 +302,16 @@ class Harness:
                 row = {'path': path, 'before': install(root, backup, before[path]) if backup else None,
                        'after': install(root, staged, after[path]) if staged else None, 'backup': backup, 'staged': staged}
                 journal['files'].append(row)
-            if not new_make:
-                install(root, projection, before[projection])
-            if not new_loader:
+            if cutoff is None:
                 install(root, loader, before[loader])
-            (root / '.devkit/update-pending.json').write_text(json.dumps(journal))
-            if new_loader:
-                self.run('make-recover-mixed-node-' + variant, ['make', 'recover'], cwd=root, env=env)
             else:
-                self.boot('bootstrap-recover-mixed-node-' + variant, 'recover', root, env=env)
-            require(all(capture(root, path) == before[path] for path in paths), 'Mixed-state rollback changed original Node files')
+                for path in paths[cutoff + 1:]:
+                    install(root, path, before[path])
+            (root / '.devkit/update-pending.json').write_text(json.dumps(journal))
+            command = [engine, 'recover', '.'] if cutoff in (-1, None) else ['make', 'recover']
+            self.run('recover-mixed-rust-' + variant, command, cwd=root, env=offline)
+            self.run('recover-repeat-rust-' + variant, [engine, 'recover', '.'], cwd=root, env=offline)
+            require(all(capture(root, path) == before[path] for path in paths), 'Mixed-state rollback changed original Rust files')
             require(not (root / '.devkit/update-pending.json').exists(), 'Mixed-state rollback left a pending journal')
     def execute(self):
         self.run('download-versioned-loader', ['curl', '--disable', '--fail', '--silent', '--show-error', '--output', self.script,
@@ -324,12 +332,22 @@ class Harness:
         source = baseline / 'apps/api/src/main.rs'
         source.write_text(source.read_text() + '\n// Preserve the product change.\n')
         (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
-        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml')}
+        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml',
+                                                  baseline / 'AGENTS.md', baseline / '.config/wt.toml')}
         self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
         bridge_env = self.environment('genuine-baseline-http-init')
         old_loader = baseline / '.devkit/runtime/devkit.sh'
         old_bytes = old_loader.read_bytes()
         bridge = ['sh', old_loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive']
+        for mode, args in [('preview', [*bridge, '--preview']), ('apply', bridge)]:
+            failed = self.run('duplicate-crate-' + mode, args, cwd=baseline, env=bridge_env, expected='devkit-api')
+            for component in ('api', 'worker'):
+                require(f'apps/{component}' in failed.stdout + failed.stderr, 'Missing conflict path')
+            require(old_loader.read_bytes() == old_bytes and not (baseline / 'Cargo.toml').exists()
+                    and not (baseline / '.devkit/update-pending.json').exists(), 'Conflicting update mutated the checkout')
+        worker = baseline / 'apps/worker'
+        for path in [worker / 'Cargo.toml', worker / 'Cargo.lock', *worker.rglob('*.rs')]:
+            path.write_text(path.read_text().replace('devkit-api', 'worker').replace('devkit_api', 'worker'))
         self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
         require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
         self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
@@ -337,28 +355,27 @@ class Harness:
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
-        require(not (baseline / 'AGENTS.md').exists() and not (baseline / '.config/wt.toml').exists(), 'Upgrade created project-owned files')
-        self.verify_node_recovery()
-        pre_040 = self.scratch / 'pre-040-checkout'
-        (pre_040 / '.devkit').mkdir(parents=True)
-        (pre_040 / '.devkit/manifest.json').write_text(json.dumps({
+        self.verify_rust_recovery()
+        pre_050 = self.scratch / 'pre-050-checkout'
+        (pre_050 / '.devkit').mkdir(parents=True)
+        (pre_050 / '.devkit/manifest.json').write_text(json.dumps({
             'schemaVersion': 2,
-            'version': '0.3.2',
+            'version': '0.4.1',
             'releaseIdentity': '0' * 64,
             'generation': 'gen-0',
             'packageMode': 'local',
             'managed': {},
             'components': {},
         }))
-        pre_040_before = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
+        pre_050_before = {str(p.relative_to(pre_050)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_050.rglob('*'))}
         requests_before = len(self.fixture.requests)
-        self.run('refuse-pre-040-project-zero-mutation', [self.engine, 'status', '--root', pre_040], expected='0.4.0')
-        self.run('refuse-pre-040-update-zero-mutation', [self.engine, 'update', pre_040, '--to', self.old_version, '--non-interactive'], expected='0.4.1')
-        require(len(self.fixture.requests) == requests_before, 'Pre-0.4.0 refusal issued unexpected release HTTP requests')
-        pre_040_after = {str(p.relative_to(pre_040)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_040.rglob('*'))}
-        require(pre_040_after == pre_040_before, 'Pre-0.4.0 refusal mutated project checkout')
-        require(not (self.scratch / 'cache refuse-pre-040-project-zero-mutation').exists(), 'Pre-0.4.0 status refusal created cache directory')
-        require(not (self.scratch / 'cache refuse-pre-040-update-zero-mutation').exists(), 'Pre-0.4.0 update refusal created cache directory')
+        self.run('refuse-pre-050-project-zero-mutation', [self.engine, 'status', '--root', pre_050], expected='0.5.0')
+        self.run('refuse-pre-050-update-zero-mutation', [self.engine, 'update', pre_050, '--to', self.old_version, '--non-interactive'], expected='0.5.1')
+        require(len(self.fixture.requests) == requests_before, 'Pre-0.5.0 refusal issued unexpected release HTTP requests')
+        pre_050_after = {str(p.relative_to(pre_050)): (p.is_dir(), p.read_bytes() if p.is_file() else b'') for p in sorted(pre_050.rglob('*'))}
+        require(pre_050_after == pre_050_before, 'Pre-0.5.0 refusal mutated project checkout')
+        require(not (self.scratch / 'cache refuse-pre-050-project-zero-mutation').exists(), 'Pre-0.5.0 status refusal created cache directory')
+        require(not (self.scratch / 'cache refuse-pre-050-update-zero-mutation').exists(), 'Pre-0.5.0 update refusal created cache directory')
     def finish(self, passed):
         self.fixture.close()
         require(self.source_before == {str(p.relative_to(self.build_set)): digest(p.read_bytes()) for p in self.build_set.rglob('*') if p.is_file()}, 'Modified source build-set')
