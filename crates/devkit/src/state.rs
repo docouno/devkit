@@ -497,6 +497,7 @@ pub(crate) fn darwin_bsd_info(
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let length = size_of::<libc::proc_bsdinfo>() as i32;
     let count = unsafe {
+        *libc::__error() = 0;
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
@@ -506,7 +507,12 @@ pub(crate) fn darwin_bsd_info(
         )
     };
     if count != length {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(0) {
+            std::io::Error::from_raw_os_error(libc::ESRCH)
+        } else {
+            error
+        });
     }
     Ok(unsafe { info.assume_init() })
 }
@@ -552,7 +558,6 @@ fn is_ancestor_or_self(target_pid: u32) -> bool {
 
 enum OwnerIdentity {
     Verified(LockOwner),
-    #[cfg(target_os = "macos")]
     Inaccessible,
 }
 
@@ -568,7 +573,6 @@ fn checkout_owner(root: &Path) -> Option<OwnerIdentity> {
     if let Some((_, ticks)) = proc_stat_ppid_and_start(owner.pid) {
         return (ticks == owner.start_time_ticks).then_some(OwnerIdentity::Verified(owner));
     }
-    #[cfg(target_os = "macos")]
     if let Ok(pid) = i32::try_from(owner.pid)
         && unsafe { libc::kill(pid, 0) } == -1
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -583,7 +587,6 @@ fn checkout_owner(root: &Path) -> Option<OwnerIdentity> {
 pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
     match checkout_owner(root)? {
         OwnerIdentity::Verified(owner) => Some(owner),
-        #[cfg(target_os = "macos")]
         OwnerIdentity::Inaccessible => None,
     }
 }
@@ -864,19 +867,15 @@ impl CheckoutLock {
                             );
                         }
                     } else {
-                        let unowned_limit_ms = if mode == CheckoutLockMode::Exclusive
-                            && shared_readers_hold_lock(&p)
-                        {
-                            5_000.min(timeout_ms)
-                        } else {
-                            250.min(timeout_ms)
-                        };
-                        #[cfg(target_os = "macos")]
                         let unowned_limit_ms =
                             if matches!(identity, Some(OwnerIdentity::Inaccessible)) {
                                 timeout_ms
+                            } else if mode == CheckoutLockMode::Exclusive
+                                && shared_readers_hold_lock(&p)
+                            {
+                                5_000.min(timeout_ms)
                             } else {
-                                unowned_limit_ms
+                                250.min(timeout_ms)
                             };
                         if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
                             anyhow::bail!("Another devkit operation owns this checkout");

@@ -181,14 +181,20 @@ class RequiredNativeCheckGuard(unittest.TestCase):
         ci, release = self.job("verify", "ci"), self.job("verify", "release")
         for caller in (ci, release):
             self.assertIn("assembly_result: ${{ needs.assemble.result }}", caller)
+            self.assertIn("source_amd64_result: ${{ needs.source-linux-amd64.result }}", caller)
+            self.assertIn("source_arm64_result: ${{ needs.source-linux-arm64.result }}", caller)
             self.assertIn("frozen: ${{ toJSON(needs.assemble.outputs) }}", caller)
-        self.assertIn("if: always()", ci)
+        # Keep the caller job key unadorned so Ruleset 25804809 required checks stay "verify / <gate>".
+        self.assertNotIn("name:", ci)
+        self.assertIn("if: '!cancelled()'", ci)
         self.assertIn("state: fresh", ci)
         self.assertIn("state: ${{ needs.admit-and-inspect.outputs.state }}", release)
         handoff = self.job("handoff")
         for env, arg in (("STATE", "state"), ("ASSEMBLY_RESULT", "assembly_result"), ("FROZEN", "frozen")):
             self.assertIn(env + ": ${{ inputs." + arg + " }}", handoff)
-        script = textwrap.dedent(handoff.split("        run: |\n", 1)[1])
+        script = textwrap.dedent(
+            handoff.split("        run: |\n", 1)[1].split("      - uses: actions/checkout@", 1)[0]
+        )
         frozen = dict(version="0.6.0", source_commit="a" * 40, source_tree="b" * 40,
                       index_sha256="c" * 64, frozen_set_artifact="devkit-frozen-set-2")
         preview = dict(preview_artifact="devkit-darwin-preview-2", preview_index_sha256="d" * 64)
@@ -217,43 +223,85 @@ class RequiredNativeCheckGuard(unittest.TestCase):
                 run = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(run.returncode == 0, valid, run.stderr)
 
+        self.assertIn("legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}", handoff)
         darwin = self.job("darwin-host")
         self.assertNotIn("if: env.PREVIEW_ARTIFACT", darwin)
+        self.assertIn("LEGACY_SHA256: ${{ needs.handoff.outputs.legacy_checkout_sha256 }}", darwin)
+        self.assertIn('test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d \' \' -f 1)" = "$LEGACY_SHA256"', darwin)
         self.assertIn("if: inputs.state == 'fresh'\n        run: |", darwin)
         self.assertIn("if: inputs.state == 'restored' || inputs.state == 'incomplete'\n"
                       "        run: python3 test/bootstrap/portable.py", darwin)
 
     def test_each_required_check_rejects_an_unsuccessful_or_skipped_worker(self):
-        workers = {"performance"}
+        workers = {"performance", "cross-host-checkout"}
         for group in ("source", "runtime", "delivery", "packaged", "registry"):
             job = self.job(group)
             self.assertIn(f"    name: {group}\n", job)
-            self.assertIn("    if: always()\n", job)
+            self.assertIn("    if: '!cancelled()'\n", job)
             dependencies = re.search(r"(?m)^    needs: \[(.+)\]$", job).group(1).split(", ")
-            expected = [group + "-linux-amd64", group + "-linux-arm64"]
             if group == "source":
-                expected.append("darwin-host")
+                expected = ["darwin-host"]
+            elif group == "packaged":
+                expected = ["cross-host-checkout", "packaged-linux-amd64", "packaged-linux-arm64"]
+            else:
+                expected = [group + "-linux-amd64", group + "-linux-arm64"]
             self.assertCountEqual(dependencies, ["handoff", *expected])
             workers.update(expected)
-            predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
-            for worker in ("handoff", expected[-1]):
-                for status in ("success", "failure", "cancelled", "skipped"):
-                    results = {name: {"result": "success"} for name in dependencies}
-                    results[worker]["result"] = status
-                    probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
-                                           capture_output=True, text=True, timeout=5)
-                    self.assertEqual(probe.returncode == 0, status == "success", (group, worker, status, probe.stderr))
+            if group == "source":
+                predicate = textwrap.dedent(job.split("        run: |\n", 1)[1])
+                for field in ("handoff", "darwin-host", "SOURCE_AMD64", "SOURCE_ARM64"):
+                    for status in ("success", "failure", "cancelled", "skipped"):
+                        results = {name: {"result": "success"} for name in dependencies}
+                        env = {"RESULTS": json.dumps(results), "SOURCE_AMD64": "success", "SOURCE_ARM64": "success"}
+                        if field in results:
+                            results[field]["result"] = status
+                            env["RESULTS"] = json.dumps(results)
+                        else:
+                            env[field] = status
+                        probe = subprocess.run(["bash", "-c", predicate], env=env,
+                                               capture_output=True, text=True, timeout=5)
+                        self.assertEqual(probe.returncode == 0, status == "success", (group, field, status, probe.stderr))
+            else:
+                predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
+                for worker in ("handoff", expected[-1]):
+                    for status in ("success", "failure", "cancelled", "skipped"):
+                        results = {name: {"result": "success"} for name in dependencies}
+                        results[worker]["result"] = status
+                        probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
+                                               capture_output=True, text=True, timeout=5)
+                        self.assertEqual(probe.returncode == 0, status == "success", (group, worker, status, probe.stderr))
         for name in workers:
             # The cross-host consumers inherit the gate through their export worker.
             worker = self.job(name)
-            self.assertNotRegex(worker, r"(?m)^    if: .*always\(")
+            self.assertNotRegex(worker, r"(?m)^    if: .*(?:always|!cancelled)\(")
             parent = re.search(r"(?m)^    needs: ([\w-]+)$", worker).group(1)
             if parent != "handoff":
                 self.assertIn("    needs: handoff\n", self.job(parent), name)
 
+    def test_release_workflow_admission_needs_and_sha256_handoffs(self):
+        admit = self.job("admit-and-inspect", "release")
+        self.assertIn("if: github.repository == 'docouno/devkit' && github.ref == 'refs/heads/main'", admit)
+        verify = self.job("verify", "release")
+        verify_needs = [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", verify).group(1).split(",") if item.strip()]
+        self.assertCountEqual(
+            verify_needs,
+            ["admit-and-inspect", "assemble", "build-linux-amd64", "build-linux-arm64",
+             "source-linux-amd64", "source-linux-arm64"],
+        )
+        self.assertIn("run_performance: true", verify)
+        publish = self.job("publish", "release")
+        publish_needs = [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", publish).group(1).split(",") if item.strip()]
+        self.assertCountEqual(publish_needs, ["assemble", "build-linux-amd64", "verify"])
+        for digest_env in ("INDEX_SHA256", "CONTROLLER_SHA256", "PERFORMANCE_SHA256"):
+            self.assertIn(digest_env + ":", publish)
+            self.assertIn(f'"${digest_env}"', publish)
+        verify_group = (REPO / ".github/workflows/verify-group.yml").read_text()
+        self.assertIn('"$LEGACY_SHA256"', verify_group)
+        self.assertIn('"$CHECKOUT_SHA256"', verify_group)
+
 
 class EventSourceGuard(unittest.TestCase):
-    def probe(self, event, status="identical"):
+    def probe(self, event, status="identical", *, default_branch="main", version="0.3.0"):
         with tempfile.TemporaryDirectory(prefix="release-admission-") as directory:
             root = Path(directory)
             calls = root / "calls.jsonl"
@@ -265,14 +313,15 @@ class EventSourceGuard(unittest.TestCase):
                     log.write(json.dumps(sys.argv[1:]) + '\\n')
                 assert sys.argv[1] == 'api'
                 if sys.argv[2] == 'repos/docouno/devkit':
-                    print(json.dumps({'default_branch': 'main'}))
+                    print(json.dumps({'default_branch': os.environ['DEFAULT_BRANCH']}))
                 else:
                     assert sys.argv[2] == 'repos/docouno/devkit/compare/' + os.environ['SOURCE_COMMIT'] + '...main'
                     print(json.dumps({'status': os.environ['MAIN_STATUS']}))
                 '''))
             gh.chmod(0o755)
             environment = {"PATH": str(root), "SOURCE_COMMIT": SOURCE,
-                           "VERSION": "0.3.0", "GUARD_CALLS": str(calls),
+                           "VERSION": version, "GUARD_CALLS": str(calls),
+                           "DEFAULT_BRANCH": default_branch,
                            "MAIN_STATUS": status, "PYTHONDONTWRITEBYTECODE": "1"}
             if event is not None:
                 environment["GITHUB_SHA"] = event
@@ -291,6 +340,26 @@ class EventSourceGuard(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("gh run rerun ORIGINAL_RUN_ID --failed", result.stderr)
         self.assertEqual(calls, [])
+
+    def test_prerelease_version_fails_before_any_provider_read(self):
+        result, calls = self.probe(SOURCE, version="0.6.0-rc.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Exact stable version required", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_non_main_default_branch_is_rejected(self):
+        result, calls = self.probe(SOURCE, default_branch="master")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Reviewed release branch must be main", result.stderr)
+        self.assertEqual(len(calls), 1)
+
+    def test_diverged_or_behind_source_is_rejected(self):
+        for status in ("diverged", "behind"):
+            with self.subTest(status=status):
+                result, calls = self.probe(SOURCE, status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Source must be reviewed main or its ancestor", result.stderr)
+                self.assertEqual(len(calls), 2)
 
     def test_equal_event_and_source_on_main_are_admitted(self):
         result, calls = self.probe(SOURCE)

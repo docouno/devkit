@@ -2512,9 +2512,13 @@ pub struct NpmrcPolicy {
 fn registry_targets_loopback(value: &str) -> Result<bool> {
     let url = url::Url::parse(value).context("Invalid registry URL")?;
     Ok(match url.host().context("Missing registry hostname")? {
-        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified(),
         url::Host::Ipv6(ip) => {
-            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
         }
         url::Host::Domain(domain) => {
             let domain = domain.trim_end_matches('.');
@@ -2928,8 +2932,15 @@ mod tests {
             "https://LOCALHOST.:8100/registry/",
             "http://127.0.0.1:8100/",
             "http://[::1]:8100/",
+            "http://0.0.0.0:4873/",
+            "http://[::]:4873/",
+            "http://[::ffff:0.0.0.0]:4873/",
+            "http://[::ffff:127.0.0.1]:4873/",
         ] {
-            assert!(registry_targets_loopback(url)?);
+            assert!(
+                registry_targets_loopback(url)?,
+                "expected loopback/unspecified for {url}"
+            );
         }
         assert!(!registry_targets_loopback("https://registry.npmjs.org/")?);
         Ok(())

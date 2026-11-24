@@ -76,6 +76,34 @@ def verify(directory=None):
                 # Even a syntactically valid CLI assignment has the wrong origin.
                 assert "cannot read accepted Make projection" in make(
                     "setup", f"DEVKIT_EXPECTED_PLAN={invalid}", ok=False)
+        # Ambient env vars (manifest cache, registered/desktop lists, Perl hooks) cannot hijack Make or devkit.sh.
+        pwned = project / "pwned"
+        hostile_env = dict(
+            env,
+            devkit_manifest_saved="1",
+            devkit_manifest_loaded="1",
+            DEVKIT_DESKTOP_APPS=f"$(shell touch '{pwned}') ; touch '{pwned}'",
+            DEVKIT_REGISTERED_APPS=f"$(shell touch '{pwned}')",
+            DEVKIT_PACKAGEABLE_PACKAGES=f"$(shell touch '{pwned}')",
+            PERL5LIB="/nonexistent/devkit-evil",
+            PERL5OPT='-MNonExistentDevkitEvil',
+            PERL_UNICODE="SDA",
+        )
+        projection.write_text(f"DEVKIT_REGISTERED_APPS := api\n"
+                              f"DEVKIT_REGISTERED_PACKAGES :=\n"
+                              f"DEVKIT_EXPECTED_PLAN := {sha}\n")
+        hostile_out = make("setup", environment=hostile_env)
+        assert f"1 {sha} {manifest_sha} task snapshot --root" in hostile_out, hostile_out
+        assert not pwned.exists(), "ambient Make variable triggered shell execution"
+        # CLI overrides of DEVKIT_REGISTERED_APPS / DEVKIT_DESKTOP_APPS do not have file origin.
+        help_cli = make("help", "DEVKIT_REGISTERED_APPS=injected",
+                        f"DEVKIT_DESKTOP_APPS=; touch '{pwned}'",
+                        environment=dict(hostile_env, DEVKIT_ENGINE_PATH=""))
+        assert "injected" not in help_cli, help_cli
+        assert not pwned.exists(), "CLI override triggered shell execution"
+        # Hostile Perl environment variables are scrubbed on devkit.sh digest and cache checks.
+        assert run("/bin/sh", loader, "make-manifest", environment=hostile_env).strip() == manifest_sha
+
         projection.write_text("DEVKIT_EXPECTED_PLAN := not-a-digest\n")
         assert "cannot read accepted Make projection" in make("setup", ok=False)
         (project / ".devkit/manifest.json").unlink()
@@ -89,6 +117,11 @@ def verify(directory=None):
         cached_env = dict(env, DEVKIT_ENGINE_PATH="", DEVKIT_CACHE_DIR=str(cache))
         cli = ("/bin/sh", loader, "cli", "--offline", "--version")
         run(*cli, environment=cached_env)
+        run(*cli, environment=dict(hostile_env, DEVKIT_ENGINE_PATH="", DEVKIT_CACHE_DIR=str(cache)))
+        for bad_root in ("/", "/tmp/.."):
+            assert "filesystem root cannot be the cache directory" in run(
+                *cli, ok=False, environment=dict(cached_env, DEVKIT_CACHE_DIR=bad_root)
+            )
         for mode in (0o700, 0o775, 0o644):
             cached.chmod(mode)
             assert "cached engine integrity differs" in run(*cli, ok=False, environment=cached_env)

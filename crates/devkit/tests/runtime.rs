@@ -145,7 +145,7 @@ fn tool_pin_parser_never_evaluates_shell_and_requires_pinned_engine_and_images()
         "c".repeat(64)
     );
     let parsed = ToolPins::parse(source.as_bytes()).unwrap();
-    assert_eq!(parsed.engine.version, "0.5.0");
+    assert_eq!(parsed.host_engine().unwrap().version, "0.5.0");
     assert!(ToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\n").as_bytes()).is_ok());
     assert!(ToolPins::parse(format!("{source}UNTRUSTED_PIN=1\n").as_bytes()).is_err());
     assert!(
@@ -713,8 +713,7 @@ if [ "$1" = "info" ]; then
 fi
 if [ "$1" = "context" ]; then
   case "$2" in
-    show) printf 'default\n' ;;
-    inspect) printf 'tcp://127.0.0.1:2375\n' ;;
+    inspect) printf 'default\ntcp://127.0.0.1:2375\n' ;;
     *) exit 90 ;;
   esac
   exit 0
@@ -1016,12 +1015,6 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         &devkit::doctor::DerivedImageReceipt::new(platform, &img_id, &rust_recipe),
     )
     .unwrap();
-    write_atomic(
-        &root.join(".devkit/state/rust-image"),
-        format!("{img_id}\n").as_bytes(),
-        0o644,
-    )
-    .unwrap();
 
     let fake_bin = temp.path().join("bin");
     fs::create_dir_all(&fake_bin).unwrap();
@@ -1038,13 +1031,13 @@ if [ "$1" = "compose" ] && [ "$2" = "version" ]; then
   exit 0
 fi
 if [ "$1" = "info" ]; then
-  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true,"ClientInfo":{{"Context":"default"}}}}\n'
   exit 0
 fi
 if [ "$1" = "context" ]; then
   case "$2" in
     show) printf 'default\n' ;;
-    inspect) printf 'unix:///var/run/docker.sock\n' ;;
+    inspect) printf 'default\nunix:///var/run/docker.sock\n' ;;
     *) exit 90 ;;
   esac
   exit 0
@@ -1180,8 +1173,8 @@ exit 0
         "prepare on existing state ran build: {log2}"
     );
 
-    // 3. Fresh checkout without `.devkit/state/rust-image` reuses local tag without `docker build`.
-    fs::remove_file(root.join(".devkit/state/rust-image")).unwrap();
+    // 3. Fresh checkout without `.devkit/state/rust-image.json` reuses local tag without `docker build`.
+    fs::remove_file(root.join(".devkit/state/rust-image.json")).unwrap();
     fs::write(&docker_log, "").unwrap();
     let setup_tag_hit = Command::new(exe)
         .args(["task", "setup", "--root", root.to_str().unwrap()])
@@ -1199,13 +1192,13 @@ exit 0
         !log3.contains("build "),
         "tag hit unexpectedly ran docker build: {log3}"
     );
-    assert_eq!(
-        fs::read_to_string(root.join(".devkit/state/rust-image")).unwrap(),
-        format!("{img_id}\n")
-    );
+    let receipt: devkit::doctor::DerivedImageReceipt =
+        devkit::files::read_json(&root.join(".devkit/state/rust-image.json")).unwrap();
+    assert_eq!(receipt.image_id, img_id);
+    assert!(!root.join(".devkit/state/rust-image").exists());
 
     // 4. Cold daemon without state or local tag runs `docker build --tag devkit-derived-rust:<pin>`.
-    fs::remove_file(root.join(".devkit/state/rust-image")).unwrap();
+    fs::remove_file(root.join(".devkit/state/rust-image.json")).unwrap();
     fs::write(&mode_file, "absent").unwrap();
     fs::write(&docker_log, "").unwrap();
     let setup_cold = Command::new(exe)

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 pub const TARGET: &str = "x86_64-unknown-linux-musl";
 pub const ENGINE_ASSET: &str = "devkit-x86_64-unknown-linux-musl";
 pub const RELEASE_BASE: &str = "https://github.com/docouno/devkit/releases/download";
+pub const MAX_ENGINE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Keep the original x86-64 asset and payload names readable by 0.5.x.
 /// Darwin joins the publication matrix after native Docker acceptance.
@@ -17,11 +19,7 @@ pub fn npm_platforms(targets: &[Target]) -> (Vec<&'static str>, Vec<&'static str
     let mut systems = Vec::new();
     let mut cpus = Vec::new();
     for target in targets {
-        let (system, cpu) = match target {
-            Target::LinuxX64 => ("linux", "x64"),
-            Target::LinuxArm64 => ("linux", "arm64"),
-            Target::DarwinArm64 => ("darwin", "arm64"),
-        };
+        let (system, cpu) = target.npm_platform();
         if !systems.contains(&system) {
             systems.push(system);
         }
@@ -41,6 +39,7 @@ pub enum Target {
 
 impl Target {
     pub const ALL: [Self; 3] = [Self::LinuxX64, Self::LinuxArm64, Self::DarwinArm64];
+    pub const LINUX: [Self; 2] = [Self::LinuxX64, Self::LinuxArm64];
 
     pub fn host() -> Result<Self> {
         match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -56,6 +55,84 @@ impl Target {
             .into_iter()
             .find(|target| target.triple() == triple)
             .with_context(|| format!("Unsupported native target: {triple}"))
+    }
+
+    pub fn is_linux(self) -> bool {
+        matches!(self, Self::LinuxX64 | Self::LinuxArm64)
+    }
+
+    pub fn is_musl(self) -> bool {
+        self.is_linux()
+    }
+
+    pub fn npm_platform(self) -> (&'static str, &'static str) {
+        match self {
+            Self::LinuxX64 => ("linux", "x64"),
+            Self::LinuxArm64 => ("linux", "arm64"),
+            Self::DarwinArm64 => ("darwin", "arm64"),
+        }
+    }
+
+    pub fn docker_platform(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxX64 => Some("linux/amd64"),
+            Self::LinuxArm64 => Some("linux/arm64"),
+            Self::DarwinArm64 => None,
+        }
+    }
+
+    pub fn from_docker_arch(arch: &str) -> Option<Self> {
+        match arch {
+            "amd64" | "x86_64" => Some(Self::LinuxX64),
+            "arm64" | "aarch64" => Some(Self::LinuxArm64),
+            _ => None,
+        }
+    }
+
+    pub fn from_docker_platform(platform: &str) -> Option<Self> {
+        match platform {
+            "linux/amd64" => Some(Self::LinuxX64),
+            "linux/arm64" => Some(Self::LinuxArm64),
+            _ => None,
+        }
+    }
+
+    pub fn elf_machine(self) -> Option<u16> {
+        match self {
+            Self::LinuxX64 => Some(62),
+            Self::LinuxArm64 => Some(183),
+            Self::DarwinArm64 => None,
+        }
+    }
+
+    pub fn pnpm_package(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxX64 => Some("@pnpm/exe.linux-x64-musl"),
+            Self::LinuxArm64 => Some("@pnpm/exe.linux-arm64-musl"),
+            Self::DarwinArm64 => None,
+        }
+    }
+
+    pub fn from_pnpm_package(package: &str) -> Option<Self> {
+        Self::LINUX
+            .into_iter()
+            .find(|target| target.pnpm_package() == Some(package))
+    }
+
+    pub fn electron_arch(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxX64 => Some("x64"),
+            Self::LinuxArm64 => Some("arm64"),
+            Self::DarwinArm64 => None,
+        }
+    }
+
+    pub fn uname_pattern(self) -> &'static str {
+        match self {
+            Self::LinuxX64 => "Linux:x86_64",
+            Self::LinuxArm64 => "Linux:aarch64|Linux:arm64",
+            Self::DarwinArm64 => "Darwin:arm64",
+        }
     }
 
     pub fn triple(self) -> &'static str {
@@ -94,11 +171,11 @@ impl Target {
         let engine = self.payload_name();
         if REQUIRED_PUBLISHABLE_TARGETS.contains(&self) {
             format!(
-                "To upgrade an older checkout with a verified local release, run /path/to/release/{engine} update . --to {version} --release-root /path/to/release. After publication, run npx @docouno/devkit@{version} update . --to {version}"
+                "Run npx @docouno/devkit@{version} update . --to {version}, or with a verified local release: /path/to/release/{engine} update . --to {version} --release-root /path/to/release"
             )
         } else {
             format!(
-                "Use the accepted release on Linux. For a checkout older than {version}, a verified three-target preview also supports /path/to/preview/{engine} update . --to {version} --release-root /path/to/preview"
+                "Use the accepted release on Linux. For a checkout older than {version}, a verified preview also supports /path/to/preview/{engine} update . --to {version} --release-root /path/to/preview"
             )
         }
     }
@@ -321,7 +398,7 @@ impl ReleaseIndex {
                 "Unsafe release asset: {name}"
             );
             ensure!(
-                SHA256_RE.is_match(&value.sha256) && value.size <= 128 * 1024 * 1024,
+                SHA256_RE.is_match(&value.sha256) && value.size <= MAX_EXECUTABLE_BYTES,
                 "Invalid release asset identity: {name}"
             );
         }
@@ -425,13 +502,16 @@ mod tests {
             .validate_publishable_matrix(REQUIRED_PUBLISHABLE_TARGETS)
             .unwrap();
         assert_eq!(index.engine_asset(arm).unwrap(), arm.asset());
-        for (target, asset) in [
-            (Target::DarwinArm64.triple(), Target::DarwinArm64.asset()),
-            (
-                "riscv64gc-unknown-linux-musl",
-                "devkit-riscv64gc-unknown-linux-musl",
-            ),
-        ] {
+        let mut extras: Vec<(&str, &str)> = Target::ALL
+            .into_iter()
+            .filter(|t| !REQUIRED_PUBLISHABLE_TARGETS.contains(t))
+            .map(|t| (t.triple(), t.asset()))
+            .collect();
+        extras.push((
+            "riscv64gc-unknown-linux-musl",
+            "devkit-riscv64gc-unknown-linux-musl",
+        ));
+        for (target, asset) in extras {
             index
                 .engines
                 .as_mut()

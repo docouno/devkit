@@ -875,11 +875,9 @@ with pathlib.Path(os.environ['COMPAT_DOCKER_LOG']).open('a') as log:
 if argv == ['compose', 'version', '--short']:
     print(os.environ['COMPAT_COMPOSE_VERSION'])
 elif argv == ['info', '--format', '{{json .}}']:
-    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine}))
-elif argv == ['context', 'show']:
-    print('default')
-elif argv == ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}', 'default']:
-    print('unix:///var/run/docker.sock')
+    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine, 'ClientInfo': {'Context': 'default'}}))
+elif argv == ['context', 'inspect', '--format', '{{.Name}}\\n{{.Endpoints.docker.Host}}']:
+    print('default\\nunix:///var/run/docker.sock')
 elif argv[0] == 'compose' and 'config' in argv:
     print(json.dumps({'services': {'api': {}}}))
 elif argv[0] == 'compose' and 'ps' in argv:
@@ -907,6 +905,8 @@ else:
                                              "unsupported Compose reached configuration or daemon queries")
                         else:
                             self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertFalse(any(call[:1] == ["context"] for call in calls),
+                                             f"native default Linux context ran extra docker context calls: {calls}")
                             if surface == "runtime":
                                 self.assertIn("COMPAT_STATUS_READY", result.stdout)
                             else:
@@ -924,7 +924,6 @@ class DoctorSnapshotTests(unittest.TestCase):
             recipe = write_rust_fixture(root)
             (root / ".devkit/state").mkdir(exist_ok=True)
             image_id = "sha256:" + "a" * 64
-            (root / ".devkit/state/rust-image").write_text(image_id + "\n")
             (root / ".devkit/state/rust-image.json").write_text(json.dumps({
                 "schemaVersion": 1, "platform": "linux/" + linux_arch(),
                 "imageId": image_id, "recipeSha256": recipe,
@@ -939,11 +938,9 @@ base = pathlib.Path(os.environ['DOCTOR_SNAPSHOT_BASE'])
 if argv[:2] == ['compose', 'version']:
     print('v5.0.0')
 elif argv == ['info', '--format', '{{json .}}']:
-    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine}))
-elif argv == ['context', 'show']:
-    print('default')
-elif argv == ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}', 'default']:
-    print('unix:///var/run/docker.sock')
+    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine, 'ClientInfo': {'Context': 'default'}}))
+elif argv == ['context', 'inspect', '--format', '{{.Name}}\\n{{.Endpoints.docker.Host}}']:
+    print('default\\nunix:///var/run/docker.sock')
 elif argv[:2] == ['image', 'inspect']:
     if (base/'armed').exists():
         (base/'ready').write_text('admission finished before image query')
@@ -1184,11 +1181,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("skipping Electron app desktop", aggregate.stderr)
         self.assertIn("apps/web:dev", aggregate.stdout)
         self.assertNotIn("packages/desktop-only", aggregate.stdout)
-        for args in [("up", "app=desktop"), ("dev-desktop",), ("up", "headless=1"), ("up", "DEVKIT_REGISTERED_APPS=desktop")]:
+        for args in [("up", "app=desktop"), ("dev-desktop",), ("up", "headless=1")]:
             selected = self.make(*args, override, env=environment, check=False)
             self.assertNotEqual(selected.returncode, 0)
             self.assertIn("42", selected.stderr)
             self.assertIn("packages/desktop-only:build", selected.stdout)
+        # CLI override of DEVKIT_REGISTERED_APPS cannot spoof file-origin projection.
+        spoofed = self.make("up", "DEVKIT_REGISTERED_APPS=desktop", override, env=environment, check=False)
+        self.assertNotIn("packages/desktop-only:build", spoofed.stdout)
+        # A real single-app desktop projection runs desktop without DISPLAY.
+        projection = self.root / ".devkit/project.mk"
+        original_projection = projection.read_text()
+        try:
+            projection.write_text(original_projection.replace(
+                "DEVKIT_REGISTERED_APPS := desktop web", "DEVKIT_REGISTERED_APPS := desktop"
+            ).replace(
+                "DEVKIT_REGISTERED_APPS := web desktop", "DEVKIT_REGISTERED_APPS := desktop"
+            ))
+            single = self.make("up", override, env=environment, check=False)
+            self.assertNotEqual(single.returncode, 0)
+            self.assertIn("42", single.stderr)
+            self.assertIn("packages/desktop-only:build", single.stdout)
+        finally:
+            projection.write_text(original_projection)
 
     def preview_fixture(self):
         write_fixture(self.root)
@@ -2394,7 +2409,9 @@ build: simulate-update
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rust image is absent/stale; run make setup", result.stderr)
         self.make("setup", timeout=180)
-        image_id = (self.root / ".devkit/state/rust-image").read_text().strip()
+        receipt = json.loads((self.root / ".devkit/state/rust-image.json").read_text())
+        image_id = receipt["imageId"]
+        self.assertFalse((self.root / ".devkit/state/rust-image").exists())
         self.assertRegex(image_id, r"^sha256:[a-f0-9]{64}$")
         image = json.loads(run("docker", "image", "inspect", image_id).stdout)[0]
         self.assertEqual(image["Config"]["Labels"]["io.docouno.devkit.rust-recipe"], recipe)
@@ -2403,7 +2420,7 @@ build: simulate-update
         for command in ("check", "test", "build"):
             self.make(command, timeout=180)
         self.assertEqual(hashes, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
-        self.assertEqual((self.root / ".devkit/state/rust-image").read_text().strip(), image_id)
+        self.assertEqual(json.loads((self.root / ".devkit/state/rust-image.json").read_text())["imageId"], image_id)
 
     def test_development_admits_compose_dependencies_before_start(self):
         write_fixture(self.root, ("web", "api"))
@@ -2523,8 +2540,8 @@ build: simulate-update
         directories = [".devkit", ".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store",
                        "node_modules", "apps/main/node_modules", "apps/main/dist"]
         directories += [str(self.base / "cache" / name) for name in ("pnpm-store", "pnpm-cache", "cargo", "electron", "tools", "empty-mask")]
-        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock", ".devkit/state/rust-image",
-                 ".devkit/state/desktop-image", ".devkit/state/rust-image.json", ".devkit/state/desktop-image.json"]
+        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock",
+                 ".devkit/state/rust-image.json", ".devkit/state/desktop-image.json"]
         dist_occurrence = 0
         for relative in directories + files + ["apps/main/dist"]:
             with self.subTest(path=relative):

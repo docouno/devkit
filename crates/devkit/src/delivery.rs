@@ -26,6 +26,14 @@ use std::{
 mod executable;
 use executable::verify_format;
 
+// Unstripped debug test binaries include DWARF debuginfo and can exceed
+// MAX_EXECUTABLE_BYTES; release builds enforce exact MAX_EXECUTABLE_BYTES.
+const EXECUTABLE_VERIFY_LIMIT: u64 = if cfg!(debug_assertions) {
+    512 * 1024 * 1024
+} else {
+    MAX_EXECUTABLE_BYTES
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnginePin {
     pub version: String,
@@ -92,7 +100,10 @@ pub fn verify_executable(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)?;
     let metadata = file.metadata()?;
-    ensure!(metadata.is_file(), "Native engine must be a regular file");
+    ensure!(
+        metadata.is_file() && metadata.len() <= EXECUTABLE_VERIFY_LIMIT,
+        "Native engine must be a bounded regular file"
+    );
     ensure!(
         !require_mode_0755 || metadata.permissions().mode() & 0o7777 == 0o755,
         "Cached executable mode differs from canonical 0755"
@@ -103,9 +114,9 @@ pub fn verify_executable(
         "Native engine checksum differs from accepted pin"
     );
     verify_format(&mut file, target)?;
+    let stamp = FileStamp::of(&metadata);
     ensure!(
-        executable_stamp(&fs::symlink_metadata(&path)?) == executable_stamp(&metadata)
-            && executable_stamp(&file.metadata()?) == executable_stamp(&metadata),
+        stamp.matches(&path)? && FileStamp::of(&file.metadata()?) == stamp,
         "Native executable changed while verifying"
     );
     Ok(())
@@ -145,31 +156,31 @@ fn mapped_executable_identity() -> Result<(u64, u64)> {
         return Err(std::io::Error::from_raw_os_error(error))
             .context("Cannot identify the mapped native executable");
     }
-    Ok((u64::from(device), inode))
+    // Match Rust's MetadataExt::dev() widening of Darwin's signed dev_t (i32).
+    Ok((i64::from(device as i32) as u64, inode))
 }
 
 // The descriptor pins the inode. Every reuse checks its physical identity
 // and timestamps against the file on disk and the executable mapped by the OS.
-#[derive(Debug, PartialEq, Eq)]
-struct ExecutableStamp(u64, u64, u64, i64, i64, i64, i64);
-fn executable_stamp(m: &fs::Metadata) -> ExecutableStamp {
-    ExecutableStamp(
-        m.dev(),
-        m.ino(),
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec(),
-        m.ctime(),
-        m.ctime_nsec(),
-    )
-}
 struct CurrentExecutable {
     file: fs::File,
     path: PathBuf,
-    stamp: ExecutableStamp,
+    stamp: FileStamp,
     sha256: String,
 }
 static CURRENT_EXECUTABLE: Mutex<Option<CurrentExecutable>> = Mutex::new(None);
+fn verify_current_identity(path: &Path, file: &fs::File, stamp: &FileStamp) -> Result<()> {
+    let disk = fs::symlink_metadata(path)?;
+    let executing = mapped_executable_identity()?;
+    ensure!(
+        disk.is_file()
+            && FileStamp::of(&disk) == *stamp
+            && FileStamp::of(&file.metadata()?) == *stamp
+            && executing == (disk.dev(), disk.ino()),
+        "Current native engine changed during operation"
+    );
+    executable_access(path)
+}
 fn with_current<T>(read: impl FnOnce(&CurrentExecutable) -> Result<T>) -> Result<T> {
     let mut cached = CURRENT_EXECUTABLE
         .lock()
@@ -182,37 +193,28 @@ fn with_current<T>(read: impl FnOnce(&CurrentExecutable) -> Result<T>) -> Result
             .open(&path)?;
         let metadata = file.metadata()?;
         ensure!(
-            metadata.is_file(),
-            "Current engine is not a regular executable"
+            metadata.is_file() && metadata.len() <= EXECUTABLE_VERIFY_LIMIT,
+            "Current engine is not a bounded regular executable"
         );
-        let stamp = executable_stamp(&metadata);
+        let stamp = FileStamp::of(&metadata);
+        verify_current_identity(&path, &file, &stamp)?;
         let sha256 = hash_reader(&mut file)?;
         verify_format(&mut file, Target::host()?)?;
+        verify_current_identity(&path, &file, &stamp)?;
         *cached = Some(CurrentExecutable {
             file,
             path,
             stamp,
             sha256,
         });
+    } else {
+        let current = cached.as_ref().expect("verified executable");
+        verify_current_identity(&current.path, &current.file, &current.stamp)?;
     }
-    let current = cached.as_ref().expect("verified executable");
-    let path = fs::symlink_metadata(&current.path)?;
-    let executing = mapped_executable_identity()?;
-    ensure!(
-        path.is_file()
-            && executable_stamp(&path) == current.stamp
-            && executable_stamp(&current.file.metadata()?) == current.stamp
-            && executing == (path.dev(), path.ino()),
-        "Current native engine changed during operation"
-    );
-    executable_access(&current.path)?;
-    read(current)
+    read(cached.as_ref().expect("verified executable"))
 }
 pub fn current_engine_digest() -> Result<String> {
     with_current(|current| Ok(current.sha256.clone()))
-}
-pub fn current_engine_path() -> Result<PathBuf> {
-    with_current(|current| Ok(current.path.clone()))
 }
 pub fn verify_current_engine(pin: &EnginePin) -> Result<PathBuf> {
     pin.validate()?;
@@ -256,13 +258,9 @@ fn render_host_selection(source: &str, pins: &BTreeMap<String, String>) -> Resul
     for target in Target::ALL {
         if let Some(sha256) = pins.get(target.triple()) {
             ensure!(SHA256_RE.is_match(sha256), "Invalid loader engine SHA256");
-            let pattern = match target {
-                Target::LinuxX64 => "Linux:x86_64",
-                Target::LinuxArm64 => "Linux:aarch64|Linux:arm64",
-                Target::DarwinArm64 => "Darwin:arm64",
-            };
             cases.push(format!(
-                "{pattern}) target={}; sha256={sha256}; payload={} ;;",
+                "{}) target={}; sha256={sha256}; payload={} ;;",
+                target.uname_pattern(),
                 target.triple(),
                 target.payload_name()
             ));

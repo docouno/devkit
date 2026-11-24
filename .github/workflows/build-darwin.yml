@@ -41,9 +41,15 @@ jobs:
           ref: ${{ inputs.source_commit }}
           persist-credentials: false
           fetch-depth: 0
+      - name: Cache Darwin Cargo registry archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .artifacts/darwin-cargo-cache
+          key: darwin-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Build the native host and exercise stock macOS primitives
         env:
           FRESH: ${{ inputs.fresh }}
+          DEVKIT_DARWIN_CARGO_HOME: ${{ github.workspace }}/.artifacts/darwin-cargo-cache
           BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
           if test "$FRESH" = true; then

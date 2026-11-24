@@ -79,8 +79,8 @@ def main():
         for key in ("MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "GNUMAKEFLAGS"):
             env.pop(key, None)
         if platform.system() == "Darwin":
-            subprocess.run(["/bin/sh", "tooling/darwin-producer.sh", "--build-frozen"], cwd=snapshot, env=env, check=True)
             work = snapshot / ".artifacts/darwin-host"
+            subprocess.run(["/bin/sh", "tooling/darwin-producer.sh", "--build-frozen"], cwd=snapshot, env=env, check=True)
             engine = work / "target/aarch64-apple-darwin/release/devkit"
             notices, receipt, extra = work / "notices", work / "notice-producer.json", ["--host-env", work / "host.json"]
         else:

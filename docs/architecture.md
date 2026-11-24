@@ -63,6 +63,10 @@ Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, 
    - Offline Node containers receive dummy placeholder values (`devkit-offline-unused`) and no CA mount; Rust containers never receive npm registry tokens or `NODE_EXTRA_CA_CERTS`.
    - `DEVKIT_CA_CERT` extends the pinned Mozilla roots for native HTTPS and standalone pnpm. The native downloader preserves the replacement semantics of an explicit `SSL_CERT_FILE`.
    - Implicit `.pnpmfile.cjs`, `.pnpmfile.mjs`, and `.pnpmfile.js` hooks are unsupported and rejected before container startup. Automatic pnpm operations also disable these hooks; project installation scripts run in the separate offline phase.
+5. **macOS APFS case-sensitivity boundary**:
+   - On case-insensitive macOS APFS volumes, Devkit never mounts a unified ancestor above the checkout root (such as `$HOME`) into `/devkit/unified`, falling back to a checkout-local pnpm store instead so host siblings outside the checkout cannot be accessed through alternate casing over VirtioFS.
+   - Electron binary installation (`setup_electron`) runs with `/workspace` mounted read-only, `/devkit/unified` unmounted, checkout secret files masked, and writes restricted to `node_modules` and `/cache/{electron,pnpm}`.
+   - On case-insensitive APFS shares, Linux VFS bind-masks over checkout-internal `.env*` files only match exact filename casing; teams requiring strict checkout-internal secret masking during explicit write-and-network sessions (`devkit exec --write --network bridge`) should use a case-sensitive APFS volume or keep sensitive credentials out of checkout `.env` files.
 
 ## Adaptive Resource Budgeting and Concurrency
 

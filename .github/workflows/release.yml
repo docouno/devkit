@@ -129,6 +129,20 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  source-linux-amd64:
+    needs: admit-and-inspect
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: amd64
+      source_commit: ${{ inputs.source_commit }}
+
+  source-linux-arm64:
+    needs: admit-and-inspect
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: arm64
+      source_commit: ${{ inputs.source_commit }}
+
   build-linux-amd64:
     needs: admit-and-inspect
     uses: ./.github/workflows/build-linux.yml
@@ -168,11 +182,21 @@ jobs:
       darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}
 
   verify:
-    needs: [admit-and-inspect, assemble, build-linux-amd64, build-linux-arm64]
+    needs:
+      [
+        admit-and-inspect,
+        assemble,
+        build-linux-amd64,
+        build-linux-arm64,
+        source-linux-amd64,
+        source-linux-arm64,
+      ]
     uses: ./.github/workflows/verify.yml
     with:
       state: ${{ needs.admit-and-inspect.outputs.state }}
       assembly_result: ${{ needs.assemble.result }}
+      source_amd64_result: ${{ needs.source-linux-amd64.result }}
+      source_arm64_result: ${{ needs.source-linux-arm64.result }}
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
@@ -189,6 +213,7 @@ jobs:
       CONTROLLER_SHA256: ${{ needs.build-linux-amd64.outputs.controller_sha256 }}
       SOURCE_TREE: ${{ needs.assemble.outputs.source_tree }}
       INDEX_SHA256: ${{ needs.assemble.outputs.index_sha256 }}
+      PERFORMANCE_SHA256: ${{ needs.verify.outputs.performance_sha256 }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -207,7 +232,7 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: ${{ needs.verify.outputs.performance_artifact }}
-          path: .artifacts/release-ops
+          path: .artifacts/release-proof
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 24.22.1
@@ -224,7 +249,11 @@ jobs:
           set -euo pipefail
           test "$(sha256sum .artifacts/frozen/release-index.json | cut -d ' ' -f 1)" = "$INDEX_SHA256"
           test "$(sha256sum .artifacts/release-ops/devkit-release | cut -d ' ' -f 1)" = "$CONTROLLER_SHA256"
-          chmod 755 .artifacts/release-ops/devkit-release .artifacts/frozen/devkit-*-unknown-linux-musl
+          test "$(sha256sum .artifacts/release-proof/performance.json | cut -d ' ' -f 1)" = "$PERFORMANCE_SHA256"
+          chmod 755 .artifacts/release-ops/devkit-release
+          jq -er '.engines[]' .artifacts/frozen/release-index.json | while IFS= read -r engine; do
+            chmod 755 ".artifacts/frozen/$engine"
+          done
           args=(--root "$PWD" --version "$VERSION" --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" --previous-env "$PREVIOUS_ENV" --previous-cli "$PREVIOUS_CLI" --previous-github "$PREVIOUS_GITHUB" --build-set "$PWD/.artifacts/frozen")
           .artifacts/release-ops/devkit-release hydrate "${args[@]}"
           .artifacts/release-ops/devkit-release stage "${args[@]}"
@@ -287,7 +316,7 @@ jobs:
             --build-set "$PWD/.artifacts/frozen" --publication-run "$BUILD_RUN" \
             --public-baseline "$PWD/.artifacts/release-proof/public-baseline.json" \
             --npx "$PWD/.artifacts/release-proof/npx-pinned.json" \
-            --performance "$PWD/.artifacts/release-ops/performance.json" \
+            --performance "$PWD/.artifacts/release-proof/performance.json" \
             --transport "$PWD/.artifacts/release-proof/transport-cold.json" \
             --readme "$PWD/.artifacts/release-proof/readme.json" \
             --output "$PWD/.artifacts/release-proof/compact.json"

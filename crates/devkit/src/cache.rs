@@ -87,6 +87,15 @@ pub fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn ensure_cache_root(root: &Path) -> Result<()> {
+    let absent = !exists(root)?;
+    create_dir_all_durable(root)?;
+    if absent {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl<'a> ReleaseCache<'a> {
     pub fn ensure_pnpm(
         &self,
@@ -214,12 +223,7 @@ impl<'a> ReleaseCache<'a> {
         })
     }
     fn initialize(&self) -> Result<()> {
-        let absent = !exists(&self.root)?;
-        create_dir_all_durable(&self.root)?;
-        if absent {
-            fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
+        ensure_cache_root(&self.root)
     }
     fn lock_path(&self, key: &str) -> Result<PathBuf> {
         self.initialize()?;
@@ -316,7 +320,25 @@ impl<'a> ReleaseCache<'a> {
             "Release engine pin differs from its actual payload"
         );
         self.install_engine(pin, timeout, |path| {
-            write_atomic(path, &release.bytes(file)?, 0o755)?;
+            let source_path = safe_path(&release.root, file)?;
+            let mut input = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&source_path)?;
+            let meta = input.metadata()?;
+            ensure!(
+                meta.is_file() && meta.len() <= MAX_ENGINE_BYTES,
+                "Release engine is not a bounded regular file"
+            );
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .mode(0o600)
+                .open(path)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.set_permissions(fs::Permissions::from_mode(0o755))?;
+            output.sync_all()?;
             release.recheck()
         })
     }
@@ -327,12 +349,16 @@ impl<'a> ReleaseCache<'a> {
         lock_timeout: Duration,
         prepare: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<PathBuf> {
+        let target = self.engine_path(pin)?;
+        if exists(&target)? {
+            verify_cached_engine(&target, pin)?;
+            return Ok(target);
+        }
         let lock_path = self.lock_path(&format!(
             "engine:{}:{}:{}",
             pin.target, pin.version, pin.sha256
         ))?;
         let _lock = lock_file_with_timeout(&lock_path, self.runner, lock_timeout)?;
-        let target = self.engine_path(pin)?;
         if exists(&target)? {
             verify_cached_engine(&target, pin)?;
             return Ok(target);
@@ -374,7 +400,7 @@ impl<'a> ReleaseCache<'a> {
         allow_network: bool,
     ) -> Result<PathBuf> {
         ensure!(
-            Target::parse(&pin.target)? != Target::DarwinArm64,
+            Target::parse(&pin.target)?.is_linux(),
             "Container helper requires a Linux target"
         );
         if pin.target == Target::host()?.triple() {
@@ -393,7 +419,7 @@ impl<'a> ReleaseCache<'a> {
         let platform = Target::parse(&pin.target)?;
         let url = format!("{RELEASE_BASE}/v{}/{}", pin.version, platform.asset());
         self.install_engine(pin, CACHE_LOCK_TIMEOUT, |path| {
-            self.fetch(&url, path, 64 * 1024 * 1024)?;
+            self.fetch(&url, path, MAX_ENGINE_BYTES)?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
             File::open(path)?.sync_all()?;
             Ok(())
@@ -669,7 +695,7 @@ fn engine_cache_path(root: &Path, pin: &EnginePin) -> Result<PathBuf> {
 fn local_helper_path(root: &Path, pin: &EnginePin) -> Result<Option<PathBuf>> {
     let target = Target::parse(&pin.target)?;
     ensure!(
-        target != Target::DarwinArm64,
+        target.is_linux(),
         "Container helper requires a Linux target"
     );
 
@@ -694,7 +720,7 @@ fn local_helper_path(root: &Path, pin: &EnginePin) -> Result<Option<PathBuf>> {
 pub fn linux_helper_ready(root: &Path, pin: &EnginePin) -> Result<bool> {
     let target = Target::parse(&pin.target)?;
     ensure!(
-        target != Target::DarwinArm64,
+        target.is_linux(),
         "Container helper requires a Linux target"
     );
     if target == Target::host()? && current_engine_digest()? == pin.sha256 {
@@ -777,7 +803,7 @@ fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunne
         compressed.metadata()?.len() <= 64 * 1024 * 1024,
         "pnpm archive exceeds byte budget"
     );
-    let decoded = flate2::read::MultiGzDecoder::new(compressed).take(128 * 1024 * 1024);
+    let decoded = flate2::read::MultiGzDecoder::new(compressed).take(MAX_EXECUTABLE_BYTES);
     let mut archive = tar::Archive::new(decoded);
     let mut found = false;
     for (index, entry) in archive.entries()?.enumerate() {
@@ -801,7 +827,7 @@ fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunne
             "Unsupported pnpm archive entry"
         );
         ensure!(
-            entry.size() <= 128 * 1024 * 1024,
+            entry.size() <= MAX_EXECUTABLE_BYTES,
             "pnpm archive entry exceeds byte budget"
         );
         if path == Path::new("package/pnpm") {
@@ -852,7 +878,7 @@ fn payload_budget(root: &Path) -> Result<()> {
             }
         } else {
             ensure!(
-                meta.is_file() && meta.len() <= 64 * 1024 * 1024,
+                meta.is_file() && meta.len() <= MAX_ENGINE_BYTES,
                 "Invalid or oversized release source/cache entry"
             );
             bytes = bytes

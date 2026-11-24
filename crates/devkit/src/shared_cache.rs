@@ -4,14 +4,15 @@ use crate::{Result, files::*};
 use anyhow::{Context, ensure};
 use std::{
     collections::BTreeSet,
+    ffi::CString,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Command,
 };
-
-#[cfg(any(target_os = "linux", test))]
-use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 pub fn directory(path: &Path) -> Result<()> {
     let path = project_root(path)?;
@@ -25,13 +26,30 @@ pub fn directory(path: &Path) -> Result<()> {
     create_dir_all_durable(&path)
 }
 
-const MASKED_CACHE_PATHS: [&str; 5] =
-    [".tmp", "empty-mask", ".locks", "engines", "empty-file-mask"];
+const MASKED_CACHE_DIRS: [&str; 7] = [
+    ".tmp",
+    "empty-mask",
+    ".locks",
+    "engines",
+    "tools",
+    "releases",
+    "refs",
+];
+const MASKED_CACHE_FILES: [&str; 3] = ["empty-file-mask", "port-leases.json", "port-leases.lock"];
 
 /// Create private bind sources before enumerating the siblings on a shared mount.
 pub fn prepare_mount_masks(cache: &Path) -> Result<()> {
-    for name in [".tmp", "empty-mask", ".locks", "engines"] {
-        directory(&safe_path(cache, name)?)?;
+    crate::cache::ensure_cache_root(cache)?;
+    let tmp = safe_path(cache, ".tmp")?;
+    let tmp_absent = !exists(&tmp)?;
+    directory(&tmp)?;
+    if tmp_absent {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700))?;
+    }
+    for name in MASKED_CACHE_DIRS {
+        if name != ".tmp" {
+            directory(&safe_path(cache, name)?)?;
+        }
     }
     ensure!(
         fs::read_dir(cache.join("empty-mask"))?.next().is_none(),
@@ -39,7 +57,7 @@ pub fn prepare_mount_masks(cache: &Path) -> Result<()> {
     );
     let path = safe_path(cache, "empty-file-mask")?;
     if !exists(&path)? {
-        let file = tempfile::NamedTempFile::new_in(cache.join(".tmp"))?;
+        let file = tempfile::NamedTempFile::new_in(&tmp)?;
         file.as_file()
             .set_permissions(fs::Permissions::from_mode(0o444))?;
         file.as_file().sync_all()?;
@@ -59,15 +77,33 @@ pub fn prepare_mount_masks(cache: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn volume_is_case_sensitive(path: &Path) -> Result<bool> {
+    unsafe extern "C" {
+        fn devkit_volume_case_sensitive(path: *const libc::c_char) -> libc::c_int;
+    }
+    let existing = nearest_existing(path)?;
+    let encoded = CString::new(existing.as_os_str().as_bytes())?;
+    // SAFETY: encoded is a live NUL-terminated pathname.
+    Ok(unsafe { devkit_volume_case_sensitive(encoded.as_ptr()) } == 1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn volume_is_case_sensitive(_path: &Path) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
 pub fn mount_identity(path: &Path) -> Result<(u64, u64)> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let path = CString::new(path.as_os_str().as_bytes())?;
     let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
     attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     attrs.commonattr = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_FSID;
-    // getattrlist packs a u32 size, dev_t and fsid_t from the same vnode.
+    // getattrlist(2) requires a 4-byte aligned buffer: u32 size, dev_t, fsid_t.
     // It needs only metadata access and never opens a FIFO or follows a link.
-    let mut bytes = [0u8; 16];
+    #[repr(C, align(4))]
+    struct MountBuffer([u8; 16]);
+    let mut buffer = MountBuffer([0u8; 16]);
+    let bytes = &mut buffer.0;
     if unsafe {
         libc::getattrlist(
             path.as_ptr(),
@@ -168,214 +204,6 @@ fn git_common_dir(checkout: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-
-    #[test]
-    fn cold_mount_masks_exist_before_selection_and_fallback_stops_on_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let checkout = project_root(&tmp.path().join("checkout")).unwrap();
-        let cache = project_root(&tmp.path().join("cache")).unwrap();
-        directory(&checkout.join(".git")).unwrap();
-        let mut attempts = Vec::new();
-        let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |p| {
-            if attempts.is_empty() {
-                for name in MASKED_CACHE_PATHS {
-                    assert!(p.masks.iter().any(
-                        |(target, _)| target == &Path::new("/devkit/unified/cache").join(name)
-                    ));
-                }
-            }
-            attempts.push(p.store.clone());
-            Ok(p.store == checkout.join(".devkit/cache/pnpm-store"))
-        })
-        .unwrap();
-        assert_eq!(
-            attempts,
-            [
-                cache.join("pnpm-store"),
-                checkout.join(".git/devkit-store"),
-                plan.store
-            ]
-        );
-        let mut count = 0;
-        assert!(
-            UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |_| {
-                count += 1;
-                anyhow::bail!("guest probe failed")
-            })
-            .is_err()
-        );
-        assert_eq!(count, 1);
-        assert!(
-            UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |_| Ok(false))
-                .unwrap_err()
-                .to_string()
-                .contains("Cannot create hardlinks")
-        );
-        let mask = cache.join("empty-file-mask");
-        assert_eq!(fs::metadata(&mask).unwrap().mode() & 0o777, 0o444);
-        fs::remove_file(&mask).unwrap();
-        symlink(checkout.join("missing"), &mask).unwrap();
-        assert!(prepare_mount_masks(&cache).is_err());
-    }
-
-    #[test]
-    fn only_the_unshared_candidate_ancestor_allows_mount_fallback() {
-        use crate::processes::ProcessOutput;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = project_root(tmp.path()).unwrap();
-        let checkout = root.join("checkout");
-        let cache = root.join("cache");
-        directory(&checkout.join(".git")).unwrap();
-        let diagnostic = |code, stderr: String| ProcessOutput {
-            code,
-            stdout: Vec::new(),
-            stderr: stderr.into_bytes(),
-        };
-        let missing = |p: &Path| {
-            format!(
-                "docker: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: {}\n\nRun 'docker run --help' for more information\n",
-                p.display()
-            )
-        };
-        let denied = format!(
-            "docker: Error response from daemon: Mounts denied:\nThe path {} is not shared from the host and is not known to Docker.\n",
-            root.display()
-        );
-        for message in [missing(&root), denied] {
-            let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |plan| {
-                if plan.store == cache.join("pnpm-store") {
-                    guest_hardlinks_supported(diagnostic(125, message.clone()), &plan.ancestor)
-                } else {
-                    Ok(true)
-                }
-            })
-            .unwrap();
-            assert_eq!(plan.store, checkout.join(".git/devkit-store"));
-        }
-        for output in [
-            diagnostic(125, missing(&root.join("other"))),
-            diagnostic(1, missing(&root)),
-            diagnostic(125, "Docker connection unavailable".into()),
-            diagnostic(1, "Hardlink probe contents changed".into()),
-        ] {
-            assert!(guest_hardlinks_supported(output, &root).is_err());
-        }
-        let absent = root.join("absent");
-        assert!(guest_hardlinks_supported(diagnostic(125, missing(&absent)), &absent).is_err());
-    }
-
-    #[test]
-    fn npmrc_mask_preserves_environment_for_daily_tasks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        for file in [".NPMRC", ".Env.Local", ".env.example"] {
-            fs::write(root.join(file), []).unwrap();
-        }
-        let alias_exists = root.join(".npmrc").exists();
-        let mut npmrc = vec![PathBuf::from(".NPMRC")];
-        let mut secrets = vec![PathBuf::from(".Env.Local"), PathBuf::from(".NPMRC")];
-        if alias_exists {
-            npmrc.push(".npmrc".into());
-            secrets.extend([PathBuf::from(".env.local"), PathBuf::from(".npmrc")]);
-        }
-        assert_eq!(mask_targets(root, false, true).unwrap(), npmrc);
-        assert_eq!(mask_targets(root, true, true).unwrap(), secrets);
-        assert!(mask_targets(root, false, false).unwrap().is_empty());
-        assert!(mask_targets(root, true, false).unwrap().is_empty());
-        assert_eq!(root.join(".npmrc").exists(), alias_exists);
-        if !alias_exists {
-            fs::write(root.join(".npmrc"), []).unwrap();
-            assert_eq!(mask_targets(root, false, true).unwrap().len(), 2);
-        }
-    }
-
-    #[test]
-    fn git_pointer_metadata_is_bounded_before_any_identity() {
-        const WORKER: &str = "DEVKIT_TEST_GIT_POINTER_BUDGET";
-        if std::env::var(WORKER).as_deref() != Ok("1") {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "shared_cache::tests::git_pointer_metadata_is_bounded_before_any_identity",
-                    "--test-threads=1",
-                ])
-                .env(WORKER, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let pages: u64 = fs::read_to_string("/proc/self/statm")
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap();
-            // SAFETY: this disposable worker limits only its own address space.
-            let maximum =
-                pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 + 64 * 1024 * 1024;
-            let limit = libc::rlimit {
-                rlim_cur: maximum,
-                rlim_max: maximum,
-            };
-            // SAFETY: limit is a live rlimit and no other process is modified.
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
-        }
-        let temp = tempfile::TempDir::new().unwrap();
-        let checkout = temp.path().join("checkout");
-        let repository = project_root(&temp.path().join("repo")).unwrap();
-        let gitdir = repository.join("worktrees/check");
-        fs::create_dir(&checkout).unwrap();
-        fs::create_dir_all(&gitdir).unwrap();
-        let pointer = checkout.join(".git");
-        let common = gitdir.join("commondir");
-        fs::write(&pointer, "gitdir: ../repo/worktrees/check\n").unwrap();
-        fs::write(&common, "../..\n").unwrap();
-        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository.clone()));
-        for path in [&pointer, &common] {
-            let original = fs::read(path).unwrap();
-            for size in [16 * 1024 + 1, 1024 * 1024 * 1024] {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .unwrap()
-                    .set_len(size)
-                    .unwrap();
-                assert!(
-                    git_common_dir(&checkout)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("exceeds byte budget")
-                );
-                fs::write(path, &original).unwrap();
-            }
-        }
-        fs::remove_file(&common).unwrap();
-        symlink(&pointer, &common).unwrap();
-        assert!(git_common_dir(&checkout).is_err());
-        fs::remove_file(&common).unwrap();
-        let name = CString::new(common.as_os_str().as_bytes()).unwrap();
-        // SAFETY: a valid terminated pathname, in the disposable fixture only.
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(git_common_dir(&checkout).is_err());
-        fs::remove_file(&common).unwrap();
-        fs::write(&common, "../..\n").unwrap();
-        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository));
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct UnifiedStorePlan {
     pub checkout: PathBuf,
@@ -389,6 +217,17 @@ pub struct UnifiedStorePlan {
 impl UnifiedStorePlan {
     fn candidate(checkout: &Path, store: &Path, cache: &Path) -> Result<Option<Self>> {
         let checkout = project_root(checkout)?;
+        let case_sensitive = volume_is_case_sensitive(&checkout)?;
+        Self::candidate_with_case_sensitivity(&checkout, store, cache, case_sensitive)
+    }
+
+    fn candidate_with_case_sensitivity(
+        checkout: &Path,
+        store: &Path,
+        cache: &Path,
+        case_sensitive: bool,
+    ) -> Result<Option<Self>> {
+        let checkout = project_root(checkout)?;
         let store = project_root(store)?;
         let Some(ancestor) = common_ancestor(&checkout, &store) else {
             return Ok(None);
@@ -397,6 +236,12 @@ impl UnifiedStorePlan {
             !checkout.starts_with(&store),
             "Dependency store cannot contain the checkout"
         );
+        // On case-insensitive host shares (default macOS APFS + VirtioFS),
+        // Linux VFS bind masks only match exact casing, so never mount an
+        // ancestor above the checkout root (such as $HOME).
+        if !case_sensitive && ancestor != checkout {
+            return Ok(None);
+        }
         let expected = mount_identity(&checkout)?;
         let mut spine = BTreeSet::new();
         for endpoint in [&checkout, &store] {
@@ -551,29 +396,45 @@ impl UnifiedStorePlan {
         path.strip_prefix(&self.cache)
             .ok()
             .and_then(Path::to_str)
-            .is_some_and(|p| MASKED_CACHE_PATHS.contains(&p))
+            .is_some_and(|p| MASKED_CACHE_DIRS.contains(&p) || MASKED_CACHE_FILES.contains(&p))
     }
     pub fn mask_checkout_files(&self, command: &mut Command, target_root: &Path) -> Result<()> {
-        let file_mask = self.cache.join("empty-file-mask");
-        for target in mask_targets(&self.checkout, true, cfg!(target_os = "macos"))? {
-            mount(command, &file_mask, &target_root.join(target), true)?;
+        mask_checkout_secrets(command, &self.checkout, &self.cache, target_root)
+    }
+}
+
+pub fn mask_checkout_secrets(
+    command: &mut Command,
+    checkout: &Path,
+    cache: &Path,
+    target_root: &Path,
+) -> Result<()> {
+    let file_mask = cache.join("empty-file-mask");
+    for target in mask_targets(checkout, true, cfg!(target_os = "macos"))? {
+        mount(command, &file_mask, &target_root.join(target), true)?;
+    }
+    if let Ok(relative) = cache.strip_prefix(checkout) {
+        let dir_mask = cache.join("empty-mask");
+        for name in MASKED_CACHE_DIRS {
+            mount(
+                command,
+                &dir_mask,
+                &target_root.join(relative).join(name),
+                true,
+            )?;
         }
-        if let Ok(relative) = self.cache.strip_prefix(&self.checkout) {
-            for name in MASKED_CACHE_PATHS {
+        for name in MASKED_CACHE_FILES {
+            if exists(&cache.join(name))? {
                 mount(
                     command,
-                    &self.cache.join(if name == "empty-file-mask" {
-                        name
-                    } else {
-                        "empty-mask"
-                    }),
+                    &file_mask,
                     &target_root.join(relative).join(name),
                     true,
                 )?;
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 fn canonical_secret_name(name: &str, fold_case: bool) -> std::borrow::Cow<'_, str> {
@@ -657,6 +518,22 @@ pub fn check_guest_hardlink(source: &Path, link: &Path, token: &str) -> Result<(
     Ok(())
 }
 
+fn contains_exact_path(text: &str, path: &str) -> bool {
+    let mut rest = text;
+    while let Some(idx) = rest.find(path) {
+        let before = rest[..idx].chars().next_back();
+        let after = rest[idx + path.len()..].chars().next();
+        let left_ok = before.is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '"' | '\''));
+        let right_ok =
+            after.is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '.' | ',' | ':'));
+        if left_ok && right_ok {
+            return true;
+        }
+        rest = &rest[idx + path.len()..];
+    }
+    false
+}
+
 fn guest_hardlinks_supported(
     output: crate::processes::ProcessOutput,
     ancestor: &Path,
@@ -664,33 +541,24 @@ fn guest_hardlinks_supported(
     if output.code == 125 && output.stdout.is_empty() {
         let stderr = std::str::from_utf8(&output.stderr)?;
         let ancestor_text = ancestor.to_str().context("Non-UTF8 dependency mount")?;
-        if let Some(reason) = stderr
-            .trim_start()
-            .strip_prefix("docker: Error response from daemon:")
-        {
-            let reason = reason.trim_start();
-            let missing = reason
-                .strip_prefix(
-                    "invalid mount config for type \"bind\": bind source path does not exist: ",
-                )
-                .and_then(|s| s.lines().next())
-                == Some(ancestor_text);
-            let unshared = format!(
-                "The path {ancestor_text} is not shared from the host and is not known to Docker."
+        let lower = stderr.to_ascii_lowercase();
+        let daemon_mount_denial = lower.contains("error response from daemon:")
+            && contains_exact_path(stderr, ancestor_text)
+            && [
+                "bind source path does not exist",
+                "mounts denied",
+                "is not shared from the host",
+                "path is not shared",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+        if daemon_mount_denial {
+            // The candidate must still be an ordinary directory on the host.
+            ensure!(
+                project_root(ancestor)? == ancestor && fs::symlink_metadata(ancestor)?.is_dir(),
+                "Dependency mount ancestor changed during the Docker probe"
             );
-            let denied = reason
-                .strip_prefix("Mounts denied:")
-                .or_else(|| reason.strip_prefix("mounts denied:"))
-                .and_then(|s| s.trim_start().lines().next())
-                == Some(unshared.as_str());
-            if missing || denied {
-                // The candidate must still be an ordinary directory on the host.
-                ensure!(
-                    project_root(ancestor)? == ancestor && fs::symlink_metadata(ancestor)?.is_dir(),
-                    "Dependency mount ancestor changed during the Docker probe"
-                );
-                return Ok(false);
-            }
+            return Ok(false);
         }
     }
     match output.success("Docker hardlink probe")?.text()?.trim() {
@@ -720,9 +588,13 @@ pub fn probe_guest_hardlinks(
         .tempfile_in(&plan.store)?;
     source.write_all(token.as_bytes())?;
     source.flush()?;
+    source
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))?;
     let destination = tempfile::Builder::new()
         .prefix(".devkit-hardlink-")
         .tempdir_in(&modules)?;
+    fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o755))?;
     let link = destination.path().join("link");
     docker.env_remove("DOCKER_DEFAULT_PLATFORM").args([
         "run",
@@ -781,4 +653,252 @@ pub fn probe_guest_hardlinks(
     destination.close()?;
     source.close()?;
     Ok(supported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cold_mount_masks_exist_before_selection_and_fallback_stops_on_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = project_root(&tmp.path().join("checkout")).unwrap();
+        let cache = project_root(&tmp.path().join("cache")).unwrap();
+        directory(&checkout.join(".git")).unwrap();
+        let mut attempts = Vec::new();
+        let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |p| {
+            if attempts.is_empty() {
+                for name in MASKED_CACHE_DIRS
+                    .iter()
+                    .chain(std::iter::once(&"empty-file-mask"))
+                {
+                    assert!(p.masks.iter().any(
+                        |(target, _)| target == &Path::new("/devkit/unified/cache").join(name)
+                    ));
+                }
+            }
+            attempts.push(p.store.clone());
+            Ok(p.store == checkout.join(".devkit/cache/pnpm-store"))
+        })
+        .unwrap();
+        assert_eq!(fs::metadata(&cache).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(cache.join(".tmp")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            attempts,
+            [
+                cache.join("pnpm-store"),
+                checkout.join(".git/devkit-store"),
+                plan.store
+            ]
+        );
+        let mut count = 0;
+        assert!(
+            UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |_| {
+                count += 1;
+                anyhow::bail!("guest probe failed")
+            })
+            .is_err()
+        );
+        assert_eq!(count, 1);
+        assert!(
+            UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |_| Ok(false))
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot create hardlinks")
+        );
+        let mask = cache.join("empty-file-mask");
+        assert_eq!(fs::metadata(&mask).unwrap().mode() & 0o777, 0o444);
+        fs::remove_file(&mask).unwrap();
+        symlink(checkout.join("missing"), &mask).unwrap();
+        assert!(prepare_mount_masks(&cache).is_err());
+    }
+
+    #[test]
+    fn case_insensitive_volumes_forbid_ancestors_outside_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = project_root(&tmp.path().join("dev/app")).unwrap();
+        let cache = project_root(&tmp.path().join("cache")).unwrap();
+        directory(&checkout).unwrap();
+        prepare_mount_masks(&cache).unwrap();
+        assert!(
+            UnifiedStorePlan::candidate_with_case_sensitivity(
+                &checkout,
+                &cache.join("pnpm-store"),
+                &cache,
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let local = UnifiedStorePlan::candidate_with_case_sensitivity(
+            &checkout,
+            &checkout.join(".devkit/cache/pnpm-store"),
+            &cache,
+            false,
+        )
+        .unwrap()
+        .expect("checkout-local store remains allowed");
+        assert_eq!(local.ancestor, checkout);
+    }
+
+    #[test]
+    fn only_the_unshared_candidate_ancestor_allows_mount_fallback() {
+        use crate::processes::ProcessOutput;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_root(tmp.path()).unwrap();
+        let checkout = root.join("checkout");
+        let cache = root.join("cache");
+        directory(&checkout.join(".git")).unwrap();
+        let diagnostic = |code, stderr: String| ProcessOutput {
+            code,
+            stdout: Vec::new(),
+            stderr: stderr.into_bytes(),
+        };
+        let missing = |p: &Path| {
+            format!(
+                "docker: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: {}\n\nRun 'docker run --help' for more information\n",
+                p.display()
+            )
+        };
+        let denied = format!(
+            "docker: Error response from daemon: Mounts denied:\nThe path {} is not shared from the host and is not known to Docker.\n",
+            root.display()
+        );
+        let lima_denied = format!(
+            "docker: Error response from daemon: mounts denied: path {} is not shared\n",
+            root.display()
+        );
+        for message in [missing(&root), denied, lima_denied] {
+            let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |plan| {
+                if plan.store == cache.join("pnpm-store") {
+                    guest_hardlinks_supported(diagnostic(125, message.clone()), &plan.ancestor)
+                } else {
+                    Ok(true)
+                }
+            })
+            .unwrap();
+            assert_eq!(plan.store, checkout.join(".git/devkit-store"));
+        }
+        for output in [
+            diagnostic(125, missing(&root.join("other"))),
+            diagnostic(1, missing(&root)),
+            diagnostic(125, "Docker connection unavailable".into()),
+            diagnostic(1, "Hardlink probe contents changed".into()),
+        ] {
+            assert!(guest_hardlinks_supported(output, &root).is_err());
+        }
+        let absent = root.join("absent");
+        assert!(guest_hardlinks_supported(diagnostic(125, missing(&absent)), &absent).is_err());
+    }
+
+    #[test]
+    fn npmrc_mask_preserves_environment_for_daily_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for file in [".NPMRC", ".Env.Local", ".env.example"] {
+            fs::write(root.join(file), []).unwrap();
+        }
+        let alias_exists = root.join(".npmrc").exists();
+        let mut npmrc = vec![PathBuf::from(".NPMRC")];
+        let mut secrets = vec![PathBuf::from(".Env.Local"), PathBuf::from(".NPMRC")];
+        if alias_exists {
+            npmrc.push(".npmrc".into());
+            secrets.extend([PathBuf::from(".env.local"), PathBuf::from(".npmrc")]);
+        }
+        assert_eq!(mask_targets(root, false, true).unwrap(), npmrc);
+        assert_eq!(mask_targets(root, true, true).unwrap(), secrets);
+        assert!(mask_targets(root, false, false).unwrap().is_empty());
+        assert!(mask_targets(root, true, false).unwrap().is_empty());
+        assert_eq!(root.join(".npmrc").exists(), alias_exists);
+        if !alias_exists {
+            fs::write(root.join(".npmrc"), []).unwrap();
+            assert_eq!(mask_targets(root, false, true).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn git_pointer_metadata_is_bounded_before_any_identity() {
+        const WORKER: &str = "DEVKIT_TEST_GIT_POINTER_BUDGET";
+        if std::env::var(WORKER).as_deref() != Ok("1") {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shared_cache::tests::git_pointer_metadata_is_bounded_before_any_identity",
+                    "--test-threads=1",
+                ])
+                .env(WORKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let pages: u64 = fs::read_to_string("/proc/self/statm")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            // SAFETY: this disposable worker limits only its own address space.
+            let maximum =
+                pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 + 64 * 1024 * 1024;
+            let limit = libc::rlimit {
+                rlim_cur: maximum,
+                rlim_max: maximum,
+            };
+            // SAFETY: limit is a live rlimit and no other process is modified.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let checkout = temp.path().join("checkout");
+        let repository = project_root(&temp.path().join("repo")).unwrap();
+        let gitdir = repository.join("worktrees/check");
+        fs::create_dir(&checkout).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        let pointer = checkout.join(".git");
+        let common = gitdir.join("commondir");
+        fs::write(&pointer, "gitdir: ../repo/worktrees/check\n").unwrap();
+        fs::write(&common, "../..\n").unwrap();
+        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository.clone()));
+        for path in [&pointer, &common] {
+            let original = fs::read(path).unwrap();
+            for size in [16 * 1024 + 1, 1024 * 1024 * 1024] {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(size)
+                    .unwrap();
+                assert!(
+                    git_common_dir(&checkout)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeds byte budget")
+                );
+                fs::write(path, &original).unwrap();
+            }
+        }
+        fs::remove_file(&common).unwrap();
+        symlink(&pointer, &common).unwrap();
+        assert!(git_common_dir(&checkout).is_err());
+        fs::remove_file(&common).unwrap();
+        let name = CString::new(common.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid terminated pathname, in the disposable fixture only.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(git_common_dir(&checkout).is_err());
+        fs::remove_file(&common).unwrap();
+        fs::write(&common, "../..\n").unwrap();
+        assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository));
+    }
 }

@@ -699,48 +699,29 @@ pub fn verify_npm_pack(
 }
 
 fn pins(root: &Path) -> Result<BTreeMap<String, String>> {
-    let raw = fs::read_to_string(safe_path(root, "toolchains.env")?)?;
+    let bytes = fs::read(safe_path(root, "toolchains.env")?)?;
+    let records = crate::runtime::Records::parse(&bytes, "DEVKIT_")?;
     let mut pins = BTreeMap::new();
-    for line in raw
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        let (key, value) = line
-            .split_once('=')
-            .context("Invalid source toolchain pin")?;
+    for (key, value) in &records.0 {
         ensure!(
-            ([
+            [
                 "DEVKIT_NODE_IMAGE",
                 "DEVKIT_NODE_VERSION",
-                "DEVKIT_RUST_VERSION"
+                "DEVKIT_RUST_VERSION",
             ]
-            .contains(&key)
-                || (key.starts_with("DEVKIT_PNPM_")
-                    && key
-                        .bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')))
-                && !value.is_empty()
-                && !value.chars().any(char::is_whitespace)
-                && pins.insert(key.to_owned(), value.to_owned()).is_none(),
-            "Unexpected/duplicate source toolchain pin"
+            .contains(key)
+                || key.starts_with("DEVKIT_PNPM_"),
+            "Unexpected source toolchain pin: {key}"
         );
+        pins.insert((*key).to_owned(), (*value).to_owned());
     }
-    ensure!(
-        [
-            "DEVKIT_NODE_IMAGE",
-            "DEVKIT_NODE_VERSION",
-            "DEVKIT_RUST_VERSION"
-        ]
-        .iter()
-        .all(|k| pins.contains_key(*k)),
-        "Incomplete source toolchains.env"
-    );
-    let (_, hash) = pins["DEVKIT_NODE_IMAGE"]
+    let node_image = records.require("DEVKIT_NODE_IMAGE")?;
+    let (_, hash) = node_image
         .rsplit_once("@sha256:")
         .context("Node image is not digest-pinned")?;
     ensure!(SHA256_RE.is_match(hash), "Invalid Node image digest");
-    version(&pins["DEVKIT_NODE_VERSION"])?;
-    version(&pins["DEVKIT_RUST_VERSION"])?;
+    version(records.require("DEVKIT_NODE_VERSION")?)?;
+    version(records.require("DEVKIT_RUST_VERSION")?)?;
     Ok(pins)
 }
 
@@ -1244,12 +1225,14 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         &payload.join("package.json"),
         &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":os,"cpu":cpu,"bin":{"devkit":"bin/devkit"},"files":package_files,"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
     )?;
-    for (name, file) in file_map(&payload)? {
-        assert_shippable_path(&name)?;
+    let mut payload_files = file_map(&payload)?;
+    for (name, file) in &mut payload_files {
+        assert_shippable_path(name)?;
         let mode = if file.mode & 0o111 != 0 { 0o755 } else { 0o644 };
         if file.mode != mode {
-            let path = safe_path(&payload, &name)?;
+            let path = safe_path(&payload, name)?;
             write_atomic(&path, &fs::read(&path)?, mode)?;
+            file.mode = mode;
         }
     }
     let migrations = verify_migration_index(&payload, &version)?;
@@ -1257,7 +1240,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         schema_version: 1,
         version: version.clone(),
         min_supported_from_version: Some(crate::state::MIN_SUPPORTED_PROJECT_VERSION.into()),
-        files: file_map(&payload)?,
+        files: payload_files,
         environment: inputs.environment.clone(),
         rust_version: settings["DEVKIT_RUST_VERSION"].clone(),
         migrations,
@@ -1394,7 +1377,18 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         "Assembly inputs changed while staging"
     );
     verify_git(options, &root, runner)?;
-    contribution::read_inputs(options, &root, &settings["DEVKIT_RUST_VERSION"])?;
+    for input in &options.target_inputs {
+        let (_, id) = read_regular_file(
+            &safe_path(&input.directory, "producer.json")?,
+            64 * 1024,
+            "Producer contribution",
+        )?
+        .context("Missing producer contribution")?;
+        ensure!(
+            id.sha256 == input.sha256,
+            "Producer contribution changed while staging"
+        );
+    }
     // Written last, outside the payload and both package archives.
     write_json(&build_set.join("release-index.json"), &index)?;
     runner.check_cancelled()?;

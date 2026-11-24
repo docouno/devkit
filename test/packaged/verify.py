@@ -66,14 +66,14 @@ def verify_creation_hint(output):
             "Successful init did not provide a make setup hint")
 
 
-def pnpm_project(root):
-    state = json.loads((root / '.devkit/manifest.json').read_text())
-    return semver_tuple(state['version']) >= (0, 5, 0)
+def read_image_id(root, kind):
+    receipt = root / ".devkit/state" / f"{kind}-image.json"
+    if receipt.is_file():
+        return json.loads(receipt.read_text())["imageId"]
+    return (root / ".devkit/state" / f"{kind}-image").read_text().strip()
 
 
 def node_workspace(root):
-    if not pnpm_project(root):
-        return set(json.loads((root / 'package.json').read_text())['workspaces'])
     # Generated membership is an explicit sequence of canonical component paths.
     text = (root / 'pnpm-workspace.yaml').read_text()
     return set(re.findall(r'^\s*-\s*[\'"]?((?:apps|packages)/[a-z][a-z0-9-]*)[\'"]?\s*$', text, re.M))
@@ -81,11 +81,8 @@ def node_workspace(root):
 
 def assert_node_workspace(root, paths):
     require(node_workspace(root) == set(paths), 'Root workspace registration mismatch')
-    if pnpm_project(root):
-        require('workspaces' not in json.loads((root / 'package.json').read_text()), 'npm workspaces survived pnpm migration')
-        require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
-    else:
-        require((root / 'package-lock.json').is_file(), 'Missing legacy npm lock')
+    require('workspaces' not in json.loads((root / 'package.json').read_text()), 'npm workspaces survived pnpm migration')
+    require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
 
 
 def source_snapshot(root):
@@ -434,12 +431,10 @@ class Verification:
                     "import { closeSync, openSync } from 'node:fs';\n"
                     "import test from 'node:test';\n\n"
                     "test('source and native lock mounts reject writable opens', () => {\n"
-                    "  for (const file of [new URL(import.meta.url), new URL('../../../package-lock.json', import.meta.url)]) {\n"
+                    "  for (const file of [new URL(import.meta.url), new URL('../../../pnpm-lock.yaml', import.meta.url), new URL('../../../pnpm-workspace.yaml', import.meta.url)]) {\n"
                     "    assert.throws(() => { const fd = openSync(file, 'r+'); closeSync(fd); }, { code: 'EROFS' });\n"
                     "  }\n"
                     "});\n")
-            if pnpm_project(root):
-                code = code.replace("new URL('../../../package-lock.json', import.meta.url)", "new URL('../../../pnpm-lock.yaml', import.meta.url), new URL('../../../pnpm-workspace.yaml', import.meta.url)")
         else:
             probe = root / "apps/api/tests/readonly_mount.rs"
             code = ('#[test]\nfn source_and_lock_mounts_reject_writable_opens() {\n'
@@ -505,7 +500,7 @@ class Verification:
         settings = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if line and not line.startswith("#"))
         name = f"devkit-packaged-{self.token}-{kind}"
         self.containers.append(name)
-        image = settings["DEVKIT_NODE_IMAGE"] if kind == "node" else (root / ".devkit/state/rust-image").read_text().strip()
+        image = settings["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
         command = ["node", "/workspace/apps/main/dist/index.js"] if kind == "node" else ["/workspace/apps/api/target/debug/devkit-api"]
         self.run(f"{kind}-emitted-start", ["docker", "run", "--detach", "--pull", "never", "--name", name,
                  "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -532,7 +527,7 @@ class Verification:
 
     def electron_runtime(self, root):
         """Resolve the installed binary from the consuming workspace, never infer hoisting."""
-        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(root, "desktop")
         name = f"devkit-packaged-{self.token}-electron-resolve"
         self.containers.append(name)
         output = self.run("consumer-electron-runtime", ["docker", "run", "--rm", "--pull", "never", "--name", name,
@@ -551,7 +546,7 @@ class Verification:
         name = f"devkit-packaged-{self.token}-{label}"
         self.containers.append(name)
         runtime_root = electron_root or root
-        image = (runtime_root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(runtime_root, "desktop")
         argv = ["docker", "run", "--detach", "--pull", "never", "--name", name,
                 "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--network", f"container:{network_container}", "--read-only", "--tmpfs", "/tmp:mode=1777",
@@ -614,7 +609,7 @@ class Verification:
 
     def starter_bind_options(self, root, kind):
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
-        image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else (root / ".devkit/state/rust-image").read_text().strip()
+        image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
         command = ["node", "/workspace/apps/main/dist/index.js"] if kind == "node" else ["/workspace/apps/api/target/debug/devkit-api"]
         common = ["--pull", "never", "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                   "--network", "none", "--read-only", "--volume", f"{root}:/workspace:ro,z"]
@@ -704,14 +699,14 @@ class Verification:
         browser = f"devkit-packaged-{self.token}-preview-browser"
         self.containers.extend([server, browser])
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
-        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(root, "desktop")
         certificate = f"devkit-packaged-{self.token}-preview-certificate"
         self.containers.append(certificate)
         self.run("preview-test-certificate", ["docker", "run", "--rm", "--pull", "never", "--name", certificate,
                  "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                  "--network", "none", "--read-only", "--cpus", "1", "--memory", "128m", "--pids-limit", "64",
                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--volume", f"{output}:/evidence:z",
-                 (root / ".devkit/state/rust-image").read_text().strip(), "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                 read_image_id(root, "rust"), "openssl", "req", "-x509", "-newkey", "rsa:2048",
                  "-nodes", "-days", "1", "-subj", "/CN=preview.test", "-keyout", "/evidence/preview-key.pem", "-out", "/evidence/preview-cert.pem"])
         common = ["--detach", "--pull", "never", "--label", f"{OWNERSHIP}={self.token}",
                   "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:rw,exec,mode=1777,size=512m",
@@ -750,28 +745,27 @@ class Verification:
         (root / "compose.yaml").write_text('services:\n  desktop:\n    environment:\n      REMOTE_DEBUGGING_PORT: "9222"\n')
         self.make(node, "dev", label="node-development-start")
         preview_template = "https://{port}-{service}.preview.example.test"
-        args = ["dev", "headless=1"] + (["DEVKIT_PREVIEW_URL_TEMPLATE=" + preview_template] if pnpm_project(root) else [])
+        args = ["dev", "headless=1", "DEVKIT_PREVIEW_URL_TEMPLATE=" + preview_template]
         self.make(root, *args, label="fullstack-development-start")
         web, api, desktop = (self.service(root, name) for name in ("web", "api", "desktop"))
         main = self.service(node, "main")
         self.http(self.port(api, 8080), "/health", {"status": "ok"})
         self.http(self.port(web, 5173), "/api/greeting?name=shared", {"message": "Hello, shared!"})
-        if pnpm_project(root):
-            actual = self.inspect("container", web)
-            env = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
-            require(env.get("DEVKIT_PREVIEW_HOSTS_FILE") in ("/run/devkit/preview-hosts.json", "/devkit/preview-hosts.json"), "Managed Vite did not receive FILE carrier")
-            require(env.get("DEVKIT_PREVIEW_HOSTS", "") == "", "Managed Vite retained CSV carrier")
-            host = f"{self.port(web, 5173)}-web.preview.example.test"
-            for authority, expected_status in [(host, 200), ("unrelated.preview.example.test", 403)]:
-                connection = http.client.HTTPConnection("127.0.0.1", self.port(web, 5173), timeout=3)
-                try:
-                    connection.request("GET", "/", headers={"Host": authority})
-                    response = connection.getresponse()
-                    response.read()
-                    require(response.status == expected_status, "Managed FILE-to-Vite host policy mismatch")
-                finally:
-                    connection.close()
-            self.results.append({"label": "managed-file-to-vite-host-policy", "passed": True, "file": env["DEVKIT_PREVIEW_HOSTS_FILE"]})
+        actual = self.inspect("container", web)
+        env = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
+        require(env.get("DEVKIT_PREVIEW_HOSTS_FILE") in ("/run/devkit/preview-hosts.json", "/devkit/preview-hosts.json"), "Managed Vite did not receive FILE carrier")
+        require(env.get("DEVKIT_PREVIEW_HOSTS", "") == "", "Managed Vite retained CSV carrier")
+        host = f"{self.port(web, 5173)}-web.preview.example.test"
+        for authority, expected_status in [(host, 200), ("unrelated.preview.example.test", 403)]:
+            connection = http.client.HTTPConnection("127.0.0.1", self.port(web, 5173), timeout=3)
+            try:
+                connection.request("GET", "/", headers={"Host": authority})
+                response = connection.getresponse()
+                response.read()
+                require(response.status == expected_status, "Managed FILE-to-Vite host policy mismatch")
+            finally:
+                connection.close()
+        self.results.append({"label": "managed-file-to-vite-host-policy", "passed": True, "file": env["DEVKIT_PREVIEW_HOSTS_FILE"]})
         self.http(self.port(main, 8080), "/health", {"status": "ok"})
         initial = "A small app, ready to change."
         marker = "Packaged harness shared UI"
@@ -812,8 +806,7 @@ class Verification:
             for mode, label in (("production-web", "production-web"), ("packaged-desktop", "packaged-desktop")):
                 helper = self.helper(root, mode, api, marker, label, packaged=extracted)
                 self.helper_finish(helper, label)
-        if pnpm_project(root):
-            self.preview_transport(root)
+        self.preview_transport(root)
         self.make(root, "status", label="fullstack-status")
         self.make(root, "logs", "tail=10", label="fullstack-finite-logs", timeout=30)
         self.make(node, "down", label="node-development-down")
@@ -861,8 +854,6 @@ class Verification:
 
     def electron_cache_corruption(self, root):
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        if state["version"].startswith("0.4."):
-            return
         component = next(path for path, value in state["components"].items()
                          if value["toolingProfile"] == "electron")
         package = root / component / "node_modules/electron"
@@ -994,7 +985,7 @@ class Verification:
         root_package = root / "package.json"
         if root_package.is_file() and any(c["toolchain"] == "node" for c in state["components"].values()):
             package = json.loads(root_package.read_text())
-            manager_metadata = "npm@11.21.1" if semver_tuple(state["version"]) < (0, 5, 0) else "pnpm@0.0.0"
+            manager_metadata = "pnpm@0.0.0"
             package["packageManager"] = manager_metadata
             pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
             engine_metadata = {"runtime": {"name": "node", "version": pins["DEVKIT_NODE_VERSION"], "onFail": "download"}}
@@ -1064,14 +1055,6 @@ class Verification:
         node_paths = [path for path,c in after['components'].items() if c['toolchain'] == 'node']
         if node_paths: assert_node_workspace(root,node_paths)
         for path, fields in native_packages.items():
-            if semver_tuple(state['version']) < (0,5,0) <= semver_tuple(version):
-                fields = json.loads(json.dumps(fields))
-                for field in ('dependencies','optionalDependencies','peerDependencies'):
-                    for name,spec in fields.get(field,{}).items():
-                        target = next((p for p in native_packages if json.loads((root/p/'package.json').read_text())['name'] == name),None)
-                        if target is not None:
-                            public = fields.get('private') is False and json.loads((root/target/'package.json').read_text()).get('private') is False
-                            fields[field][name] = 'workspace:^' if public else 'workspace:*'
             current = json.loads((root / path / "package.json").read_text())
             require({key: value for key, value in current.items() if key != "devDependencies"} == fields,
                     f"{kind} update changed product manifest fields: {path}")
@@ -1095,11 +1078,6 @@ class Verification:
                              "preservedFiles": len(preserve), "unknownMetadataPreserved": True})
 
     def verify_v04_libraries_and_design_system(self, fullstack):
-        manager_version = json.loads((self.manager / "release.json").read_text())["version"]
-        core_parts = tuple(int(part) for part in manager_version.split("-", 1)[0].split("+")[0].split("."))
-        if core_parts < (0, 4, 0):
-            return
-
         # 1. Zero-app ts-library lifecycle: init -> setup -> dev refusal -> check/test/build ->
         #    private package refusal -> "private": false + devkit sync -> npm version 0.2.0 ->
         #    setup -> make package -> verified tarball + package-receipt.json.
@@ -1121,7 +1099,7 @@ class Verification:
         self.run("tslib-sync", self.cli(self.manager, "sync", tslib))
         self.make(tslib, "setup", label="tslib-setup-after-sync")
         self.run("tslib-npm-version", self.exec_cli(
-            tslib, "packages/lib", "pnpm" if pnpm_project(tslib) else "npm", "version", "0.2.0", "--no-git-tag-version", write=True))
+            tslib, "packages/lib", "pnpm", "version", "0.2.0", "--no-git-tag-version", write=True))
         self.make(tslib, "setup", label="tslib-setup-after-version")
         self.make(tslib, "package", label="tslib-package")
 
@@ -1295,8 +1273,7 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
-            if semver_tuple(json.loads((self.manager / "release.json").read_text())["version"]) >= (0, 5, 0):
-                self.fullstack_web()
+            self.fullstack_web()
             self.electron_cache_corruption(fullstack)
             self.cross_host_checkout(export=os.environ.get("DEVKIT_VERIFY_EXPORT_CHECKOUT"),
                                      imported=os.environ.get("DEVKIT_VERIFY_IMPORT_CHECKOUT"))
@@ -1339,6 +1316,26 @@ class Verification:
             raise failure
 
 
+    def export_cross_host_only(self, destination):
+        failure = None
+        try:
+            self.cross_host_checkout(export=destination)
+            require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
+        except BaseException as error:
+            failure = error
+        finally:
+            try:
+                self.cleanup()
+            except BaseException as error:
+                failure = RuntimeError(f"{failure or ''}\nCleanup: {error}")
+            if failure is None and os.environ.get("DEVKIT_VERIFY_KEEP") != "1":
+                shutil.rmtree(self.scratch)
+            else:
+                print(f"Preserved scratch: {self.scratch}", flush=True)
+        if failure:
+            raise failure
+
+
 def main():
     def interrupted(signum, _frame):
         # selectors retries InterruptedError as EINTR; cancellation must unwind.
@@ -1352,9 +1349,15 @@ def main():
     parser.add_argument("--package-source", choices=("local", "registry"), default="local")
     parser.add_argument("--public-bootstrap", type=Path,
                         help="Run lifecycle operations through this downloaded public bootstrap")
+    parser.add_argument("--export-cross-host-only", type=Path,
+                        help="Only create, verify, and export the cross-host checkout bundle")
     args = parser.parse_args()
-    Verification(args.release, args.next_release, package_source=args.package_source,
-                 public_bootstrap=args.public_bootstrap).verify()
+    verifier = Verification(args.release, args.next_release, package_source=args.package_source,
+                            public_bootstrap=args.public_bootstrap)
+    if args.export_cross_host_only:
+        verifier.export_cross_host_only(args.export_cross_host_only)
+    else:
+        verifier.verify()
 
 
 if __name__ == "__main__":

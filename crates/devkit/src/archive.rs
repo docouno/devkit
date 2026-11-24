@@ -15,10 +15,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_COMPRESSED: u64 = 128 * 1024 * 1024;
+pub const MAX_COMPRESSED: u64 = crate::distribution::MAX_EXECUTABLE_BYTES;
 pub const MAX_EXPANDED: u64 = 256 * 1024 * 1024;
-const MAX_FILE: u64 = 64 * 1024 * 1024;
+const MAX_FILE: u64 = crate::distribution::MAX_ENGINE_BYTES;
 const MAX_ENTRIES: usize = 16_384;
+const ARCHIVE_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     let src = CString::new(source.as_os_str().as_bytes())
@@ -157,6 +158,7 @@ pub fn extract_archive_with(
         source.is_file() && source.len() <= MAX_COMPRESSED,
         "Invalid or oversized release archive"
     );
+    let source_stamp = FileStamp::of(&source);
     let destination = project_root(destination)?;
     ensure!(!exists(&destination)?, "Archive destination already exists");
     let parent = destination.parent().context("Archive destination parent")?;
@@ -169,7 +171,7 @@ pub fn extract_archive_with(
     let mut stream = BudgetReader {
         reader: MultiGzDecoder::new(File::open(&archive)?),
         remaining: MAX_EXPANDED,
-        deadline: Instant::now() + Duration::from_secs(30),
+        deadline: Instant::now() + ARCHIVE_DEADLINE,
         runner,
     };
     let mut names = BTreeSet::new();
@@ -247,6 +249,7 @@ pub fn extract_archive_with(
                 "Truncated archive entry: {encoded}"
             );
             output.set_permissions(fs::Permissions::from_mode(mode))?;
+            #[cfg(not(target_os = "macos"))]
             output.sync_all()?;
             files.insert(relative.to_owned());
         }
@@ -273,27 +276,34 @@ pub fn extract_archive_with(
             "Unnecessary empty archive directory: {directory}"
         );
     }
-    let now = fs::symlink_metadata(&archive)?;
     ensure!(
-        now.is_file() && now.len() == source.len(),
+        source_stamp.matches(&archive)?,
         "Archive changed during extraction"
     );
-    // Include implicit ancestors; synchronize every directory once, deepest first.
-    let mut parents = BTreeSet::new();
-    for name in &files {
-        let path = safe_path(&payload, name)?;
-        for ancestor in path
-            .ancestors()
-            .skip(1)
-            .take_while(|p| p.starts_with(&payload))
-        {
-            if !parents.insert(ancestor.to_path_buf()) {
-                break;
+    #[cfg(target_os = "macos")]
+    {
+        // One APFS F_FULLFSYNC barrier flushes the staged tree before atomic rename.
+        sync_directory(&payload)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Include implicit ancestors; synchronize every directory once, deepest first.
+        let mut parents = BTreeSet::new();
+        for name in &files {
+            let path = safe_path(&payload, name)?;
+            for ancestor in path
+                .ancestors()
+                .skip(1)
+                .take_while(|p| p.starts_with(&payload))
+            {
+                if !parents.insert(ancestor.to_path_buf()) {
+                    break;
+                }
             }
         }
-    }
-    for parent in parents.iter().rev() {
-        sync_directory(parent)?;
+        for parent in parents.iter().rev() {
+            sync_directory(parent)?;
+        }
     }
     if let Some(runner) = runner {
         runner.check_cancelled()?;
@@ -349,7 +359,7 @@ pub fn create_archive(source: &Path, root_name: &str, target: &Path) -> Result<(
             header.set_cksum();
             tar.append_data(&mut header, &name, io::empty())?;
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + ARCHIVE_DEADLINE;
         let mut total = 0_u64;
         for (name, id) in &before {
             ensure!(

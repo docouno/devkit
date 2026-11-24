@@ -13,26 +13,27 @@ use std::{
     path::Path,
 };
 
-fn managed_bytes(
+pub(crate) fn managed_bytes(
     root: &Path,
     name: &str,
     managed: &BTreeMap<String, FileIdentity>,
 ) -> Result<Vec<u8>> {
+    let conflict = || {
+        format!(
+            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        )
+    };
+    let expected = managed.get(name).with_context(conflict)?;
     let (bytes, id) = read_regular_file(&input_path(root, name)?, 65536, "toolchain pin file")?
-        .with_context(|| format!("Missing {name}"))?;
-    ensure!(
-        managed
-            .get(name)
-            .is_some_and(|expected| id.matches_git_tracked(expected)),
-        "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
-    );
+        .with_context(conflict)?;
+    ensure!(id.matches_git_tracked(expected), "{}", conflict());
     Ok(bytes)
 }
 
-struct Records<'a>(BTreeMap<&'a str, &'a str>);
+pub(crate) struct Records<'a>(pub(crate) BTreeMap<&'a str, &'a str>);
 
 impl<'a> Records<'a> {
-    fn parse(bytes: &'a [u8], prefix: &str) -> Result<Self> {
+    pub(crate) fn parse(bytes: &'a [u8], prefix: &str) -> Result<Self> {
         ensure!(bytes.len() <= 65536, "Toolchain pins exceed byte budget");
         let mut values = BTreeMap::new();
         for line in std::str::from_utf8(bytes)?.lines() {
@@ -58,7 +59,7 @@ impl<'a> Records<'a> {
         Ok(Self(values))
     }
 
-    fn require(&self, key: &str) -> Result<&'a str> {
+    pub(crate) fn require(&self, key: &str) -> Result<&'a str> {
         self.0
             .get(key)
             .copied()
@@ -164,7 +165,6 @@ pub struct ToolPins {
     pub rust_version: String,
     pub rust_recipe: String,
     pub desktop_recipe: Option<String>,
-    pub engine: EnginePin,
     pub engines: EnginePins,
 }
 
@@ -172,7 +172,6 @@ impl ToolPins {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let records = Records::parse(bytes, "DEVKIT_")?;
         let engines = EnginePins::from_records(&records)?;
-        let engine = engines.for_target(Target::host()?)?;
         let node_image = records.require("DEVKIT_NODE_IMAGE")?;
         let (name, hash) = node_image
             .rsplit_once("@sha256:")
@@ -194,13 +193,16 @@ impl ToolPins {
         Ok(Self {
             version: engines.version.clone(),
             engines,
-            engine,
             node_image: node_image.into(),
             node_version: version(records.require("DEVKIT_NODE_VERSION")?)?.into(),
             rust_version: version(records.require("DEVKIT_RUST_VERSION")?)?.into(),
             rust_recipe: rust_recipe.into(),
             desktop_recipe: desktop_recipe.map(str::to_owned),
         })
+    }
+
+    pub fn host_engine(&self) -> Result<EnginePin> {
+        self.engines.for_target(Target::host()?)
     }
 
     pub fn admit(root: &Path, state: &ProjectState) -> Result<Self> {
@@ -256,11 +258,8 @@ impl PnpmPin {
     ];
 
     pub fn target(&self) -> Result<Target> {
-        match self.package.as_str() {
-            "@pnpm/exe.linux-x64-musl" => Ok(Target::LinuxX64),
-            "@pnpm/exe.linux-arm64-musl" => Ok(Target::LinuxArm64),
-            _ => anyhow::bail!("Unsupported pnpm package: {}", self.package),
-        }
+        Target::from_pnpm_package(&self.package)
+            .with_context(|| format!("Unsupported pnpm package: {}", self.package))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -330,15 +329,18 @@ impl PnpmPin {
     pub fn release_env_from_source(root: &Path) -> Result<String> {
         let bytes = Self::read_pin_file(&input_path(root, "toolchains.env")?)?;
         let records = Records::parse(&bytes, "DEVKIT_")?;
-        let legacy = Self::select(&records, Target::LinuxX64)?;
-        let arm = Self::select(&records, Target::LinuxArm64)?;
-        let mut output = legacy.encode();
-        output.push_str(&format!(
-            "DEVKIT_PNPM_TARGETS={},{}\n",
-            Target::LinuxX64.triple(),
-            Target::LinuxArm64.triple()
-        ));
-        for (target, pin) in [(Target::LinuxX64, legacy), (Target::LinuxArm64, arm)] {
+        let pins = Target::LINUX
+            .into_iter()
+            .map(|target| Ok((target, Self::select(&records, target)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut output = pins[0].1.encode();
+        let triples = Target::LINUX
+            .into_iter()
+            .map(Target::triple)
+            .collect::<Vec<_>>()
+            .join(",");
+        output.push_str(&format!("DEVKIT_PNPM_TARGETS={triples}\n"));
+        for (target, pin) in pins {
             let values = [pin.package, pin.tarball_sha256, pin.binary_sha256];
             for (column, value) in Self::COLUMNS.into_iter().zip(values) {
                 output.push_str(&format!("{column}_{}={value}\n", target.key_suffix()));
@@ -360,9 +362,6 @@ impl PnpmPin {
         let bytes = managed_bytes(root, ".devkit/runtime/pnpm.env", &header.managed)?;
         Self::select(&Records::parse(&bytes, "DEVKIT_PNPM_")?, target)
     }
-    pub fn from_checkout(root: &Path) -> Result<Self> {
-        Self::from_checkout_for_target(root, Target::LinuxX64)
-    }
     pub fn from_pin_file_for_target(path: &Path, target: Target) -> Result<Self> {
         let bytes = Self::read_pin_file(path)?;
         let source = std::str::from_utf8(&bytes)?
@@ -376,7 +375,7 @@ impl PnpmPin {
             records
                 .0
                 .entry("DEVKIT_PNPM_PACKAGE")
-                .or_insert("@pnpm/exe.linux-x64-musl");
+                .or_insert(Target::LinuxX64.pnpm_package().unwrap());
         }
         Self::select(&records, target)
     }

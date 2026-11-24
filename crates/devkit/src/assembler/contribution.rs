@@ -2,7 +2,7 @@
 //! The assembler verifies the sealed inputs without executing their binaries.
 use super::*;
 use crate::delivery::verify_executable;
-use crate::distribution::{BuildInfo, REQUIRED_PUBLISHABLE_TARGETS, Target};
+use crate::distribution::{BuildInfo, MAX_ENGINE_BYTES, REQUIRED_PUBLISHABLE_TARGETS, Target};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -76,8 +76,12 @@ fn actions_attempt(run: &str) -> Result<Option<(&str, u64)>> {
         [owner, name].iter().all(|s| !s.is_empty()
             && s.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)))
+            && !id.is_empty()
+            && !id.starts_with('0')
             && id.bytes().all(|b| b.is_ascii_digit())
             && id.parse::<u64>()? > 0
+            && !attempt.is_empty()
+            && !attempt.starts_with('0')
             && attempt.bytes().all(|b| b.is_ascii_digit()),
         "Invalid Actions run"
     );
@@ -111,7 +115,7 @@ pub fn contribute(options: &ProduceOptions, runner: &ProcessRunner) -> Result<Va
     let target = Target::host()?;
     let binary = target.asset();
     let directory = stage.path().join("contribution");
-    let (bytes, id) = read_regular_file(&engine, 128 * 1024 * 1024, "Producer executable")?
+    let (bytes, id) = read_regular_file(&engine, MAX_ENGINE_BYTES, "Producer executable")?
         .context("Missing producer executable")?;
     let binary_size = bytes.len() as u64;
     write_atomic(&directory.join(binary), &bytes, 0o755)?;
@@ -225,7 +229,7 @@ impl<'a> Contribution<'a> {
                 && p.build_info.schema_version == 1
                 && p.build_info.target == p.target
                 && p.binary_size > 0
-                && p.binary_size <= 128 * 1024 * 1024,
+                && p.binary_size <= MAX_ENGINE_BYTES,
             "Invalid producer executable identity for {}",
             t.triple()
         );
@@ -435,6 +439,10 @@ mod tests {
         assert!(!compatible_build_run("local-author", original).unwrap());
         assert!(
             compatible_build_run(original, &retry.replace("attempts/2", "attempts/0")).is_err()
+        );
+        assert!(compatible_build_run(original, &retry.replace("runs/7", "runs/07")).is_err());
+        assert!(
+            compatible_build_run(original, &retry.replace("attempts/2", "attempts/02")).is_err()
         );
     }
 }

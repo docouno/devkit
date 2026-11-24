@@ -188,23 +188,42 @@ fn mach_o(dylib_command: u32, dependency: &str) -> Vec<u8> {
     }
     let linker = path_command(0xe, 12, "/usr/lib/dyld");
     let dylib = path_command(dylib_command, 24, dependency);
-    let mut signature = [0; 16];
-    let table_size = (linker.len() + dylib.len() + signature.len()) as u32;
+    let mut segment = [0_u8; 72];
+    let mut signature = [0_u8; 16];
+    let table_size = (linker.len() + dylib.len() + segment.len() + signature.len()) as u32;
+    let total_size = u64::from(32 + table_size) + 12;
+    segment[..4].copy_from_slice(&0x19_u32.to_le_bytes()); // LC_SEGMENT_64
+    segment[4..8].copy_from_slice(&72_u32.to_le_bytes());
+    segment[8..14].copy_from_slice(b"__TEXT");
+    segment[40..48].copy_from_slice(&0_u64.to_le_bytes()); // fileoff
+    segment[48..56].copy_from_slice(&total_size.to_le_bytes()); // filesize
+    segment[60..64].copy_from_slice(&5_u32.to_le_bytes()); // VM_PROT_READ | VM_PROT_EXECUTE
     signature[..4].copy_from_slice(&0x1d_u32.to_le_bytes());
     signature[4..8].copy_from_slice(&16_u32.to_le_bytes());
     signature[8..12].copy_from_slice(&(32 + table_size).to_le_bytes());
-    signature[12..].copy_from_slice(&1_u32.to_le_bytes());
-    let mut header = [0; 32];
+    signature[12..].copy_from_slice(&12_u32.to_le_bytes());
+    let mut header = [0_u8; 32];
     for (at, value) in [
         (0, 0xfeedfacf_u32),
         (4, 0x0100000c),
         (12, 2),
-        (16, 3),
+        (16, 4),
         (20, table_size),
     ] {
         header[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
-    [header.as_slice(), &linker, &dylib, &signature, &[0]].concat()
+    let mut superblob = [0_u8; 12];
+    superblob[..4].copy_from_slice(&0xfade0cc0_u32.to_be_bytes());
+    superblob[4..8].copy_from_slice(&12_u32.to_be_bytes());
+    [
+        header.as_slice(),
+        &linker,
+        &dylib,
+        &segment,
+        &signature,
+        &superblob,
+    ]
+    .concat()
 }
 
 #[test]
@@ -219,17 +238,23 @@ fn target_format_and_mach_o_load_commands_are_verified_before_execution() {
     };
     let signed = mach_o(0xc, "/usr/lib/libSystem.B.dylib");
     assert!(verify(&signed, Target::DarwinArm64));
+    let seg_offset = signed.len() - 12 - 16 - 72;
+    let sig_offset = signed.len() - 12 - 16;
+    let blob_offset = signed.len() - 12;
     for (offset, value) in [
-        (0, 0xcafebabe_u32),          // universal executable
-        (4, 0x01000007),              // thin x86-64
-        (12, 6),                      // shared library
-        (16, u32::MAX),               // overflowing command count
-        (20, u32::MAX),               // table beyond EOF
-        (36, 7),                      // undersized command
-        (40, 0),                      // path inside the command header
-        (signed.len() - 17, 0),       // missing LC_CODE_SIGNATURE
-        (signed.len() - 9, 1),        // signature inside the header
-        (signed.len() - 5, u32::MAX), // signature beyond EOF
+        (0, 0xcafebabe_u32),         // universal executable
+        (4, 0x01000007),             // thin x86-64
+        (12, 6),                     // shared library
+        (16, u32::MAX),              // overflowing command count
+        (20, u32::MAX),              // table beyond EOF
+        (36, 7),                     // undersized command
+        (40, 0),                     // path inside the command header
+        (seg_offset + 60, 1),        // non-executable segment
+        (seg_offset + 48, u32::MAX), // segment beyond EOF
+        (sig_offset, 0),             // missing LC_CODE_SIGNATURE
+        (sig_offset + 8, 1),         // signature inside the header
+        (sig_offset + 12, u32::MAX), // signature beyond EOF
+        (blob_offset, 0xdeadbeef),   // bad CSMAGIC_EMBEDDED_SIGNATURE
     ] {
         let mut bytes = signed.clone();
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

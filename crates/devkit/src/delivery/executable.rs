@@ -9,10 +9,10 @@ use std::{
 /// selected by the caller, so foreign contributions never need to execute.
 pub(super) fn verify_format(file: &mut File, target: Target) -> Result<()> {
     file.rewind()?;
-    match target {
-        Target::LinuxX64 => verify_elf(file, 62),
-        Target::LinuxArm64 => verify_elf(file, 183),
-        Target::DarwinArm64 => verify_mach_o(file),
+    if let Some(machine) = target.elf_machine() {
+        verify_elf(file, machine)
+    } else {
+        verify_mach_o(file)
     }
 }
 
@@ -74,11 +74,11 @@ fn verify_elf(file: &mut File, machine: u16) -> Result<()> {
                 "Invalid ELF dynamic segment"
             );
             file.seek(SeekFrom::Start(start))?;
-            for _ in 0..size / 16 {
-                let mut item = [0_u8; 16];
-                file.read_exact(&mut item)?;
+            let mut dynamic = vec![0_u8; size as usize];
+            file.read_exact(&mut dynamic)?;
+            for item in dynamic.as_chunks::<16>().0 {
                 ensure!(
-                    word64(&item) != 1,
+                    word64(item) != 1,
                     "Native engine requires a dynamic library"
                 );
             }
@@ -105,6 +105,7 @@ fn command_path(command: &[u8], fixed_size: usize) -> Result<&str> {
 }
 
 fn verify_mach_o(file: &mut File) -> Result<()> {
+    const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
     let file_len = file.metadata()?.len();
     let mut header = [0_u8; 32];
     file.read_exact(&mut header)
@@ -126,7 +127,8 @@ fn verify_mach_o(file: &mut File) -> Result<()> {
     file.read_exact(&mut commands)?;
     let mut rest = commands.as_slice();
     let mut linker = false;
-    let mut signature = false;
+    let mut executable_segment = false;
+    let mut signature: Option<(u64, u64)> = None;
     for _ in 0..count {
         ensure!(rest.len() >= 8, "Truncated Mach-O load command");
         let size = word32(&rest[4..]) as usize;
@@ -137,6 +139,28 @@ fn verify_mach_o(file: &mut File) -> Result<()> {
         let command;
         (command, rest) = rest.split_at(size);
         match word32(command) {
+            // LC_SEGMENT_64
+            0x19 => {
+                ensure!(size >= 72, "Truncated Mach-O segment command");
+                let fileoff = word64(&command[40..]);
+                let filesize = word64(&command[48..]);
+                let initprot = word32(&command[60..]);
+                let nsects = word32(&command[64..]) as usize;
+                ensure!(
+                    fileoff
+                        .checked_add(filesize)
+                        .is_some_and(|end| end <= file_len)
+                        && nsects
+                            .checked_mul(80)
+                            .and_then(|bytes| bytes.checked_add(72))
+                            .is_some_and(|end| end <= size),
+                    "Invalid Mach-O segment bounds"
+                );
+                // VM_PROT_EXECUTE == 0x4
+                if initprot & 0x4 != 0 && filesize > 0 {
+                    executable_segment = true;
+                }
+            }
             // LC_LOAD_DYLINKER
             0xe => {
                 ensure!(
@@ -160,25 +184,41 @@ fn verify_mach_o(file: &mut File) -> Result<()> {
             0x8000001c | 0x27 => {
                 anyhow::bail!("Mach-O contains a runtime search path or dyld environment command")
             }
+            // LC_CODE_SIGNATURE
             0x1d => {
                 ensure!(
-                    !signature && size == 16,
+                    signature.is_none() && size == 16,
                     "Invalid Mach-O code signature command"
                 );
                 let offset = u64::from(word32(&command[8..]));
-                let size = u64::from(word32(&command[12..]));
+                let sig_size = u64::from(word32(&command[12..]));
                 ensure!(
-                    offset >= data_start && size > 0 && offset + size <= file_len,
+                    offset >= data_start
+                        && sig_size >= 12
+                        && offset
+                            .checked_add(sig_size)
+                            .is_some_and(|end| end <= file_len),
                     "Invalid Mach-O code signature range"
                 );
-                signature = true;
+                signature = Some((offset, sig_size));
             }
             _ => {}
         }
     }
     ensure!(
-        rest.is_empty() && linker && signature,
-        "Mach-O requires a complete command table, system linker and code signature"
+        rest.is_empty() && linker && executable_segment,
+        "Mach-O requires a complete command table, executable segment, system linker and code signature"
+    );
+    let (sig_offset, sig_size) = signature.context("Mach-O requires a code signature")?;
+    let mut superblob = [0_u8; 8];
+    file.seek(SeekFrom::Start(sig_offset))?;
+    file.read_exact(&mut superblob)
+        .context("Truncated Mach-O code signature blob")?;
+    let magic = u32::from_be_bytes(superblob[..4].try_into().unwrap());
+    let blob_len = u64::from(u32::from_be_bytes(superblob[4..8].try_into().unwrap()));
+    ensure!(
+        magic == CSMAGIC_EMBEDDED_SIGNATURE && (12..=sig_size).contains(&blob_len),
+        "Invalid Mach-O embedded code signature"
     );
     Ok(())
 }

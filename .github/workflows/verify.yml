@@ -6,6 +6,12 @@ on:
       assembly_result:
         required: true
         type: string
+      source_amd64_result:
+        required: true
+        type: string
+      source_arm64_result:
+        required: true
+        type: string
       state:
         required: true
         type: string
@@ -25,6 +31,9 @@ on:
       performance_artifact:
         description: Artifact from the successful isolated performance job, including its original attempt
         value: ${{ jobs.performance.outputs.artifact_name }}
+      performance_sha256:
+        description: SHA-256 of the verified performance receipt
+        value: ${{ jobs.performance.outputs.artifact_sha256 }}
 
 permissions:
   contents: read
@@ -32,6 +41,10 @@ permissions:
 jobs:
   handoff:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      legacy_checkout_artifact: ${{ steps.legacy.outputs.artifact }}
+      legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}
     steps:
       - name: Validate the completed assembly handoff
         env:
@@ -51,35 +64,110 @@ jobs:
                (.preview_index_sha256 | test("^[0-9a-f]{64}\\z"))
              else $state == "restored" or $state == "incomplete" end)
           ' <<< "$FROZEN" || { echo "Invalid frozen or preview identity for state $STATE" >&2; exit 1; }
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ fromJSON(inputs.frozen).source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/restore-baseline
+      - name: Create a transferable checkout using the released v0.5.1 engine
+        id: legacy
+        run: |
+          set -euo pipefail
+          python3 test/bootstrap/legacy_checkout.py export --release .artifacts/baseline/v0.5.1/payload --bundle .artifacts/legacy.bundle
+          {
+            echo "artifact=devkit-legacy-checkout-$GITHUB_RUN_ATTEMPT"
+            echo "sha256=$(sha256sum .artifacts/legacy.bundle | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: ${{ steps.legacy.outputs.artifact }}
+          path: .artifacts/legacy.bundle
+          if-no-files-found: error
+          retention-days: 90
 
-  source-linux-amd64:
+  cross-host-checkout:
     needs: handoff
-    uses: ./.github/workflows/verify-group.yml
-    with:
-      frozen: ${{ inputs.frozen }}
-      group: source
-      platform: amd64
-      native: ${{ inputs.amd64 }}
-
-  source-linux-arm64:
-    needs: handoff
-    uses: ./.github/workflows/verify-group.yml
-    with:
-      frozen: ${{ inputs.frozen }}
-      group: source
-      platform: arm64
-      native: ${{ inputs.arm64 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      checkout_artifact: ${{ steps.export.outputs.checkout_artifact }}
+      checkout_sha256: ${{ steps.export.outputs.checkout_sha256 }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ fromJSON(inputs.frozen).source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/verify-frozen
+        with:
+          version: ${{ fromJSON(inputs.frozen).version }}
+          source_commit: ${{ fromJSON(inputs.frozen).source_commit }}
+          source_tree: ${{ fromJSON(inputs.frozen).source_tree }}
+          index_sha256: ${{ fromJSON(inputs.frozen).index_sha256 }}
+          frozen_set_artifact: ${{ fromJSON(inputs.frozen).frozen_set_artifact }}
+          platform: amd64
+          need_baseline: 'false'
+          controller_artifact: ${{ fromJSON(inputs.amd64).controller_artifact }}
+          controller_sha256: ${{ fromJSON(inputs.amd64).controller_sha256 }}
+      - name: Cache verified consumer pnpm executable
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/docouno/devkit/tools
+          key: pnpm-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.env') }}
+      - name: Cache consumer Rust image
+        id: rust_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .artifacts/cache/consumer-images.tar
+          key: consumer-images-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('runtime/rust.Dockerfile', 'toolchains.env') }}
+      - name: Load cached consumer Rust image
+        if: steps.rust_cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
+          docker load --input .artifacts/cache/consumer-images.tar
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}} {{index .Config.Labels "io.docouno.devkit.platform"}} {{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:amd64-$rust_pin")" = "linux/amd64 linux/amd64 $rust_pin"
+      - name: Prepare pinned consumer Node image
+        run: |
+          set -euo pipefail
+          img=$(sed -n 's/^DEVKIT_NODE_IMAGE=//p' toolchains.env)
+          test -n "$img"
+          docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"
+      - name: Export verified cross-host consumer checkout
+        id: export
+        run: |
+          set -euo pipefail
+          python3 test/packaged/verify.py .artifacts/frozen/payload --export-cross-host-only "$PWD/.artifacts/checkout.bundle"
+          {
+            echo "checkout_artifact=devkit-cross-host-checkout-$GITHUB_RUN_ATTEMPT"
+            echo "checkout_sha256=$(sha256sum .artifacts/checkout.bundle | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: ${{ steps.export.outputs.checkout_artifact }}
+          path: .artifacts/checkout.bundle
+          if-no-files-found: error
+          retention-days: 90
 
   source:
     name: source
-    if: always()
-    needs: [handoff, source-linux-amd64, source-linux-arm64, darwin-host]
+    if: '!cancelled()'
+    needs: [handoff, darwin-host]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+          SOURCE_AMD64: ${{ inputs.source_amd64_result }}
+          SOURCE_ARM64: ${{ inputs.source_arm64_result }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_AMD64" = success
+          test "$SOURCE_ARM64" = success
+          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   runtime-linux-amd64:
     needs: handoff
@@ -101,7 +189,7 @@ jobs:
 
   runtime:
     name: runtime
-    if: always()
+    if: '!cancelled()'
     needs: [handoff, runtime-linux-amd64, runtime-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
@@ -120,18 +208,19 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   delivery-linux-arm64:
-    needs: source-linux-amd64
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
       group: delivery
       platform: arm64
       native: ${{ inputs.arm64 }}
-      legacy_checkout_artifact: ${{ needs.source-linux-amd64.outputs.legacy_checkout_artifact }}
+      legacy_checkout_artifact: ${{ needs.handoff.outputs.legacy_checkout_artifact }}
+      legacy_checkout_sha256: ${{ needs.handoff.outputs.legacy_checkout_sha256 }}
 
   delivery:
     name: delivery
-    if: always()
+    if: '!cancelled()'
     needs: [handoff, delivery-linux-amd64, delivery-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
@@ -150,19 +239,20 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   packaged-linux-arm64:
-    needs: packaged-linux-amd64
+    needs: cross-host-checkout
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
       group: packaged
       platform: arm64
       native: ${{ inputs.arm64 }}
-      checkout_artifact: ${{ needs.packaged-linux-amd64.outputs.checkout_artifact }}
+      checkout_artifact: ${{ needs.cross-host-checkout.outputs.checkout_artifact }}
+      checkout_sha256: ${{ needs.cross-host-checkout.outputs.checkout_sha256 }}
 
   packaged:
     name: packaged
-    if: always()
-    needs: [handoff, packaged-linux-amd64, packaged-linux-arm64]
+    if: '!cancelled()'
+    needs: [handoff, cross-host-checkout, packaged-linux-amd64, packaged-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -190,7 +280,7 @@ jobs:
 
   registry:
     name: registry
-    if: always()
+    if: '!cancelled()'
     needs: [handoff, registry-linux-amd64, registry-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
@@ -200,12 +290,13 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   darwin-host:
-    needs: source-linux-amd64
+    needs: handoff
     runs-on: macos-15
     timeout-minutes: 30
     env:
       PREVIEW_ARTIFACT: ${{ fromJSON(inputs.frozen).preview_artifact }}
       PREVIEW_SHA256: ${{ fromJSON(inputs.frozen).preview_index_sha256 }}
+      LEGACY_SHA256: ${{ needs.handoff.outputs.legacy_checkout_sha256 }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -220,7 +311,7 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         if: inputs.state == 'fresh'
         with:
-          name: ${{ needs.source-linux-amd64.outputs.legacy_checkout_artifact }}
+          name: ${{ needs.handoff.outputs.legacy_checkout_artifact }}
           path: .artifacts/legacy-handoff
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         if: inputs.state == 'fresh'
@@ -233,9 +324,13 @@ jobs:
           set -euo pipefail
           dir="$PWD/.artifacts/preview"
           test "$(shasum -a 256 "$dir/release-index.json" | cut -d ' ' -f 1)" = "$PREVIEW_SHA256"
+          test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d ' ' -f 1)" = "$LEGACY_SHA256"
           archive=$(jq -er '.archive' "$dir/release-index.json")
           test "$(shasum -a 256 "$dir/$archive" | cut -d ' ' -f 1)" = "$(jq -er --arg name "$archive" '.files[$name].sha256' "$dir/release-index.json")"
-          chmod 755 "$dir"/devkit-*-{musl,darwin} "$dir"/{install,bootstrap}.sh
+          jq -er '.engines[]' "$dir/release-index.json" | while IFS= read -r engine; do
+            chmod 755 "$dir/$engine"
+          done
+          chmod 755 "$dir"/{install,bootstrap}.sh
           mkdir "$dir/payload"
           tar -xzf "$dir/$archive" --strip-components=1 -C "$dir/payload"
           python3 test/darwin/verify.py --build-set "$dir"
@@ -251,6 +346,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       artifact_name: ${{ steps.receipt.outputs.artifact_name }}
+      artifact_sha256: ${{ steps.receipt.outputs.artifact_sha256 }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -268,6 +364,19 @@ jobs:
           need_baseline: 'true'
           controller_artifact: ${{ fromJSON(inputs.amd64).controller_artifact }}
           controller_sha256: ${{ fromJSON(inputs.amd64).controller_sha256 }}
+      - name: Cache consumer Rust image for performance baseline
+        id: consumer_rust_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .artifacts/cache/consumer-images.tar
+          key: consumer-images-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('runtime/rust.Dockerfile', 'toolchains.env') }}
+      - name: Load cached consumer Rust image
+        if: steps.consumer_rust_cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          rust_pin=$(sha256sum runtime/rust.Dockerfile | cut -d ' ' -f 1)
+          docker load --input .artifacts/cache/consumer-images.tar
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}} {{index .Config.Labels "io.docouno.devkit.platform"}} {{index .Config.Labels "io.docouno.devkit.rust-recipe"}}' "devkit-derived-rust:amd64-$rust_pin")" = "linux/amd64 linux/amd64 $rust_pin"
       - name: Cache author Rust trace image
         id: author_rust_cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -306,7 +415,12 @@ jobs:
           retention-days: 90
       - name: Identify this successful performance artifact for failed-only reruns
         id: receipt
-        run: printf 'artifact_name=devkit-performance-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          {
+            printf 'artifact_name=devkit-performance-%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'artifact_sha256=%s\n' "$(sha256sum .artifacts/release-ops/performance.json | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
       - name: Preserve performance diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

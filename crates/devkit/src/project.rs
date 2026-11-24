@@ -303,8 +303,8 @@ impl LockResolver for DockerPnpmResolver {
             &root,
             NodeLockKind::for_version(&release.manifest.version)?,
         )?;
-        crate::native::validate_vm_registries(&npmrc_policy, registry)?;
         if !self.offline {
+            crate::native::validate_vm_registries(&npmrc_policy, registry)?;
             verify_required_npm_env_vars(&npmrc_policy)?;
         }
         let fallback_runner;

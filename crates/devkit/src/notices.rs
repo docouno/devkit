@@ -355,7 +355,7 @@ fn std_sources(root: &Path, target: Target) -> Result<BTreeMap<String, FileIdent
         bytes.len() > 1024,
         "Incomplete Rust library copyright bundle"
     );
-    if target != Target::DarwinArm64 {
+    if target.is_musl() {
         ensure!(
             String::from_utf8_lossy(&bytes)
                 .to_ascii_lowercase()

@@ -48,7 +48,7 @@ pub(super) fn spelling(path: &Path) -> Result<PathBuf> {
     loop {
         match fs::symlink_metadata(directory) {
             Ok(meta) if meta.is_dir() => break,
-            Ok(meta) if directory == path => leaf = Some(meta),
+            Ok(meta) if directory == path && !meta.file_type().is_symlink() => leaf = Some(meta),
             Ok(_) => bail!("Non-directory path ancestor: {}", directory.display()),
             Err(error) if absent(&error) => {}
             Err(error) => return Err(error.into()),
@@ -98,9 +98,12 @@ fn entry_name(path: &Path) -> Result<Option<std::ffi::OsString>> {
     let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
     attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     attrs.commonattr = libc::ATTR_CMN_NAME;
-    // getattrlist returns u32 byte count, then attrreference (i32 relative offset,
-    // u32 length), then the NUL-terminated directory entry name.
-    let mut bytes = [0u8; 12 + libc::PATH_MAX as usize];
+    // getattrlist(2) requires a 4-byte aligned output buffer: u32 byte count,
+    // attrreference (i32 relative offset, u32 length), then NUL-terminated name.
+    #[repr(C, align(4))]
+    struct AttrBuffer([u8; 12 + libc::PATH_MAX as usize]);
+    let mut buffer = AttrBuffer([0u8; 12 + libc::PATH_MAX as usize]);
+    let bytes = &mut buffer.0;
     let result = unsafe {
         libc::getattrlist(
             path.as_ptr(),

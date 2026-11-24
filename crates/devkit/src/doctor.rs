@@ -21,7 +21,6 @@ use std::{
     fs,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,14 +137,6 @@ pub fn compose_project_name(root: &Path) -> String {
     )
 }
 
-fn linux_target(platform: &str) -> Option<Target> {
-    match platform {
-        "linux/amd64" => Some(Target::LinuxX64),
-        "linux/arm64" => Some(Target::LinuxArm64),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DerivedImageReceipt {
@@ -182,12 +173,8 @@ pub fn read_image_receipt(
     if recipe.sha256 != pin {
         return Ok(None);
     }
-    let path = safe_path(root, &format!(".devkit/state/{kind}-image"))?;
-    let Some((raw, _)) = read_regular_file(&path, 4096, "image receipt")? else {
-        return Ok(None);
-    };
     let path = safe_path(root, &format!(".devkit/state/{kind}-image.json"))?;
-    let Some((bytes, _)) = read_regular_file(&path, 4096, "image platform receipt")? else {
+    let Some((bytes, _)) = read_regular_file(&path, 4096, "image receipt")? else {
         return Ok(None);
     };
     let Ok(receipt) = serde_json::from_slice::<DerivedImageReceipt>(&bytes) else {
@@ -195,18 +182,18 @@ pub fn read_image_receipt(
     };
     let valid = receipt.schema_version == 1
         && receipt.recipe_sha256 == pin
-        && linux_target(&receipt.platform).is_some()
+        && Target::from_docker_platform(&receipt.platform).is_some()
         && receipt
             .image_id
             .strip_prefix("sha256:")
-            .is_some_and(|s| SHA256_RE.is_match(s))
-        && std::str::from_utf8(&raw).is_ok_and(|s| s.trim_end_matches('\n') == receipt.image_id);
+            .is_some_and(|s| SHA256_RE.is_match(s));
     Ok(valid.then_some(receipt))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeWorkspaceReceipt {
+    pub schema_version: u32,
     pub platform: String,
     pub digest: String,
 }
@@ -214,6 +201,7 @@ pub struct NodeWorkspaceReceipt {
 impl NodeWorkspaceReceipt {
     pub fn new(platform: &str, release_identity: &str, node_digest: &str) -> Self {
         Self {
+            schema_version: 1,
             platform: platform.into(),
             digest: digest(format!("{release_identity}\n{platform}\n{node_digest}")),
         }
@@ -227,7 +215,11 @@ pub fn read_node_receipt(root: &Path) -> Result<Option<NodeWorkspaceReceipt>> {
     };
     Ok(serde_json::from_slice::<NodeWorkspaceReceipt>(&bytes)
         .ok()
-        .filter(|r| linux_target(&r.platform).is_some() && SHA256_RE.is_match(&r.digest)))
+        .filter(|r| {
+            r.schema_version == 1
+                && Target::from_docker_platform(&r.platform).is_some()
+                && SHA256_RE.is_match(&r.digest)
+        }))
 }
 
 /// Missing receipts and receipts written for different daemons cannot establish a platform.
@@ -301,7 +293,8 @@ pub fn local_receipts(
     let helper_check = daemon_platform
         .or(prepared)
         .map(|platform| -> Result<bool> {
-            let Some((p, target)) = pins.as_ref().zip(linux_target(platform)) else {
+            let Some((p, target)) = pins.as_ref().zip(Target::from_docker_platform(platform))
+            else {
                 return Ok(false);
             };
             let pin = p.engines.for_target(target)?;
@@ -472,17 +465,6 @@ pub struct DoctorCheck {
     pub remediation: Option<String>,
 }
 
-fn sanitized_docker() -> Command {
-    let mut c = Command::new("docker");
-    c.env_remove("DOCKER_DEFAULT_PLATFORM");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("COMPOSE_") {
-            c.env_remove(key);
-        }
-    }
-    c
-}
-
 fn read_net_mtu(iface: &str) -> Option<u32> {
     if iface.is_empty() || iface.contains(['/', '\0', '.']) {
         return None;
@@ -535,7 +517,7 @@ pub fn run_doctor_with_cache(
     let mut docker_remediation: Option<String> = None;
 
     match runner.run(
-        sanitized_docker().args(["compose", "version", "--short"]),
+        crate::runtime::docker_command().args(["compose", "version", "--short"]),
         OutputMode::Capture(64 * 1024),
     ) {
         Ok(out) if out.code == 0 => {
@@ -572,7 +554,7 @@ pub fn run_doctor_with_cache(
     }
 
     match runner.run(
-        sanitized_docker().args(["info", "--format", "{{json .}}"]),
+        crate::runtime::docker_command().args(["info", "--format", "{{json .}}"]),
         OutputMode::Capture(1024 * 1024),
     ) {
         Ok(out) if out.code == 0 => {
@@ -618,8 +600,8 @@ pub fn run_doctor_with_cache(
         }
     }
 
-    let probe_env = if daemon_info.is_some() {
-        match ProbeEnvironment::capture_with_docker(runner) {
+    let probe_env = if let Some(info) = daemon_info.as_ref() {
+        match ProbeEnvironment::capture_with_docker(runner, info.client_context.as_deref()) {
             Ok(env) => env,
             Err(error) => {
                 runner.check_cancelled()?;
@@ -1073,12 +1055,16 @@ fn inspect_checkout_lockfree(
         if s.components
             .values()
             .any(|c| c.toolchain == Toolchain::Node)
-            && SemVer::parse(&s.version)? >= SemVer::parse("0.5.0")?
         {
             let target = daemon_platform
-                .and_then(linux_target)
+                .and_then(Target::from_docker_platform)
                 .unwrap_or(Target::LinuxX64);
-            crate::runtime::PnpmPin::from_checkout_for_target(&root, target)?;
+            if let Err(err) = crate::runtime::PnpmPin::from_checkout_for_target(&root, target) {
+                if err.to_string().contains("Missing pnpm pin for ") {
+                    return Err(crate::distribution::missing_target(&s.version, target));
+                }
+                return Err(err);
+            }
         }
         let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
         let receipts = local_receipts(
@@ -1103,9 +1089,11 @@ fn inspect_checkout_lockfree(
                 })
                 .unwrap_or_else(|| {
                     if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET"
-                        && let Ok(host) = Target::host()
+                        && let Some(target) = daemon_platform
+                            .and_then(Target::from_docker_platform)
+                            .or_else(|| Target::host().ok())
                     {
-                        host.checkout_upgrade_hint()
+                        target.checkout_upgrade_hint()
                     } else if msg.contains("Managed file conflict") {
                         "git checkout -- .devkit && make sync".into()
                     } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
@@ -1205,24 +1193,24 @@ mod tests {
     }
 
     #[test]
-    fn derived_image_receipt_requires_matching_sidecar_recipe_and_image_id() {
+    fn derived_image_receipt_requires_matching_recipe_and_valid_schema() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let recipe = root.join(".devkit/runtime/rust.Dockerfile");
         write_atomic(&recipe, b"recipe", 0o644).unwrap();
         let pin = digest(b"recipe");
         let id = format!("sha256:{}", "a".repeat(64));
-        let raw = root.join(".devkit/state/rust-image");
-        write_atomic(&raw, id.as_bytes(), 0o644).unwrap();
         assert!(read_image_receipt(root, "rust", &pin).unwrap().is_none());
-        let sidecar = root.join(".devkit/state/rust-image.json");
+        let receipt_path = root.join(".devkit/state/rust-image.json");
         let expected = DerivedImageReceipt::new("linux/arm64", &id, &pin);
-        write_json(&sidecar, &expected).unwrap();
+        write_json(&receipt_path, &expected).unwrap();
         assert_eq!(
             read_image_receipt(root, "rust", &pin).unwrap(),
             Some(expected)
         );
-        write_atomic(&raw, format!("sha256:{}", "b".repeat(64)).as_bytes(), 0o644).unwrap();
+        let mut wrong_schema = DerivedImageReceipt::new("linux/arm64", &id, &pin);
+        wrong_schema.schema_version = 2;
+        write_json(&receipt_path, &wrong_schema).unwrap();
         assert!(read_image_receipt(root, "rust", &pin).unwrap().is_none());
     }
 }

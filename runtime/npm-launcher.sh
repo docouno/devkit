@@ -28,7 +28,7 @@ engine=$root/$payload
 [ ! -L "$engine" ] && [ -f "$engine" ] && [ -x "$engine" ] || fail "missing executable for $target"
 case "$host_os" in
   Linux) actual=$(sha256sum < "$engine") ;;
-  Darwin) actual=$(/usr/bin/shasum -a 256 < "$engine") ;;
+  Darwin) actual=$(/usr/bin/env -i /usr/bin/shasum -a 256 < "$engine") ;;
 esac
 [ "${actual%% *}" = "$sha256" ] || fail "engine checksum differs for $target"
 exec "$engine" "$@"

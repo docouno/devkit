@@ -404,19 +404,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             "Expected stand reserve or stand remove [TARGET]"
         );
         let root = project_root(&resolve_metadata_target(&globals.args[2..])?)?;
-        let version = state::ensure_supported_checkout_floor(
-            &root,
-            false,
-            state::MIN_SUPPORTED_PROJECT_VERSION,
-        )?;
-        if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
-            return Err(error(
-                "UNSUPPORTED_PROJECT_VERSION",
-                format!(
-                    "stand {action} requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
-                ),
-            ));
-        }
+        state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
         dispatch_accepted("stand", &globals, runner)?;
         match action {
             "reserve" => {
@@ -562,9 +550,6 @@ fn try_dispatch_info(
     }
     let candidate = (|| -> Result<Option<(PathBuf, String)>> {
         let header = state::parse_accepted_header(&bytes)?;
-        if SemVer::parse(&header.version)? < SemVer::parse("0.5.0")? {
-            return Ok(None);
-        }
         let pin = accepted_host_pin(&root, &header)?;
         if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some()
             || delivery::current_engine_digest()? == pin.sha256
@@ -692,17 +677,8 @@ pub(crate) fn accepted_host_pin(
     root: &std::path::Path,
     header: &state::AcceptedManifestHeader,
 ) -> Result<delivery::EnginePin> {
-    let name = ".devkit/runtime/toolchains.env";
-    let path = safe_path(root, name)?;
-    let conflict_msg = || {
-        format!(
-            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
-        )
-    };
-    let expected = header.managed.get(name).with_context(conflict_msg)?;
-    let (bytes, id) =
-        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
-    ensure!(id.matches_git_tracked(expected), "{}", conflict_msg());
+    let bytes =
+        crate::runtime::managed_bytes(root, ".devkit/runtime/toolchains.env", &header.managed)?;
     let pins = crate::runtime::EnginePins::parse(&bytes)?;
     ensure!(
         pins.version == header.version,

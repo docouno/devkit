@@ -149,7 +149,10 @@ jobs:
           set -euo pipefail
           test "$(sha256sum .artifacts/frozen/release-index.json | cut -d ' ' -f 1)" = "$EXPECTED_INDEX"
           test "$(sha256sum .artifacts/release-ops/devkit-release | cut -d ' ' -f 1)" = "$CONTROLLER_SHA256"
-          chmod 755 .artifacts/release-ops/devkit-release .artifacts/frozen/devkit-*-unknown-linux-musl
+          chmod 755 .artifacts/release-ops/devkit-release
+          jq -er '.engines[]' .artifacts/frozen/release-index.json | while IFS= read -r engine; do
+            chmod 755 ".artifacts/frozen/$engine"
+          done
           .artifacts/release-ops/devkit-release hydrate --root "$PWD" --version "$VERSION" \
             --source-commit "$(git rev-parse HEAD)" --source-tree "$(git rev-parse 'HEAD^{tree}')" --build-set "$PWD/.artifacts/frozen"
       - name: Freeze handoff identities

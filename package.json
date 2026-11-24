@@ -11,7 +11,7 @@
     "check:types": "node node_modules/typescript/bin/tsc --project tsconfig.json --noEmit",
     "check:format": "node node_modules/prettier/bin/prettier.cjs --check .",
     "check:lint": "node node_modules/eslint/bin/eslint.js tooling/*.mjs tooling/npm-inputs/*.mjs test/*.mjs 'packages/env/{src,bin}/*.js' 'packages/env/test/*.mjs' --no-ignore --max-warnings=0",
-    "check:shell": "sh -n runtime/devkit.sh && bash -n test/verify-consumers.sh test/verify-registry.sh test/verify-bootstrap.sh test/verify-public.sh",
+    "check:shell": "sh -n runtime/devkit.sh runtime/npm-launcher.sh tooling/darwin-producer.sh && bash -n test/verify-consumers.sh test/verify-registry.sh test/verify-bootstrap.sh test/verify-public.sh",
     "fix:format": "node node_modules/prettier/bin/prettier.cjs --write .",
     "test:npm-inputs": "node --test --test-concurrency=1 test/npm-inputs.test.mjs",
     "test:env": "pnpm --dir packages/env run test",

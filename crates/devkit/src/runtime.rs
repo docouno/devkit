@@ -82,6 +82,7 @@ pub struct ExecRequest {
 }
 mod pins;
 pub use pins::{EnginePins, PnpmPin, ToolPins};
+pub(crate) use pins::{Records, managed_bytes};
 
 /// This admission deliberately does not read native dependency graphs/locks.
 /// It permits service operations and explicit repair of stale native inputs.
@@ -233,6 +234,7 @@ impl ToolAdmission {
 #[derive(Clone, Copy)]
 enum TaskAccess {
     SetupNode,
+    SetupElectron,
     Finite,
     PackageLibrary,
     Fix,
@@ -333,7 +335,7 @@ impl<'a> PreparedContext<'a> {
         cache_dir: Option<&Path>,
     ) -> Result<Self> {
         if verify_pin {
-            crate::delivery::verify_current_engine(&admission.pins.engine)?;
+            crate::delivery::verify_current_engine(&admission.pins.host_engine()?)?;
         }
         let project = crate::doctor::compose_project_name(&admission.root);
         Ok(Self {
@@ -358,6 +360,7 @@ impl<'a> PreparedContext<'a> {
     }
     fn cache_directory(&self, name: &str) -> Result<PathBuf> {
         let root = self.cache_root()?;
+        crate::cache::ensure_cache_root(&root)?;
         for entry in [
             "pnpm-store",
             "pnpm-cache",
@@ -368,7 +371,6 @@ impl<'a> PreparedContext<'a> {
         ] {
             ensure_directory(&safe_path(&root, entry)?)?;
         }
-        crate::shared_cache::directory(&root)?;
         let path = safe_path(&root, name)?;
         crate::shared_cache::directory(&path)?;
         if name == "cargo" {
@@ -453,11 +455,11 @@ impl<'a> PreparedContext<'a> {
         let version = text(&manifest["version"], "Electron version")?;
         crate::files::version(version)?;
         let plan = self.store_plan()?;
-        let (arch, machine) = match self.daemon()?.target {
-            crate::distribution::Target::LinuxX64 => ("x64", 62),
-            crate::distribution::Target::LinuxArm64 => ("arm64", 183),
-            _ => anyhow::bail!("Electron requires a Linux daemon"),
-        };
+        let daemon_target = self.daemon()?.target;
+        let (arch, machine) = daemon_target
+            .electron_arch()
+            .zip(daemon_target.elf_machine())
+            .context("Electron requires a Linux daemon")?;
         let locks = plan.store.join(".locks");
         crate::shared_cache::directory(&locks)?;
         let _lock = crate::cache::lock_file(
@@ -501,7 +503,7 @@ impl<'a> PreparedContext<'a> {
                 ),
                 network: "bridge",
                 forward_npm_secrets: true,
-                access: TaskAccess::ExecWrite,
+                access: TaskAccess::SetupElectron,
                 inputs: Some(inputs),
             })?;
             ensure!(
@@ -727,7 +729,11 @@ impl<'a> PreparedContext<'a> {
             .strip_prefix("linux/")
             .context("Expected Linux image platform")?;
         let derived_tag = format!("devkit-derived-{kind}:{arch}-{pin}");
-        let state = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
+        let legacy_state = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
+        let state = safe_path(
+            &self.admission.root,
+            &format!(".devkit/state/{kind}-image.json"),
+        )?;
         let inspect = |reference: &str| -> Result<Option<String>> {
             let format = format!(
                 "{{{{.Id}}}}\n{{{{.Os}}}}/{{{{.Architecture}}}}\n{{{{index .Config.Labels \"{label}\"}}}}\n{{{{index .Config.Labels \"io.docouno.devkit.platform\"}}}}"
@@ -754,8 +760,8 @@ impl<'a> PreparedContext<'a> {
         let record = |id: &str| -> Result<()> {
             self.admission.recheck()?;
             let receipt = crate::doctor::DerivedImageReceipt::new(platform, id, pin);
-            write_atomic(&state, format!("{id}\n").as_bytes(), 0o644)?;
-            write_json(&state.with_extension("json"), &receipt)
+            write_json(&state, &receipt)?;
+            remove_file(&legacy_state)
         };
         if let Some(receipt) = crate::doctor::read_image_receipt(&self.admission.root, kind, pin)?
             && receipt.platform == platform
@@ -861,6 +867,7 @@ impl<'a> PreparedContext<'a> {
         } = task;
         let write_root = matches!(access, TaskAccess::ExecWrite);
         let setup = matches!(access, TaskAccess::SetupNode);
+        let setup_electron = matches!(access, TaskAccess::SetupElectron);
         let node = profile != ToolingProfile::Rust;
         let fix = matches!(access, TaskAccess::Fix);
         let package_release_dir = if matches!(access, TaskAccess::PackageLibrary) {
@@ -1043,6 +1050,7 @@ impl<'a> PreparedContext<'a> {
                         package_release_dir.as_deref() != Some(path.as_str())
                     }
                     TaskAccess::ExecReadOnly => path.ends_with("node_modules"),
+                    TaskAccess::SetupElectron => !path.ends_with("node_modules"),
                     _ => false,
                 };
                 c.args([
@@ -1086,13 +1094,22 @@ impl<'a> PreparedContext<'a> {
                 )?;
             }
             if node && !setup && !write_root {
-                for relative in crate::shared_cache::npmrc_targets(root)? {
-                    crate::shared_cache::mount(
+                if setup_electron {
+                    crate::shared_cache::mask_checkout_secrets(
                         &mut c,
-                        &root_cache.join("empty-file-mask"),
-                        &Path::new("/workspace").join(relative),
-                        true,
+                        root,
+                        &root_cache,
+                        Path::new("/workspace"),
                     )?;
+                } else {
+                    for relative in crate::shared_cache::npmrc_targets(root)? {
+                        crate::shared_cache::mount(
+                            &mut c,
+                            &root_cache.join("empty-file-mask"),
+                            &Path::new("/workspace").join(relative),
+                            true,
+                        )?;
+                    }
                 }
             }
             let work_root = unified
@@ -1497,9 +1514,7 @@ fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
     }
     for p in [
         ".devkit/state/node-workspace.lock",
-        ".devkit/state/rust-image",
         ".devkit/state/rust-image.json",
-        ".devkit/state/desktop-image",
         ".devkit/state/desktop-image.json",
     ] {
         identity(&safe_path(&admission.root, p)?)?;
@@ -2584,15 +2599,7 @@ pub fn reserve_stand(root: &Path, cache: Option<&Path>, runner: &ProcessRunner) 
     let deadline = Instant::now() + Duration::from_secs(1);
     let root = project_root(root)?;
     runtime_pending(&root)?;
-    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
-    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
-        return Err(crate::cli::error(
-            "UNSUPPORTED_PROJECT_VERSION",
-            format!(
-                "stand reserve requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
-            ),
-        ));
-    }
+    ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let request = RuntimeRequest::new(root.clone(), "stand reserve".into());
     let before = read_project_state(&root)?;
     let runnable = |c: &ComponentState| {
@@ -2771,19 +2778,11 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
 
     let root = project_root(root)?;
     runtime_pending(&root)?;
-    let version = ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
-    if SemVer::parse(&version)? < SemVer::parse("0.5.0")? {
-        return Err(crate::cli::error(
-            "UNSUPPORTED_PROJECT_VERSION",
-            format!(
-                "stand remove requires Devkit 0.5.0 or newer (accepted project version is {version}); update the project first"
-            ),
-        ));
-    }
+    ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
     let request = RuntimeRequest::new(root.clone(), "stand remove".into());
     let _lock = CheckoutLock::acquire_exclusive(&root, "stand remove", Some(runner))?;
     let admission = ToolAdmission::capture_service(&request)?;
-    crate::delivery::verify_current_engine(&admission.pins.engine)?;
+    crate::delivery::verify_current_engine(&admission.pins.host_engine()?)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let previous = History::read(&root, runner, deadline)?;
     ensure!(

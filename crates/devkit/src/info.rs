@@ -5,7 +5,6 @@ use crate::{
     files::*,
     model::{DevelopmentKind, Role},
     processes::ProcessRunner,
-    runtime::ToolPins,
     stand::{epoch::Physical, ledger, ports::Ports, preview},
     state,
 };
@@ -352,7 +351,7 @@ pub(crate) fn inspect(
         .flatten();
     let pins_version = pins
         .as_ref()
-        .and_then(|(bytes, _)| ToolPins::parse(bytes).ok())
+        .and_then(|(bytes, _)| crate::runtime::EnginePins::parse(bytes).ok())
         .map(|pins| pins.version);
     let version = accepted
         .as_ref()
@@ -469,7 +468,7 @@ pub(crate) fn inspect(
         format!("Stand: {condition}"),
     ];
     if pending {
-        lines.push("Update pending. Run make recover.".into());
+        lines.push("Update pending. Run devkit recover (or make recover).".into());
     }
     for service in &services {
         lines.push(format!("Service {}: {}", service.service, service.state));

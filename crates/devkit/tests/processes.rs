@@ -199,23 +199,8 @@ fn native_process_probe() {
         return;
     }
     let runner = ProcessRunner::new().unwrap();
-    #[cfg(target_os = "macos")]
-    if scenario.starts_with("watcher-") {
-        runner
-            .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
-            .unwrap();
-    }
     let owned = OwnedContainer::new("devkit-process-test".into(), "accepted-token".into());
     if scenario.starts_with("metadata-") {
-        #[cfg(target_os = "macos")]
-        if scenario == "metadata-handshake" {
-            runner
-                .enable_group_watcher(
-                    Path::new(&std::env::var_os("DEVKIT_PROCESS_FIXTURE").unwrap())
-                        .join("observer"),
-                )
-                .unwrap();
-        }
         if scenario == "metadata-results" {
             use devkit::processes::CpMetadata;
             let budget = Duration::from_secs(2);
@@ -286,19 +271,7 @@ fn native_process_probe() {
         "cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"",
         "primary-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 42",
         "probe-cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 125",
-        "watcher-fork" => {
-            r#"printf '%s' "$$" > "$DEVKIT_PROCESS_FIXTURE/task-pid"
-            for worker in 1 2 3 4; do
-                (i=0; while test "$i" -lt 100; do
-                    sleep 0.02 & wait "$!"; i=$((i+1))
-                done) &
-            done
-            touch "$DEVKIT_PROCESS_FIXTURE/ready"; wait"#
-        }
-        "watcher-leader-exits" => {
-            r#"printf '%s' "$$" > "$DEVKIT_PROCESS_FIXTURE/task-pid"; sleep 25 & printf '%s' "$!" > "$DEVKIT_PROCESS_FIXTURE/child-pid"; touch "$DEVKIT_PROCESS_FIXTURE/ready"; while ! test -f "$DEVKIT_PROCESS_FIXTURE/exit"; do sleep 0.02; done"#
-        }
-        "wait-cancel" | "watcher-kill" => {
+        "wait-cancel" => {
             "sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
         }
         "delayed-create" => {
@@ -798,31 +771,6 @@ fn tracked_stdin_is_exact_bounded_and_has_a_terminal_receipt() {
     );
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn killed_controller_releases_descendants_and_captured_pipes() {
-    let fixture = Fixture::new();
-    let mut child = fixture.start("watcher-kill");
-    wait_for(&fixture.root().join("ready"));
-    let descendant = fs::read_to_string(fixture.root().join("child-pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(process_exists(descendant));
-    child.kill().unwrap();
-    let output = wait(child);
-    assert!(!output.status.success());
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while process_exists(descendant) {
-        assert!(
-            Instant::now() < deadline,
-            "Controller died but creator descendant survived"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 #[test]
 fn metadata_reads_share_the_reap_deadline_and_stop_term_ignoring_descendants() {
     let fixture = Fixture::new();
@@ -885,179 +833,6 @@ fn recovery_observations_can_finish_after_cancellation() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn metadata_deadline_bounds_an_unresponsive_observer_handshake() {
-    let fixture = Fixture::new();
-    script(
-        &fixture.root().join("docker"),
-        "#!/bin/sh\ntouch \"$DEVKIT_PROCESS_FIXTURE/started\"\n",
-    );
-    script(
-        &fixture.root().join("observer"),
-        "#!/bin/sh\nexec /bin/sleep 25\n",
-    );
-    let output = wait(fixture.start("metadata-handshake"));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!fixture.root().join("started").exists());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn replaced_observer_path_fails_before_launching_the_command() {
-    let t = TempDir::new().unwrap();
-    let path = t.path().join("devkit");
-    fs::copy(env!("CARGO_BIN_EXE_devkit"), &path).unwrap();
-    let runner = ProcessRunner::new().unwrap();
-    runner.enable_group_watcher(path.clone()).unwrap();
-    runner.capture(&mut Command::new("true")).unwrap();
-    let replacement = t.path().join("replacement");
-    fs::copy("/bin/echo", &replacement).unwrap();
-    fs::rename(replacement, path).unwrap();
-    let marker = t.path().join("started");
-    let error = runner
-        .capture(Command::new("touch").arg(&marker))
-        .err()
-        .unwrap();
-    assert!(format!("{error:#}").contains("Observer executable changed"));
-    assert!(!marker.exists());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn controller_death_drains_ordinary_workers_while_they_fork() {
-    for _ in 0..4 {
-        let fixture = Fixture::new();
-        let mut controller = fixture.start("watcher-fork");
-        wait_for(&fixture.root().join("ready"));
-        let task = fs::read_to_string(fixture.root().join("task-pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        let group = unsafe { libc::getpgid(task) };
-        assert!(group > 1);
-        controller.kill().unwrap();
-        let _ = wait(controller);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while process_exists(group) || unsafe { libc::kill(-group, 0) } == 0 {
-            assert!(Instant::now() < deadline, "Forking worker group survived");
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn observer_releases_inherited_locks_and_reusable_commands() {
-    let t = TempDir::new().unwrap();
-    let path = t.path().join("lock");
-    let file = fs::File::create(&path).unwrap();
-    file.lock().unwrap();
-    // Simulate a tool exporting a non-CLOEXEC descriptor into devkit.
-    assert_eq!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
-        0
-    );
-    let runner = ProcessRunner::new().unwrap();
-    runner
-        .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
-        .unwrap();
-    let mut command = Command::new("true");
-    runner.capture(&mut command).unwrap();
-    drop(file);
-    fs::File::open(&path).unwrap().try_lock().unwrap();
-    let error = runner
-        .capture(&mut Command::new("/no/such/devkit-test-command"))
-        .err()
-        .unwrap();
-    assert!(format!("{error:#}").contains("Cannot start"));
-    runner.capture(&mut command).unwrap();
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn failed_group_registration_is_a_reaped_spawn_error() {
-    use std::{io::Read, os::unix::process::CommandExt};
-    let runner = ProcessRunner::new().unwrap();
-    runner
-        .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
-        .unwrap();
-    let (mut observed, write_pid) = io::pipe().unwrap();
-    let fd = write_pid.as_raw_fd();
-    let original_group = unsafe { libc::getpgrp() };
-    let mut command = Command::new("true");
-    // Exercise the rejection path with a child already assigned a different
-    // PGID. A failed registration must never let this command reach exec.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, original_group) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let bytes = libc::getpid().to_ne_bytes();
-            if libc::write(fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            Ok(())
-        });
-    }
-    let mut reaped = false;
-    assert!(
-        runner
-            .run_tracked(&mut command, OutputMode::Capture(16), None, &mut reaped)
-            .is_err()
-    );
-    drop(write_pid);
-    let mut bytes = [0; 4];
-    observed.read_exact(&mut bytes).unwrap();
-    let pid = i32::from_ne_bytes(bytes);
-    assert!(reaped && !process_exists(pid));
-    assert_eq!(
-        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
-        -1
-    );
-    assert_eq!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(libc::ECHILD)
-    );
-    runner.capture(&mut Command::new("true")).unwrap();
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn watcher_cleans_descendants_of_an_exited_unreaped_creator() {
-    let fixture = Fixture::new();
-    let mut controller = fixture.start("watcher-leader-exits");
-    wait_for(&fixture.root().join("ready"));
-    let pid = controller.id() as i32;
-    let descendant = fs::read_to_string(fixture.root().join("child-pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-    let mut status = 0;
-    assert_eq!(
-        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
-        pid
-    );
-    fs::write(fixture.root().join("exit"), "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while process_exists(descendant) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let survived = process_exists(descendant);
-    controller.kill().unwrap();
-    let _ = wait(controller);
-    assert!(
-        !survived,
-        "Exited group leader left a descendant while the controller was stopped"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
 fn auto_reaping_controller_is_detected_before_group_creation() {
     let fixture = Fixture::new();
     let output = wait(fixture.start("no-waitable-children"));
@@ -1066,102 +841,4 @@ fn auto_reaping_controller_is_detected_before_group_creation() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn observer_still_owns_the_group_after_both_controller_and_task_are_reaped() {
-    let fixture = Fixture::new();
-    let mut controller = fixture.start("watcher-leader-exits");
-    wait_for(&fixture.root().join("ready"));
-    let pid = |name| {
-        fs::read_to_string(fixture.root().join(name))
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap()
-    };
-    let task = pid("task-pid");
-    let descendant = pid("child-pid");
-    let group = unsafe { libc::getpgid(task) };
-    assert!(group > 1 && group != task);
-    assert_eq!(unsafe { libc::getpgid(descendant) }, group);
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-    let size = size_of::<libc::proc_bsdinfo>() as i32;
-    assert_eq!(
-        unsafe {
-            libc::proc_pidinfo(
-                group,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        },
-        size
-    );
-    let observer = unsafe { info.assume_init() }.pbi_ppid as i32;
-    assert_eq!(unsafe { libc::getpgid(observer) }, observer);
-    assert_ne!(group, observer);
-
-    use std::os::unix::process::CommandExt;
-    // The stopped observer's group must not receive orphan-job SIGHUP/SIGCONT.
-    let mut outside = Command::new("sleep")
-        .arg("25")
-        .process_group(observer)
-        .spawn()
-        .unwrap();
-    // Retain a dead group member until after the observer and anchor exit.
-    let mut witness = Command::new("sleep")
-        .arg("25")
-        .process_group(group)
-        .spawn()
-        .unwrap();
-    // Delay notification handling until launchd has collected the original
-    // program. Its ordinary descendant still holds the controller output pipe.
-    assert_eq!(unsafe { libc::kill(observer, libc::SIGSTOP) }, 0);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-        let size = size_of::<libc::proc_bsdinfo>() as i32;
-        let count = unsafe {
-            libc::proc_pidinfo(
-                observer,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        assert_eq!(count, size);
-        if unsafe { info.assume_init() }.pbi_status == libc::SSTOP {
-            break;
-        }
-        assert!(Instant::now() < deadline, "Observer did not stop");
-        thread::sleep(Duration::from_millis(5));
-    }
-    controller.kill().unwrap();
-    assert!(!controller.wait().unwrap().success());
-    fs::write(fixture.root().join("exit"), "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while process_exists(task) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    let task_reaped = !process_exists(task);
-    let descendant_alive = process_exists(descendant);
-    assert_eq!(unsafe { libc::kill(observer, libc::SIGCONT) }, 0);
-    let _ = wait(controller);
-    assert!(
-        task_reaped && descendant_alive,
-        "Lost the intended exit ordering"
-    );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while process_exists(descendant) || process_exists(observer) || process_exists(group) {
-        assert!(Instant::now() < deadline, "Creator group survived");
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(!witness.wait().unwrap().success());
-    assert!(outside.try_wait().unwrap().is_none());
-    outside.kill().unwrap();
-    outside.wait().unwrap();
 }

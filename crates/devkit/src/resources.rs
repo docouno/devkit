@@ -90,6 +90,7 @@ pub struct DockerDaemonInfo {
     pub cgroup_driver: Option<String>,
     pub cgroup_version: Option<String>,
     pub rootless: bool,
+    pub client_context: Option<String>,
 }
 
 impl DockerDaemonInfo {
@@ -105,11 +106,11 @@ impl DockerDaemonInfo {
             .to_owned();
         ensure!(os_type == "linux", "A Linux Docker daemon is required");
         let arch = v.get("Architecture").and_then(Value::as_str).unwrap_or("");
-        let (platform, target) = match arch {
-            "amd64" | "x86_64" => ("linux/amd64", Target::LinuxX64),
-            "arm64" | "aarch64" => ("linux/arm64", Target::LinuxArm64),
-            _ => anyhow::bail!("Unsupported Linux Docker daemon architecture: {arch:?}"),
-        };
+        let target = Target::from_docker_arch(arch)
+            .with_context(|| format!("Unsupported Linux Docker daemon architecture: {arch:?}"))?;
+        let platform = target
+            .docker_platform()
+            .context("Unsupported Linux Docker daemon platform")?;
         let rootless = v
             .get("SecurityOptions")
             .and_then(Value::as_array)
@@ -118,6 +119,13 @@ impl DockerDaemonInfo {
                     .filter_map(Value::as_str)
                     .any(|s| s.contains("rootless"))
             });
+        let client_context = v
+            .get("ClientInfo")
+            .and_then(|c| c.get("Context"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         Ok(Self {
             os_type,
             platform,
@@ -149,6 +157,7 @@ impl DockerDaemonInfo {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             rootless,
+            client_context,
         })
     }
 }
@@ -567,6 +576,8 @@ fn read_inactive_file_bytes(stat_path: &Path) -> u64 {
 fn effective_docker_endpoint(
     host: Option<&str>,
     context: Option<&str>,
+    client_context: Option<&str>,
+    vm_host: bool,
     mut query: impl FnMut(&[&str]) -> Result<String>,
 ) -> Result<(String, Option<String>)> {
     // With both overrides present, let the installed CLI identify the endpoint it uses.
@@ -575,23 +586,33 @@ fn effective_docker_endpoint(
     {
         return Ok((host.to_owned(), None));
     }
-    let context = query(&["context", "show"])?;
-    ensure!(
-        !context.is_empty() && context.len() <= 256 && !context.starts_with('-'),
-        "Invalid Docker context"
-    );
-    let host = query(&[
+    // On native Linux without overrides, the immutable built-in "default" context
+    // targets the standard local Unix socket; reuse ClientInfo.Context from docker info.
+    if !vm_host
+        && host.is_none_or(str::is_empty)
+        && context.is_none_or(str::is_empty)
+        && client_context == Some("default")
+    {
+        return Ok(("unix:///var/run/docker.sock".into(), Some("default".into())));
+    }
+    let inspected = query(&[
         "context",
         "inspect",
         "--format",
-        "{{.Endpoints.docker.Host}}",
-        &context,
+        "{{.Name}}\n{{.Endpoints.docker.Host}}",
     ])?;
+    let mut lines = inspected.lines();
+    let name = lines.next().unwrap_or_default().trim();
+    let endpoint = lines.next().unwrap_or_default().trim();
     ensure!(
-        !host.is_empty() && !host.contains(['\n', '\r']),
+        !name.is_empty()
+            && name.len() <= 256
+            && !name.starts_with('-')
+            && !endpoint.is_empty()
+            && lines.next().is_none(),
         "Docker context has no valid endpoint"
     );
-    Ok((host, Some(context)))
+    Ok((endpoint.to_owned(), Some(name.to_owned())))
 }
 
 impl ProbeEnvironment {
@@ -602,11 +623,16 @@ impl ProbeEnvironment {
         Self::from_endpoint(docker_host, None)
     }
 
-    pub fn capture_with_docker(runner: &ProcessRunner) -> Result<Self> {
+    pub fn capture_with_docker(
+        runner: &ProcessRunner,
+        client_context: Option<&str>,
+    ) -> Result<Self> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let (host, context) = effective_docker_endpoint(
             std::env::var("DOCKER_HOST").ok().as_deref(),
             std::env::var("DOCKER_CONTEXT").ok().as_deref(),
+            client_context,
+            cfg!(target_os = "macos"),
             |args| {
                 let result = runner.capture_before(
                     Command::new("docker")
@@ -666,7 +692,7 @@ impl ProbeEnvironment {
 impl HostResourceBudget {
     pub fn probe_with_docker(runner: &ProcessRunner, docker: &mut Command) -> Result<Self> {
         let info = query_docker_info(runner, docker)?;
-        let env = ProbeEnvironment::capture_with_docker(runner)?;
+        let env = ProbeEnvironment::capture_with_docker(runner, info.client_context.as_deref())?;
         let (budget, warnings) = Self::evaluate(&env, Some(info))?;
         for w in warnings {
             eprintln!("devkit: warning: {w}");
@@ -1885,28 +1911,51 @@ mod tests {
         let local = "unix:///Users/example/.colima/default/docker.sock";
         let remote = "ssh://other-daemon";
         for (selected, endpoint) in [("colima", local), ("default", remote)] {
-            let (host, name) =
-                effective_docker_endpoint(Some(remote), Some("colima"), |args| match args {
-                    ["context", "show"] => Ok(selected.into()),
+            let (host, name) = effective_docker_endpoint(
+                Some(remote),
+                Some("colima"),
+                Some("colima"),
+                true,
+                |args| match args {
                     [
                         "context",
                         "inspect",
                         "--format",
-                        "{{.Endpoints.docker.Host}}",
-                        name,
-                    ] if *name == selected => Ok(endpoint.into()),
+                        "{{.Name}}\n{{.Endpoints.docker.Host}}",
+                    ] => Ok(format!("{selected}\n{endpoint}")),
                     _ => anyhow::bail!("unexpected Docker query"),
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
             assert_eq!(host, endpoint);
             assert_eq!(name.as_deref(), Some(selected));
         }
         assert_eq!(
-            effective_docker_endpoint(Some(local), None, |_| anyhow::bail!(
+            effective_docker_endpoint(Some(local), None, None, false, |_| anyhow::bail!(
                 "unexpected Docker query"
             ))
             .unwrap(),
             (local.into(), None)
+        );
+        assert_eq!(
+            effective_docker_endpoint(None, None, Some("default"), false, |_| anyhow::bail!(
+                "unexpected Docker query"
+            ))
+            .unwrap(),
+            ("unix:///var/run/docker.sock".into(), Some("default".into()))
+        );
+        assert_eq!(
+            effective_docker_endpoint(None, None, Some("default"), true, |args| match args {
+                [
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{.Name}}\n{{.Endpoints.docker.Host}}",
+                ] => Ok(format!("default\n{local}")),
+                _ => anyhow::bail!("unexpected Docker query"),
+            })
+            .unwrap(),
+            (local.into(), Some("default".into()))
         );
     }
 

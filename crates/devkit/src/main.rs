@@ -5,15 +5,6 @@ fn main() -> std::process::ExitCode {
         let value = std::env::var_os(devkit::processes::PARENT_HANDOFF);
         // SAFETY: process entry, before signals, threads or native libraries are initialized.
         unsafe { std::env::remove_var(devkit::processes::PARENT_HANDOFF) };
-        if args.first().is_some_and(|v| v == "internal")
-            && args.get(1).is_some_and(|v| v == "watch-group")
-        {
-            return if devkit::processes::run_watcher(&args[2..]).is_ok() {
-                std::process::ExitCode::SUCCESS
-            } else {
-                std::process::ExitCode::FAILURE
-            };
-        }
         value
     };
     let json = devkit::cli::wants_json(&args);
@@ -21,10 +12,7 @@ fn main() -> std::process::ExitCode {
     let result = (|| -> devkit::Result<()> {
         let runner = devkit::processes::ProcessRunner::new()?;
         #[cfg(target_os = "macos")]
-        {
-            runner.enable_current_group_watcher()?;
-            devkit::processes::watch_cli_parent(&runner, handoff.as_deref())?;
-        }
+        devkit::processes::watch_cli_parent(&runner, handoff.as_deref())?;
         #[cfg(target_os = "linux")]
         devkit::processes::watch_parent(&runner)?;
         let result = devkit::cli::main(args, &runner);

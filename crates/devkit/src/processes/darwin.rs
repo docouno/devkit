@@ -1,21 +1,18 @@
 //! Darwin has no parent-death signal or child subreaper. Watch the invoking
-//! process in-process and arm an independent observer before a creator may exec.
+//! parent in-process via kqueue and keep each creator child un-reaped until
+//! its process group drains.
 use super::*;
 use crate::state::proc_stat_ppid_and_start;
 use std::{
-    ffi::{OsStr, OsString},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    os::{
-        fd::{FromRawFd, OwnedFd},
-        unix::net::UnixStream,
-    },
-    path::PathBuf,
+    ffi::OsStr,
+    os::fd::{FromRawFd, OwnedFd},
     ptr,
     sync::OnceLock,
 };
 
 pub const PARENT_HANDOFF: &str = "DEVKIT_EXEC_PARENT";
 static PARENT: OnceLock<(i32, u64)> = OnceLock::new();
+const BACKGROUND_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 struct Queue(OwnedFd);
 
@@ -32,12 +29,12 @@ impl Queue {
         Ok(queue)
     }
 
-    fn register(&self, id: i32, filter: i16, flags: u16, fflags: u32) -> io::Result<()> {
+    fn watch_exit(&self, pid: i32) -> io::Result<()> {
         let event = libc::kevent {
-            ident: id as usize,
-            filter,
-            flags,
-            fflags,
+            ident: pid as usize,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
             data: 0,
             udata: ptr::null_mut(),
         };
@@ -60,15 +57,6 @@ impl Queue {
                 return Err(error);
             }
         }
-    }
-
-    fn watch_exit(&self, pid: i32) -> io::Result<()> {
-        self.register(
-            pid,
-            libc::EVFILT_PROC,
-            libc::EV_ADD | libc::EV_ONESHOT,
-            libc::NOTE_EXIT,
-        )
     }
 
     fn wait(&self) -> io::Result<libc::kevent> {
@@ -101,6 +89,13 @@ impl Queue {
 
 fn start_of(pid: i32) -> Option<u64> {
     proc_stat_ppid_and_start(pid.try_into().ok()?).map(|(_, start)| start)
+}
+
+pub(super) fn register_platform_signals(
+    _cancelled: &Arc<AtomicUsize>,
+    _registrations: &mut Vec<signal_hook::SigId>,
+) -> Result<()> {
+    Ok(())
 }
 
 pub fn watch_cli_parent(runner: &ProcessRunner, handoff: Option<&OsStr>) -> Result<()> {
@@ -152,226 +147,23 @@ pub fn watch_cli_parent(runner: &ProcessRunner, handoff: Option<&OsStr>) -> Resu
     Ok(())
 }
 
-pub(super) fn set_handoff(command: &mut Command) -> Result<()> {
+pub(super) fn set_handoff(runner: &ProcessRunner, command: &mut Command) -> Result<()> {
     if let Some((pid, started)) = PARENT.get() {
-        ensure!(
-            unsafe { libc::getppid() } == *pid,
-            "Parent exited before delegation"
-        );
+        if unsafe { libc::getppid() } != *pid || (*started != 0 && start_of(*pid) != Some(*started))
+        {
+            runner.cancel(libc::SIGTERM);
+            return runner.check_cancelled();
+        }
         command.env(PARENT_HANDOFF, format!("{pid}:{started}"));
     }
     Ok(())
 }
 
-unsafe extern "C" {
-    fn devkit_main_image_header() -> usize;
-    fn devkit_image_identity_at(pid: i32, header: usize, device: *mut u32, inode: *mut u64) -> i32;
+pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
+    runner.check_cancelled()
 }
 
-pub(super) struct WatcherImage {
-    path: PathBuf,
-    file: std::fs::File,
-}
-
-impl WatcherImage {
-    pub(super) fn open(path: PathBuf) -> Result<Self> {
-        let path = std::fs::canonicalize(path)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
-        ensure!(file.metadata()?.is_file(), "Invalid observer executable");
-        Ok(Self { path, file })
-    }
-
-    pub(super) fn current() -> Result<Self> {
-        let image = Self::open(std::env::current_exe()?)?;
-        image.check_mapping(std::process::id() as i32, unsafe {
-            devkit_main_image_header()
-        })?;
-        Ok(image)
-    }
-
-    fn check_path(&self) -> Result<()> {
-        let held = self.file.metadata()?;
-        let path = std::fs::symlink_metadata(&self.path)?;
-        ensure!(
-            path.is_file() && path.dev() == held.dev() && path.ino() == held.ino(),
-            "Observer executable changed"
-        );
-        Ok(())
-    }
-
-    fn check_mapping(&self, pid: i32, header: usize) -> Result<()> {
-        let (mut device, mut inode) = (0, 0);
-        let error = unsafe { devkit_image_identity_at(pid, header, &mut device, &mut inode) };
-        if error != 0 {
-            return Err(io::Error::from_raw_os_error(error))
-                .context("Cannot identify mapped observer executable");
-        }
-        let held = self.file.metadata()?;
-        ensure!(
-            (u64::from(device), inode) == (held.dev(), held.ino()),
-            "Mapped observer executable changed"
-        );
-        self.check_path()
-    }
-}
-
-const READY: u8 = 1;
-const TERMINATE: u8 = 2;
-
-/// Only the observer signals the group. Its own child reserves the group ID
-/// until a membership snapshot proves that no live producers remain.
-pub(super) struct Observer {
-    child: Child,
-    channel: UnixStream,
-    pgid: i32,
-    waited: bool,
-    admitted: bool,
-    startup_deadline: Instant,
-}
-
-fn reap(pid: i32) {
-    while unsafe { libc::waitpid(pid, ptr::null_mut(), 0) } < 0
-        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-    {}
-}
-
-// Transfer a pending wait past its caller's deadline. The standalone case also
-// transfers the group: the direct child's PID pins its identity until reap().
-fn reap_later(pid: i32, group: Option<i32>) {
-    let cleanup = move || {
-        if let Some(pgid) = group {
-            drain_until(pgid, None);
-        }
-        reap(pid);
-    };
-    // Thread limits can prevent the handoff; keep ownership in this thread.
-    if thread::Builder::new()
-        .name("devkit-reap".into())
-        .spawn(cleanup)
-        .is_err()
-    {
-        cleanup();
-    }
-}
-
-fn wait_before(child: &mut Child, deadline: Instant) -> Result<ExitStatus> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            reap_later(child.id() as i32, None);
-            anyhow::bail!("Creator process group cleanup exceeded its deadline");
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-}
-
-fn bound_handshake(channel: &UnixStream, deadline: Instant) -> Result<()> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|t| !t.is_zero())
-        .context("Creator group observer startup exceeded its deadline")?;
-    channel.set_read_timeout(Some(remaining))?;
-    channel.set_write_timeout(Some(remaining))?;
-    Ok(())
-}
-
-fn read_handshake(channel: &mut UnixStream, mut frame: &mut [u8], deadline: Instant) -> Result<()> {
-    // SO_RCVTIMEO bounds each read. Partial frames share the startup deadline.
-    while !frame.is_empty() {
-        bound_handshake(channel, deadline)?;
-        match channel.read(frame) {
-            Ok(0) => anyhow::bail!("Observer closed its startup socket"),
-            Ok(count) => frame = &mut frame[count..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-impl Observer {
-    fn start(image: &WatcherImage, startup_deadline: Instant) -> Result<Self> {
-        image.check_path()?;
-        let (channel, peer) = UnixStream::pair()?;
-        let fd = peer.as_raw_fd();
-        let mut command = Command::new(&image.path);
-        command
-            .args(["internal", "watch-group"])
-            .arg(std::process::id().to_string())
-            .arg(fd.to_string())
-            .env_remove(PARENT_HANDOFF)
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command
-            .spawn()
-            .context("Cannot start creator group observer")?;
-        drop(peer);
-        let mut observer = Self {
-            child,
-            channel,
-            pgid: 0,
-            waited: false,
-            admitted: false,
-            startup_deadline,
-        };
-        let mut header = [0; size_of::<usize>()];
-        read_handshake(&mut observer.channel, &mut header, startup_deadline)?;
-        image.check_mapping(observer.child.id() as i32, usize::from_ne_bytes(header))?;
-        bound_handshake(&observer.channel, startup_deadline)?;
-        observer.channel.write_all(&[READY])?;
-        observer.admitted = true;
-        let mut bytes = [0; 4];
-        read_handshake(&mut observer.channel, &mut bytes, startup_deadline)
-            .context("Creator group observer failed to initialize")?;
-        observer.pgid = i32::from_ne_bytes(bytes);
-        ensure!(observer.pgid > 1, "Invalid creator group acknowledgement");
-        Ok(observer)
-    }
-
-    fn finish(&mut self, deadline: Instant) -> Result<()> {
-        // EOF also handles exec, controller death, and failures during setup.
-        let _ = self.channel.shutdown(std::net::Shutdown::Both);
-        if !self.admitted {
-            let _ = self.child.kill();
-        }
-        self.waited = true;
-        let status = wait_before(&mut self.child, deadline)?;
-        ensure!(status.success(), "Creator group observer failed");
-        Ok(())
-    }
-}
-
-impl Drop for Observer {
-    fn drop(&mut self) {
-        if !self.waited {
-            let _ = self.finish(
-                self.startup_deadline
-                    .min(Instant::now() + Duration::from_secs(1)),
-            );
-        }
-    }
-}
-
-pub(super) fn spawn(
-    command: &mut Command,
-    executable: Option<&WatcherImage>,
-    deadline: Option<Instant>,
-) -> Result<Creator> {
+pub(super) fn spawn(command: &mut Command, _deadline: Option<Instant>) -> Result<Creator> {
     // Auto-reaped children cannot pin a numeric PGID or supply an exit status.
     let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
     if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } < 0 {
@@ -382,71 +174,12 @@ pub(super) fn spawn(
         action.sa_sigaction != libc::SIG_IGN && action.sa_flags & libc::SA_NOCLDWAIT == 0,
         "Creator supervision requires waitable children"
     );
-    let Some(executable) = executable else {
-        return Ok(Creator::new(command.spawn()?));
-    };
-    let maximum = Instant::now() + Duration::from_secs(5);
-    let startup_deadline = deadline.map_or(maximum, |at| at.min(maximum));
-    let observer = Observer::start(executable, startup_deadline)?;
-    bound_handshake(&observer.channel, startup_deadline)?;
-    let pgid = observer.pgid;
-    let owner = std::process::id() as i32;
-    let fd = observer.channel.as_raw_fd();
-    command.process_group(pgid);
-    // A Command retains pre_exec callbacks across spawns. Retire ours before
-    // the descriptor can be closed and reused in the controller.
-    let active = Arc::new(AtomicBool::new(true));
-    let armed = active.clone();
-    unsafe {
-        command.pre_exec(move || {
-            if armed.load(Ordering::Acquire) {
-                if libc::getppid() != owner || libc::getpgrp() != pgid {
-                    return Err(io::Error::from_raw_os_error(libc::EPERM));
-                }
-                // An earlier pre_exec callback may have closed descriptors.
-                // Only borrow this socket number through async-signal-safe calls.
-                let bytes = libc::getpid().to_ne_bytes();
-                transfer(bytes.len(), || {
-                    libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL)
-                })?;
-                let mut ack = 0_u8;
-                transfer(1, || libc::read(fd, (&raw mut ack).cast(), 1))?;
-                if ack != READY {
-                    return Err(io::Error::from_raw_os_error(libc::EPIPE));
-                }
-            }
-            Ok(())
-        });
-    }
-    let result = command.spawn();
-    active.store(false, Ordering::Release);
-    let mut creator = Creator::new(result?);
-    creator.pid = pgid;
-    creator.observer = Some(observer);
-    Ok(creator)
+    Ok(Creator::new(command.spawn()?))
 }
 
-// A short control frame aborts this spawn before exec. The controller then
-// owns both children and tears down the observer's group.
-fn transfer(size: usize, mut syscall: impl FnMut() -> isize) -> io::Result<()> {
-    loop {
-        let n = syscall();
-        if n == size as isize {
-            return Ok(());
-        }
-        if n >= 0 {
-            return Err(io::Error::from_raw_os_error(libc::EPIPE));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-/// Observe status without collecting the direct child. In the standalone
-/// library path that child itself pins the group's numeric identity.
-pub(super) fn poll_creator(child: &Child) -> io::Result<Option<ExitStatus>> {
+/// Observe status without collecting the direct child so its PID continues to
+/// pin the process group's numeric identity until cleanup finishes.
+pub(super) fn poll_creator(child: &mut Child) -> io::Result<Option<ExitStatus>> {
     loop {
         // Darwin can leave siginfo untouched when no child event is ready.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -525,7 +258,6 @@ fn drained(pgid: i32) -> io::Result<bool> {
         };
         zombies.insert(pid, birth);
     }
-
     if zombies.is_empty() {
         return Ok(true);
     }
@@ -539,18 +271,19 @@ fn drained(pgid: i32) -> io::Result<bool> {
     }))
 }
 
-fn drain_until(pgid: i32, deadline: Option<Instant>) -> bool {
-    // killpg targets a snapshot. Keep the identity pinned and repeat until a
-    // fresh snapshot proves that no ordinary descendant can fork again.
+fn drain_until(pgid: i32, deadline: Instant) -> bool {
+    // killpg targets a snapshot. Keep the leader un-reaped to pin the PGID
+    // and repeat until a fresh snapshot proves no ordinary descendant remains
+    // or the finite deadline expires.
     let mut delay = Duration::from_millis(2);
     loop {
         signal_group(pgid, libc::SIGKILL);
         if matches!(drained(pgid), Ok(true)) {
             return true;
         }
-        let wait = deadline.map_or(delay, |at| {
-            at.saturating_duration_since(Instant::now()).min(delay)
-        });
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(delay);
         if wait.is_zero() {
             return false;
         }
@@ -559,49 +292,40 @@ fn drain_until(pgid: i32, deadline: Option<Instant>) -> bool {
     }
 }
 
-struct Anchor {
-    pid: i32,
-    _lifetime: io::PipeWriter,
+fn reap(pid: i32) {
+    while unsafe { libc::waitpid(pid, ptr::null_mut(), 0) } < 0
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
 }
 
-impl Anchor {
-    fn start(channel: &UnixStream, queue: &Queue) -> Result<Self> {
-        let (reader, writer) = io::pipe()?;
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(io::Error::last_os_error().into());
+// Transfer a pending wait past its caller's deadline with a bounded drain budget
+// so an unkillable or cross-UID member never wedges cleanup forever.
+fn reap_later(pid: i32, group: Option<i32>) {
+    let cleanup = move || {
+        if let Some(pgid) = group {
+            drain_until(pgid, Instant::now() + BACKGROUND_DRAIN_BUDGET);
         }
-        if pid == 0 {
-            // No allocations, runtime code or inherited locks after fork.
-            unsafe {
-                libc::close(channel.as_raw_fd());
-                libc::close(queue.0.as_raw_fd());
-                libc::close(writer.as_raw_fd());
-                // The pipe closes on observer exit, including failure before enrollment.
-                let mut byte = 0u8;
-                while libc::read(reader.as_raw_fd(), (&raw mut byte).cast(), 1) < 0
-                    && *libc::__error() == libc::EINTR
-                {}
-                libc::_exit(0);
-            }
-        }
-        let anchor = Self {
-            pid,
-            _lifetime: writer,
-        };
-        if unsafe { libc::setpgid(pid, pid) } < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(anchor)
+        reap(pid);
+    };
+    if thread::Builder::new()
+        .name("devkit-reap".into())
+        .spawn(cleanup)
+        .is_err()
+    {
+        cleanup();
     }
 }
 
-impl Drop for Anchor {
-    fn drop(&mut self) {
-        // Also covers failure to create the group before enrollment.
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
-        drain_until(self.pid, None);
-        reap(self.pid);
+fn wait_before(child: &mut Child, deadline: Instant) -> Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            reap_later(child.id() as i32, None);
+            anyhow::bail!("Creator process group cleanup exceeded its deadline");
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -610,13 +334,8 @@ impl Creator {
         if self.finished {
             return Ok(());
         }
-        if let Some(observer) = &mut self.observer {
-            // The observer may already be draining after the task exited.
-            let _ = observer.channel.write_all(&[TERMINATE]);
-        } else {
-            signal_group(self.pid, libc::SIGTERM);
-            signal_group(self.pid, libc::SIGCONT);
-        }
+        signal_group(self.pid, libc::SIGTERM);
+        signal_group(self.pid, libc::SIGCONT);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(self.try_wait(), Ok(None)) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
@@ -630,121 +349,13 @@ impl Creator {
         }
         let _ = self.child.kill();
         self.finished = true;
-        let stopped = if let Some(mut observer) = self.observer.take() {
-            observer.finish(deadline)
-        } else if drain_until(self.pid, Some(deadline)) {
-            Ok(())
-        } else {
+        if !drain_until(self.pid, deadline) {
             reap_later(self.child.id() as i32, Some(self.pid));
             anyhow::bail!("Creator process group cleanup exceeded its deadline");
-        };
-        let waited = wait_before(&mut self.child, deadline);
-        stopped?;
-        waited?;
+        }
+        wait_before(&mut self.child, deadline)?;
         Ok(())
     }
-}
-
-pub fn run_watcher(args: &[OsString]) -> Result<()> {
-    ensure!(
-        args.len() == 2,
-        "Expected controller PID and observer socket"
-    );
-    let parse = |arg: &OsString| -> Result<i32> {
-        Ok(arg.to_str().context("Invalid observer argument")?.parse()?)
-    };
-    let owner = parse(&args[0])?;
-    let fd = parse(&args[1])?;
-    ensure!(
-        owner > 1
-            && unsafe { libc::getppid() == owner && libc::getpgrp() == libc::getpid() }
-            && fd >= 3,
-        "Invalid observer parent"
-    );
-    let mut kind: libc::c_int = 0;
-    let mut size = size_of_val(&kind) as libc::socklen_t;
-    ensure!(
-        unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_TYPE,
-                (&raw mut kind).cast(),
-                &mut size,
-            )
-        } == 0
-            && kind == libc::SOCK_STREAM,
-        "Invalid observer socket"
-    );
-    // Post-exec and single-threaded. /dev/fd can enumerate its own transient directory FD.
-    let mut descriptors = Vec::new();
-    for entry in std::fs::read_dir("/dev/fd")? {
-        let name = entry?.file_name();
-        let n: i32 = name.to_str().context("Invalid descriptor name")?.parse()?;
-        if n >= 3 && n != fd {
-            descriptors.push(n);
-        }
-    }
-    for n in descriptors {
-        if unsafe { libc::close(n) } < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EBADF) {
-                return Err(error.into());
-            }
-        }
-    }
-    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
-    channel.set_read_timeout(Some(Duration::from_secs(5)))?;
-    channel.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let queue = Queue::new()?;
-    queue.watch_exit(owner)?;
-    queue.register(fd, libc::EVFILT_READ, libc::EV_ADD, 0)?;
-    ensure!(
-        unsafe { libc::getppid() } == owner,
-        "Observer parent exited"
-    );
-    // A terminal or graceful group shutdown must leave the observer available
-    // to finish the job if its controller is killed midway through cleanup.
-    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
-        ensure!(
-            unsafe { libc::signal(sig, libc::SIG_IGN) } != libc::SIG_ERR,
-            "Cannot arm group observer"
-        );
-    }
-    // The controller checks this child's actual VM region against its open
-    // executable before admitting the observer or starting a creator.
-    channel.write_all(&unsafe { devkit_main_image_header() }.to_ne_bytes())?;
-    let mut admitted = [0];
-    channel.read_exact(&mut admitted)?;
-    ensure!(admitted == [READY], "Observer executable was not admitted");
-    let anchor = Anchor::start(&channel, &queue)?;
-    channel.write_all(&anchor.pid.to_ne_bytes())?;
-    if queue.wait()?.filter == libc::EVFILT_READ {
-        let mut bytes = [0; 4];
-        if let Err(error) = channel.read_exact(&mut bytes) {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok(());
-            }
-            return Err(error.into());
-        }
-        let pid = i32::from_ne_bytes(bytes);
-        ensure!(
-            pid > 1 && unsafe { libc::getpgid(pid) } == anchor.pid,
-            "Invalid creator group"
-        );
-        queue.watch_exit(pid)?;
-        channel.write_all(&[READY])?;
-        while queue.wait()?.filter == libc::EVFILT_READ {
-            let mut action = [0];
-            if channel.read(&mut action)? == 0 {
-                break;
-            }
-            ensure!(action == [TERMINATE], "Invalid creator group request");
-            signal_group(anchor.pid, libc::SIGTERM);
-            signal_group(anchor.pid, libc::SIGCONT);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -752,45 +363,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_partial_observer_frame_shares_one_deadline() {
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        let writer = thread::spawn(move || {
-            for _ in 0..8 {
-                if sender.write_all(&[READY]).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(60));
-            }
-        });
-        assert!(
-            read_handshake(
-                &mut receiver,
-                &mut [0; 8],
-                Instant::now() + Duration::from_millis(200)
-            )
-            .is_err()
-        );
-        drop(receiver);
-        writer.join().unwrap();
-    }
-
-    #[test]
-    fn wrong_mapped_image_fails_observer_admission() {
-        let header = unsafe { devkit_main_image_header() };
-        let pid = std::process::id() as i32;
-        WatcherImage::current()
-            .unwrap()
-            .check_mapping(pid, header)
-            .unwrap();
-        let other = WatcherImage::open("/bin/sh".into()).unwrap();
-        assert!(other.check_mapping(pid, header).is_err());
-    }
-
-    #[test]
-    fn observing_normal_exit_keeps_the_standalone_leader_waitable_until_cleanup() {
+    fn observing_normal_exit_keeps_the_leader_waitable_until_cleanup() {
         let mut creator = spawn(
             Command::new("sh").args(["-c", "exit 37"]).process_group(0),
-            None,
             None,
         )
         .unwrap();
@@ -805,12 +380,12 @@ mod tests {
         }
         // A second kernel observation succeeds only while the leader is held.
         assert_eq!(
-            poll_creator(&creator.child).unwrap().unwrap().code(),
+            poll_creator(&mut creator.child).unwrap().unwrap().code(),
             Some(37)
         );
         creator.finish().unwrap();
         assert_eq!(
-            poll_creator(&creator.child).unwrap_err().raw_os_error(),
+            poll_creator(&mut creator.child).unwrap_err().raw_os_error(),
             Some(libc::ECHILD)
         );
         creator.finish().unwrap();

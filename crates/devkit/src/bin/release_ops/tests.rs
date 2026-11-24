@@ -131,7 +131,10 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join(",");
         let mut pins = format!(
-            "DEVKIT_VERSION={version}\nDEVKIT_ENGINE_TARGET={legacy}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGETS={triples}\n",
+            "DEVKIT_VERSION={version}\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.13.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_TARGET={legacy}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGETS={triples}\n",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
             hashes[legacy]
         );
         for target in targets {
@@ -144,6 +147,36 @@ impl Fixture {
         files::write_atomic(
             &payload.join("runtime/toolchains.env"),
             pins.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        let pnpm_x64 = devkit::runtime::PnpmPin {
+            package: devkit::distribution::Target::LinuxX64
+                .pnpm_package()
+                .unwrap()
+                .into(),
+            version: "10.30.3".into(),
+            tarball_sha256: "4".repeat(64),
+            binary_sha256: "5".repeat(64),
+        };
+        let mut pnpm_env = pnpm_x64.encode();
+        pnpm_env.push_str(&format!(
+            "DEVKIT_PNPM_TARGETS={},{}\n",
+            devkit::distribution::Target::LinuxX64.triple(),
+            devkit::distribution::Target::LinuxArm64.triple(),
+        ));
+        for target in devkit::distribution::Target::LINUX {
+            let suffix = target.key_suffix();
+            let pkg = target.pnpm_package().unwrap();
+            pnpm_env.push_str(&format!(
+                "DEVKIT_PNPM_PACKAGE_{suffix}={pkg}\nDEVKIT_PNPM_TARBALL_SHA256_{suffix}={}\nDEVKIT_PNPM_SHA256_{suffix}={}\n",
+                "4".repeat(64),
+                "5".repeat(64),
+            ));
+        }
+        files::write_atomic(
+            &payload.join("runtime/pnpm.env"),
+            pnpm_env.as_bytes(),
             0o644,
         )
         .unwrap();
@@ -382,22 +415,21 @@ fn frozen_payload_and_npm_cannot_enable_an_unpublished_target() {
         let payload = work.path().join("payload");
         archive::extract_archive(&set.root.join(&set.index.archive), &payload, "devkit-0.3.0")
             .unwrap();
-        let darwin = devkit::distribution::Target::DarwinArm64;
+        let extra_triple = "riscv64gc-unknown-linux-musl";
+        let extra_asset = "devkit-riscv64gc-unknown-linux-musl";
+        let extra_suffix = "RISCV64GC_UNKNOWN_LINUX_MUSL";
         match change {
-            "engine" => {
-                files::write_atomic(&payload.join(darwin.asset()), b"preview", 0o755).unwrap()
-            }
+            "engine" => files::write_atomic(&payload.join(extra_asset), b"preview", 0o755).unwrap(),
             "pin" => {
                 let path = payload.join("runtime/toolchains.env");
                 let pins = fs::read_to_string(&path).unwrap().replace(
                     "musl\nDEVKIT_ENGINE_SHA256_X86",
-                    &format!("musl,{}\nDEVKIT_ENGINE_SHA256_X86", darwin.triple()),
+                    &format!("musl,{extra_triple}\nDEVKIT_ENGINE_SHA256_X86"),
                 );
                 fs::write(
                     path,
                     format!(
-                        "{pins}DEVKIT_ENGINE_SHA256_{}={}\n",
-                        darwin.key_suffix(),
+                        "{pins}DEVKIT_ENGINE_SHA256_{extra_suffix}={}\n",
                         "a".repeat(64)
                     ),
                 )
@@ -407,7 +439,7 @@ fn frozen_payload_and_npm_cannot_enable_an_unpublished_target() {
                 let path = payload.join("package.json");
                 let mut package: Value = files::read_json(&path).unwrap();
                 package[change] = match change {
-                    "os" => json!(["linux", "darwin"]),
+                    "os" => json!(["linux", "freebsd"]),
                     "cpu" => json!(["x64"]),
                     _ => json!({"devkit": "devkit"}),
                 };

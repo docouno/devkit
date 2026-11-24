@@ -21,12 +21,18 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-static INITIAL_PPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "linux")]
+pub use linux::{restore_exec_pdeathsig, watch_parent};
 
 #[cfg(target_os = "macos")]
 mod darwin;
 #[cfg(target_os = "macos")]
-pub use darwin::{PARENT_HANDOFF, run_watcher, watch_cli_parent};
+use darwin as platform;
+#[cfg(target_os = "macos")]
+pub use darwin::{PARENT_HANDOFF, restore_exec_pdeathsig, watch_cli_parent};
 
 #[derive(Debug)]
 pub struct CommandFailure {
@@ -150,8 +156,6 @@ impl Drop for Signals {
 #[derive(Clone)]
 pub struct ProcessRunner {
     signals: Arc<Signals>,
-    #[cfg(target_os = "macos")]
-    watcher: Arc<std::sync::OnceLock<darwin::WatcherImage>>,
 }
 #[derive(Clone, Debug)]
 pub struct OwnedContainer {
@@ -218,52 +222,10 @@ impl ProcessRunner {
             }?;
             signals.registrations.push(id);
         }
-        #[cfg(target_os = "linux")]
-        {
-            let cancelled = cancelled.clone();
-            // SAFETY: getppid() and lock-free atomic operations are async-signal-safe.
-            // Linux PR_SET_PDEATHSIG fires when the spawning OS thread exits even while
-            // the parent process (TGID) remains alive; only cancel when getppid() changes.
-            let id = unsafe {
-                signal_hook::low_level::register(libc::SIGURG, move || {
-                    let initial = INITIAL_PPID.load(Ordering::Relaxed);
-                    if initial > 0 && libc::getppid() != initial {
-                        let _ = cancelled.compare_exchange(
-                            0,
-                            libc::SIGTERM as usize,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        );
-                    }
-                })
-            }?;
-            signals.registrations.push(id);
-        }
-        // Orphaned ordinary creator descendants remain our responsibility.
-        // SAFETY: prctl accepts these scalar arguments, with no borrowed pointers.
-        #[cfg(target_os = "linux")]
-        ensure!(
-            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0,
-            "Cannot enable child reaping"
-        );
+        platform::register_platform_signals(&cancelled, &mut signals.registrations)?;
         Ok(Self {
             signals: Arc::new(signals),
-            #[cfg(target_os = "macos")]
-            watcher: Arc::default(),
         })
-    }
-    #[cfg(target_os = "macos")]
-    pub fn enable_group_watcher(&self, executable: std::path::PathBuf) -> Result<()> {
-        self.watcher
-            .set(darwin::WatcherImage::open(executable)?)
-            .map_err(|_| anyhow::anyhow!("Group observer already enabled"))
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn enable_current_group_watcher(&self) -> Result<()> {
-        self.watcher
-            .set(darwin::WatcherImage::current()?)
-            .map_err(|_| anyhow::anyhow!("Group observer already enabled"))
     }
 
     fn spawn_creator(&self, command: &mut Command, deadline: Option<Instant>) -> Result<Creator> {
@@ -274,15 +236,7 @@ impl ProcessRunner {
             command.env_remove("DOCKER_DEFAULT_PLATFORM");
         }
         command.process_group(0);
-        #[cfg(target_os = "macos")]
-        {
-            darwin::spawn(command, self.watcher.get(), deadline)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = deadline;
-            Ok(Creator::new(command.spawn()?))
-        }
+        platform::spawn(command, deadline)
     }
 
     pub(crate) fn cancel(&self, sig: i32) {
@@ -1131,8 +1085,6 @@ struct Creator {
     child: Child,
     pid: i32,
     finished: bool,
-    #[cfg(target_os = "macos")]
-    observer: Option<darwin::Observer>,
 }
 impl Creator {
     fn new(child: Child) -> Self {
@@ -1141,99 +1093,10 @@ impl Creator {
             child,
             pid,
             finished: false,
-            #[cfg(target_os = "macos")]
-            observer: None,
         }
     }
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        #[cfg(target_os = "macos")]
-        {
-            darwin::poll_creator(&self.child)
-        }
-        #[cfg(target_os = "linux")]
-        self.child.try_wait()
-    }
-    #[cfg(target_os = "linux")]
-    fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
-        // This process has no daemon-side mutation to reconcile. Stop it
-        // immediately and never enter the mutation grace period on drop.
-        self.finished = true;
-        signal_group(self.pid, libc::SIGKILL);
-        loop {
-            if self.try_wait()?.is_some() {
-                reap_available(self.pid)?;
-                if !group_exists(self.pid) {
-                    return Ok(());
-                }
-            }
-            ensure!(
-                Instant::now() < deadline,
-                "Metadata query process group was not reaped"
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-    #[cfg(target_os = "linux")]
-    fn finish(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        signal_group(self.pid, libc::SIGTERM);
-        signal_group(self.pid, libc::SIGCONT);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut first_error = None;
-        let mut reaped = false;
-        // Reap the direct creator via Child before waitpid handles adopted
-        // descendants, and still kill the group if waiting itself fails.
-        while Instant::now() < deadline {
-            match self.try_wait() {
-                Ok(Some(_)) => {
-                    reaped = true;
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(error) => {
-                    first_error = Some(anyhow::Error::from(error));
-                    break;
-                }
-            }
-        }
-        if !reaped {
-            signal_group(self.pid, libc::SIGKILL);
-        }
-        if let Err(error) = self.child.wait() {
-            first_error.get_or_insert(error.into());
-        }
-        while group_exists(self.pid) && Instant::now() < deadline {
-            if let Err(error) = reap_available(self.pid) {
-                first_error.get_or_insert(error);
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        if group_exists(self.pid) {
-            signal_group(self.pid, libc::SIGKILL);
-        }
-        let reap_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Err(error) = reap_available(self.pid) {
-                first_error.get_or_insert(error);
-            }
-            if !group_exists(self.pid) {
-                self.finished = true;
-                break;
-            }
-            if Instant::now() >= reap_deadline {
-                first_error
-                    .get_or_insert_with(|| anyhow::anyhow!("Creator process group was not reaped"));
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        platform::poll_creator(&mut self.child)
     }
 }
 impl Drop for Creator {
@@ -1251,83 +1114,13 @@ fn signal_group(pid: i32, signal: i32) {
         libc::kill(-pid, signal);
     }
 }
-#[cfg(target_os = "linux")]
-fn group_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only probes the creator's PGID.
-    let result = unsafe { libc::kill(-pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-#[cfg(target_os = "linux")]
-fn reap_available(pid: i32) -> Result<()> {
-    loop {
-        let mut status = 0;
-        // SAFETY: waitpid is restricted to adopted children in our owned PGID.
-        let waited = unsafe { libc::waitpid(-pid, &mut status, libc::WNOHANG) };
-        if waited > 0 {
-            continue;
-        }
-        if waited == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        if error.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(());
-        }
-        return Err(error.into());
-    }
-}
-/// The CLI dies with its invoking Make/shell; its installed handlers still get
-/// to clean up. Install ProcessRunner before calling this, before any spawn.
-#[cfg(target_os = "linux")]
-pub fn watch_parent(runner: &ProcessRunner) -> Result<()> {
-    // SAFETY: getppid and scalar prctl arguments contain no borrowed pointers.
-    let parent = unsafe { libc::getppid() };
-    INITIAL_PPID.store(parent, Ordering::SeqCst);
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGURG, 0, 0, 0) } == 0,
-        "Cannot watch parent lifetime"
-    );
-    let current = unsafe { libc::getppid() };
-    if current != parent || (parent != 1 && current == 1) {
-        runner.cancel(libc::SIGTERM);
-        runner.check_cancelled()?;
-    }
-    Ok(())
-}
-
-/// Restore SIGTERM parent-death notification before replacing this image via execve,
-/// while guarding against a parent exit in the transition window.
-#[cfg(target_os = "linux")]
-pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
-    runner.check_cancelled()?;
-    let initial = INITIAL_PPID.load(Ordering::SeqCst);
-    // SAFETY: scalar prctl arguments contain no borrowed pointers.
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } == 0,
-        "Cannot restore parent death signal before exec"
-    );
-    let current = unsafe { libc::getppid() };
-    if initial > 0 && (current != initial || (initial != 1 && current == 1)) {
-        runner.cancel(libc::SIGTERM);
-        runner.check_cancelled()?;
-    }
-    Ok(())
-}
 
 /// Prepare a CLI-to-CLI exec, preserving the original parent across image replacement.
 pub fn restore_self_exec(runner: &ProcessRunner, command: &mut Command) -> Result<()> {
+    restore_exec_pdeathsig(runner)?;
     #[cfg(target_os = "macos")]
-    darwin::set_handoff(command)?;
+    darwin::set_handoff(runner, command)?;
     #[cfg(target_os = "linux")]
     let _ = command;
-    restore_exec_pdeathsig(runner)
-}
-
-#[cfg(target_os = "macos")]
-pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
-    // Each creator owns its observer. An exec also closes all control sockets.
-    runner.check_cancelled()
+    Ok(())
 }

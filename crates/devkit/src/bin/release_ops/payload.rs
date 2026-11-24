@@ -3,9 +3,9 @@ use devkit::{
     delivery::{
         render_bootstrap_pins, render_npm_launcher, render_project_loader_pins, verify_executable,
     },
-    distribution::npm_platforms,
+    distribution::{Target, npm_platforms},
     release::{AdmittedRelease, admit_release},
-    runtime::EnginePins,
+    runtime::{PnpmPin, ToolPins},
 };
 
 impl FrozenSet {
@@ -95,11 +95,15 @@ impl FrozenSet {
             .with_context(|| format!("Hydrated engine differs from its frozen asset: {asset}"))?;
             hashes.insert(target.triple().to_owned(), hash.clone());
         }
-        let pins = EnginePins::parse(&release.bytes("runtime/toolchains.env")?)?;
+        let pins = ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?;
         ensure!(
-            pins.version == self.index.version && pins.hashes() == &hashes,
+            pins.version == self.index.version && pins.engines.hashes() == &hashes,
             "Frozen toolchain engine pins differ from the release index"
         );
+        for target in Target::LINUX {
+            PnpmPin::from_release_for_target(release, target)
+                .with_context(|| format!("Invalid frozen pnpm pin for {}", target.triple()))?;
+        }
         let package: Value = serde_json::from_slice(&release.bytes("package.json")?)?;
         let (systems, cpus) = npm_platforms(targets);
         ensure!(

@@ -122,18 +122,23 @@ impl Daemon {
             let result = runner.capture_before(Command::new("docker").args(args), deadline)?;
             Ok(result.text()?.trim_end_matches('\n').to_owned())
         };
-        let context = query(&["context", "show"])?;
-        ensure!(
-            !context.is_empty() && context.len() <= 256 && !context.starts_with('-'),
-            "Invalid Docker context"
-        );
-        let host = query(&[
+        let inspected = query(&[
             "context",
             "inspect",
             "--format",
-            "{{.Endpoints.docker.Host}}",
-            &context,
+            "{{.Name}}\n{{.Endpoints.docker.Host}}",
         ])?;
+        let mut lines = inspected.lines();
+        let context = lines.next().unwrap_or_default().to_owned();
+        let host = lines.next().unwrap_or_default().to_owned();
+        ensure!(
+            !context.is_empty()
+                && context.len() <= 256
+                && !context.starts_with('-')
+                && !host.is_empty()
+                && lines.next().is_none(),
+            "Invalid Docker context"
+        );
         let server = query(&["info", "--format", "{{.ID}}"])?;
         ensure!(
             !server.is_empty()
