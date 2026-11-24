@@ -127,7 +127,7 @@ impl Drop for Signals {
 pub struct ProcessRunner {
     signals: Arc<Signals>,
     #[cfg(target_os = "macos")]
-    watcher: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    watcher: Arc<std::sync::OnceLock<darwin::WatcherImage>>,
 }
 #[derive(Clone, Debug)]
 pub struct OwnedContainer {
@@ -231,11 +231,18 @@ impl ProcessRunner {
     #[cfg(target_os = "macos")]
     pub fn enable_group_watcher(&self, executable: std::path::PathBuf) -> Result<()> {
         self.watcher
-            .set(executable)
+            .set(darwin::WatcherImage::open(executable)?)
             .map_err(|_| anyhow::anyhow!("Group observer already enabled"))
     }
 
-    fn spawn_creator(&self, command: &mut Command) -> Result<Creator> {
+    #[cfg(target_os = "macos")]
+    pub fn enable_current_group_watcher(&self) -> Result<()> {
+        self.watcher
+            .set(darwin::WatcherImage::current()?)
+            .map_err(|_| anyhow::anyhow!("Group observer already enabled"))
+    }
+
+    fn spawn_creator(&self, command: &mut Command, deadline: Option<Instant>) -> Result<Creator> {
         if std::path::Path::new(command.get_program())
             .file_name()
             .is_some_and(|p| p == "docker")
@@ -245,10 +252,13 @@ impl ProcessRunner {
         command.process_group(0);
         #[cfg(target_os = "macos")]
         {
-            darwin::spawn(command, self.watcher.get().map(|path| path.as_path()))
+            darwin::spawn(command, self.watcher.get(), deadline)
         }
         #[cfg(target_os = "linux")]
-        Ok(Creator::new(command.spawn()?))
+        {
+            let _ = deadline;
+            Ok(Creator::new(command.spawn()?))
+        }
     }
 
     pub(crate) fn cancel(&self, sig: i32) {
@@ -413,7 +423,8 @@ impl ProcessRunner {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
-        let mut creator = match self.spawn_creator(command) {
+        let metadata_started = metadata_deadline.map(|_| Instant::now());
+        let mut creator = match self.spawn_creator(command, metadata_deadline) {
             Ok(creator) => creator,
             Err(error) => {
                 if let Some(flag) = reaped.as_deref_mut() {
@@ -454,12 +465,14 @@ impl ProcessRunner {
                 reader_failed.clone(),
             )
         });
-        let started = Instant::now();
+        let started = metadata_started.unwrap_or_else(Instant::now);
         let status = loop {
             if !cleanup && let Err(error) = self.check_cancelled() {
                 break Err(error);
             }
-            if timeout.is_some_and(|t| started.elapsed() >= t) {
+            if timeout.is_some_and(|t| started.elapsed() >= t)
+                || metadata_deadline.is_some_and(|at| Instant::now() >= at)
+            {
                 break Err(anyhow::anyhow!("Process exceeded its deadline"));
             }
             if overflow.load(Ordering::SeqCst) {
@@ -603,7 +616,7 @@ impl ProcessRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut creator = self
-            .spawn_creator(&mut command)
+            .spawn_creator(&mut command, None)
             .context("Cannot start image metadata query")?;
         let mut stdout = creator
             .child

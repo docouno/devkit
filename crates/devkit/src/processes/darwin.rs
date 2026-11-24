@@ -4,11 +4,12 @@ use super::*;
 use crate::state::proc_stat_ppid_and_start;
 use std::{
     ffi::{OsStr, OsString},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     os::{
         fd::{FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
-    path::Path,
+    path::PathBuf,
     ptr,
     sync::OnceLock,
 };
@@ -162,22 +163,129 @@ pub(super) fn set_handoff(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-const READY: u8 = 1;
+unsafe extern "C" {
+    fn devkit_main_image_header() -> usize;
+    fn devkit_image_identity_at(pid: i32, header: usize, device: *mut u32, inode: *mut u64) -> i32;
+}
 
-/// Each active creator has a group leader independent of the task. The caller
-/// owns this direct child and never collects it before the last group signal.
+pub(super) struct WatcherImage {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl WatcherImage {
+    pub(super) fn open(path: PathBuf) -> Result<Self> {
+        let path = std::fs::canonicalize(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        ensure!(file.metadata()?.is_file(), "Invalid observer executable");
+        Ok(Self { path, file })
+    }
+
+    pub(super) fn current() -> Result<Self> {
+        let image = Self::open(std::env::current_exe()?)?;
+        image.check_mapping(std::process::id() as i32, unsafe {
+            devkit_main_image_header()
+        })?;
+        Ok(image)
+    }
+
+    fn check_path(&self) -> Result<()> {
+        let held = self.file.metadata()?;
+        let path = std::fs::symlink_metadata(&self.path)?;
+        ensure!(
+            path.is_file() && path.dev() == held.dev() && path.ino() == held.ino(),
+            "Observer executable changed"
+        );
+        Ok(())
+    }
+
+    fn check_mapping(&self, pid: i32, header: usize) -> Result<()> {
+        let (mut device, mut inode) = (0, 0);
+        let error = unsafe { devkit_image_identity_at(pid, header, &mut device, &mut inode) };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error))
+                .context("Cannot identify mapped observer executable");
+        }
+        let held = self.file.metadata()?;
+        ensure!(
+            (u64::from(device), inode) == (held.dev(), held.ino()),
+            "Mapped observer executable changed"
+        );
+        self.check_path()
+    }
+}
+
+const READY: u8 = 1;
+const TERMINATE: u8 = 2;
+
+/// Only the observer signals the group. Its own child reserves the group ID
+/// until a membership snapshot proves that no live producers remain.
 pub(super) struct Observer {
     child: Child,
     channel: UnixStream,
+    pgid: i32,
+    waited: bool,
+    admitted: bool,
+    startup_deadline: Instant,
+}
+
+fn reap(pid: i32) {
+    while unsafe { libc::waitpid(pid, ptr::null_mut(), 0) } < 0
+        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+    {}
+}
+
+// Transfer a pending wait past its caller's deadline. The standalone case also
+// transfers the group: the direct child's PID pins its identity until reap().
+fn reap_later(pid: i32, group: Option<i32>) {
+    let cleanup = move || {
+        if let Some(pgid) = group {
+            drain_until(pgid, None);
+        }
+        reap(pid);
+    };
+    // Thread limits can prevent the handoff; keep ownership in this thread.
+    if thread::Builder::new()
+        .name("devkit-reap".into())
+        .spawn(cleanup)
+        .is_err()
+    {
+        cleanup();
+    }
+}
+
+fn wait_before(child: &mut Child, deadline: Instant) -> Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            reap_later(child.id() as i32, None);
+            anyhow::bail!("Creator process group cleanup exceeded its deadline");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn bound_handshake(channel: &UnixStream, deadline: Instant) -> Result<()> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|t| !t.is_zero())
+        .context("Creator group observer startup exceeded its deadline")?;
+    channel.set_read_timeout(Some(remaining))?;
+    channel.set_write_timeout(Some(remaining))?;
+    Ok(())
 }
 
 impl Observer {
-    fn start(executable: &Path) -> Result<Self> {
+    fn start(image: &WatcherImage, startup_deadline: Instant) -> Result<Self> {
+        image.check_path()?;
         let (channel, peer) = UnixStream::pair()?;
-        channel.set_read_timeout(Some(Duration::from_secs(5)))?;
-        channel.set_write_timeout(Some(Duration::from_secs(5)))?;
         let fd = peer.as_raw_fd();
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&image.path);
         command
             .args(["internal", "watch-group"])
             .arg(std::process::id().to_string())
@@ -199,26 +307,60 @@ impl Observer {
             .spawn()
             .context("Cannot start creator group observer")?;
         drop(peer);
-        let mut observer = Self { child, channel };
-        let mut ack = [0];
+        let mut observer = Self {
+            child,
+            channel,
+            pgid: 0,
+            waited: false,
+            admitted: false,
+            startup_deadline,
+        };
+        bound_handshake(&observer.channel, startup_deadline)?;
+        let mut header = [0; size_of::<usize>()];
+        observer.channel.read_exact(&mut header)?;
+        image.check_mapping(observer.child.id() as i32, usize::from_ne_bytes(header))?;
+        bound_handshake(&observer.channel, startup_deadline)?;
+        observer.channel.write_all(&[READY])?;
+        observer.admitted = true;
+        let mut bytes = [0; 4];
         observer
             .channel
-            .read_exact(&mut ack)
+            .read_exact(&mut bytes)
             .context("Creator group observer failed to initialize")?;
-        ensure!(ack == [READY], "Invalid creator group acknowledgement");
+        observer.pgid = i32::from_ne_bytes(bytes);
+        ensure!(observer.pgid > 1, "Invalid creator group acknowledgement");
         Ok(observer)
+    }
+
+    fn finish(&mut self, deadline: Instant) -> Result<()> {
+        // EOF also handles exec, controller death, and failures during setup.
+        let _ = self.channel.shutdown(std::net::Shutdown::Both);
+        if !self.admitted {
+            let _ = self.child.kill();
+        }
+        self.waited = true;
+        let status = wait_before(&mut self.child, deadline)?;
+        ensure!(status.success(), "Creator group observer failed");
+        Ok(())
     }
 }
 
 impl Drop for Observer {
     fn drop(&mut self) {
-        // Our unreaped direct child pins this PID, even if its program exited.
-        signal_group(self.child.id() as i32, libc::SIGKILL);
-        let _ = self.child.wait();
+        if !self.waited {
+            let _ = self.finish(
+                self.startup_deadline
+                    .min(Instant::now() + Duration::from_secs(1)),
+            );
+        }
     }
 }
 
-pub(super) fn spawn(command: &mut Command, executable: Option<&Path>) -> Result<Creator> {
+pub(super) fn spawn(
+    command: &mut Command,
+    executable: Option<&WatcherImage>,
+    deadline: Option<Instant>,
+) -> Result<Creator> {
     // Auto-reaped children cannot pin a numeric PGID or supply an exit status.
     let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
     if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } < 0 {
@@ -232,8 +374,11 @@ pub(super) fn spawn(command: &mut Command, executable: Option<&Path>) -> Result<
     let Some(executable) = executable else {
         return Ok(Creator::new(command.spawn()?));
     };
-    let observer = Observer::start(executable)?;
-    let pgid = observer.child.id() as i32;
+    let maximum = Instant::now() + Duration::from_secs(5);
+    let startup_deadline = deadline.map_or(maximum, |at| at.min(maximum));
+    let observer = Observer::start(executable, startup_deadline)?;
+    bound_handshake(&observer.channel, startup_deadline)?;
+    let pgid = observer.pgid;
     let owner = std::process::id() as i32;
     let fd = observer.channel.as_raw_fd();
     command.process_group(pgid);
@@ -320,23 +465,121 @@ pub(super) fn poll_creator(child: &Child) -> io::Result<Option<ExitStatus>> {
     }
 }
 
-fn descendants_remain(pgid: i32, task: i32) -> io::Result<bool> {
-    // At most two known direct children can occupy the group. Three slots
-    // suffice to find another member, including an orphan awaiting launchd.
-    let mut pids = [0i32; 3];
-    let n = unsafe {
-        *libc::__error() = 0;
-        libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), size_of_val(&pids) as i32)
-    };
-    if n <= 0 {
-        let error = io::Error::last_os_error();
-        if n < 0 || error.raw_os_error() != Some(0) {
-            return Err(error);
+fn members(pgid: i32) -> io::Result<Vec<i32>> {
+    let mut pids = vec![0; 8];
+    loop {
+        let bytes = i32::try_from(size_of_val(pids.as_slice()))
+            .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+        let n = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes)
+        };
+        if n <= 0 {
+            let error = io::Error::last_os_error();
+            if n < 0 || error.raw_os_error() != Some(0) {
+                return Err(error);
+            }
         }
+        if (n as usize) < pids.len() {
+            pids.truncate(n as usize);
+            return Ok(pids);
+        }
+        pids.resize(pids.len() * 2, 0);
     }
-    Ok(pids[..n as usize]
-        .iter()
-        .any(|pid| *pid != pgid && *pid != task))
+}
+
+fn zombie_birth(pid: i32) -> Option<(u64, u64)> {
+    let info = crate::state::darwin_bsd_info(pid, true).ok()?;
+    (info.pbi_pid == pid as u32 && info.pbi_status == libc::SZOMB)
+        .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+fn drained(pgid: i32) -> io::Result<bool> {
+    let mut zombies = BTreeMap::new();
+    for pid in members(pgid)? {
+        let Some(birth) = zombie_birth(pid) else {
+            return Ok(false);
+        };
+        zombies.insert(pid, birth);
+    }
+
+    if zombies.is_empty() {
+        return Ok(true);
+    }
+    // Check the identities on both sides of a fresh kernel group snapshot.
+    // A process that forked and died during the first inspection may have left
+    // a new member. A zombie held by another parent can never fork again.
+    Ok(members(pgid)?.into_iter().all(|pid| {
+        zombies
+            .get(&pid)
+            .is_some_and(|birth| Some(*birth) == zombie_birth(pid))
+    }))
+}
+
+fn drain_until(pgid: i32, deadline: Option<Instant>) -> bool {
+    // killpg targets a snapshot. Keep the identity pinned and repeat until a
+    // fresh snapshot proves that no ordinary descendant can fork again.
+    let mut delay = Duration::from_millis(2);
+    loop {
+        signal_group(pgid, libc::SIGKILL);
+        if matches!(drained(pgid), Ok(true)) {
+            return true;
+        }
+        let wait = deadline.map_or(delay, |at| {
+            at.saturating_duration_since(Instant::now()).min(delay)
+        });
+        if wait.is_zero() {
+            return false;
+        }
+        thread::sleep(wait);
+        delay = (delay * 2).min(Duration::from_millis(100));
+    }
+}
+
+struct Anchor {
+    pid: i32,
+    _lifetime: io::PipeWriter,
+}
+
+impl Anchor {
+    fn start(channel: &UnixStream, queue: &Queue) -> Result<Self> {
+        let (reader, writer) = io::pipe()?;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if pid == 0 {
+            // No allocations, runtime code or inherited locks after fork.
+            unsafe {
+                libc::close(channel.as_raw_fd());
+                libc::close(queue.0.as_raw_fd());
+                libc::close(writer.as_raw_fd());
+                // The pipe closes on observer exit, including failure before enrollment.
+                let mut byte = 0u8;
+                while libc::read(reader.as_raw_fd(), (&raw mut byte).cast(), 1) < 0
+                    && *libc::__error() == libc::EINTR
+                {}
+                libc::_exit(0);
+            }
+        }
+        let anchor = Self {
+            pid,
+            _lifetime: writer,
+        };
+        if unsafe { libc::setpgid(pid, pid) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(anchor)
+    }
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        // Also covers failure to create the group before enrollment.
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        drain_until(self.pid, None);
+        reap(self.pid);
+    }
 }
 
 impl Creator {
@@ -344,8 +587,13 @@ impl Creator {
         if self.finished {
             return Ok(());
         }
-        signal_group(self.pid, libc::SIGTERM);
-        signal_group(self.pid, libc::SIGCONT);
+        if let Some(observer) = &mut self.observer {
+            // The observer may already be draining after the task exited.
+            let _ = observer.channel.write_all(&[TERMINATE]);
+        } else {
+            signal_group(self.pid, libc::SIGTERM);
+            signal_group(self.pid, libc::SIGCONT);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(self.try_wait(), Ok(None)) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
@@ -357,29 +605,18 @@ impl Creator {
         if self.finished {
             return Ok(());
         }
-        signal_group(self.pid, libc::SIGKILL);
-        // The direct executable may have moved itself to a different group.
-        // Its PID is still ours until wait(), and a second SIGKILL is harmless.
         let _ = self.child.kill();
-        // Stop every member before giving up ownership of the group identity.
-        let drained = (|| -> Result<()> {
-            loop {
-                if self.try_wait()?.is_some()
-                    && !descendants_remain(self.pid, self.child.id() as i32)?
-                {
-                    return Ok(());
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "Creator process group was not reaped"
-                );
-                thread::sleep(Duration::from_millis(2));
-            }
-        })();
         self.finished = true;
-        let waited = self.child.wait();
-        drop(self.observer.take());
-        drained?;
+        let stopped = if let Some(mut observer) = self.observer.take() {
+            observer.finish(deadline)
+        } else if drain_until(self.pid, Some(deadline)) {
+            Ok(())
+        } else {
+            reap_later(self.child.id() as i32, Some(self.pid));
+            anyhow::bail!("Creator process group cleanup exceeded its deadline");
+        };
+        let waited = wait_before(&mut self.child, deadline);
+        stopped?;
         waited?;
         Ok(())
     }
@@ -451,31 +688,38 @@ pub fn run_watcher(args: &[OsString]) -> Result<()> {
             "Cannot arm group observer"
         );
     }
-    // From READY until exit we are the leader. On every return path signal our
-    // own group, even when both the task and its controller have been reaped.
-    struct OwnGroup;
-    impl Drop for OwnGroup {
-        fn drop(&mut self) {
-            unsafe {
-                libc::kill(0, libc::SIGKILL);
-            }
-        }
-    }
-    let _group = OwnGroup;
-    channel.write_all(&[READY])?;
+    // The controller checks this child's actual VM region against its open
+    // executable before admitting the observer or starting a creator.
+    channel.write_all(&unsafe { devkit_main_image_header() }.to_ne_bytes())?;
+    let mut admitted = [0];
+    channel.read_exact(&mut admitted)?;
+    ensure!(admitted == [READY], "Observer executable was not admitted");
+    let anchor = Anchor::start(&channel, &queue)?;
+    channel.write_all(&anchor.pid.to_ne_bytes())?;
     if queue.wait()?.filter == libc::EVFILT_READ {
         let mut bytes = [0; 4];
-        channel.read_exact(&mut bytes)?;
+        if let Err(error) = channel.read_exact(&mut bytes) {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         let pid = i32::from_ne_bytes(bytes);
         ensure!(
-            pid > 1 && unsafe { libc::getpgid(pid) == libc::getpgrp() },
+            pid > 1 && unsafe { libc::getpgid(pid) } == anchor.pid,
             "Invalid creator group"
         );
         queue.watch_exit(pid)?;
         channel.write_all(&[READY])?;
-        // NOTE_EXIT for either process, or EOF on the controller's CLOEXEC
-        // socket during image replacement, ends this group's lifetime.
-        queue.wait()?;
+        while queue.wait()?.filter == libc::EVFILT_READ {
+            let mut action = [0];
+            if channel.read(&mut action)? == 0 {
+                break;
+            }
+            ensure!(action == [TERMINATE], "Invalid creator group request");
+            signal_group(anchor.pid, libc::SIGTERM);
+            signal_group(anchor.pid, libc::SIGCONT);
+        }
     }
     Ok(())
 }
@@ -485,9 +729,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wrong_mapped_image_fails_observer_admission() {
+        let header = unsafe { devkit_main_image_header() };
+        let pid = std::process::id() as i32;
+        WatcherImage::current()
+            .unwrap()
+            .check_mapping(pid, header)
+            .unwrap();
+        let other = WatcherImage::open("/bin/sh".into()).unwrap();
+        assert!(other.check_mapping(pid, header).is_err());
+    }
+
+    #[test]
     fn observing_normal_exit_keeps_the_standalone_leader_waitable_until_cleanup() {
         let mut creator = spawn(
             Command::new("sh").args(["-c", "exit 37"]).process_group(0),
+            None,
             None,
         )
         .unwrap();

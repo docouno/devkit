@@ -22,6 +22,33 @@ fn process_exists(pid: i32) -> bool {
     }
 }
 
+fn descendant_stopped(pid: i32) -> bool {
+    if !process_exists(pid) {
+        return true;
+    }
+    // launchd may still be collecting an orphan. Its zombie is terminal.
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = size_of::<libc::proc_bsdinfo>() as i32;
+        if unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        } == size
+        {
+            return unsafe { info.assume_init() }.pbi_status == libc::SZOMB;
+        }
+        !process_exists(pid)
+    }
+    #[cfg(target_os = "linux")]
+    false
+}
+
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -173,7 +200,7 @@ fn native_process_probe() {
     }
     let runner = ProcessRunner::new().unwrap();
     #[cfg(target_os = "macos")]
-    if matches!(scenario.as_str(), "watcher-kill" | "watcher-leader-exits") {
+    if scenario.starts_with("watcher-") {
         runner
             .enable_group_watcher(env!("CARGO_BIN_EXE_devkit").into())
             .unwrap();
@@ -188,6 +215,15 @@ fn native_process_probe() {
         "cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"",
         "primary-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 42",
         "probe-cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 125",
+        "watcher-fork" => {
+            r#"printf '%s' "$$" > "$DEVKIT_PROCESS_FIXTURE/task-pid"
+            for worker in 1 2 3 4; do
+                (i=0; while test "$i" -lt 100; do
+                    sleep 0.02 & wait "$!"; i=$((i+1))
+                done) &
+            done
+            touch "$DEVKIT_PROCESS_FIXTURE/ready"; wait"#
+        }
         "watcher-leader-exits" => {
             r#"printf '%s' "$$" > "$DEVKIT_PROCESS_FIXTURE/task-pid"; sleep 25 & printf '%s' "$!" > "$DEVKIT_PROCESS_FIXTURE/child-pid"; touch "$DEVKIT_PROCESS_FIXTURE/ready"; while ! test -f "$DEVKIT_PROCESS_FIXTURE/exit"; do sleep 0.02; done"#
         }
@@ -282,8 +318,8 @@ fn normal_creator_exit_reaps_children_holding_output_pipe() {
     assert!(before.elapsed() < Duration::from_secs(5));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
     assert!(
-        !process_exists(pid.trim().parse().unwrap()),
-        "Creator child was not reaped"
+        descendant_stopped(pid.trim().parse().unwrap()),
+        "Creator descendant was still running"
     );
 }
 #[test]
@@ -362,7 +398,7 @@ fn cancellation_reaps_before_cleanup_and_never_reports_success() {
             }
             if let Ok(pid) = fs::read_to_string(fixture.root().join("child-pid")) {
                 assert!(
-                    !process_exists(pid.trim().parse().unwrap()),
+                    descendant_stopped(pid.trim().parse().unwrap()),
                     "Creator child survived {scenario}"
                 );
             }
@@ -381,7 +417,7 @@ fn deadlines_reap_the_creator_group_before_exact_owned_cleanup() {
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
         assert!(
-            !process_exists(pid.trim().parse().unwrap()),
+            descendant_stopped(pid.trim().parse().unwrap()),
             "Timed-out creator descendant survived"
         );
         if scenario == "timed-owned" {
@@ -432,7 +468,7 @@ fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() 
     assert!(error.to_string().contains("exceeded its deadline"));
     assert!(started.elapsed() < Duration::from_secs(4));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
-    assert!(!process_exists(pid.trim().parse().unwrap()));
+    assert!(descendant_stopped(pid.trim().parse().unwrap()));
 }
 
 #[test]
@@ -703,6 +739,72 @@ fn killed_controller_releases_descendants_and_captured_pipes() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn metadata_deadline_bounds_an_unresponsive_observer_handshake() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().join("observer");
+    script(&path, "#!/bin/sh\nexec /bin/sleep 25\n");
+    let runner = ProcessRunner::new().unwrap();
+    runner.enable_group_watcher(path).unwrap();
+    let start = Instant::now();
+    let marker = t.path().join("started");
+    assert!(
+        runner
+            .capture_before(
+                Command::new("touch").arg(&marker),
+                start + Duration::from_millis(300)
+            )
+            .is_err()
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn replaced_observer_path_fails_before_launching_the_command() {
+    let t = TempDir::new().unwrap();
+    let path = t.path().join("devkit");
+    fs::copy(env!("CARGO_BIN_EXE_devkit"), &path).unwrap();
+    let runner = ProcessRunner::new().unwrap();
+    runner.enable_group_watcher(path.clone()).unwrap();
+    runner.capture(&mut Command::new("true")).unwrap();
+    let replacement = t.path().join("replacement");
+    fs::copy("/bin/echo", &replacement).unwrap();
+    fs::rename(replacement, path).unwrap();
+    let marker = t.path().join("started");
+    let error = runner
+        .capture(Command::new("touch").arg(&marker))
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("Observer executable changed"));
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn controller_death_drains_ordinary_workers_while_they_fork() {
+    for _ in 0..4 {
+        let fixture = Fixture::new();
+        let mut controller = fixture.start("watcher-fork");
+        wait_for(&fixture.root().join("ready"));
+        let task = fs::read_to_string(fixture.root().join("task-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let group = unsafe { libc::getpgid(task) };
+        assert!(group > 1);
+        controller.kill().unwrap();
+        let _ = wait(controller);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_exists(group) || unsafe { libc::kill(-group, 0) } == 0 {
+            assert!(Instant::now() < deadline, "Forking worker group survived");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn observer_releases_inherited_locks_and_reusable_commands() {
     let t = TempDir::new().unwrap();
     let path = t.path().join("lock");
@@ -836,16 +938,38 @@ fn observer_still_owns_the_group_after_both_controller_and_task_are_reaped() {
     };
     let task = pid("task-pid");
     let descendant = pid("child-pid");
-    let observer = unsafe { libc::getpgid(task) };
-    assert!(observer > 1 && observer != task);
-    assert_eq!(unsafe { libc::getpgid(descendant) }, observer);
+    let group = unsafe { libc::getpgid(task) };
+    assert!(group > 1 && group != task);
+    assert_eq!(unsafe { libc::getpgid(descendant) }, group);
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>() as i32;
+    assert_eq!(
+        unsafe {
+            libc::proc_pidinfo(
+                group,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        },
+        size
+    );
+    let observer = unsafe { info.assume_init() }.pbi_ppid as i32;
+    assert_eq!(unsafe { libc::getpgid(observer) }, observer);
+    assert_ne!(group, observer);
 
-    // Keep this group from becoming an orphaned, stopped job. POSIX would
-    // resume it with SIGHUP/SIGCONT when the controller dies.
     use std::os::unix::process::CommandExt;
-    let mut witness = Command::new("sleep")
+    // The stopped observer's group must not receive orphan-job SIGHUP/SIGCONT.
+    let mut outside = Command::new("sleep")
         .arg("25")
         .process_group(observer)
+        .spawn()
+        .unwrap();
+    // Retain a dead group member until after the observer and anchor exit.
+    let mut witness = Command::new("sleep")
+        .arg("25")
+        .process_group(group)
         .spawn()
         .unwrap();
     // Delay notification handling until launchd has collected the original
@@ -882,14 +1006,17 @@ fn observer_still_owns_the_group_after_both_controller_and_task_are_reaped() {
     let descendant_alive = process_exists(descendant);
     assert_eq!(unsafe { libc::kill(observer, libc::SIGCONT) }, 0);
     let _ = wait(controller);
-    assert!(!witness.wait().unwrap().success());
     assert!(
         task_reaped && descendant_alive,
         "Lost the intended exit ordering"
     );
     let deadline = Instant::now() + Duration::from_secs(3);
-    while process_exists(descendant) || process_exists(observer) {
+    while process_exists(descendant) || process_exists(observer) || process_exists(group) {
         assert!(Instant::now() < deadline, "Creator group survived");
         thread::sleep(Duration::from_millis(5));
     }
+    assert!(!witness.wait().unwrap().success());
+    assert!(outside.try_wait().unwrap().is_none());
+    outside.kill().unwrap();
+    outside.wait().unwrap();
 }

@@ -490,14 +490,17 @@ pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
+pub(crate) fn darwin_bsd_info(
+    pid: i32,
+    include_zombies: bool,
+) -> std::io::Result<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let length = size_of::<libc::proc_bsdinfo>() as i32;
     let count = unsafe {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            u64::from(include_zombies),
             info.as_mut_ptr().cast(),
             length,
         )
@@ -511,7 +514,7 @@ fn darwin_bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
 #[cfg(target_os = "macos")]
 pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
-    match darwin_bsd_info(pid) {
+    match darwin_bsd_info(pid, false) {
         Ok(info) => {
             return (info.pbi_pid == pid as u32 && info.pbi_status != libc::SZOMB).then_some((
                 info.pbi_ppid,

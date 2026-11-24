@@ -19,6 +19,7 @@ help:
 	  'make pack-preview target_inputs="triple:dir:sha ..." output=/new/set  Verify all three targets for host testing' \
 	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished development build' \
 	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.5.1/payload baseline_set=/absolute/v0.5.1' \
+	  '  Both hosts verify the baseline archive. Only x86-64 runs its executable for migration checks.' \
 	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.5.1' \
 	  'make verify-public from_version=0.5.1 version=0.6.0 expected_index_sha256=SHA256' \
 	  'make init release=/absolute/set/payload target=/absolute/new/project' \
@@ -166,18 +167,22 @@ verify-bootstrap:
 	@test -n "$$DEVKIT_BASELINE_SET" || { printf '%s\n' 'Set baseline_set=/absolute/v0.5.1.' >&2; exit 1; }
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
 	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --baseline-set "$$DEVKIT_BASELINE_SET" < /dev/null
+# The v0.5.1 baseline has an x86-64 executable. ARM64 exercises its genuine
+# archive in verify-bootstrap and uses the current release for native gates.
 verify-packaged:
 	@test -n "$$DEVKIT_VERIFY_RELEASE" || { echo 'Set release= to the immutable payload.' >&2; exit 1; }
-	@if test -n "$$DEVKIT_VERIFY_PREVIOUS"; then \
+	@if test "$$DEVKIT_AUTHOR_TRIPLE" = aarch64-unknown-linux-musl; then \
+	  unset DEVKIT_VERIFY_NEXT_RELEASE; python3 test/packaged/verify.py "$$DEVKIT_VERIFY_RELEASE"; \
+	elif test -n "$$DEVKIT_VERIFY_PREVIOUS"; then \
 	  DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS"; \
-	elif test "$$DEVKIT_AUTHOR_TRIPLE" = aarch64-unknown-linux-musl; then \
-	  python3 test/packaged/verify.py "$$DEVKIT_VERIFY_RELEASE"; \
 	else echo 'Set previous= to the baseline payload.' >&2; exit 1; fi < /dev/null
 verify-registry: $(author_blackbox_build) $(author_fixtures_build) verify-engine
 	@test -n "$$DEVKIT_VERIFY_RELEASE" || { echo 'Set release= to the immutable payload.' >&2; exit 1; }
 	@set -- "$$DEVKIT_VERIFY_RELEASE"; \
-	if test -n "$$DEVKIT_VERIFY_PREVIOUS"; then set -- "$$DEVKIT_VERIFY_PREVIOUS" "$$@"; \
-	elif test "$$DEVKIT_AUTHOR_TRIPLE" != aarch64-unknown-linux-musl; then echo 'Set previous= to the baseline payload.' >&2; exit 1; fi; \
+	if test "$$DEVKIT_AUTHOR_TRIPLE" != aarch64-unknown-linux-musl; then \
+	  test -n "$$DEVKIT_VERIFY_PREVIOUS" || { echo 'Set previous= to the baseline payload.' >&2; exit 1; }; \
+	  set -- "$$DEVKIT_VERIFY_PREVIOUS" "$$@"; \
+	fi; \
 	DEVKIT_AUTHOR_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_REGISTRY_FIXTURE="$$DEVKIT_AUTHOR_FIXTURES/registry_fixture" bash test/verify-registry.sh "$$@" < /dev/null
 verify-public:
 	@test -n "$$DEVKIT_EXPECTED_INDEX_SHA256" || { printf '%s\n' 'Set expected_index_sha256= to the frozen release-index.json SHA256.' >&2; exit 1; }

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,6 +101,44 @@ class HiddenArtifactGuard(unittest.TestCase):
 
 
 class NativeProducerGuard(unittest.TestCase):
+    def test_fresh_checkout_enters_native_build_with_default_darwin_output(self):
+        with tempfile.TemporaryDirectory(prefix="devkit-fresh-producer-") as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            (source / "tooling").mkdir(parents=True)
+            for rel in ("tooling/frozen-producer.py", "tooling/darwin-producer.sh", "rust-toolchain.toml"):
+                shutil.copy2(REPO / rel, source / rel)
+            (source / ".gitignore").write_text(".artifacts/\n")
+            subprocess.run(["git", "init", "--quiet"], cwd=source, check=True)
+            subprocess.run(["git", "add", "."], cwd=source, check=True)
+            subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "commit", "--quiet", "-m", "fixture"], cwd=source, check=True)
+
+            # Exercise the hosted shell entry on either OS. Stop at the pinned
+            # toolchain boundary after the real producer has made its checkout.
+            shims = base / "bin"
+            shims.mkdir()
+            uname = shims / "uname"
+            uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; *) exec /usr/bin/uname "$@";; esac\n')
+            uname.chmod(0o755)
+            for name in ("rustup", "make"):
+                native = shims / name
+                native.write_text('#!/bin/sh\npwd > "$PROBE_NATIVE_CWD"\nexit 43\n')
+                native.chmod(0o755)
+            marker = base / "native-cwd"
+            env = dict(os.environ, PATH=str(shims) + os.pathsep + os.environ["PATH"],
+                       PROBE_NATIVE_CWD=str(marker), DEVKIT_AUTHOR_CARGO_HOME=str(base / "cache"))
+            output = source / ".artifacts/contribution"
+            self.assertFalse(output.parent.exists())
+            result = subprocess.run(["tooling/darwin-producer.sh", output], cwd=source, env=env,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.is_file(), result.stderr)
+            snapshot = Path(marker.read_text().strip())
+            self.assertEqual(snapshot.name, "source")
+            self.assertEqual(snapshot.parent.parent.resolve(), output.parent.resolve())
+            self.assertFalse(output.exists())
+
     def test_verified_checkout_ignores_local_artifacts_and_rejects_hidden_source_changes(self):
         producer = runpy.run_path(str(REPO / "tooling/frozen-producer.py"))
         with tempfile.TemporaryDirectory(prefix="devkit-producer-") as temporary:

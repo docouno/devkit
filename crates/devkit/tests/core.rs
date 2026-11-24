@@ -3315,14 +3315,19 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
         let m = if id.mode & 0o111 != 0 { 0o775 } else { 0o664 };
         fs::set_permissions(proj.join(rel), fs::Permissions::from_mode(m)).unwrap();
     }
-    let mut sdk_pkg: Value = read_json(&proj.join("packages/sdk/package.json")).unwrap();
-    sdk_pkg["description"] = json!("Updated under umask 0002");
-    put_json(&proj, "packages/sdk/package.json", &sdk_pkg);
-    fs::set_permissions(
-        proj.join("packages/sdk/package.json"),
-        fs::Permissions::from_mode(0o664),
-    )
-    .unwrap();
+    let sdk_pkg: Value = read_json(&proj.join("packages/sdk/package.json")).unwrap();
+    let sdk_name = sdk_pkg["name"].as_str().unwrap();
+    let web_manifest = "apps/web/package.json";
+    let mut web_pkg: Value = read_json(&proj.join(web_manifest)).unwrap();
+    assert_eq!(
+        web_pkg["dependencies"]
+            .as_object_mut()
+            .unwrap()
+            .remove(sdk_name),
+        Some(json!("workspace:*"))
+    );
+    put_json(&proj, web_manifest, &web_pkg);
+    fs::set_permissions(proj.join(web_manifest), fs::Permissions::from_mode(0o664)).unwrap();
 
     // Also place a live Unix domain socket and a FIFO inside the project tree to verify
     // source_signature and copy_tree ignore transient IPC nodes cleanly.
@@ -3344,6 +3349,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
     .unwrap();
     assert!(!preview.no_op);
     assert!(!preview.applied);
+    assert!(preview.files.iter().any(|f| f.path == "pnpm-lock.yaml"));
     assert!(
         !preview
             .files

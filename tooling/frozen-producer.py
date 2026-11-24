@@ -65,12 +65,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    output = args.output.absolute()
-    if output.exists() or output.is_symlink() or not output.parent.is_dir():
-        raise SystemExit("Contribution output must be new and have an existing parent")
     root = Path.cwd()
     scratch = root / ".artifacts"
     scratch.mkdir(exist_ok=True)
+    output = args.output.absolute()
+    if output.exists() or output.is_symlink() or not output.parent.is_dir():
+        raise SystemExit("Contribution output must be new and have an existing parent")
     with tempfile.TemporaryDirectory(prefix="native-producer-", dir=scratch) as temporary:
         snapshot = Path(temporary) / "source"
         commit, tree = checkout(root, snapshot)

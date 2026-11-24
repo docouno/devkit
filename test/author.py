@@ -44,6 +44,40 @@ def verify_assembler_handoff(scratch):
         assert ("--verified-preview" in args) == (target == "pack-preview")
 
 
+def verify_baseline_selection(root):
+    """Run the documented verification entry with native suite entry points recorded."""
+    wrappers = root / "baseline-probes"
+    wrappers.mkdir()
+    uname = wrappers / "uname"
+    uname.write_text('#!/bin/sh\nif test "$1" = -m; then echo "$PROBE_ARCH"; else exec /usr/bin/uname "$@"; fi\n')
+    uname.chmod(0o755)
+    for name in ("python3", "bash"):
+        probe = wrappers / name
+        probe.write_text(f"#!{sys.executable}\n" +
+                         "import json, os, sys\nwith open(os.environ['PROBE_LOG'], 'a') as f:\n"
+                         "    print(json.dumps([sys.argv[1:], os.environ.get('DEVKIT_VERIFY_NEXT_RELEASE')]), file=f)\n")
+        probe.chmod(0o755)
+    for arch in ("x86_64", "aarch64"):
+        log = wrappers / (arch + ".jsonl")
+        env = dict(os.environ, PATH=str(wrappers) + os.pathsep + os.environ["PATH"],
+                   PROBE_ARCH=arch, PROBE_LOG=str(log), DEVKIT_VERIFY_NEXT_RELEASE="stale")
+        argv = ["make", "--no-print-directory"]
+        for other in ("verify-source-gates", "verify-runtime-gates", "verify-delivery", "verify-engine", "build-fixtures"):
+            argv.extend(["-o", other])
+        argv.extend(["verify", "build_set=/new", "release=/new/payload", "previous=/v0.5.1/payload", "baseline_set=/v0.5.1"])
+        result = subprocess.run(argv, cwd=root, env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr + result.stdout
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        assert calls[0][0] == ["test/bootstrap/verify.py", "--build-set", "/new", "--baseline-set", "/v0.5.1"], calls
+        if arch == "x86_64":
+            assert calls[1] == [["test/packaged/verify.py", "/v0.5.1/payload"], "/new/payload"], calls
+            assert calls[2][0] == ["test/verify-registry.sh", "/v0.5.1/payload", "/new/payload"], calls
+        else:
+            assert calls[1] == [["test/packaged/verify.py", "/new/payload"], None], calls
+            assert calls[2][0] == ["test/verify-registry.sh", "/new/payload"], calls
+        assert len(calls) == 3, calls
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
@@ -106,6 +140,8 @@ def main():
             marker.unlink(missing_ok=True)
         verify_assembler_handoff(root)
         rows.append(dict(name='assemble-with-native-contributions', passed=True))
+        verify_baseline_selection(root)
+        rows.append(dict(name='baseline-routing-on-both-linux-hosts', passed=True))
         if args.data_only:
             (proof / 'receipt.json').write_text(json.dumps(dict(passed=True, cases=rows, implicitMakeEvaluation=False), indent=2) + '\n')
             print(f'PASS literal Make operator data; {proof}')

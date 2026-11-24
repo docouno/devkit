@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import time
 from support import Harness, digest, require
+from release_targets import engine_asset, host_target
 
 
 class Safety(Harness):
@@ -105,13 +106,38 @@ class Safety(Harness):
         self.run('native-reader-deadline', [self.engine, 'internal', 'fetch', '--url', 'https://github.com/deadline', '--output', output, '--max-bytes', '128'], expected='devkit:', timeout=16)
         require(time.monotonic() - started < 15 and not output.exists(), 'Stalled reader outlived its bound')
         self.fixture.resume.set()
-        # Exercise the current reader using an index that consumers may acquire online.
-        # The immutable x86-64 baseline supplies that transport for local development sets.
-        self.transport_index = self.index if self.index['publicationEligible'] else self.old_index
-        self.transport_version = self.transport_index['version']
-        transport_base = f'{self.base}/v{self.transport_version}'
-        self.transport_archive_route = f'{transport_base}/{self.transport_index["archive"]}'
-        self.transport_index_route = f'{transport_base}/release-index.json'
+        self.verify_archive_transport()
+        # Oversized metadata is refused before any project write, lock, or SDK process.
+        project = self.scratch / 'oversized manifest'
+        (project / '.devkit').mkdir(parents=True)
+        (project / '.devkit/manifest.json').write_bytes(b'{"schemaVersion":2,"pad":"' + b'a' * (4 * 1024 * 1024) + b'"}')
+        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='4 MiB byte budget')
+        require(not (project / '.devkit/state').exists(), 'Oversized manifest created state or lock directory')
+        require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')
+
+    def verify_archive_transport(self):
+        host = host_target()
+        index = self.index
+        if not index['publicationEligible'] and host == self.old_index['target']:
+            index = self.old_index
+        self.transport_version = index['version']
+        base = f'{self.base}/v{self.transport_version}'
+        self.transport_archive_route = f'{base}/{index["archive"]}'
+        self.transport_index_route = f'{base}/release-index.json'
+        original = self.fixture.routes[self.transport_index_route]
+        self.transport_index = index
+        if not index['publicationEligible']:
+            # The historical release has no engine for this host. Only the
+            # private archive test server advertises the host-compatible bytes.
+            require(engine_asset(index, host) in index['files'], f'Missing preview engine for {host}')
+            self.transport_index = dict(index, publicationEligible=True, buildRun='loopback-archive-test')
+            self.fixture.routes[self.transport_index_route] = json.dumps(self.transport_index).encode()
+        try:
+            self.verify_archives()
+        finally:
+            self.fixture.routes[self.transport_index_route] = original
+
+    def verify_archives(self):
         original_archive = self.fixture.routes[self.transport_archive_route]
         original_index = self.fixture.routes[self.transport_index_route]
         try:
@@ -193,10 +219,3 @@ class Safety(Harness):
         changed = bytearray(valid); changed[-8] ^= 1
         self.reject_archive('native-CRC', bytes(changed))
         self.reject_archive('native-truncated-gzip', valid[:-1])
-        # Oversized metadata is refused before any project write, lock, or SDK process.
-        project = self.scratch / 'oversized manifest'
-        (project / '.devkit').mkdir(parents=True)
-        (project / '.devkit/manifest.json').write_bytes(b'{"schemaVersion":2,"pad":"' + b'a' * (4 * 1024 * 1024) + b'"}')
-        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='4 MiB byte budget')
-        require(not (project / '.devkit/state').exists(), 'Oversized manifest created state or lock directory')
-        require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')

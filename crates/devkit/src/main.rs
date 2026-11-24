@@ -22,7 +22,7 @@ fn main() -> std::process::ExitCode {
         let runner = devkit::processes::ProcessRunner::new()?;
         #[cfg(target_os = "macos")]
         {
-            runner.enable_group_watcher(std::env::current_exe()?)?;
+            runner.enable_current_group_watcher()?;
             devkit::processes::watch_cli_parent(&runner, handoff.as_deref())?;
         }
         #[cfg(target_os = "linux")]

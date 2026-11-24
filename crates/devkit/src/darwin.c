@@ -24,12 +24,15 @@ int devkit_sysctl_process(pid_t pid, uint32_t *parent, uint64_t *start) {
     return 0;
 }
 
-int devkit_mapped_executable_identity(uint32_t *device, uint64_t *inode) {
-    uintptr_t header = (uintptr_t)_dyld_get_image_header(0);
+uintptr_t devkit_main_image_header(void) {
+    return (uintptr_t)_dyld_get_image_header(0);
+}
+
+int devkit_image_identity_at(pid_t pid, uintptr_t header, uint32_t *device, uint64_t *inode) {
     struct proc_regionwithpathinfo info;
     if (!header)
         return ENOEXEC;
-    int size = proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, header, &info, sizeof(info));
+    int size = proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, header, &info, sizeof(info));
     if (size != sizeof(info))
         return size <= 0 && errno ? errno : EIO;
     if (header < info.prp_prinfo.pri_address ||
@@ -39,4 +42,8 @@ int devkit_mapped_executable_identity(uint32_t *device, uint64_t *inode) {
     *device = info.prp_vip.vip_vi.vi_stat.vst_dev;
     *inode = info.prp_vip.vip_vi.vi_stat.vst_ino;
     return 0;
+}
+
+int devkit_mapped_executable_identity(uint32_t *device, uint64_t *inode) {
+    return devkit_image_identity_at(getpid(), devkit_main_image_header(), device, inode);
 }
