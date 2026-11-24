@@ -64,7 +64,7 @@ devkit_selectors_valid := $(if $(and $(DEVKIT_APP),$(DEVKIT_PACKAGE)),,$(and $(d
 devkit_dev_selectors_valid := $(if $(DEVKIT_PACKAGE),,$(devkit_app_valid))
 
 devkit_dev_aggregate := $(if $(DEVKIT_APP),0,$(if $(word 2,$(devkit_apps)),1,0))
-devkit_needs_desktop_probe := $(if $(filter dev up,$(MAKECMDGOALS)),$(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(devkit_desktop_apps))))
+devkit_needs_desktop_probe := $(if $(filter dev up,$(value MAKECMDGOALS)),$(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(devkit_desktop_apps))))
 ifneq ($(devkit_needs_desktop_probe),)
 devkit_host_os := $(shell uname -s)
 ifeq ($(devkit_host_os),Darwin)

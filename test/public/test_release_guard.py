@@ -201,6 +201,43 @@ class NativeProducerGuard(unittest.TestCase):
             dst2 = base / "dst2"
             producer["sync_cargo_cache"](lock, src, dst2)
             self.assertFalse((dst2 / "registry/cache/index.crates.io-test/demo-1.0.0.crate").exists())
+            # Restore verified crate and verify intermediate src/dst symlinks & leaf dst symlinks cannot escape.
+            (cache / "demo-1.0.0.crate").write_bytes(good)
+            idx_dir = src / "registry/index/index.crates.io-test"
+            idx_dir.mkdir(parents=True)
+            (idx_dir / "config.json").write_text('{"dl":"https://static.crates.io/crates"}\n')
+            outside = base / "outside"
+            (outside / "index").mkdir(parents=True)
+            (outside / "index/escape.txt").write_text("host-escape")
+            src_sym = base / "src-sym"
+            src_sym.mkdir()
+            (src_sym / "registry").symlink_to(outside)
+            dst_from_sym = base / "dst-from-sym"
+            producer["sync_cargo_cache"](lock, src_sym, dst_from_sym)
+            self.assertFalse((dst_from_sym / "registry").exists())
+            # Destination intermediate symlink must not write outside dst.
+            dst_dir_sym = base / "dst-dir-sym"
+            dst_dir_sym.mkdir()
+            (dst_dir_sym / "registry").symlink_to(outside)
+            producer["sync_cargo_cache"](lock, src, dst_dir_sym)
+            self.assertFalse((outside / "cache").exists())
+            self.assertFalse((outside / "index/index.crates.io-test").exists())
+            # Destination leaf symlinks must not overwrite host files; read-only regular files overwrite cleanly.
+            dst_leaf_sym = base / "dst-leaf-sym"
+            (dst_leaf_sym / "registry/cache/index.crates.io-test").mkdir(parents=True)
+            (dst_leaf_sym / "registry/index/index.crates.io-test").mkdir(parents=True)
+            (dst_leaf_sym / "registry/cache/index.crates.io-test/demo-1.0.0.crate").symlink_to(secret)
+            (dst_leaf_sym / "registry/index/index.crates.io-test/config.json").symlink_to(secret)
+            ro_src = src / "git/db/sample"
+            ro_src.mkdir(parents=True)
+            (ro_src / "pack").write_bytes(b"new-pack")
+            ro_dst = dst_leaf_sym / "git/db/sample"
+            ro_dst.mkdir(parents=True)
+            (ro_dst / "pack").write_bytes(b"old-pack")
+            (ro_dst / "pack").chmod(0o444)
+            producer["sync_cargo_cache"](lock, src, dst_leaf_sym)
+            self.assertEqual(secret.read_text(), "host-secret")
+            self.assertEqual((ro_dst / "pack").read_bytes(), b"new-pack")
 
 
 class RequiredNativeCheckGuard(unittest.TestCase):

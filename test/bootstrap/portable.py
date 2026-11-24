@@ -116,6 +116,10 @@ def verify(directory=None):
         display_up = make("up", environment=hostile_env)
         assert "task dev-snapshot --root" in display_up, display_up
         assert not pwned.exists(), "ambient DISPLAY triggered shell execution"
+        # Ambient MAKECMDGOALS='$(shell ...)' is never expanded recursively (even on make -n help).
+        goals_env = dict(hostile_env, MAKECMDGOALS=f"$(shell touch '{pwned}')")
+        make("-n", "help", environment=dict(goals_env, DEVKIT_ENGINE_PATH=""))
+        assert not pwned.exists(), "ambient MAKECMDGOALS triggered shell execution"
         # Hostile Perl environment variables are scrubbed on devkit.sh digest and cache checks.
         assert run("/bin/sh", loader, "make-manifest", environment=hostile_env).strip() == manifest_sha
 

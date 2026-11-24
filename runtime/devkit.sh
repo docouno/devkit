@@ -22,7 +22,7 @@ if [ "$mode" = project ]; then
 fi
 if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
   [ "$#" -eq 2 ] || fail 'worktree-hook requires reserve, start, or remove'
-  unset MAKEFLAGS MFLAGS MAKEOVERRIDES GNUMAKEFLAGS MAKEFILES MAKELEVEL
+  unset MAKEFLAGS MFLAGS MAKEOVERRIDES GNUMAKEFLAGS MAKEFILES MAKELEVEL MAKECMDGOALS
   unset app package component follow tail headless cleanup reconcile preview json
   unset name template api use profile to command cmd write network prepare
   unset DEVKIT_APP DEVKIT_PACKAGE DEVKIT_TARGET_COMPONENT DEVKIT_FOLLOW DEVKIT_TAIL

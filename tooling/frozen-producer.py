@@ -68,17 +68,66 @@ def cargo_lock_checksums(lockfile):
     return expected
 
 
+def safe_existing_dir(root, rel):
+    current = root
+    for part in Path(rel).parts:
+        current = current / part
+        if current.is_symlink() or not current.is_dir():
+            return None
+    return current
+
+
+def safe_ensure_dir(root, rel_dir):
+    if root.is_symlink():
+        return None
+    if not root.exists():
+        root.mkdir(parents=True, exist_ok=True)
+    elif not root.is_dir():
+        return None
+    current = root
+    for part in rel_dir.parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+        if current.exists():
+            if not current.is_dir():
+                return None
+        else:
+            current.mkdir(mode=0o755)
+    return current
+
+
+def write_regular_nofollow(path, data):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISREG(st.st_mode):
+            return
+        if not (st.st_mode & 0o200):
+            os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        handle.write(data)
+
+
 def sync_cargo_cache(lockfile, src, dst):
-    """Copy Cargo registry/git cache entries without following symlinks,
-    verifying every .crate tarball SHA-256 against Cargo.lock before trusting it."""
+    """Copy Cargo registry/git cache entries without following symlinks on either
+    source or destination, verifying every .crate tarball SHA-256 against Cargo.lock."""
     src_root = Path(src).resolve()
     dst_root = Path(dst).resolve()
     if src_root == dst_root or not src_root.is_dir():
         return
     expected = None
     for rel in ("registry/index", "registry/cache", "git/db"):
-        base = src_root / rel
-        if base.is_symlink() or not base.is_dir():
+        base = safe_existing_dir(src_root, rel)
+        if base is None:
             continue
         is_crate_cache = rel == "registry/cache"
         if is_crate_cache and expected is None:
@@ -88,10 +137,14 @@ def sync_cargo_cache(lockfile, src, dst):
             # Refuse symlinks inside cached directories.
             dirs[:] = [d for d in dirs if not (current_path / d).is_symlink()]
             rel_dir = current_path.relative_to(src_root)
-            target_dir = dst_root / rel_dir
+            target_dir = None
             for name in files:
                 source_file = current_path / name
-                if source_file.is_symlink() or not source_file.is_file():
+                try:
+                    src_st = os.lstat(source_file)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(src_st.st_mode):
                     continue
                 if is_crate_cache:
                     want = expected.get(name)
@@ -100,11 +153,13 @@ def sync_cargo_cache(lockfile, src, dst):
                     data = source_file.read_bytes()
                     if hashlib.sha256(data).hexdigest() != want:
                         continue
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    (target_dir / name).write_bytes(data)
                 else:
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source_file, target_dir / name, follow_symlinks=False)
+                    data = source_file.read_bytes()
+                if target_dir is None:
+                    target_dir = safe_ensure_dir(dst_root, rel_dir)
+                    if target_dir is None:
+                        break
+                write_regular_nofollow(target_dir / name, data)
 
 
 def linux_build(snapshot, env):
@@ -146,6 +201,9 @@ def main():
             env.pop(key, None)
         if platform.system() == "Darwin":
             work = snapshot / ".artifacts/darwin-host"
+            darwin_cache = env.get("DEVKIT_DARWIN_CARGO_HOME")
+            if darwin_cache and not Path(darwin_cache).is_absolute():
+                env["DEVKIT_DARWIN_CARGO_HOME"] = str((root / darwin_cache).absolute())
             subprocess.run(["/bin/sh", "tooling/darwin-producer.sh", "--build-frozen"], cwd=snapshot, env=env, check=True)
             engine = work / "target/aarch64-apple-darwin/release/devkit"
             notices, receipt, extra = work / "notices", work / "notice-producer.json", ["--host-env", work / "host.json"]
