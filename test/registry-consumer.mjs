@@ -274,7 +274,7 @@ if (mode === 'serve') {
     for (const item of metadata) {
       assert(requests.includes(`/@docouno/env/-/env-${item.version}.tgz`));
     }
-    assert(requests.some((path) => !path.startsWith('/@docouno/')));
+    assert(requests.some((path) => path.endsWith('.tgz') && !path.startsWith('/@docouno/')));
   } else {
     throw Error('Expected serve, first, second, negative or release-day');
   }
