@@ -475,8 +475,12 @@ fn profile_transitions_preserve_runtime_content_created_during_commit() {
 fn idempotent_add_and_register_admit_the_accepted_runtime() {
     let temp = TempDir::new().unwrap();
     let release = fixture_release(temp.path(), "0.6.0");
-    for register in [true, false] {
-        let root = temp.path().join(format!("consumer-{register}"));
+    for (case, register) in [
+        ("licenses-dir", true),
+        ("extra-pin", false),
+        ("stale-compose", false),
+    ] {
+        let root = temp.path().join(format!("consumer-{case}"));
         init(&release, &root, "rust", PackageMode::Registry);
         if register {
             copy_tree(
@@ -521,19 +525,86 @@ fn idempotent_add_and_register_admit_the_accepted_runtime() {
         };
         assert!(apply().unwrap().applied);
         assert!(apply().unwrap().no_op);
-        let expected = if register {
-            fs::create_dir(root.join(".devkit/runtime/licenses")).unwrap();
-            ".devkit/runtime/licenses"
-        } else {
-            let path = ".devkit/runtime/toolchains.env";
-            fs::copy(release.join("runtime/toolchains.env"), root.join(path)).unwrap();
-            let mut state = read_project_state(&root).unwrap();
-            record_managed_change(&root, &mut state, path, true);
-            "DEVKIT_DESKTOP_RECIPE_HASH"
+        let expected = match case {
+            "licenses-dir" => {
+                fs::create_dir(root.join(".devkit/runtime/licenses")).unwrap();
+                ".devkit/runtime/licenses"
+            }
+            "extra-pin" => {
+                let path = ".devkit/runtime/toolchains.env";
+                fs::copy(release.join("runtime/toolchains.env"), root.join(path)).unwrap();
+                let mut state = read_project_state(&root).unwrap();
+                record_managed_change(&root, &mut state, path, true);
+                "DEVKIT_DESKTOP_RECIPE_HASH"
+            }
+            _ => {
+                let path = ".devkit/runtime/compose.tools.yaml";
+                fs::copy(release.join("runtime/compose.tools.yaml"), root.join(path)).unwrap();
+                let mut state = read_project_state(&root).unwrap();
+                record_managed_change(&root, &mut state, path, true);
+                "projection is stale"
+            }
         };
         let before = author_port_payload(&root);
         let error = apply().unwrap_err();
-        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
         assert_eq!(author_port_payload(&root), before);
     }
+}
+
+#[test]
+fn runtime_inventory_rejects_unlisted_dirs_and_accepts_non_normalized_root() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("consumer");
+    let state = init(&release, &root, "rust", PackageMode::Registry);
+
+    let non_normalized = root.join("apps/..");
+    verify_managed_set(&non_normalized, &state).unwrap();
+    let manifest_id = identity(&root.join(MANIFEST_PATH)).unwrap().unwrap();
+    admit_runtime_snapshot(&non_normalized, state.clone(), manifest_id).unwrap();
+
+    for dir in [
+        ".devkit/runtime/.git",
+        ".devkit/runtime/extra",
+        ".devkit/runtime/desktop.Dockerfile",
+    ] {
+        fs::create_dir(root.join(dir)).unwrap();
+        let err = verify_managed_set(&root, &state).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Unlisted runtime directory"),
+            "{dir}: {err:#}"
+        );
+        fs::remove_dir(root.join(dir)).unwrap();
+    }
+
+    // Unclassified attribution keys in manifest.json are rejected even if on disk.
+    let extra_notice = ".devkit/runtime/licenses/extra.NOTICE";
+    put(&root, extra_notice, b"unclassified\n");
+    let mut forged = state;
+    record_managed_change(&root, &mut forged, extra_notice, true);
+    let err = verify_managed_set(&root, &forged).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("Unclassified managed runtime attribution"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn sync_preserves_pnpm_lock_comments_and_empty_packages_map() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("node-consumer");
+    let initial = init(&release, &root, "node", PackageMode::Registry);
+
+    let lock_path = root.join("pnpm-lock.yaml");
+    let original = fs::read_to_string(&lock_path).unwrap();
+    let commented = format!("# preserved header\n{original}");
+    fs::write(&lock_path, &commented).unwrap();
+
+    let synced =
+        sync_project(&release, &root, &UpdateOptions::default(), &FixtureResolver).unwrap();
+    assert!(synced.no_op);
+    assert_eq!(synced.state.generation, initial.generation);
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), commented);
 }

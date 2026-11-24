@@ -130,8 +130,11 @@ fn dispatch_admits_engine_identity_and_checks_every_record_before_delegating() {
     let pin = EnginePin::from_toolchains(engine_only.as_bytes()).unwrap();
     assert_eq!(pin.version, "0.5.0");
     assert!(
-        EnginePin::from_toolchains(format!("{engine_only}\nDEVKIT_FUTURE_PIN=1\n").as_bytes())
-            .is_ok()
+        EnginePin::from_toolchains(
+            format!("{engine_only}\nDEVKIT_FUTURE_PIN=1\nDEVKIT_DESKTOP_RECIPE_HASH=future-pin\n")
+                .as_bytes()
+        )
+        .is_ok()
     );
     for invalid in [
         "UNTRUSTED_PIN=1",
@@ -140,7 +143,6 @@ fn dispatch_admits_engine_identity_and_checks_every_record_before_delegating() {
         "DEVKIT_FUTURE_PIN='quoted'",
         "DEVKIT_FUTURE_PIN=a\0b",
         "DEVKIT_VERSION=0.5.0",
-        "DEVKIT_DESKTOP_RECIPE_HASH=bad",
     ] {
         assert!(
             EnginePin::from_toolchains(format!("{engine_only}\n{invalid}").as_bytes()).is_err(),
@@ -173,12 +175,13 @@ fn dispatch_admits_engine_identity_and_checks_every_record_before_delegating() {
 }
 
 #[test]
-fn release_admits_exactly_the_full_set_of_immutable_tool_pins() {
+fn release_admits_required_immutable_tool_pins_and_allows_future_keys() {
     let source = toolchains("0.6.0");
     let pins = ReleaseToolPins::parse(source.as_bytes()).unwrap();
     assert_eq!(pins.desktop_recipe, "c".repeat(64));
+    assert!(ReleaseToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\n").as_bytes()).is_ok());
     for invalid in [
-        format!("{source}DEVKIT_FUTURE_PIN=1\n"),
+        source.replace(&"c".repeat(64), "bad"),
         source.replace("node:24@sha256:", "$(touch/tmp/NO)@sha256:"),
         source.replace(&format!("@sha256:{}", "a".repeat(64)), ""),
         source.replace("DEVKIT_DESKTOP_RECIPE_HASH=", "DEVKIT_OTHER="),

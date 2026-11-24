@@ -366,41 +366,50 @@ pub fn render_workspace_compose(
     json_bytes(&render_workspace_compose_value(state, inputs)?)
 }
 
-fn checked_tool_compose(bytes: &[u8], electron: bool) -> Result<Value> {
+fn node_leaks_electron_cache(node: &Map<String, Value>) -> bool {
+    let env_leaks = match node.get("environment") {
+        Some(Value::Object(map)) => {
+            map.contains_key("ELECTRON_CACHE")
+                || map
+                    .values()
+                    .any(|v| v.as_str().is_some_and(|s| s.contains("/cache/electron")))
+        }
+        Some(Value::Array(items)) => items.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.contains("ELECTRON_CACHE") || s.contains("/cache/electron"))
+        }),
+        _ => false,
+    };
+    let volume_leaks = node
+        .get("volumes")
+        .and_then(Value::as_array)
+        .is_some_and(|volumes| {
+            volumes.iter().any(|volume| {
+                volume["target"] == "/cache/electron"
+                    || volume["source"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("ELECTRON_CACHE"))
+                    || volume
+                        .as_str()
+                        .is_some_and(|s| s.contains("/cache/electron"))
+            })
+        });
+    env_leaks || volume_leaks
+}
+
+fn checked_tool_compose_profile(bytes: &[u8], electron: bool) -> Result<Value> {
     let model = parse_compose(bytes)?;
     let services = object(&model["services"], "Tool Compose services")?;
     let node = services.get("node").context("Missing node tool service")?;
     let node_settings = object(node, "Node tool service")?;
-    let node_settings = serde_json::to_string(node_settings)?;
     ensure!(
-        !node_settings.contains("ELECTRON_CACHE") && !node_settings.contains("/cache/electron"),
+        !node_leaks_electron_cache(node_settings),
         "The node tool service contains an Electron cache"
     );
     if electron {
-        let desktop = services
-            .get("desktop")
-            .context("Missing desktop tool service")?;
-        let security = desktop["security_opt"]
-            .as_array()
-            .context("Missing desktop security options")?;
-        let volumes = desktop["volumes"]
-            .as_array()
-            .context("Missing desktop volumes")?;
         ensure!(
-            desktop["shm_size"] == "256m"
-                && desktop["cap_drop"] == json!(["ALL"])
-                && security.iter().any(|opt| opt == "no-new-privileges:true")
-                && security.iter().any(|opt| opt
-                    == "seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"),
-            "Invalid desktop tool service security settings"
-        );
-        ensure!(
-            desktop["environment"]["HOME"].is_string()
-                && desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
-                && ["/workspace", "/devkit/bin/pnpm", "/cache/electron"]
-                    .iter()
-                    .all(|target| volumes.iter().any(|volume| volume["target"] == *target)),
-            "Invalid desktop tool environment or mounts"
+            services.contains_key("desktop"),
+            "Missing desktop tool service"
         );
     } else {
         let source = std::str::from_utf8(bytes)?;
@@ -414,8 +423,37 @@ fn checked_tool_compose(bytes: &[u8], electron: bool) -> Result<Value> {
     Ok(model)
 }
 
+fn checked_release_tool_compose(bytes: &[u8]) -> Result<Value> {
+    let model = checked_tool_compose_profile(bytes, true)?;
+    let desktop = &model["services"]["desktop"];
+    let security = desktop["security_opt"]
+        .as_array()
+        .context("Missing desktop security options")?;
+    let volumes = desktop["volumes"]
+        .as_array()
+        .context("Missing desktop volumes")?;
+    ensure!(
+        desktop["shm_size"] == "256m"
+            && desktop["cap_drop"] == json!(["ALL"])
+            && security.iter().any(|opt| opt == "no-new-privileges:true")
+            && security.iter().any(|opt| {
+                opt == "seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"
+            }),
+        "Invalid desktop tool service security settings"
+    );
+    ensure!(
+        desktop["environment"]["HOME"].is_string()
+            && desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
+            && ["/workspace", "/devkit/bin/pnpm", "/cache/electron"]
+                .iter()
+                .all(|target| volumes.iter().any(|volume| volume["target"] == *target)),
+        "Invalid desktop tool environment or mounts"
+    );
+    Ok(model)
+}
+
 pub fn render_headless_tool_compose(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut expected = checked_tool_compose(bytes, true)?;
+    let mut expected = checked_release_tool_compose(bytes)?;
     expected["services"]
         .as_object_mut()
         .unwrap()
@@ -434,17 +472,22 @@ pub fn render_headless_tool_compose(bytes: &[u8]) -> Result<Vec<u8>> {
         .sum();
     let headless = format!("{prefix}\n{}", &desktop_body[body_len..]).into_bytes();
     ensure!(
-        checked_tool_compose(&headless, false)? == expected,
+        checked_tool_compose_profile(&headless, false)? == expected,
         "Removing desktop changed other tool Compose settings"
     );
     Ok(headless)
+}
+
+pub(crate) fn verify_release_tool_compose(bytes: &[u8]) -> Result<()> {
+    render_headless_tool_compose(bytes)?;
+    Ok(())
 }
 
 fn assert_tool_compose(root: &Path, electron: bool) -> Result<()> {
     let path = safe_path(root, ".devkit/runtime/compose.tools.yaml")?;
     let (bytes, _) = read_regular_file(&path, MAX_YAML_BYTES as u64, "Tool Compose projection")?
         .context("Missing tool Compose projection")?;
-    checked_tool_compose(&bytes, electron)?;
+    checked_tool_compose_profile(&bytes, electron)?;
     Ok(())
 }
 
@@ -481,20 +524,20 @@ mod tests {
     #[test]
     fn tool_projection_rejects_stale_desktop_mounts_and_security() {
         let full = include_bytes!("../../../runtime/compose.tools.yaml");
-        let mut model = checked_tool_compose(full, true).unwrap();
-        assert!(checked_tool_compose(full, false).is_err());
+        let mut model = checked_release_tool_compose(full).unwrap();
+        assert!(checked_tool_compose_profile(full, false).is_err());
         model["services"]["desktop"]["volumes"] = model["services"]["node"]["volumes"].clone();
-        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), true).is_err());
+        assert!(checked_release_tool_compose(&json_bytes(&model).unwrap()).is_err());
 
         let mut model = parse_compose(full).unwrap();
         model["services"]["desktop"]["cap_drop"] = json!([]);
-        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), true).is_err());
+        assert!(checked_release_tool_compose(&json_bytes(&model).unwrap()).is_err());
         let headless = render_headless_tool_compose(full).unwrap();
-        let mut model = checked_tool_compose(&headless, false).unwrap();
+        let mut model = checked_tool_compose_profile(&headless, false).unwrap();
         model["services"]["node"]["volumes"]
             .as_array_mut()
             .unwrap()
             .push(json!("cache:/cache/electron"));
-        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), false).is_err());
+        assert!(checked_tool_compose_profile(&json_bytes(&model).unwrap(), false).is_err());
     }
 }

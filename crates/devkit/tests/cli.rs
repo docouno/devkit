@@ -1508,6 +1508,10 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
             String::from_utf8_lossy(&desc.stdout)
         );
         assert_eq!(decoded(&desc)["result"]["version"], expected_ver);
+        assert_eq!(
+            decoded(&desc)["result"]["receipts"]["desktopImageReady"],
+            false
+        );
 
         let doctor = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args(["--json", "--cache-dir"])
@@ -1548,6 +1552,10 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
             String::from_utf8_lossy(&stat.stdout)
         );
         assert_eq!(decoded(&stat)["ok"], true);
+        assert_eq!(
+            decoded(&stat)["result"]["receipts"]["desktopImageReady"],
+            false
+        );
         assert!(!empty_cache.exists());
     }
 
@@ -1580,6 +1588,18 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     // Use a single local cache so both upgrades share the same current payload.
     let genuine_cache = temp.path().join("genuine-upgrade");
     let baseline = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.artifacts/baseline");
+    let available: Vec<_> = [("0.4.1", &proj_041), ("0.5.1", &proj_051)]
+        .into_iter()
+        .filter_map(|(version, project)| {
+            let old_engine = baseline.join(format!("v{version}/payload/devkit"));
+            old_engine
+                .is_file()
+                .then_some((version, project, old_engine))
+        })
+        .collect();
+    if available.is_empty() {
+        return;
+    }
     // The author debug build includes symbols and exceeds the release entry budget.
     // Keep its executable code, then reseal the fixture before old engines import it.
     let engine_path = rel_current.join("devkit");
@@ -1597,11 +1617,7 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     release.files = file_map(&rel_current).unwrap();
     release.files.remove("release.json");
     write_json(&manifest_path, &release).unwrap();
-    for (version, project) in [("0.4.1", &proj_041), ("0.5.1", &proj_051)] {
-        let old_engine = baseline.join(format!("v{version}/payload/devkit"));
-        if !old_engine.is_file() {
-            continue;
-        }
+    for (version, project, old_engine) in available {
         let updated = Command::new(old_engine)
             .args(["--json", "--offline", "--cache-dir"])
             .arg(&genuine_cache)

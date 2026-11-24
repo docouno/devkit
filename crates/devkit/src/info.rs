@@ -245,21 +245,30 @@ fn observe_stand(
     Ok((known, services, stopped_services))
 }
 
-fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'static str> {
+fn local_readiness(
+    root: &Path,
+    state: &crate::model::ProjectState,
+    pins: &CheckoutToolPins,
+) -> &'static str {
     let native = match crate::native::inspect_native_components(root, state) {
         Ok(native) => native,
         Err(error) => {
             let exceeds_budget = error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge);
-            return Ok(if exceeds_budget {
+            return if exceeds_budget {
                 "unknown"
             } else {
                 "setup-required"
-            });
+            };
         }
     };
-    let receipts = crate::doctor::local_receipts(root, state, Some(&native.node_inputs.digest))?;
+    let receipts = crate::doctor::local_receipts_with_pins(
+        root,
+        state,
+        pins,
+        Some(&native.node_inputs.digest),
+    );
     let ready = state.components.values().all(|c| match c.toolchain {
         Toolchain::Rust => receipts["rustImageReady"] == true,
         Toolchain::Node => {
@@ -268,7 +277,7 @@ fn local_readiness(root: &Path, state: &crate::model::ProjectState) -> Result<&'
                     || receipts["desktopImageReady"] == true)
         }
     });
-    Ok(if ready { "ready" } else { "setup-required" })
+    if ready { "ready" } else { "setup-required" }
 }
 
 pub(crate) fn inspect(
@@ -375,10 +384,10 @@ pub(crate) fn inspect(
         };
         if !pending
             && state.version == env!("CARGO_PKG_VERSION")
-            && CheckoutToolPins::admit(&root, state).is_ok()
+            && let Ok(pins) = CheckoutToolPins::admit(&root, state)
         {
             if !busy {
-                readiness = local_readiness(&root, state)?;
+                readiness = local_readiness(&root, state, &pins);
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));

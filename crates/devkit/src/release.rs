@@ -8,18 +8,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
 use sha2::{Digest, Sha512};
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
-
-pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 4] = [
-    "runtime/devkit.mk",
-    "runtime/devkit.sh",
-    "runtime/toolchains.env",
-    "runtime/compose.tools.yaml",
-];
 
 pub fn markdown_heading_anchors(markdown: &str) -> BTreeSet<String> {
     let mut anchors = BTreeSet::new();
@@ -190,7 +182,7 @@ pub struct AdmittedRelease {
     pub root: PathBuf,
     pub manifest: Release,
     pub identity: String,
-    headless_tools: Option<Vec<u8>>,
+    scoped_runtime_checked: bool,
 }
 pub fn release_identity(root: &Path) -> Result<String> {
     Ok(digest(fs::read(safe_path(root, "release.json")?)?))
@@ -274,14 +266,15 @@ pub fn admit_release(root: &Path) -> Result<AdmittedRelease> {
         identity: before.sha256,
         root,
         manifest,
-        headless_tools: None,
+        scoped_runtime_checked: false,
     };
     // A newer engine owns its runtime format. Older dispatchers only need the
     // verified payload and its engine pin to hand control to that engine.
     if crate::state::uses_profile_scoped_runtime(&release.manifest.version)?
         && SemVer::parse(&release.manifest.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
     {
-        release.headless_tools = Some(release.check_scoped_runtime()?);
+        release.check_scoped_runtime()?;
+        release.scoped_runtime_checked = true;
     }
     Ok(release)
 }
@@ -289,7 +282,7 @@ pub fn read_release(root: &Path) -> Result<Release> {
     Ok(admit_release(root)?.manifest)
 }
 impl AdmittedRelease {
-    fn check_scoped_runtime(&self) -> Result<Vec<u8>> {
+    fn check_scoped_runtime(&self) -> Result<()> {
         // Every attribution in this directory needs a declared profile. A
         // headless checkout omits the directory together with the seccomp file.
         for name in self
@@ -304,10 +297,10 @@ impl AdmittedRelease {
             );
         }
         let empty = digest(b"");
-        for name in REQUIRED_RUNTIME_FILES
+        for name in crate::state::REQUIRED_RUNTIME_FILES
             .into_iter()
             .chain(crate::state::DESKTOP_RUNTIME_FILES)
-            .chain(["runtime/LICENSE"])
+            .chain([crate::state::RUNTIME_LICENSE_FILE])
         {
             let file = self
                 .manifest
@@ -325,14 +318,14 @@ impl AdmittedRelease {
             pins.desktop_recipe == self.manifest.files["runtime/desktop.Dockerfile"].sha256,
             "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
         );
-        crate::projections::render_headless_tool_compose(&self.bytes("runtime/compose.tools.yaml")?)
+        crate::projections::verify_release_tool_compose(&self.bytes("runtime/compose.tools.yaml")?)
     }
 
-    pub(crate) fn scoped_tool_compose(&self) -> Result<Cow<'_, [u8]>> {
-        match &self.headless_tools {
-            Some(bytes) => Ok(Cow::Borrowed(bytes)),
-            // Direct lifecycle APIs can stage a payload without CLI dispatch.
-            None => Ok(Cow::Owned(self.check_scoped_runtime()?)),
+    pub(crate) fn ensure_scoped_runtime(&self) -> Result<()> {
+        if self.scoped_runtime_checked {
+            Ok(())
+        } else {
+            self.check_scoped_runtime()
         }
     }
 
@@ -343,22 +336,27 @@ impl AdmittedRelease {
             .get(name)
             .with_context(|| format!("Release is missing {name}"))?;
         let path = safe_path(&self.root, name)?;
-        ensure!(
-            identity(&path)?.as_ref() == Some(expected),
-            "Release payload changed: {name}"
-        );
-        let bytes = fs::read(path)?;
-        ensure!(
-            digest(&bytes) == expected.sha256,
-            "Release payload changed: {name}"
-        );
+        let (bytes, actual) = read_regular_file(&path, crate::archive::MAX_FILE, name)?
+            .with_context(|| format!("Release payload changed: {name}"))?;
+        ensure!(actual == *expected, "Release payload changed: {name}");
         Ok(bytes)
     }
     pub fn recheck(&self) -> Result<()> {
-        let now = admit_release(&self.root)?;
+        let manifest_path = safe_path(&self.root, "release.json")?;
+        let before = identity(&manifest_path)?.context("Missing release manifest")?;
         ensure!(
-            now.identity == self.identity,
+            before.sha256 == self.identity,
             "Release changed while staging"
+        );
+        let mut actual = file_map(&self.root)?;
+        actual.remove("release.json");
+        ensure!(
+            actual == self.manifest.files,
+            "Release payload file set or integrity differs from its manifest"
+        );
+        ensure!(
+            identity(&manifest_path)?.as_ref() == Some(&before),
+            "Release manifest changed during admission"
         );
         Ok(())
     }

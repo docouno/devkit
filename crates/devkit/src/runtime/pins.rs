@@ -42,9 +42,6 @@ impl<'a> Records<'a> {
                 "Invalid/duplicate toolchain key: {key}"
             );
         }
-        if let Some(pin) = values.get(DESKTOP_HASH) {
-            ensure!(SHA256_RE.is_match(pin), "Invalid {DESKTOP_HASH}");
-        }
         Ok(Self(values))
     }
 
@@ -92,13 +89,15 @@ impl CheckoutToolPins {
             .rsplit_once("@sha256:")
             .context("Node image must be digest pinned")?;
         let rust_recipe = records.require("DEVKIT_RUST_RECIPE_HASH")?;
+        let desktop_recipe = records.0.get(DESKTOP_HASH).copied();
         ensure!(
             !name.is_empty()
                 && name
                     .bytes()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"./:-".contains(&c))
                 && SHA256_RE.is_match(digest)
-                && SHA256_RE.is_match(rust_recipe),
+                && SHA256_RE.is_match(rust_recipe)
+                && desktop_recipe.is_none_or(|pin| SHA256_RE.is_match(pin)),
             "Invalid immutable tool pins"
         );
         Ok(Self {
@@ -107,7 +106,7 @@ impl CheckoutToolPins {
             node_version: version(records.require("DEVKIT_NODE_VERSION")?)?.into(),
             rust_version: version(records.require("DEVKIT_RUST_VERSION")?)?.into(),
             rust_recipe: rust_recipe.into(),
-            desktop_recipe: records.0.get(DESKTOP_HASH).map(|value| (*value).to_owned()),
+            desktop_recipe: desktop_recipe.map(str::to_owned),
         })
     }
 
@@ -168,11 +167,19 @@ impl ReleaseToolPins {
         let desktop_recipe = pins
             .desktop_recipe
             .with_context(|| format!("Missing toolchain pin: {DESKTOP_HASH}"))?;
-        ensure!(records.0.len() == 8, "Unexpected release toolchain pins");
         Ok(Self {
             engine: pins.engine,
             node_image: pins.node_image,
             desktop_recipe,
         })
     }
+}
+
+pub(crate) fn render_headless_toolchains(bytes: &[u8]) -> Result<Vec<u8>> {
+    let prefix = format!("{DESKTOP_HASH}=");
+    Ok(std::str::from_utf8(bytes)?
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with(&prefix))
+        .collect::<String>()
+        .into_bytes())
 }

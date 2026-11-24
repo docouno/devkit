@@ -282,6 +282,7 @@ pub fn identity(path: &Path) -> Result<Option<FileIdentity>> {
 }
 
 pub(crate) const TOOLCHAIN_PINS_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const SECCOMP_PROFILE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const PNPM_YAML_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn is_pnpm_yaml(path: &Path) -> bool {
@@ -296,6 +297,8 @@ fn input_budget(path: &Path) -> Option<(u64, &'static str)> {
         Some((PNPM_YAML_MAX_BYTES as u64, "pnpm YAML"))
     } else if path.ends_with(".devkit/runtime/toolchains.env") {
         Some((TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins"))
+    } else if path.ends_with(".devkit/runtime/desktop-seccomp.json") {
+        Some((SECCOMP_PROFILE_MAX_BYTES as u64, "desktop seccomp profile"))
     } else if path.ends_with(".devkit/runtime/compose.tools.yaml") {
         Some((
             crate::compose::MAX_YAML_BYTES as u64,
@@ -647,6 +650,7 @@ mod tests {
         let file = File::create(&slot)?;
         for (name, limit) in [
             ("toolchains.env", TOOLCHAIN_PINS_MAX_BYTES),
+            ("desktop-seccomp.json", SECCOMP_PROFILE_MAX_BYTES),
             ("compose.tools.yaml", crate::compose::MAX_YAML_BYTES),
         ] {
             file.set_len(limit as u64 + 1)?;

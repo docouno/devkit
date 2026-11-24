@@ -227,11 +227,16 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
             None => fs::remove_file(bad.path().join(path)).unwrap(),
         }
         seal(bad.path());
+        let bad_identity = devkit::release::release_identity(bad.path()).unwrap();
         assert!(
             cache
                 .acquire(version, None, Some(bad.path()), true)
                 .is_err(),
             "{path}"
+        );
+        assert!(
+            !cache.release_path(version, &bad_identity).unwrap().exists(),
+            "rejected release must not be published into cache: {path}"
         );
         assert_eq!(fs::read(&reference).unwrap(), saved, "{path}");
         assert_eq!(
@@ -240,6 +245,18 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
             "{path}"
         );
     }
+
+    // Removing the version reference must heal when the cached release is re-admitted.
+    fs::remove_file(&reference).unwrap();
+    assert!(cache.acquire(version, None, None, true).is_err());
+    assert_eq!(
+        cache.import(&source, version, None).unwrap().identity,
+        good.identity
+    );
+    assert_eq!(
+        cache.acquire(version, None, None, true).unwrap().identity,
+        good.identity
+    );
 }
 
 #[test]

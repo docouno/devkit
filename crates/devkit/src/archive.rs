@@ -17,7 +17,7 @@ use std::{
 
 pub const MAX_COMPRESSED: u64 = 128 * 1024 * 1024;
 pub const MAX_EXPANDED: u64 = 256 * 1024 * 1024;
-const MAX_FILE: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 16_384;
 
 pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {

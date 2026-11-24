@@ -139,7 +139,20 @@ pub fn local_receipts(
     node_inputs_digest: Option<&str>,
 ) -> Result<Value> {
     let pins = CheckoutToolPins::admit(root, project_state)?;
+    Ok(local_receipts_with_pins(
+        root,
+        project_state,
+        &pins,
+        node_inputs_digest,
+    ))
+}
 
+pub(crate) fn local_receipts_with_pins(
+    root: &Path,
+    project_state: &ProjectState,
+    pins: &CheckoutToolPins,
+    node_inputs_digest: Option<&str>,
+) -> Value {
     let computed_node_digest = match node_inputs_digest {
         Some(d) => Some(d.to_owned()),
         None => crate::native::admit_native_components(root, project_state)
@@ -171,11 +184,11 @@ pub fn local_receipts(
             recorded_derived_image_ready(root, "desktop", "desktop.Dockerfile", pin)
         });
 
-    Ok(json!({
+    json!({
         "nodeWorkspaceReady": node_workspace_ready,
         "rustImageReady": rust_image_ready,
         "desktopImageReady": desktop_image_ready,
-    }))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -890,7 +903,12 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
         if SemVer::parse(&full.state.version)? >= SemVer::parse("0.5.0")? {
             crate::runtime::PnpmPin::from_checkout(&root)?;
         }
-        let receipts = local_receipts(&root, &full.state, Some(&full.native.node_inputs.digest))?;
+        let receipts = local_receipts_with_pins(
+            &root,
+            &full.state,
+            &full.pins,
+            Some(&full.native.node_inputs.digest),
+        );
         Ok((full.state, receipts))
     })();
 

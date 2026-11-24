@@ -925,7 +925,7 @@ class Verification:
         for command in ("describe", "doctor", "status"):
             result = json.loads(self.run(label + "-" + command, [
                 "sh", ".devkit/runtime/devkit.sh", "cli", command, ".", "--json"], cwd=root))["result"]
-            if command == "describe":
+            if command in ("describe", "status"):
                 require(result["receipts"]["desktopImageReady"] is desktop_ready, "Wrong desktop image receipt")
             if command == "doctor":
                 checkout = next(check for check in result["checks"] if check["id"] == "checkout_state")

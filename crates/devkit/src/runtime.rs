@@ -3,6 +3,7 @@ use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
 mod pins;
+pub(crate) use pins::render_headless_toolchains;
 pub use pins::{CheckoutToolPins, ReleaseToolPins};
 
 use anyhow::{Context, ensure};
@@ -337,6 +338,7 @@ enum TaskAccess {
 struct ContainerTask<'a> {
     component: Option<&'a str>,
     profile: ToolingProfile,
+    electron_cache: bool,
     image: &'a str,
     argv: &'a [OsString],
     network: &'a str,
@@ -484,6 +486,7 @@ impl<'a> PreparedContext<'a> {
             self.task(ContainerTask {
                 component: Some(path),
                 profile: ToolingProfile::Node,
+                electron_cache: true,
                 image: &self.admission.pins.node_image,
                 argv: &node_argv(
                     self,
@@ -876,6 +879,7 @@ impl<'a> PreparedContext<'a> {
         let ContainerTask {
             component,
             profile,
+            electron_cache,
             image,
             argv,
             network,
@@ -931,7 +935,7 @@ impl<'a> PreparedContext<'a> {
         } else {
             None
         };
-        let electron_cache = if node {
+        let electron_cache_dir = if electron_cache {
             Some(self.cache_directory("electron")?)
         } else {
             None
@@ -1101,7 +1105,7 @@ impl<'a> PreparedContext<'a> {
             for (source, target) in [
                 (cargo_cache.as_deref(), "/cache/cargo"),
                 (pnpm_cache.as_deref(), "/cache/pnpm"),
-                (electron_cache.as_deref(), "/cache/electron"),
+                (electron_cache_dir.as_deref(), "/cache/electron"),
             ] {
                 if let Some(source) = source {
                     crate::shared_cache::mount(&mut c, source, Path::new(target), false)?;
@@ -1159,11 +1163,13 @@ impl<'a> PreparedContext<'a> {
                 "NPM_CONFIG_UPDATE_NOTIFIER=false",
                 "NPM_CONFIG_FUND=false",
                 "NPM_CONFIG_AUDIT=false",
-                "ELECTRON_CACHE=/cache/electron",
                 "CARGO_HOME=/cache/cargo",
                 "RUSTUP_AUTO_INSTALL=0",
             ] {
                 c.args(["--env", value]);
+            }
+            if electron_cache {
+                c.args(["--env", "ELECTRON_CACHE=/cache/electron"]);
             }
             env_plan.write_docker_args(&mut c);
             c.args([
@@ -1208,10 +1214,17 @@ impl<'a> PreparedContext<'a> {
                 c.args(["--env", "VITE_API_ENABLED=true"]);
             }
             if profile == ToolingProfile::Electron {
-                let seccomp = safe_path(root, ".devkit/runtime/desktop-seccomp.json")?;
+                let seccomp_name = ".devkit/runtime/desktop-seccomp.json";
+                let expected = self
+                    .admission
+                    .state
+                    .managed
+                    .get(seccomp_name)
+                    .context("Missing managed desktop-seccomp.json")?;
+                let seccomp = safe_path(root, seccomp_name)?;
                 ensure!(
-                    identity(&seccomp)?.is_some(),
-                    "Missing managed desktop-seccomp.json"
+                    identity(&seccomp)?.is_some_and(|actual| actual.matches_git_tracked(expected)),
+                    "Managed desktop-seccomp.json differs from the accepted profile"
                 );
                 c.args(["--security-opt", &format!("seccomp={}", seccomp.display())]);
             }
@@ -1690,10 +1703,11 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     let full = if service {
         None
     } else {
-        Some(admit_runtime_snapshot(
+        Some(admit_runtime_snapshot_with_pins(
             &tool.root,
             tool.state.clone(),
             tool.manifest_identity.clone(),
+            Some(tool.pins.clone()),
         )?)
     };
     let target = tool.target(&request)?;
@@ -1802,6 +1816,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.task(ContainerTask {
             component: None,
             profile: ToolingProfile::Node,
+            electron_cache: false,
             image: &ctx.admission.pins.node_image,
             argv: &node_argv(
                 &ctx,
@@ -1832,6 +1847,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                     ctx.task(ContainerTask {
                         component: Some(path),
                         profile: c.tooling_profile,
+                        electron_cache: c.tooling_profile == ToolingProfile::Electron,
                         image: &ctx.admission.pins.node_image,
                         argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                         network: "none",
@@ -1845,6 +1861,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 ctx.task(ContainerTask {
                     component: None,
                     profile: ToolingProfile::Node,
+                    electron_cache: has_electron(&full.state),
                     image: &ctx.admission.pins.node_image,
                     argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                     network: "none",
@@ -1906,6 +1923,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.task(ContainerTask {
             component: Some(&target),
             profile: component.tooling_profile,
+            electron_cache: false,
             image: &image,
             argv: &[
                 "/devkit/devkit".into(),
@@ -1967,6 +1985,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             ctx.task(ContainerTask {
                 component: Some(&target),
                 profile: component.tooling_profile,
+                electron_cache: component.tooling_profile == ToolingProfile::Electron,
                 image: &image,
                 argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), command.into()]),
                 network: "none",
@@ -2152,6 +2171,11 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         } else {
             ToolingProfile::Node
         },
+        electron_cache: toolchain != Toolchain::Rust
+            && target.as_deref().map_or_else(
+                || has_electron(&ctx.admission.state),
+                |p| ctx.admission.state.components[p].tooling_profile == ToolingProfile::Electron,
+            ),
         image: &image,
         argv: &request.argv,
         network: &request.network,
@@ -3569,11 +3593,12 @@ pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
         obj.insert("exposedContainerPort".into(), json!(exposed_port));
         components.insert(path.clone(), Value::Object(obj));
     }
-    let receipts = crate::doctor::local_receipts(
+    let receipts = crate::doctor::local_receipts_with_pins(
         &full.root,
         &full.state,
+        &full.pins,
         Some(&full.native.node_inputs.digest),
-    )?;
+    );
     Ok(json!({
         "root": full.root,
         "version": full.state.version,
@@ -3611,7 +3636,12 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
         &mut services,
     )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
-    let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
+    let receipts = crate::doctor::local_receipts_with_pins(
+        &ctx.admission.root,
+        &ctx.admission.state,
+        &ctx.admission.pins,
+        None,
+    );
     ctx.admission.recheck()?;
     runner.check_cancelled()?;
     drop(lock);
