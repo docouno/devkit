@@ -60,31 +60,33 @@ pub fn prepare_mount_masks(cache: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn mount_identity(path: &Path) -> Result<(u64, u64)> {
-    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
-    let metadata = fs::symlink_metadata(path)?;
-    let flags = if metadata.is_symlink() {
-        libc::O_SYMLINK
-    } else {
-        libc::O_NOFOLLOW
-    };
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_EVTONLY | flags)
-        .open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        (metadata.dev(), metadata.ino()) == (opened.dev(), opened.ino()),
-        "Filesystem path changed during mount inspection"
-    );
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: fstatfs initializes stats on success and file is open throughout.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
+    attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    attrs.commonattr = libc::ATTR_CMN_DEVID | libc::ATTR_CMN_FSID;
+    // getattrlist packs a u32 size, dev_t and fsid_t from the same vnode.
+    // It needs only metadata access and never opens a FIFO or follows a link.
+    let mut bytes = [0u8; 16];
+    if unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut attrs).cast(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    } < 0
+    {
         return Err(std::io::Error::last_os_error().into());
     }
-    let stats = unsafe { stats.assume_init() };
-    // Darwin fsid_t consists of two i32 values. libc keeps its fields private.
-    let fsid = unsafe { std::mem::transmute::<libc::fsid_t, u64>(stats.f_fsid) };
-    Ok((fsid, opened.dev()))
+    ensure!(
+        u32::from_ne_bytes(bytes[..4].try_into()?) as usize == bytes.len(),
+        "Incomplete filesystem identity"
+    );
+    let device = u32::from_ne_bytes(bytes[4..8].try_into()?);
+    let fsid = u64::from_ne_bytes(bytes[8..].try_into()?);
+    Ok((fsid, u64::from(device)))
 }
 
 #[cfg(target_os = "linux")]
@@ -221,21 +223,73 @@ mod tests {
     }
 
     #[test]
+    fn only_the_unshared_candidate_ancestor_allows_mount_fallback() {
+        use crate::processes::ProcessOutput;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_root(tmp.path()).unwrap();
+        let checkout = root.join("checkout");
+        let cache = root.join("cache");
+        directory(&checkout.join(".git")).unwrap();
+        let diagnostic = |code, stderr: String| ProcessOutput {
+            code,
+            stdout: Vec::new(),
+            stderr: stderr.into_bytes(),
+        };
+        let missing = |p: &Path| {
+            format!(
+                "docker: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: {}\n\nRun 'docker run --help' for more information\n",
+                p.display()
+            )
+        };
+        let denied = format!(
+            "docker: Error response from daemon: Mounts denied:\nThe path {} is not shared from the host and is not known to Docker.\n",
+            root.display()
+        );
+        for message in [missing(&root), denied] {
+            let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |plan| {
+                if plan.store == cache.join("pnpm-store") {
+                    guest_hardlinks_supported(diagnostic(125, message.clone()), &plan.ancestor)
+                } else {
+                    Ok(true)
+                }
+            })
+            .unwrap();
+            assert_eq!(plan.store, checkout.join(".git/devkit-store"));
+        }
+        for output in [
+            diagnostic(125, missing(&root.join("other"))),
+            diagnostic(1, missing(&root)),
+            diagnostic(125, "Docker connection unavailable".into()),
+            diagnostic(1, "Hardlink probe contents changed".into()),
+        ] {
+            assert!(guest_hardlinks_supported(output, &root).is_err());
+        }
+        let absent = root.join("absent");
+        assert!(guest_hardlinks_supported(diagnostic(125, missing(&absent)), &absent).is_err());
+    }
+
+    #[test]
     fn npmrc_mask_preserves_environment_for_daily_tasks() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for file in [".NPMRC", ".Env.Local", ".env.example"] {
             fs::write(root.join(file), []).unwrap();
         }
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                npmrc_targets(root).unwrap(),
-                [PathBuf::from(".NPMRC"), PathBuf::from(".npmrc")]
-            );
-            assert_eq!(mask_targets(root, true).unwrap().len(), 4);
-        } else {
-            assert!(npmrc_targets(root).unwrap().is_empty());
-            assert!(mask_targets(root, true).unwrap().is_empty());
+        let alias_exists = root.join(".npmrc").exists();
+        let mut npmrc = vec![PathBuf::from(".NPMRC")];
+        let mut secrets = vec![PathBuf::from(".Env.Local"), PathBuf::from(".NPMRC")];
+        if alias_exists {
+            npmrc.push(".npmrc".into());
+            secrets.extend([PathBuf::from(".env.local"), PathBuf::from(".npmrc")]);
+        }
+        assert_eq!(mask_targets(root, false, true).unwrap(), npmrc);
+        assert_eq!(mask_targets(root, true, true).unwrap(), secrets);
+        assert!(mask_targets(root, false, false).unwrap().is_empty());
+        assert!(mask_targets(root, true, false).unwrap().is_empty());
+        assert_eq!(root.join(".npmrc").exists(), alias_exists);
+        if !alias_exists {
+            fs::write(root.join(".npmrc"), []).unwrap();
+            assert_eq!(mask_targets(root, false, true).unwrap().len(), 2);
         }
     }
 
@@ -467,7 +521,11 @@ impl UnifiedStorePlan {
             let metadata = fs::symlink_metadata(&source)?;
             if metadata.file_type().is_symlink()
                 || self.cache_mask(&source)
-                || (path == self.checkout && secret_name(&entry.file_name().to_string_lossy()))
+                || (path == self.checkout
+                    && secret_name(&canonical_secret_name(
+                        &entry.file_name().to_string_lossy(),
+                        cfg!(target_os = "macos"),
+                    )))
             {
                 continue;
             }
@@ -497,7 +555,7 @@ impl UnifiedStorePlan {
     }
     pub fn mask_checkout_files(&self, command: &mut Command, target_root: &Path) -> Result<()> {
         let file_mask = self.cache.join("empty-file-mask");
-        for target in mask_targets(&self.checkout, true)? {
+        for target in mask_targets(&self.checkout, true, cfg!(target_os = "macos"))? {
             mount(command, &file_mask, &target_root.join(target), true)?;
         }
         if let Ok(relative) = self.cache.strip_prefix(&self.checkout) {
@@ -518,30 +576,38 @@ impl UnifiedStorePlan {
     }
 }
 
-fn canonical_secret_name(name: &str) -> std::borrow::Cow<'_, str> {
-    if cfg!(target_os = "macos") {
+fn canonical_secret_name(name: &str, fold_case: bool) -> std::borrow::Cow<'_, str> {
+    if fold_case {
         name.to_ascii_lowercase().into()
     } else {
         name.into()
     }
 }
 fn secret_name(name: &str) -> bool {
-    let name = canonical_secret_name(name);
     name == ".npmrc" || name == ".env" || (name.starts_with(".env.") && name != ".env.example")
 }
 
-fn mask_targets(root: &Path, all_secrets: bool) -> Result<Vec<PathBuf>> {
+fn mask_targets(root: &Path, all_secrets: bool, fold_case: bool) -> Result<Vec<PathBuf>> {
     let mut paths = BTreeSet::new();
     for entry in sorted_entries(root)? {
         let name = entry.file_name();
         let text = name.to_string_lossy();
-        let canonical = canonical_secret_name(&text);
-        if (canonical == ".npmrc" || all_secrets && secret_name(&text))
+        let canonical = canonical_secret_name(&text, fold_case);
+        if (canonical == ".npmrc" || all_secrets && secret_name(&canonical))
             && entry.file_type()?.is_file()
         {
             paths.insert(PathBuf::from(&name));
-            if cfg!(target_os = "macos") {
-                paths.insert(PathBuf::from(canonical.as_ref()));
+            if canonical != text {
+                // On case-sensitive shares, binding a missing alias would create it on the host.
+                match fs::symlink_metadata(root.join(canonical.as_ref())) {
+                    Ok(meta) if meta.is_file() => {
+                        paths.insert(PathBuf::from(canonical.as_ref()));
+                    }
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    _ => (),
+                }
             }
         }
     }
@@ -549,7 +615,7 @@ fn mask_targets(root: &Path, all_secrets: bool) -> Result<Vec<PathBuf>> {
 }
 
 pub fn npmrc_targets(root: &Path) -> Result<Vec<PathBuf>> {
-    mask_targets(root, false)
+    mask_targets(root, false, cfg!(target_os = "macos"))
 }
 
 pub fn mount(command: &mut Command, source: &Path, target: &Path, readonly: bool) -> Result<()> {
@@ -589,6 +655,49 @@ pub fn check_guest_hardlink(source: &Path, link: &Path, token: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+fn guest_hardlinks_supported(
+    output: crate::processes::ProcessOutput,
+    ancestor: &Path,
+) -> Result<bool> {
+    if output.code == 125 && output.stdout.is_empty() {
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        let ancestor_text = ancestor.to_str().context("Non-UTF8 dependency mount")?;
+        if let Some(reason) = stderr
+            .trim_start()
+            .strip_prefix("docker: Error response from daemon:")
+        {
+            let reason = reason.trim_start();
+            let missing = reason
+                .strip_prefix(
+                    "invalid mount config for type \"bind\": bind source path does not exist: ",
+                )
+                .and_then(|s| s.lines().next())
+                == Some(ancestor_text);
+            let unshared = format!(
+                "The path {ancestor_text} is not shared from the host and is not known to Docker."
+            );
+            let denied = reason
+                .strip_prefix("Mounts denied:")
+                .or_else(|| reason.strip_prefix("mounts denied:"))
+                .and_then(|s| s.trim_start().lines().next())
+                == Some(unshared.as_str());
+            if missing || denied {
+                // The candidate must still be an ordinary directory on the host.
+                ensure!(
+                    project_root(ancestor)? == ancestor && fs::symlink_metadata(ancestor)?.is_dir(),
+                    "Dependency mount ancestor changed during the Docker probe"
+                );
+                return Ok(false);
+            }
+        }
+    }
+    match output.success("Docker hardlink probe")?.text()?.trim() {
+        "supported" => Ok(true),
+        "unsupported" => Ok(false),
+        _ => anyhow::bail!("Unexpected Docker hardlink probe result"),
+    }
 }
 
 pub fn probe_guest_hardlinks(
@@ -653,25 +762,22 @@ pub fn probe_guest_hardlinks(
                 .join(link.strip_prefix(&plan.checkout)?),
         )
         .arg(&token);
-    let output = runner.run_owned_with_timeout(
+    let output = runner.run_owned_unchecked(
         &mut docker,
         OutputMode::Capture(8192),
         &owned,
-        std::time::Duration::from_secs(30),
+        Some(std::time::Duration::from_secs(30)),
     )?;
-    let supported = match output.text()?.trim() {
-        "supported" => {
-            let (bytes, _) = read_regular_file(&link, 64, "Docker hardlink probe")?
-                .context("Docker hardlink missing on host")?;
-            ensure!(
-                bytes == token.as_bytes(),
-                "Docker hardlink contents differ on host"
-            );
-            true
-        }
-        "unsupported" => false,
-        _ => anyhow::bail!("Unexpected Docker hardlink probe result"),
-    };
+    runner.check_cancelled()?;
+    let supported = guest_hardlinks_supported(output, &plan.ancestor)?;
+    if supported {
+        let (bytes, _) = read_regular_file(&link, 64, "Docker hardlink probe")?
+            .context("Docker hardlink missing on host")?;
+        ensure!(
+            bytes == token.as_bytes(),
+            "Docker hardlink contents differ on host"
+        );
+    }
     destination.close()?;
     source.close()?;
     Ok(supported)

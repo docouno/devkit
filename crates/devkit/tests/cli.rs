@@ -1450,6 +1450,28 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     let proj_current = make_proj(&rel_current, "proj-current");
     let proj_990 = make_proj(&rel_990, "proj-990");
 
+    // The accepted 0.5.x engine can only write the unqualified image ID.
+    write_atomic(
+        &proj_051.join(".devkit/state/rust-image"),
+        format!("sha256:{}\n", "a".repeat(64)).as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    for (project, expected) in [(&proj_051, "make doctor"), (&proj_current, "make setup")] {
+        let doctor = decoded(&invoke(project, &["doctor", ".", "--json"]));
+        let checkout = doctor["result"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "checkout_state")
+            .unwrap();
+        assert_eq!(checkout["status"], "warn", "{checkout}");
+        assert!(
+            checkout["remediation"].as_str().unwrap().contains(expected),
+            "{checkout}"
+        );
+    }
+
     // 2. `devkit update <proj-050> --to 0.5.1` symmetrically delegates downward to 0.5.1 engine.
     let upd_051 = Command::new(env!("CARGO_BIN_EXE_devkit"))
         .args([

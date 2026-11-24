@@ -386,6 +386,18 @@ fn engine_pins_preserve_legacy_dispatch_and_validate_the_whole_matrix() {
             .to_string()
             .contains("npx @docouno/devkit@0.6.0 update . --to 0.6.0")
     );
+    assert!(
+        error
+            .to_string()
+            .contains("--release-root /path/to/release")
+    );
+    let preview = old.for_target(Target::DarwinArm64).unwrap_err();
+    assert_eq!(devkit::cli::error_code(&preview), "UNSUPPORTED_HOST_TARGET");
+    let message = preview.to_string();
+    assert!(message.contains(
+        "/path/to/preview/devkit-aarch64-apple-darwin update . --to 0.6.0 --release-root /path/to/preview"
+    ));
+    assert!(!message.contains("npx"));
     let matrix = format!(
         "{legacy}DEVKIT_ENGINE_TARGETS={},{},riscv64-future-linux\nDEVKIT_ENGINE_SHA256_{}={a}\nDEVKIT_ENGINE_SHA256_{}={b}\nDEVKIT_ENGINE_SHA256_RISCV64_FUTURE_LINUX={a}\n",
         x64.triple(),

@@ -6,6 +6,11 @@ case "$(uname -s):$(uname -m)" in Darwin:arm64) ;; *) echo 'Apple Silicon host r
 test "$#" = 1 || { echo 'Usage: darwin-producer.sh OUTPUT | --test-only' >&2; exit 1; }
 root=$(git rev-parse --show-toplevel)
 cd "$root"
+case "$1" in
+  --build-frozen) test -n "${DEVKIT_FROZEN_COMMIT:-}" && test -n "${DEVKIT_FROZEN_TREE:-}" || exit 1 ;;
+  --test-only) unset DEVKIT_FROZEN_COMMIT DEVKIT_FROZEN_TREE ;;
+  *) exec python3 tooling/frozen-producer.py "$1" ;;
+esac
 version=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
 test -n "$version"
 rustup toolchain install "$version" --profile minimal
@@ -21,11 +26,12 @@ target=aarch64-apple-darwin
 work="$root/.artifacts/darwin-host"
 export CARGO_TARGET_DIR="$work/target" CARGO_HOME="$work/cargo-home"
 mkdir -p "$CARGO_HOME"
-DEVKIT_SOURCE_COMMIT=$(git rev-parse HEAD)
-DEVKIT_SOURCE_TREE=$(git rev-parse 'HEAD^{tree}')
-export DEVKIT_SOURCE_COMMIT DEVKIT_SOURCE_TREE
 cargo fetch --locked --target "$target"
 cargo test --locked --offline --target "$target" --lib --test archive --test delivery --test processes -- --test-threads=1
+rss_test=pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks
+cargo test --locked --offline --target "$target" --test native -- --list > "$work/native-tests.txt"
+grep -Fx "$rss_test: test" "$work/native-tests.txt"
+cargo test --locked --offline --target "$target" --test native "$rss_test" -- --exact --test-threads=1
 python3 test/bootstrap/portable.py
 test "$1" != --test-only || exit 0
 
@@ -35,7 +41,6 @@ engine="$CARGO_TARGET_DIR/$target/release/devkit"
 "$engine" internal build-info
 "$engine" internal collect-notices --root "$root" --cargo-home "$CARGO_HOME" \
   --rust-docs "$sysroot/share/doc/rust" --rust-version "$version" --output "$work/notices" > "$work/notice-producer.json"
-notice_sha=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["noticeSetSha256"])' < "$work/notice-producer.json")
 python3 - "$work/host.json" <<'PY'
 import json, subprocess, sys
 from pathlib import Path
@@ -51,5 +56,3 @@ versions = {name: subprocess.check_output(command, text=True).splitlines()[0]
             for name, command in commands.items()}
 Path(sys.argv[1]).write_text(json.dumps(versions) + '\n')
 PY
-"$engine" internal contribute --root "$root" --engine "$engine" --notices "$work/notices" \
-  --notice-set-sha256 "$notice_sha" --build-run "${BUILD_RUN:-local-author}" --host-env "$work/host.json" --output "$1"

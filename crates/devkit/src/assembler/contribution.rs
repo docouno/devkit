@@ -14,6 +14,8 @@ struct Producer {
     binary_sha256: String,
     binary_size: u64,
     build_info: BuildInfo,
+    #[serde(default)]
+    verified: bool,
     notice_set_sha256: String,
     build_run: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -28,6 +30,7 @@ pub struct ProduceOptions {
     pub build_run: String,
     pub output: PathBuf,
     pub host_env: Option<PathBuf>,
+    pub verified: bool,
 }
 
 pub struct TargetInput {
@@ -119,6 +122,12 @@ pub fn contribute(options: &ProduceOptions, runner: &ProcessRunner) -> Result<Va
         info.target == target.triple(),
         "Native producer target differs"
     );
+    if options.verified {
+        ensure!(
+            info.source_verified,
+            "Verified contribution requires a frozen source build"
+        );
+    }
     copy_tree(&notices, &directory.join("notices"), &|_| false, false)?;
     let settings = pins(&root)?;
     let receipt = verify_notice_set(
@@ -152,6 +161,7 @@ pub fn contribute(options: &ProduceOptions, runner: &ProcessRunner) -> Result<Va
         binary_sha256: id.sha256,
         binary_size,
         build_info: info,
+        verified: options.verified,
         notice_set_sha256: options.notice_set_sha256.clone(),
         build_run: options.build_run.clone(),
         host_env,
@@ -159,6 +169,22 @@ pub fn contribute(options: &ProduceOptions, runner: &ProcessRunner) -> Result<Va
     let bytes = json_bytes(&receipt)?;
     ensure!(bytes.len() <= 64 * 1024, "Producer receipt too large");
     write_atomic(&directory.join("producer.json"), &bytes, 0o644)?;
+    if options.verified {
+        verify_source_checkout(
+            &root,
+            receipt
+                .build_info
+                .source_commit
+                .as_deref()
+                .context("Missing producer commit")?,
+            receipt
+                .build_info
+                .source_tree
+                .as_deref()
+                .context("Missing producer tree")?,
+            runner,
+        )?;
+    }
     runner.check_cancelled()?;
     publish_new_directory(&directory, &output)?;
     Ok(json!({"target":target.triple(),"contributionSha256":digest(bytes)}))
@@ -203,7 +229,12 @@ impl<'a> Contribution<'a> {
             "Invalid producer executable identity for {}",
             t.triple()
         );
-        if !options.local {
+        if options.mode != AssemblyMode::Local {
+            ensure!(
+                p.verified && p.build_info.source_verified,
+                "Unverified contribution for {}",
+                t.triple()
+            );
             ensure!(
                 p.build_info.source_commit.as_deref() == Some(&options.source_commit)
                     && p.build_info.source_tree.as_deref() == Some(&options.source_tree)
@@ -304,13 +335,15 @@ pub(super) fn read_inputs<'a>(
         seen.contains(TARGET),
         "Missing canonical x86_64 contribution"
     );
-    if !options.local {
+    if options.mode != AssemblyMode::Local {
+        let required = if options.mode == AssemblyMode::Published {
+            REQUIRED_PUBLISHABLE_TARGETS
+        } else {
+            &Target::ALL
+        };
         ensure!(
-            seen == REQUIRED_PUBLISHABLE_TARGETS
-                .iter()
-                .map(|t| t.triple())
-                .collect(),
-            "Incomplete or unexpected publishable target matrix"
+            seen == required.iter().map(|t| t.triple()).collect(),
+            "Incomplete or unexpected verified target matrix"
         );
     }
     contributions.sort_by_key(Contribution::target);
@@ -329,10 +362,10 @@ mod tests {
         let receipt = json!({
             "schemaVersion":1, "target":target.triple(), "binary":target.asset(),
             "binarySha256":"1".repeat(64), "binarySize":120,
-            "buildInfo":{"schemaVersion":1,"target":target.triple(),"version":"0.6.0","sourceCommit":commit,"sourceTree":tree},
+            "verified":true,"buildInfo":{"sourceVerified":true,"schemaVersion":1,"target":target.triple(),"version":"0.6.0","sourceCommit":commit,"sourceTree":tree},
             "noticeSetSha256":"2".repeat(64), "buildRun":"workflow"
         });
-        let assembler = AssemblyOptions {
+        let mut assembler = AssemblyOptions {
             root: tmp.path().into(),
             output: tmp.path().join("set"),
             target_inputs: Vec::new(),
@@ -340,22 +373,36 @@ mod tests {
             source_commit: commit,
             source_tree: tree,
             build_run: "workflow".into(),
-            local: false,
+            mode: AssemblyMode::Published,
         };
         for (path, wrong, diagnostic) in [
-            ("/target", "aarch64-apple-darwin", "executable identity"),
-            ("/binary", "devkit", "executable identity"),
-            ("/buildInfo/target", TARGET, "executable identity"),
+            ("/verified", Value::Bool(false), "Unverified"),
+            (
+                "/buildInfo/sourceVerified",
+                Value::Bool(false),
+                "Unverified",
+            ),
+            (
+                "/target",
+                json!("aarch64-apple-darwin"),
+                "executable identity",
+            ),
+            ("/binary", json!("devkit"), "executable identity"),
+            ("/buildInfo/target", json!(TARGET), "executable identity"),
             (
                 "/buildInfo/sourceCommit",
-                "another commit",
+                json!("another commit"),
                 "Producer source",
             ),
-            ("/buildInfo/sourceTree", "another tree", "Producer source"),
-            ("/buildRun", "another workflow", "build run differs"),
+            (
+                "/buildInfo/sourceTree",
+                json!("another tree"),
+                "Producer source",
+            ),
+            ("/buildRun", json!("another workflow"), "build run differs"),
         ] {
             let mut altered = receipt.clone();
-            *altered.pointer_mut(path).unwrap() = json!(wrong);
+            *altered.pointer_mut(path).unwrap() = wrong;
             let bytes = json_bytes(&altered).unwrap();
             let input = TargetInput {
                 directory: tmp.path().into(),
@@ -363,10 +410,16 @@ mod tests {
                 sha256: digest(&bytes),
             };
             fs::write(tmp.path().join("producer.json"), bytes).unwrap();
-            let err = Contribution::read(&input, &assembler, tmp.path(), "1.99.1")
-                .err()
-                .expect("mismatched receipt");
-            assert!(err.to_string().contains(diagnostic), "{path}: {err}");
+            for mode in [AssemblyMode::Published, AssemblyMode::VerifiedPreview] {
+                assembler.mode = mode;
+                let err = Contribution::read(&input, &assembler, tmp.path(), "1.99.1")
+                    .err()
+                    .expect("mismatched receipt");
+                assert!(
+                    err.to_string().contains(diagnostic),
+                    "{mode:?} {path}: {err}"
+                );
+            }
         }
     }
 

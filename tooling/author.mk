@@ -190,14 +190,12 @@ define author_node_setup
 	    $(2) --config.package-import-method="$$method"
 endef
 
+override author_frozen_env :=
 define author_rust
 	@test -x "$$DEVKIT_AUTHOR_ENGINE" || { printf '%s\n' 'Native author engine is missing. Run make setup.' >&2; exit 1; }
 	@mkdir -p "$$DEVKIT_AUTHOR_CARGO_HOME" "$$DEVKIT_AUTHOR_TARGET" "$$DEVKIT_AUTHOR_ROOT/.artifacts/author"
 	@set -eu; read -r token < /proc/sys/kernel/random/uuid; name="devkit-author-$$token"; \
 	res_flags=$$("$$DEVKIT_AUTHOR_ENGINE" internal docker-flags --cpus 4 --memory 3072m --pids-limit 512); \
-	DEVKIT_SOURCE_COMMIT=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse HEAD); \
-	DEVKIT_SOURCE_TREE=$$(env -i PATH="$$PATH" git -C "$$DEVKIT_AUTHOR_ROOT" rev-parse 'HEAD^{tree}'); \
-	export DEVKIT_SOURCE_COMMIT DEVKIT_SOURCE_TREE; \
 	exec "$$DEVKIT_AUTHOR_ENGINE" internal guard "$$name" "$$token" -- \
 	  docker run --pull never --rm --init --name "$$name" \
 	    --label "io.docouno.devkit.invocation=$$token" \
@@ -208,7 +206,7 @@ define author_rust
 	    --volume "$$DEVKIT_AUTHOR_ROOT/.artifacts:/workspace/.artifacts:z" \
 	    --workdir /workspace --env HOME=/tmp/devkit-author-home --env CARGO_HOME=/cargo \
 	    --env CARGO_TARGET_DIR=/target --env "CARGO_BUILD_JOBS=$${CARGO_BUILD_JOBS:-2}" --env RUSTUP_AUTO_INSTALL=0 \
-	    --env DEVKIT_SOURCE_COMMIT --env DEVKIT_SOURCE_TREE \
+	    $(author_frozen_env) \
 	    "$$DEVKIT_AUTHOR_RUST_IMAGE" $(1)
 endef
 

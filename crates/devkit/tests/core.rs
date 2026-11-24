@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     compose::{ComposeNormalizer, admit_compose_inventory, capture_compose_inputs, parse_compose},
+    distribution::Target,
     files::*,
     model::*,
     project::*,
@@ -68,12 +69,33 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
         );
     }
     let engine_sha = digest(format!("fixture-engine-{version}").as_bytes());
+    let parsed = SemVer::parse(version).unwrap();
+    let multi_target = parsed >= SemVer::parse("0.6.0").unwrap();
+    let mut engine_pins = format!(
+        "DEVKIT_ENGINE_TARGET={}\nDEVKIT_ENGINE_SHA256={engine_sha}\n",
+        Target::LinuxX64.triple()
+    );
+    if multi_target {
+        let targets = Target::ALL.map(Target::triple).join(",");
+        engine_pins.push_str(&format!("DEVKIT_ENGINE_TARGETS={targets}\n"));
+        for target in Target::ALL {
+            let sha = if target == Target::LinuxX64 {
+                engine_sha.clone()
+            } else {
+                digest(format!("fixture-engine-{version}-{}", target.triple()).as_bytes())
+            };
+            engine_pins.push_str(&format!(
+                "DEVKIT_ENGINE_SHA256_{}={sha}\n",
+                target.key_suffix()
+            ));
+        }
+    }
     let recipe_hash = "b".repeat(64);
     put(
         &root,
         "runtime/toolchains.env",
         format!(
-            "DEVKIT_VERSION={version}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+            "DEVKIT_VERSION={version}\n{engine_pins}DEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
         )
         .as_bytes(),
     );
@@ -164,16 +186,18 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             bytes.as_bytes(),
         );
     }
-    if SemVer::parse(version).unwrap() >= SemVer::parse("0.5.0").unwrap() {
-        let pin = devkit::runtime::PnpmPin::from_source_pins(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap(),
-        )
-        .unwrap();
-        put(&root, "runtime/pnpm.env", pin.encode().as_bytes());
+    if parsed >= SemVer::parse("0.5.0").unwrap() {
+        use devkit::runtime::PnpmPin;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        let pins = if multi_target {
+            PnpmPin::release_env_from_source(source).unwrap()
+        } else {
+            PnpmPin::from_source_pins(source).unwrap().encode()
+        };
+        put(&root, "runtime/pnpm.env", pins.as_bytes());
     }
     seal(&root, version);
     root

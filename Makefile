@@ -5,7 +5,7 @@ include toolchains.env
 include tooling/author.mk
 
 .PHONY: verify-engine fix-rust-format publish-inputs-guard local-inputs-guard pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
-	test-env test-npm-inputs build build-target local-contribution build-fixtures build-controller pnpm-lock npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
+	test-env test-npm-inputs build build-target frozen-notices pack-preview local-contribution build-fixtures build-controller pnpm-lock npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
 	@printf '%s\n' 'Devkit author workspace (Linux x86_64 or ARM64 + Docker Compose >=5.0.0 + Python 3)' \
@@ -13,10 +13,11 @@ help:
 	  'make fix-format     Apply source formatting explicitly' \
 	  'make check          Rust fmt/Clippy and env declarations/lint/format/shell checks' \
 	  'make test           Native units, Cargo/Git/strace gates and Node env/npm tests' \
-	  'make build          Build the attributed static release ELF, offline' \
-	  'make build-target output=/absolute/new/contribution  Build a native target and notices' \
+	  'make build          Build the local static engine, offline' \
+	  'make build-target output=/absolute/new/contribution  Build a verified native contribution from clean HEAD' \
 	  'make pack target_inputs="triple:dir:sha ..." output=/new/set [npm_inputs=/dir]  Assemble native contributions' \
-	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished preview' \
+	  'make pack-preview target_inputs="triple:dir:sha ..." output=/new/set  Verify all three targets for host testing' \
+	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished development build' \
 	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.5.1/payload baseline_set=/absolute/v0.5.1' \
 	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.5.1' \
 	  'make verify-public from_version=0.5.1 version=0.6.0 expected_index_sha256=SHA256' \
@@ -125,14 +126,18 @@ npm-inputs:
 	$(call author_node,bridge,node tooling/prepare-npm-inputs.mjs --root /workspace --version "$$DEVKIT_RELEASE_VERSION" --output "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-npm" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-npm-producer.json")
 notices: build
 	$(call author_rust,sh -ec 'exec "$$1" internal collect-notices --root /workspace --cargo-home /cargo --rust-docs "$$(rustc --print sysroot)/share/doc/rust" --rust-version "$$2" --output "$$3"' sh "/target/$$DEVKIT_AUTHOR_TRIPLE/release/devkit" "$$DEVKIT_RUST_VERSION" "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-notices" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notice-producer.json")
-build-target: pack-guard notices build-controller build-fixtures
-	$(call contribute,$$DEVKIT_ASSEMBLY_OUTPUT)
+# Only the isolated producer invokes this target in its fresh committed checkout.
+frozen-notices: override author_frozen_env := --env DEVKIT_FROZEN_COMMIT --env DEVKIT_FROZEN_TREE
+frozen-notices: notices
+build-target: pack-guard build-controller build-fixtures
+	@python3 tooling/frozen-producer.py "$$DEVKIT_ASSEMBLY_OUTPUT"
 local-contribution: notices
 	$(call contribute,$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-contribution)
-pack: override export DEVKIT_ASSEMBLE_LOCAL :=
-pack: publish-inputs-guard pack-guard $(if $(filter undefined,$(origin npm_inputs)),npm-inputs)
+pack: override export DEVKIT_ASSEMBLY_MODE := publish
+pack-preview: override export DEVKIT_ASSEMBLY_MODE := preview
+pack pack-preview: publish-inputs-guard pack-guard $(if $(filter undefined,$(origin npm_inputs)),npm-inputs)
 	@python3 tooling/assemble.py
-pack-local: override export DEVKIT_ASSEMBLE_LOCAL := --local
+pack-local: override export DEVKIT_ASSEMBLY_MODE := local
 pack-local: local-inputs-guard pack-guard $(if $(strip $(value target_inputs)),,local-contribution) $(if $(filter undefined,$(origin npm_inputs)),npm-inputs)
 	@python3 tooling/assemble.py
 publish-inputs-guard:

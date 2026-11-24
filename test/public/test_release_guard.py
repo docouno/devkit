@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 from pathlib import Path
 import re
 import subprocess
@@ -95,6 +96,40 @@ class HiddenArtifactGuard(unittest.TestCase):
             self.assertEqual(missing_hidden_upload_flags(template.format(path)), [path])
         self.assertEqual(missing_hidden_upload_flags(template.format("reports/receipt.json")), [])
         self.assertEqual(missing_hidden_upload_flags(template.format("|\n        reports/receipt.json\n        !.private/**")), [])
+
+
+class NativeProducerGuard(unittest.TestCase):
+    def test_verified_checkout_ignores_local_artifacts_and_rejects_hidden_source_changes(self):
+        producer = runpy.run_path(str(REPO / "tooling/frozen-producer.py"))
+        with tempfile.TemporaryDirectory(prefix="devkit-producer-") as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            source.mkdir()
+
+            def git(*args):
+                return subprocess.check_output(["git", "-C", source, *args], text=True).strip()
+
+            git("init", "--quiet")
+            (source / "engine.rs").write_text("committed")
+            (source / ".gitignore").write_text(".artifacts/\n")
+            git("add", ".")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "--quiet", "-m", "fixture")
+            artifacts = source / ".artifacts"
+            artifacts.mkdir()
+            (artifacts / "stale-compiler-output").write_text("unverified")
+            stage = artifacts / "snapshot"
+            self.assertEqual(producer["checkout"](source, stage), (git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")))
+            self.assertFalse((stage / ".artifacts").exists())
+            for name, flag in [("assumed", "assume-unchanged"), ("skipped", "skip-worktree")]:
+                git("update-index", "--" + flag, "engine.rs")
+                (source / "engine.rs").write_text("different")
+                self.assertEqual(git("status", "--porcelain"), "")
+                with self.assertRaisesRegex(SystemExit, "Tracked producer source differs"):
+                    producer["checkout"](source, artifacts / name)
+                self.assertEqual((stage / "engine.rs").read_text(), "committed")
+                (source / "engine.rs").write_text("committed")
+                git("update-index", "--no-" + flag, "engine.rs")
 
 
 class RequiredNativeCheckGuard(unittest.TestCase):

@@ -3,7 +3,7 @@
 use crate::{
     Result, cache::ReleaseCache, delivery, distribution, files::*, processes::ProcessRunner, state,
 };
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -565,23 +565,7 @@ fn try_dispatch_info(
         if SemVer::parse(&header.version)? < SemVer::parse("0.5.0")? {
             return Ok(None);
         }
-        let pins_name = ".devkit/runtime/toolchains.env";
-        let Some(expected_pins) = header.managed.get(pins_name) else {
-            return Ok(None);
-        };
-        let Some((pins_bytes, pins_id)) =
-            read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
-        else {
-            return Ok(None);
-        };
-        if !pins_id.matches_git_tracked(expected_pins) {
-            return Ok(None);
-        }
-        let pins = crate::runtime::EnginePins::parse(&pins_bytes)?;
-        if pins.version != header.version {
-            return Ok(None);
-        }
-        let pin = pins.for_target(distribution::Target::host()?)?;
+        let pin = accepted_host_pin(&root, &header)?;
         if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some()
             || delivery::current_engine_digest()? == pin.sha256
         {
@@ -661,27 +645,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     };
     state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
     let header = state::read_accepted_header(&root)?;
-    let name = ".devkit/runtime/toolchains.env";
-    let path = safe_path(&root, name)?;
-    let conflict_msg = || {
-        format!(
-            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
-        )
-    };
-    let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
-    let (pins_bytes, pins_id) =
-        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
-    ensure!(
-        pins_id.matches_git_tracked(expected_pins),
-        "{}",
-        conflict_msg()
-    );
-    let pins = crate::runtime::EnginePins::parse(&pins_bytes)?;
-    ensure!(
-        pins.version == header.version,
-        "Accepted version differs from toolchain pins"
-    );
-    let pin = pins.for_target(distribution::Target::host()?)?;
+    let pin = accepted_host_pin(&root, &header)?;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(
@@ -722,6 +686,29 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     use std::os::unix::process::CommandExt;
     crate::processes::restore_self_exec(runner, &mut command)?;
     Err(command.exec()).context("Cannot execute the accepted native engine")
+}
+
+pub(crate) fn accepted_host_pin(
+    root: &std::path::Path,
+    header: &state::AcceptedManifestHeader,
+) -> Result<delivery::EnginePin> {
+    let name = ".devkit/runtime/toolchains.env";
+    let path = safe_path(root, name)?;
+    let conflict_msg = || {
+        format!(
+            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
+        )
+    };
+    let expected = header.managed.get(name).with_context(conflict_msg)?;
+    let (bytes, id) =
+        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
+    ensure!(id.matches_git_tracked(expected), "{}", conflict_msg());
+    let pins = crate::runtime::EnginePins::parse(&bytes)?;
+    ensure!(
+        pins.version == header.version,
+        "Accepted version differs from toolchain pins"
+    );
+    pins.for_target(distribution::Target::host()?)
 }
 
 fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Result<bool> {
@@ -826,9 +813,10 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     "--build-run",
                     "--output",
                     "--host-env",
+                    "--verified",
                 ],
                 &[],
-                &[],
+                &["--verified"],
             )?;
             ensure!(
                 options.target.is_none(),
@@ -843,6 +831,7 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     build_run: options.required("--build-run")?.to_owned(),
                     output: options.required_path("--output")?,
                     host_env: options.path("--host-env"),
+                    verified: options.flag("--verified"),
                 },
                 runner,
             )?;
@@ -860,9 +849,10 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     "--source-tree",
                     "--build-run",
                     "--local",
+                    "--verified-preview",
                 ],
                 &["--target-input"],
-                &["--local"],
+                &["--local", "--verified-preview"],
             )?;
             ensure!(
                 options.target.is_none(),
@@ -881,7 +871,12 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     source_commit: options.required("--source-commit")?.to_owned(),
                     source_tree: options.required("--source-tree")?.to_owned(),
                     build_run: options.required("--build-run")?.to_owned(),
-                    local: options.flag("--local"),
+                    mode: match (options.flag("--local"), options.flag("--verified-preview")) {
+                        (false, false) => crate::assembler::AssemblyMode::Published,
+                        (true, false) => crate::assembler::AssemblyMode::Local,
+                        (false, true) => crate::assembler::AssemblyMode::VerifiedPreview,
+                        (true, true) => bail!("Choose one assembly mode"),
+                    },
                 },
                 runner,
             )?;

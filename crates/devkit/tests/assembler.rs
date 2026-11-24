@@ -290,7 +290,7 @@ fn an_existing_output_is_never_replaced_even_when_it_is_empty() {
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     assert!(
@@ -351,7 +351,7 @@ fn runtime_notices_refuse_empty_missing_and_symlinked_sources_before_staging() {
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     let names = ["Apache-2.0.txt", "moby-profiles.NOTICE"];
@@ -611,7 +611,7 @@ fn assembler_requires_the_external_contribution_digest_before_downstream_inputs_
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     assert!(

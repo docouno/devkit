@@ -112,7 +112,7 @@ darwin_file() {
     sub stamp {
       return "" unless @_ && S_ISREG($_[2]);
       # Preserve all time precision exposed by Time::HiRes.
-      return sprintf "%s/%s:%s:%s/%s", @_[3,0,1,7],
+      return sprintf "%s/%s:%s:%s:%o/%s", @_[3,0,1,7], $_[2] & 07777,
         unpack("H*", pack("dd", @_[9,10]));
     }
     my @initial = lstat($path);
@@ -319,10 +319,14 @@ cache_path() {
         my @info = lstat($path);
         exit 1 if !@info && !$!{ENOENT};
         if (@info && S_ISLNK($info[2])) {
-          exit 1 if @parts || $name !~ /\A(?:tmp|var|etc)\z/;
+          my $alias = lc $name;
+          exit 1 if @parts || $alias !~ /\A(?:tmp|var|etc)\z/;
+          my @system = lstat("/$alias");
+          exit 1 unless @system && $system[0] == $info[0] && $system[1] == $info[1];
           my $dest = readlink($path);
-          exit 1 unless defined($dest) && ($dest eq "private/$name" || $dest eq "/private/$name");
+          exit 1 unless defined($dest) && ($dest eq "private/$alias" || $dest eq "/private/$alias");
           push @parts, "private";
+          $name = $alias;
           @info = lstat("/private/$name");
           exit 1 unless @info && S_ISDIR($info[2]);
         }
@@ -349,7 +353,7 @@ engine_metadata() {
   if [ "$host_os" = Darwin ]; then
     darwin_file stamp "$engine" 134217728
   else
-    stat -c '%h/%d:%i:%s/%z' -- "$engine"
+    stat -c '%h/%d:%i:%s:%a/%z' -- "$engine"
   fi
 }
 engine_link_settled() {
@@ -362,6 +366,9 @@ engine_link_settled() {
 valid_engine_once() {
   [ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || return 1
   engine_stamp=$(engine_metadata) || return 1
+  if [ -z "${DEVKIT_ENGINE_PATH:-}" ]; then
+    case "$engine_stamp" in *:755/*) ;; *) return 1 ;; esac
+  fi
   if [ "$host_os" = Darwin ]; then
     observed=$(darwin_file hash "$engine" 134217728 "$engine_stamp") || return 1
     [ "$observed" = "$expected" ]
@@ -373,9 +380,9 @@ valid_engine_once() {
     set -eu
     exec 3<"$1"
     fd=/proc/$$/fd/3
-    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s:%a/%z" -- "$fd")" = "$2" ]
     head -c 134217729 <&3 | sha256sum
-    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s:%a/%z" -- "$fd")" = "$2" ]
   ' sh "$engine" "$engine_stamp") || return 1
   [ "${observed%% *}" = "$expected" ] && [ "$(engine_metadata)" = "$engine_stamp" ]
 }

@@ -275,7 +275,7 @@ class Harness:
         require(worktree['standState'] == 'stopped' and len(worktree['standPorts']) == 1, 'Cold Worktrunk reservation was not available on return')
         run('worktrunk-remove-cold', [wt, 'remove', '--foreground', '--yes', 'approved'])
         require(not approved.exists(), 'Worktrunk did not complete removal')
-    def verify_node_recovery(self):
+    def verify_node_recovery(self, target_source):
         target = self.scratch / 'genuine-node-migration'
         env = self.environment('genuine-node-migration')
         sdk_env = {key: value for key, value in env.items() if key not in ('HTTPS_PROXY', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE')}
@@ -287,7 +287,7 @@ class Harness:
         loader = '.devkit/runtime/devkit.sh'
         projection = '.devkit/runtime/devkit.mk'
         manifest = '.devkit/manifest.json'
-        self.run('genuine-node-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive'],
+        self.run('genuine-node-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive', *target_source],
                  cwd=target, env=env, timeout=360)
         old = json.loads((saved / manifest).read_bytes())
         new = json.loads((target / manifest).read_bytes())
@@ -375,6 +375,18 @@ class Harness:
         old_loader = baseline / '.devkit/runtime/devkit.sh'
         old_bytes = old_loader.read_bytes()
         bridge = ['sh', old_loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive']
+        target_source = []
+        if not self.index['publicationEligible']:
+            previous_requests = len(self.fixture.requests)
+            old_manifest = (baseline / '.devkit/manifest.json').read_bytes()
+            self.run('genuine-project-loader-refuses-unpublished-index', [*bridge, '--preview'],
+                     cwd=baseline, env=bridge_env, expected='Release index version/provenance differs')
+            require(self.fixture.requests[previous_requests:] == [self.index_route],
+                    'The old loader must reject the unpublished index before downloading its archive')
+            require(old_loader.read_bytes() == old_bytes and (baseline / '.devkit/manifest.json').read_bytes() == old_manifest,
+                    'Rejected online preview changed the accepted checkout')
+            target_source = ['--release-root', self.payload]
+            bridge.extend(target_source)
         self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
         require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
         self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
@@ -382,7 +394,7 @@ class Harness:
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
-        self.verify_node_recovery()
+        self.verify_node_recovery(target_source)
 
     def verify_version_floor(self):
         pre_050 = self.scratch / 'pre-050-checkout'

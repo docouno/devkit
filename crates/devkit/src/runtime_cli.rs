@@ -221,11 +221,20 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         if let Some(cache_dir) = cache_dir {
             make.env("DEVKIT_CACHE_DIR", cache_dir);
         }
+        let root = crate::files::project_root(&request.root)?;
         crate::state::ensure_supported_checkout_floor(
-            &crate::files::project_root(&request.root)?,
+            &root,
             false,
             crate::state::MIN_SUPPORTED_PROJECT_VERSION,
         )?;
+        // An older loader cannot explain a missing host target. Other checkout
+        // diagnostics, including custom help and repair prerequisites, belong to Make.
+        if let Err(error) = crate::state::read_accepted_header(&root)
+            .and_then(|header| crate::cli::accepted_host_pin(&root, &header))
+            && crate::cli::error_code(&error) == "UNSUPPORTED_HOST_TARGET"
+        {
+            return Err(error);
+        }
         crate::processes::restore_exec_pdeathsig(runner)?;
         // Make owns its signal/exit behavior and the actual DAG. Native leaves
         // supervise their own children; no second controller kills their cleanup.

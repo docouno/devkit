@@ -146,9 +146,9 @@ Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI
 
 ## Devkit release verification on Apple Silicon
 
-The host-only job on `macos-15` exercises the native CLI and the stock shell and Make entry points. The Docker gate uses a native Linux runner and an Apple Silicon host with a local Linux Docker VM. Both machines need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
+The host-only job on `macos-15` exercises the native CLI and the stock shell and Make entry points. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
 
-On Linux, take the preview artifact name and its index SHA-256 from the Actions assembly summary for the candidate run. Set `run_id`, `preview_artifact`, and `preview_sha256` to those values, and set `mac_host` to the Mac's SSH address. From the candidate checkout, download the preview and export a consumer bundle. This command exercises one generated fullstack web project on Linux and records its commit. The regular Linux verification bundle belongs to a different release identity.
+On Linux x86-64, take the run ID, three-target preview artifact name, and preview index SHA-256 from the candidate Actions run and its assembly summary. Set `run_id`, `preview_artifact`, and `preview_sha256` accordingly. From the candidate checkout, generate a fullstack web project, run its gates, and send the preview, Git bundle, and x86-64 receipt to the ARM64 runner at `linux_arm_host`.
 
 ```sh
 handoff="$PWD/.artifacts/devkit-preview-handoff"
@@ -159,10 +159,21 @@ python3 test/packaged/darwin_vm.py \
   --build-set "$handoff/preview" \
   --expected-index-sha256 "$preview_sha256" \
   --export-checkout-bundle "$handoff/checkout.bundle"
+scp -r "$handoff" "$linux_arm_host:."
+```
+
+On Linux ARM64, set `preview_sha256` from the same assembly summary. Run from the candidate checkout and copy the handoff, now including both Linux receipts, to the Mac at `mac_host`.
+
+```sh
+handoff="$HOME/devkit-preview-handoff"
+python3 test/packaged/darwin_vm.py \
+  --build-set "$handoff/preview" \
+  --expected-index-sha256 "$preview_sha256" \
+  --checkout-bundle "$handoff/checkout.bundle"
 scp -r "$handoff" "$mac_host:."
 ```
 
-On the Mac, set `preview_sha256` from the same assembly summary. Run the following from the candidate checkout with the name of the local VM's Docker context. Each host verifies the frozen files, extracts the release into its own scratch directory, and checks its manifest and engine digests before executing it.
+On the Mac, set `preview_sha256` from the same assembly summary. Run from the candidate checkout using the name of the local VM's Docker context. Each host verifies the frozen assets and the extracted manifest and engines before executing the preview.
 
 ```sh
 python3 test/packaged/darwin_vm.py \
@@ -172,4 +183,4 @@ python3 test/packaged/darwin_vm.py \
   --docker-context desktop-linux
 ```
 
-Keep the Linux `linux-bundle.json` and Mac `darwin-vm.json` receipts printed under `.artifacts/packaged`. Their index digest, release identity and checkout commit must match. Publication of the Darwin binary requires a successful Docker run on the candidate bytes.
+Keep the two `checkout.bundle.<target>.json` receipts beside the bundle and the Mac's `darwin-vm.json` receipt printed under `.artifacts/packaged`. The Mac gate verifies that both Linux receipts identify the same preview index, release identity, and consumer commit as its own run. Publication of the Darwin binary requires this gate to pass on the candidate bytes.

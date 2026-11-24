@@ -87,12 +87,14 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   delivery-linux-arm64:
+    needs: source-linux-amd64
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
       group: delivery
       platform: arm64
       native: ${{ inputs.arm64 }}
+      legacy_checkout_artifact: ${{ needs.source-linux-amd64.outputs.legacy_checkout_artifact }}
 
   delivery:
     name: delivery
@@ -162,6 +164,7 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   darwin-host:
+    needs: source-linux-amd64
     runs-on: macos-15
     timeout-minutes: 30
     env:
@@ -178,6 +181,11 @@ jobs:
         with:
           name: ${{ env.PREVIEW_ARTIFACT }}
           path: .artifacts/preview
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        if: env.PREVIEW_ARTIFACT != ''
+        with:
+          name: ${{ needs.source-linux-amd64.outputs.legacy_checkout_artifact }}
+          path: .artifacts/legacy-handoff
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         if: env.PREVIEW_ARTIFACT != ''
         with:
@@ -195,6 +203,7 @@ jobs:
           mkdir "$dir/payload"
           tar -xzf "$dir/$archive" --strip-components=1 -C "$dir/payload"
           python3 test/darwin/verify.py --build-set "$dir"
+          python3 test/bootstrap/legacy_checkout.py verify --release "$dir/payload" --bundle .artifacts/legacy-handoff/legacy.bundle
       - name: Verify stock host entry points for a restored Linux release
         if: env.PREVIEW_ARTIFACT == ''
         run: python3 test/bootstrap/portable.py

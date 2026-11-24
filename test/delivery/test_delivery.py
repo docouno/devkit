@@ -418,7 +418,7 @@ class ReleaseFixture:
 
 class DeliveryTests(ReleaseFixture, unittest.TestCase):
     @unittest.skipUnless(DOCKER_ENABLED and host_target() == LINUX_X64 and os.environ.get("DEVKIT_BASELINE_SET"), "Requires the real baseline and Docker")
-    def test_legacy_volume_survives_native_update_and_git_delivery(self):
+    def test_baseline_stand_volume_survives_native_update_and_git_delivery(self):
         baseline = Path(os.environ["DEVKIT_BASELINE_SET"]) / "payload"
         old_engine = baseline / "devkit"
         upgraded = None
@@ -484,7 +484,10 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
                 mounts = json.loads(run("docker", "container", "inspect", cid).stdout)[0]["Mounts"]
                 self.assertEqual(next(m["Name"] for m in mounts if m["Destination"] == "/state"), volume)
                 run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".")
-                self.assertEqual(run("docker", "volume", "inspect", volume).returncode, 0)
+                # The 0.5.1 stand owns this volume. Explicit retirement removes it
+                # after both update routes have preserved the original name and data.
+                remaining = run("docker", "volume", "ls", "--quiet", "--filter", f"label={label}={token}")
+                self.assertNotIn(volume, remaining.stdout.splitlines())
                 self.assertEqual(find_actor(), "")
             finally:
                 run("make", "down", check=False)

@@ -9,44 +9,53 @@ import subprocess
 import tarfile
 
 from verify import Verification, require
-from release_targets import DARWIN_ARM64, executable_header_matches, host_target, payload_engine
+from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, payload_engine
 
 
-def check_vm(test, context, daemon, bundle):
-    require(test.run("vm-worktrunk-version", ["wt", "--version"]).split()[1] == "0.74.0",
-            "Use Worktrunk 0.74.0 for the generated hook proof")
-    test.run("vm-compose-version", ["docker", "compose", "version"])
-    test.run("vm-system-make", ["make", "--version"])
-    project = test.create("fullstack", "vm-desktop")
-    # Force the store selector to exercise its bounded-common-ancestor fallback.
-    # These siblings all belong to the disposable harness.
-    for n in range(257):
-        (test.scratch / f"sibling-{n}").mkdir()
-    (project / ".npmrc").unlink(missing_ok=True)
-    npmrc = project / ".NPMRC"
-    npmrc.write_text("@vm-proof:registry=https://registry.npmjs.org/\n")
-    if not (project / ".npmrc").exists():
-        (project / ".npmrc").write_bytes(npmrc.read_bytes())
+def check_vm_npmrc(test, project):
+    lower, upper = project / ".npmrc", project / ".NPMRC"
+    lower.unlink(missing_ok=True)
+    upper.write_text("@vm-proof:registry=https://registry.npmjs.org/\n")
+    exec_node = [payload_engine(test.manager), "exec", "--root", project,
+                 "--component", "apps/web", "--network", "bridge", "--prepare", "--", "node", "-e"]
+    case_sensitive = not lower.exists()
+    if case_sensitive:
+        test.run("vm-uppercase-only-mask", [*exec_node,
+                 "const f=require('node:fs'),a=require('node:assert/strict');"
+                 "a.equal(f.readFileSync('/workspace/.NPMRC','utf8'),'');"
+                 "a.equal(f.existsSync('/workspace/.npmrc'),false)"])
+        require(not lower.exists(), "The read-only probe created a lowercase .npmrc")
+        upper.rename(lower)
     ca = test.scratch / "fixture-ca.pem"
     test.run("vm-fixture-ca", ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
              "-subj", "/CN=VM Acceptance Fixture", "-keyout", test.scratch / "fixture.key", "-out", ca])
     test.environment["DEVKIT_CA_CERT"] = str(ca)
     probe = ("const f=require('node:fs'),a=require('node:assert/strict');"
-             "for(const n of ['.npmrc','.NPMRC'])a.equal(f.readFileSync('/workspace/'+n,'utf8'),'');"
+             "for(const n of process.argv.slice(1))a.equal(f.readFileSync('/workspace/'+n,'utf8'),'');"
              "a.match(f.readFileSync('/devkit/user.npmrc','utf8'),/@vm-proof:registry=/);"
              "a.match(f.readFileSync('/devkit/ca.pem','utf8'),/BEGIN CERTIFICATE/)")
-    test.run("vm-userconfig-ca-and-masks", [payload_engine(test.manager), "exec", "--root", project,
-             "--component", "apps/web", "--network", "bridge", "--prepare", "--", "node", "-e", probe])
-    lower = project / ".npmrc"
+    names = [".npmrc"] if case_sensitive else [".npmrc", ".NPMRC"]
+    test.run("vm-userconfig-ca-and-masks", [*exec_node, probe, *names])
     accepted = lower.read_bytes()
     try:
         lower.write_text("registry=http://127.0.0.1:8080/\n")
         test.make(project, "setup", expected="macOS host loopback", label="vm-loopback-registry-refusal")
     finally:
         lower.write_bytes(accepted)
+
+
+def check_vm(test, context, daemon, bundle):
+    require(test.run("vm-worktrunk-version", ["wt", "--version"]).split() == ["wt", "v0.74.0"],
+            "Use Worktrunk 0.74.0 for the generated hook proof")
+    test.run("vm-compose-version", ["docker", "compose", "version"])
+    test.run("vm-system-make", ["make", "--version"])
+    project = test.create("fullstack", "vm-desktop")
+    # Force the store selector to exercise its bounded-common-ancestor fallback.
+    for n in range(257):
+        (test.scratch / f"sibling-{n}").mkdir()
+    check_vm_npmrc(test, project)
     (project / ".env").write_text("VM_ACCEPTANCE=yes\n")
-    (project / "compose.yaml").write_text(
-        'services:\n  web:\n    environment:\n      VM_ACCEPTANCE: "${VM_ACCEPTANCE:?}"\n')
+    (project / "compose.yaml").write_text("services:\n  web:\n    env_file: [.env]\n")
     test.healthy(project, "vm-desktop")
     store = project / ".devkit/cache/pnpm-store"
     local = project / "apps/desktop/node_modules/electron/dist/icudtl.dat"
@@ -72,8 +81,11 @@ def check_vm(test, context, daemon, bundle):
         for name in ("desktop", "web", "api"):
             require(test.inspect("container", test.service(project, name))["State"]["Running"],
                     f"VM stand service {name} did not start")
-        web = test.inspect("container", test.service(project, "web"))
+        web_id = test.service(project, "web")
+        web = test.inspect("container", web_id)
         require("VM_ACCEPTANCE=yes" in web["Config"]["Env"], "Compose lost project-owned .env")
+        require(test.run("vm-web-dotenv", ["docker", "exec", web_id, "cat", "/workspace/.env"])
+                == (project / ".env").read_text(), "The web container cannot read the project-owned .env")
         test.make(project, "status", label="vm-stand-status")
     finally:
         test.make(project, "down", label="vm-stand-down")
@@ -90,34 +102,69 @@ def check_vm(test, context, daemon, bundle):
             "budget": budget, "store": str(store), "crossHostCommit": commit}
 
 
+def bundle_commit(bundle):
+    heads = subprocess.check_output(["git", "bundle", "list-heads", bundle, "refs/heads/main"], text=True).split()
+    require(len(heads) == 2 and heads[1] == "refs/heads/main", "Bundle must contain the consumer main branch")
+    return heads[0]
+
+
+def receipt_path(bundle, target):
+    return bundle.with_name(f"{bundle.name}.{target}.json")
+
+
+def read_linux_proof(bundle, target, index_sha, identity, commit):
+    path = receipt_path(bundle, target)
+    proof = json.loads(path.read_text())
+    require(proof["passed"] is True and proof["target"] == target and proof["helper"]["target"] == target
+            and proof["indexSha256"] == index_sha and proof["releaseIdentity"] == identity
+            and proof["commit"] == commit, f"Linux proof does not match the preview and consumer commit: {path}")
+    return proof
+
+
+def check_linux(args, target):
+    require(not args.docker_context, "--docker-context selects the Mac VM")
+    export = args.export_checkout_bundle
+    if export:
+        require(not export.exists(), "Cross-host bundle already exists")
+    bundle = (export or args.checkout_bundle).resolve(strict=not export)
+    helper = Verification(args.build_set, preview_index_sha256=args.expected_index_sha256)
+    try:
+        if export:
+            helper.cross_host_checkout(export=bundle)
+        else:
+            other = LINUX_ARM64 if target == LINUX_X64 else LINUX_X64
+            read_linux_proof(bundle, other, args.expected_index_sha256, helper.release_identity, bundle_commit(bundle))
+            # The preview is unpublished. Prime the isolated host cache through a local Rust-only init.
+            helper.run("prime-preview-cache", [payload_engine(helper.manager), "init", helper.scratch / "prime",
+                       "--app", "api=rust-api", "--release-root", helper.manager, "--package-source", "local",
+                       "--offline", "--non-interactive"])
+            helper.cross_host_checkout(imported=bundle)
+        require(not helper.forbidden_log.exists(), "Attempted to use a host language SDK")
+    finally:
+        helper.cleanup()
+    proof = {**helper.results[-1], "indexSha256": args.expected_index_sha256}
+    require(proof["commit"] == bundle_commit(bundle), "Verified checkout and transfer bundle disagree")
+    path = receipt_path(bundle, target)
+    path.write_text(json.dumps(proof, indent=2) + "\n")
+    print("Verified checkout:", proof["commit"], "Linux evidence:", path, flush=True)
+    shutil.rmtree(helper.scratch)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-set", type=Path, required=True)
     parser.add_argument("--expected-index-sha256", required=True)
     bundle = parser.add_mutually_exclusive_group(required=True)
     bundle.add_argument("--export-checkout-bundle", type=Path,
-                        help="Create and verify a Linux consumer checkout for transfer to the Mac")
-    bundle.add_argument("--checkout-bundle", type=Path, help="Verify the transferred Linux checkout on the Mac")
+                        help="Create and verify the shared consumer checkout on the first Linux host")
+    bundle.add_argument("--checkout-bundle", type=Path, help="Verify the shared checkout on the next host")
     parser.add_argument("--docker-context", help="Named local Docker context on the Mac")
     args = parser.parse_args()
-    if args.export_checkout_bundle:
-        require(host_target() != DARWIN_ARM64 and not args.docker_context,
-                "Export the checkout from a native Linux runner")
-        require(not args.export_checkout_bundle.exists(), "Cross-host bundle already exists")
-        helper = Verification(args.build_set, preview_index_sha256=args.expected_index_sha256)
-        try:
-            helper.cross_host_checkout(export=args.export_checkout_bundle)
-            require(not helper.forbidden_log.exists(), "Attempted to use a host language SDK")
-        finally:
-            helper.cleanup()
-        proof = {**helper.results[-1], "indexSha256": args.expected_index_sha256}
-        receipt = helper.receipt / "linux-bundle.json"
-        receipt.write_text(json.dumps(proof, indent=2) + "\n")
-        print("Exported checkout:", args.export_checkout_bundle, "commit:", proof["commit"], flush=True)
-        print("Linux bundle evidence:", receipt, flush=True)
-        shutil.rmtree(helper.scratch)
+    target = host_target()
+    if target in (LINUX_X64, LINUX_ARM64):
+        check_linux(args, target)
         return
-    require(host_target() == DARWIN_ARM64, "Run on Apple Silicon")
+    require(target == DARWIN_ARM64 and args.checkout_bundle, "Export the checkout from a native Linux runner")
     require(args.docker_context and args.docker_context != "default" and not os.environ.get("DOCKER_HOST"),
             "Use a named local Docker context without a DOCKER_HOST override")
     bundle_path = args.checkout_bundle.resolve(strict=True)
@@ -130,6 +177,9 @@ def main():
     arch = {"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64"}[daemon["Architecture"]]
     helper = Verification(args.build_set, daemon_arch=arch, scratch_parent=Path.home(),
                           preview_index_sha256=args.expected_index_sha256)
+    commit = bundle_commit(bundle_path)
+    linux_proofs = [read_linux_proof(bundle_path, t, args.expected_index_sha256, helper.release_identity, commit)
+                    for t in (LINUX_X64, LINUX_ARM64)]
     (helper.scratch / "without-host-sdks/make").symlink_to("/usr/bin/make")
     home = helper.scratch / "test home"
     home.mkdir()
@@ -138,9 +188,11 @@ def main():
                               DOCKER_CONTEXT=args.docker_context, WORKTRUNK_WORKTREE_PATH="{{ repo_path }}/.worktrees/{{ branch | sanitize }}")
     evidence = {"passed": False, "indexSha256": args.expected_index_sha256, "releaseIdentity": helper.release_identity,
                 "macOS": subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip(),
-                "dockerBackend": daemon.get("OperatingSystem"), "dockerVersion": daemon.get("ServerVersion")}
+                "dockerBackend": daemon.get("OperatingSystem"), "dockerVersion": daemon.get("ServerVersion"),
+                "linuxProofs": linux_proofs}
     try:
         evidence.update(check_vm(helper, args.docker_context, daemon, bundle_path))
+        require(evidence["crossHostCommit"] == commit, "Mac checkout differs from the two Linux proofs")
         require(not helper.forbidden_log.exists(), "Attempted to use a host language SDK")
         evidence["passed"] = True
     finally:

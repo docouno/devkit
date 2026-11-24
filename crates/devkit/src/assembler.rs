@@ -85,6 +85,13 @@ pub fn verify_migration_index(root: &Path, version: &str) -> Result<Vec<Migratio
     Ok(index.migrations)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssemblyMode {
+    Published,
+    VerifiedPreview,
+    Local,
+}
+
 pub struct AssemblyOptions {
     pub root: PathBuf,
     pub target_inputs: Vec<TargetInput>,
@@ -93,7 +100,7 @@ pub struct AssemblyOptions {
     pub source_commit: String,
     pub source_tree: String,
     pub build_run: String,
-    pub local: bool,
+    pub mode: AssemblyMode,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -804,7 +811,7 @@ fn isolated_git_command(
 }
 
 fn verify_git(options: &AssemblyOptions, root: &Path, runner: &ProcessRunner) -> Result<()> {
-    if options.local {
+    if options.mode == AssemblyMode::Local {
         return Ok(());
     }
     ensure!(
@@ -1059,7 +1066,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
     let source_version = fs::read_to_string(safe_path(&root, "VERSION")?)?;
     let workspace: toml::Value =
         toml::from_str(&fs::read_to_string(safe_path(&root, "Cargo.toml")?)?)?;
-    if !options.local {
+    if options.mode != AssemblyMode::Local {
         let root_package: Value = read_json(&safe_path(&root, "package.json")?)?;
         let cargo_version = workspace
             .get("workspace")
@@ -1231,14 +1238,8 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         "LICENSE",
     ];
     package_files.extend(contributions.iter().map(|c| c.target().payload_name()));
-    let mut os = vec!["linux"];
-    if engine_pins.contains_key(crate::distribution::Target::DarwinArm64.triple()) {
-        os.push("darwin");
-    }
-    let mut cpu = vec!["x64"];
-    if contributions.len() > 1 {
-        cpu.push("arm64");
-    }
+    let targets: Vec<_> = contributions.iter().map(|input| input.target()).collect();
+    let (os, cpu) = crate::distribution::npm_platforms(&targets);
     write_json(
         &payload.join("package.json"),
         &json!({"name":"@docouno/devkit","version":version,"description":"Pinned development environments and modular project templates for TypeScript and Rust","license":"MIT","os":os,"cpu":cpu,"bin":{"devkit":"bin/devkit"},"files":package_files,"repository":{"type":"git","url":"git+https://github.com/docouno/devkit.git"}}),
@@ -1371,7 +1372,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         source_commit: options.source_commit.clone(),
         source_tree: options.source_tree.clone(),
         build_run: options.build_run.clone(),
-        publication_eligible: !options.local,
+        publication_eligible: options.mode == AssemblyMode::Published,
         release_identity: admitted.identity.clone(),
         engine: ENGINE_ASSET.to_owned(),
         engines: Some(engines),
@@ -1383,7 +1384,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         files: assets,
     };
     index.validate()?;
-    if !options.local {
+    if options.mode == AssemblyMode::Published {
         index.validate_publishable_matrix(crate::distribution::REQUIRED_PUBLISHABLE_TARGETS)?;
     }
     runner.check_cancelled()?;

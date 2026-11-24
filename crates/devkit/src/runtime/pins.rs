@@ -138,6 +138,10 @@ impl EnginePins {
         Ok(Self { version, hashes })
     }
 
+    pub fn hashes(&self) -> &BTreeMap<String, String> {
+        &self.hashes
+    }
+
     pub fn for_target(&self, target: Target) -> Result<EnginePin> {
         let triple = target.triple();
         let sha = self

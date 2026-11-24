@@ -6,18 +6,37 @@ use std::{
 };
 
 pub(super) fn system_alias(path: PathBuf) -> Result<PathBuf> {
-    for name in ["tmp", "var", "etc"] {
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        return Ok(path);
+    }
+    if let Some(std::path::Component::Normal(first)) = components.next()
+        && let Some(name) = ["tmp", "var", "etc"]
+            .into_iter()
+            .find(|name| first.as_bytes().eq_ignore_ascii_case(name.as_bytes()))
+    {
         let alias = Path::new("/").join(name);
-        if let Ok(rest) = path.strip_prefix(&alias) {
+        let supplied = Path::new("/").join(first);
+        // On case-sensitive mounts an alternative spelling may be a different entry.
+        let metadata = |path: &Path| match fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if absent(&error) => Ok(None),
+            Err(error) => Err(error),
+        };
+        if let (Some(a), Some(b)) = (metadata(&alias)?, metadata(&supplied)?)
+            && a.is_symlink()
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+        {
             let expected = Path::new("private").join(name);
-            match fs::read_link(&alias) {
-                Ok(link) if link == expected || link == Path::new("/").join(&expected) => {
-                    return Ok(Path::new("/").join(expected).join(rest));
-                }
-                Ok(_) => bail!("Unexpected system alias: {}", alias.display()),
-                Err(error) if error.kind() == io::ErrorKind::InvalidInput || absent(&error) => {}
-                Err(error) => return Err(error.into()),
-            }
+            let absolute = Path::new("/").join(&expected);
+            let target = fs::read_link(&supplied)?;
+            ensure!(
+                target == expected || target == absolute,
+                "Unexpected system alias: {}",
+                supplied.display()
+            );
+            return Ok(absolute.join(components.as_path()));
         }
     }
     Ok(path)
@@ -38,7 +57,7 @@ pub(super) fn spelling(path: &Path) -> Result<PathBuf> {
     }
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_EVTONLY)
+        .custom_flags(libc::O_SEARCH | libc::O_NOFOLLOW)
         .open(directory)?;
     let mut bytes = [0; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH takes a PATH_MAX-byte buffer and a live directory descriptor.
@@ -137,6 +156,20 @@ mod tests {
                 canon.join("MyFile")
             );
         }
+        for name in ["TMP", "VaR", "EtC"] {
+            let supplied = Path::new("/").join(name);
+            let real = Path::new("/").join(name.to_ascii_lowercase());
+            let same_entry = fs::symlink_metadata(&supplied).is_ok_and(|m| {
+                let real = fs::symlink_metadata(&real).unwrap();
+                m.dev() == real.dev() && m.ino() == real.ino()
+            });
+            let resolved = system_alias(supplied.join("absent")).unwrap();
+            if same_entry {
+                assert_eq!(resolved, fs::canonicalize(&real).unwrap().join("absent"));
+            } else {
+                assert_eq!(resolved, supplied.join("absent"));
+            }
+        }
         symlink(&dir, t.path().join("alias")).unwrap();
         assert!(project_root(&t.path().join("alias/new")).is_err());
     }
@@ -157,11 +190,23 @@ mod tests {
             project_root(&dir),
             project_root(&fifo),
             project_root(&dir.join("second")),
+            project_root(&dir.join("absent")),
         ];
+        let mount = crate::shared_cache::mount_identity(&dir);
+        let fifo_mount = crate::shared_cache::mount_identity(&fifo);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        for (result, expected) in results
-            .into_iter()
-            .zip([dir.clone(), fifo, dir.join("second")])
+        assert_eq!(
+            mount.unwrap(),
+            crate::shared_cache::mount_identity(&root).unwrap()
+        );
+        assert_eq!(
+            fifo_mount.unwrap(),
+            crate::shared_cache::mount_identity(&root).unwrap()
+        );
+        for (result, expected) in
+            results
+                .into_iter()
+                .zip([dir.clone(), fifo, dir.join("second"), dir.join("absent")])
         {
             assert_eq!(result.unwrap(), expected);
         }

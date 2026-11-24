@@ -29,17 +29,19 @@ def verify_assembler_handoff(scratch):
               f"aarch64-unknown-linux-musl:{scratch}/native arm:{'b' * 64}"]
     npm = scratch / "npm handoff"
     output = scratch / "new set"
-    result = subprocess.run([
-        "make", "--no-print-directory", "pack", f"DEVKIT_AUTHOR_ENGINE={capture}",
-        f"output={output}", f"npm_inputs={npm}", "target_inputs=" + shlex.join(inputs),
-    ], cwd=ROOT, capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stdout + result.stderr
-    args = json.loads(result.stdout)
-    assert args[:2] == ["internal", "assemble"]
-    assert args[args.index("--npm-inputs") + 1] == str(npm)
-    assert args[args.index("--output") + 1] == str(output)
-    assert [args[i + 1] for i, arg in enumerate(args) if arg == "--target-input"] == inputs
-    assert "--local" not in args
+    for target in ("pack", "pack-preview"):
+        result = subprocess.run([
+            "make", "--no-print-directory", target, f"DEVKIT_AUTHOR_ENGINE={capture}",
+            f"output={output}", f"npm_inputs={npm}", "target_inputs=" + shlex.join(inputs),
+        ], cwd=ROOT, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stdout + result.stderr
+        args = json.loads(result.stdout)
+        assert args[:2] == ["internal", "assemble"]
+        assert args[args.index("--npm-inputs") + 1] == str(npm)
+        assert args[args.index("--output") + 1] == str(output)
+        assert [args[i + 1] for i, arg in enumerate(args) if arg == "--target-input"] == inputs
+        assert "--local" not in args
+        assert ("--verified-preview" in args) == (target == "pack-preview")
 
 
 def main():

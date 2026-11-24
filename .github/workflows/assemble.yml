@@ -191,7 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           export DEVKIT_AUTHOR_ENGINE="$PWD/.artifacts/amd64/devkit-x86_64-unknown-linux-musl"
-          make pack-local output="$PWD/.artifacts/preview" npm_inputs="$PWD/.artifacts/npm-inputs" \
+          make pack-preview output="$PWD/.artifacts/preview" npm_inputs="$PWD/.artifacts/npm-inputs" \
             target_inputs="x86_64-unknown-linux-musl:.artifacts/amd64:$AMD64 aarch64-unknown-linux-musl:.artifacts/arm64:$ARM64 aarch64-apple-darwin:.artifacts/darwin:$DARWIN" build_run="$BUILD_RUN"
           jq -e '.publicationEligible == false and (.engines | length) == 3' .artifacts/preview/release-index.json
           preview_artifact="devkit-darwin-preview-$GITHUB_RUN_ATTEMPT"

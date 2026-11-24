@@ -1,4 +1,5 @@
 //! A bounded release state machine, with provider operations at one seam.
+mod payload;
 mod provider;
 mod readiness;
 #[cfg(test)]
@@ -284,33 +285,6 @@ impl FrozenSet {
         };
         result.validate()?;
         Ok(result)
-    }
-    fn hydrate(&self) -> Result<()> {
-        let payload = self.root.join("payload");
-        if !payload.exists() {
-            archive::extract_archive(
-                &self.root.join(&self.index.archive),
-                &payload,
-                &format!("devkit-{}", self.index.version),
-            )?;
-        }
-        let admitted = devkit::release::admit_release(&payload)?;
-        ensure!(
-            admitted.identity == self.index.release_identity,
-            "Hydrated payload identity differs"
-        );
-        for target in REQUIRED_PUBLISHABLE_TARGETS {
-            let asset = self.index.engine_asset(*target)?;
-            let path = payload.join(target.payload_name());
-            devkit::delivery::verify_executable(
-                &path,
-                &self.index.files[asset].sha256,
-                *target,
-                true,
-            )
-            .with_context(|| format!("Hydrated engine differs from its frozen asset: {asset}"))?;
-        }
-        Ok(())
     }
     fn asset_names(&self) -> BTreeSet<String> {
         self.index

@@ -127,7 +127,7 @@ impl Drop for Signals {
 pub struct ProcessRunner {
     signals: Arc<Signals>,
     #[cfg(target_os = "macos")]
-    watcher: Arc<darwin::GroupWatcher>,
+    watcher: Arc<std::sync::OnceLock<std::path::PathBuf>>,
 }
 #[derive(Clone, Debug)]
 pub struct OwnedContainer {
@@ -230,7 +230,9 @@ impl ProcessRunner {
     }
     #[cfg(target_os = "macos")]
     pub fn enable_group_watcher(&self, executable: std::path::PathBuf) -> Result<()> {
-        self.watcher.enable(executable)
+        self.watcher
+            .set(executable)
+            .map_err(|_| anyhow::anyhow!("Group observer already enabled"))
     }
 
     fn spawn_creator(&self, command: &mut Command) -> Result<Creator> {
@@ -243,9 +245,7 @@ impl ProcessRunner {
         command.process_group(0);
         #[cfg(target_os = "macos")]
         {
-            let mut creator = Creator::new(self.watcher.spawn(command)?);
-            creator.watcher = Some(self.watcher.clone());
-            Ok(creator)
+            darwin::spawn(command, self.watcher.get().map(|path| path.as_path()))
         }
         #[cfg(target_os = "linux")]
         Ok(Creator::new(command.spawn()?))
@@ -888,7 +888,8 @@ impl ProcessRunner {
             (Err(primary), _) => Err(primary),
             (Ok(output), Err(cleanup)) if output.code != 0 => {
                 eprintln!("devkit: {cleanup:#}");
-                Ok(output)
+                // A failed ownership check must stop callers that retry selected exit codes.
+                output.success("Container task")
             }
             (Ok(_), Err(error)) => Err(failure(1, format!("{error:#}"))),
             (Ok(output), Ok(())) => {
@@ -1103,7 +1104,7 @@ struct Creator {
     pid: i32,
     finished: bool,
     #[cfg(target_os = "macos")]
-    watcher: Option<Arc<darwin::GroupWatcher>>,
+    observer: Option<darwin::Observer>,
 }
 impl Creator {
     fn new(child: Child) -> Self {
@@ -1113,17 +1114,18 @@ impl Creator {
             pid,
             finished: false,
             #[cfg(target_os = "macos")]
-            watcher: None,
+            observer: None,
         }
     }
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         #[cfg(target_os = "macos")]
         {
-            darwin::poll_creator(&mut self.child)
+            darwin::poll_creator(&self.child)
         }
         #[cfg(target_os = "linux")]
         self.child.try_wait()
     }
+    #[cfg(target_os = "linux")]
     fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
         // This process has no daemon-side mutation to reconcile. Stop it
         // immediately and never enter the mutation grace period on drop.
@@ -1143,6 +1145,7 @@ impl Creator {
             thread::sleep(Duration::from_millis(2));
         }
     }
+    #[cfg(target_os = "linux")]
     fn finish(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
@@ -1212,12 +1215,6 @@ impl Drop for Creator {
         {
             eprintln!("devkit: Cannot reap creator: {error:#}");
         }
-        #[cfg(target_os = "macos")]
-        if let Some(watcher) = &self.watcher
-            && let Err(error) = watcher.disarm(self.pid)
-        {
-            eprintln!("devkit: Cannot release group watch: {error:#}");
-        }
     }
 }
 fn signal_group(pid: i32, signal: i32) {
@@ -1226,11 +1223,13 @@ fn signal_group(pid: i32, signal: i32) {
         libc::kill(-pid, signal);
     }
 }
+#[cfg(target_os = "linux")]
 fn group_exists(pid: i32) -> bool {
     // SAFETY: signal 0 only probes the creator's PGID.
     let result = unsafe { libc::kill(-pid, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+#[cfg(target_os = "linux")]
 fn reap_available(pid: i32) -> Result<()> {
     loop {
         let mut status = 0;
@@ -1301,6 +1300,6 @@ pub fn restore_self_exec(runner: &ProcessRunner, command: &mut Command) -> Resul
 
 #[cfg(target_os = "macos")]
 pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
-    runner.watcher.shutdown()?;
+    // Each creator owns its observer. An exec also closes all control sockets.
     runner.check_cancelled()
 }

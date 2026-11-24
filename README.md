@@ -156,14 +156,16 @@ Run `make help` for author commands. Releases are built, tested and published th
 
 `DEVKIT_AUTHOR_PNPM_STORE` and `DEVKIT_AUTHOR_PNPM_CACHE` configure the author SDK caches for setup and subsequent Node gates, including offline integration tests. They default to `.artifacts/author/pnpm-store` and `.artifacts/author/pnpm-cache` in this checkout; external directories are mounted into the SDK containers.
 
-Build a native release contribution on each Linux architecture with `make build-target output=/absolute/new/contribution`. Each contribution contains the executable, its notices and a hashed producer receipt. Assemble the contributions from the same commit with:
+From a clean committed checkout, run `make build-target output=/absolute/new/contribution` on each native Linux architecture. The producer compiles from a fresh checkout of that commit using an empty Cargo target directory and stamps its executable with the source commit and tree. It verifies the original checkout before emitting the executable, notices and hashed receipt. Assemble the contributions for the same version, source and build run with the following command.
 
 ```sh
 make pack output=/absolute/new/build-set \
   target_inputs="x86_64-unknown-linux-musl:$amd64_dir:$amd64_sha aarch64-unknown-linux-musl:$arm64_dir:$arm64_sha"
 ```
 
-The SHA values are the producer-reported SHA-256 digests of `producer.json`. Pass `npm_inputs=/absolute/prepared/directory` to use already prepared npm inputs. For a local x86-64 preview, `make pack-local output=/absolute/new/preview` prepares a single-host set.
+The SHA values are the producer-reported SHA-256 digests of `producer.json`. Pass `npm_inputs=/absolute/prepared/directory` to use already prepared npm inputs. Use `make pack-preview` with the same arguments and a third verified Apple Silicon contribution to assemble the unpublished host-test set. In GitHub Actions, both verified assembly modes accept contributions from the same run and an equal or earlier attempt.
+
+For development on x86-64, `make pack-local output=/absolute/new/preview` builds from the current working tree. Local builds carry no verified source attribution and the resulting set has `publicationEligible: false`.
 
 The published engine targets are Linux x86-64 and ARM64. The Darwin ARM64 build is for host testing. Publishing it also requires a full run against a local Linux Docker VM on Apple Silicon.
 

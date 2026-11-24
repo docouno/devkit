@@ -81,6 +81,28 @@ def verify(directory=None):
         (project / ".devkit/manifest.json").unlink()
         os.mkfifo(project / ".devkit/manifest.json")
         run("/bin/sh", loader, "make-manifest", ok=False)
+        cache = project / "native cache"
+        cached = cache / "engines" / target / "0.6.0" / sha / "devkit"
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(recorder.read_bytes())
+        cached.chmod(0o755)
+        cached_env = dict(env, DEVKIT_ENGINE_PATH="", DEVKIT_CACHE_DIR=str(cache))
+        cli = ("/bin/sh", loader, "cli", "--offline", "--version")
+        run(*cli, environment=cached_env)
+        for mode in (0o700, 0o775, 0o644):
+            cached.chmod(mode)
+            assert "cached engine integrity differs" in run(*cli, ok=False, environment=cached_env)
+        recorder.chmod(0o700)
+        run(*cli, environment=env)
+        alias = project / "user cache alias"
+        alias.symlink_to(cache, target_is_directory=True)
+        assert "symbolic link" in run(*cli, ok=False, environment=dict(cached_env, DEVKIT_CACHE_DIR=str(alias)))
+        if platform.system() == "Darwin":
+            for name in ("tmp", "var", "etc"):
+                canonical, mixed = Path("/") / name, Path("/") / name.capitalize()
+                if mixed.is_symlink() and os.path.samestat(mixed.lstat(), canonical.lstat()):
+                    absent_cache = mixed / ("devkit-absent-" + project.name)
+                    assert "run make setup" in run(*cli, ok=False, environment=dict(cached_env, DEVKIT_CACHE_DIR=str(absent_cache)))
         print(f"PASS portable project loader and Make on {platform.system()} {platform.machine()}")
 
 

@@ -1102,12 +1102,10 @@ fn inspect_checkout_lockfree(
                     (!cmd.is_empty()).then(|| cmd.to_owned())
                 })
                 .unwrap_or_else(|| {
-                    if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET" {
-                        format!(
-                            "npx @docouno/devkit@{} update . --to {}",
-                            env!("CARGO_PKG_VERSION"),
-                            env!("CARGO_PKG_VERSION")
-                        )
+                    if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET"
+                        && let Ok(host) = Target::host()
+                    {
+                        host.checkout_upgrade_hint()
                     } else if msg.contains("Managed file conflict") {
                         "git checkout -- .devkit && make sync".into()
                     } else if msg.contains("Cargo.lock") || msg.contains("Native lock") {
@@ -1139,6 +1137,14 @@ fn inspect_checkout_lockfree(
                         owner.operation, owner.pid
                     ),
                     None,
+                )
+            } else if !ready && version.starts_with("0.5.") {
+                (
+                    "warn",
+                    format!(
+                        "Checkout Devkit {version} uses readiness receipts without platform metadata"
+                    ),
+                    Some("Run make doctor in the checkout to inspect it with its accepted Devkit version".into()),
                 )
             } else if !ready {
                 (

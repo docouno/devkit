@@ -12,6 +12,26 @@ pub const RELEASE_BASE: &str = "https://github.com/docouno/devkit/releases/downl
 /// Darwin joins the publication matrix after native Docker acceptance.
 pub const REQUIRED_PUBLISHABLE_TARGETS: &[Target] = &[Target::LinuxX64, Target::LinuxArm64];
 
+/// npm declares operating systems and CPUs separately. The launcher selects exact pairs.
+pub fn npm_platforms(targets: &[Target]) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut systems = Vec::new();
+    let mut cpus = Vec::new();
+    for target in targets {
+        let (system, cpu) = match target {
+            Target::LinuxX64 => ("linux", "x64"),
+            Target::LinuxArm64 => ("linux", "arm64"),
+            Target::DarwinArm64 => ("darwin", "arm64"),
+        };
+        if !systems.contains(&system) {
+            systems.push(system);
+        }
+        if !cpus.contains(&cpu) {
+            cpus.push(cpu);
+        }
+    }
+    (systems, cpus)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Target {
     LinuxX64,
@@ -68,6 +88,20 @@ impl Target {
             Self::DarwinArm64 => "AARCH64_APPLE_DARWIN",
         }
     }
+
+    pub(crate) fn checkout_upgrade_hint(self) -> String {
+        let version = env!("CARGO_PKG_VERSION");
+        let engine = self.payload_name();
+        if REQUIRED_PUBLISHABLE_TARGETS.contains(&self) {
+            format!(
+                "To upgrade an older checkout with a verified local release, run /path/to/release/{engine} update . --to {version} --release-root /path/to/release. After publication, run npx @docouno/devkit@{version} update . --to {version}"
+            )
+        } else {
+            format!(
+                "Use the accepted release on Linux. For a checkout older than {version}, a verified three-target preview also supports /path/to/preview/{engine} update . --to {version} --release-root /path/to/preview"
+            )
+        }
+    }
 }
 
 /// Wire readers can admit future triples without claiming to execute them.
@@ -83,12 +117,12 @@ pub fn valid_target_triple(triple: &str) -> bool {
 }
 
 pub fn missing_target(version: &str, target: Target) -> anyhow::Error {
-    let current = env!("CARGO_PKG_VERSION");
     crate::cli::error(
         "UNSUPPORTED_HOST_TARGET",
         format!(
-            "Devkit {version} has no engine for {}. Upgrade the checkout with: npx @docouno/devkit@{current} update . --to {current}",
-            target.triple()
+            "Devkit {version} has no engine for {}. {}",
+            target.triple(),
+            target.checkout_upgrade_hint()
         ),
     )
 }
@@ -99,6 +133,9 @@ pub struct BuildInfo {
     pub schema_version: u32,
     pub version: String,
     pub target: String,
+    /// Only the isolated producer builds from a fresh checkout and target directory.
+    #[serde(default)]
+    pub source_verified: bool,
     pub source_commit: Option<String>,
     pub source_tree: Option<String>,
 }
@@ -115,8 +152,10 @@ pub fn build_info() -> BuildInfo {
             "unsupported-build-target"
         }
         .to_owned(),
-        source_commit: option_env!("DEVKIT_SOURCE_COMMIT").map(str::to_owned),
-        source_tree: option_env!("DEVKIT_SOURCE_TREE").map(str::to_owned),
+        source_verified: option_env!("DEVKIT_FROZEN_COMMIT").is_some()
+            && option_env!("DEVKIT_FROZEN_TREE").is_some(),
+        source_commit: option_env!("DEVKIT_FROZEN_COMMIT").map(str::to_owned),
+        source_tree: option_env!("DEVKIT_FROZEN_TREE").map(str::to_owned),
     }
 }
 
