@@ -118,8 +118,9 @@ fn init_legacy_registry(release: &Path, target: &Path, registry: &str) -> Result
     // Resolve the registry fixture from the legacy manifests before testing migration.
     let lock_path = target.join("package-lock.json");
     fs::remove_file(&lock_path)?;
-    let pins =
-        devkit::runtime::ToolPins::parse(&fs::read(release.join("runtime/toolchains.env"))?)?;
+    let pins = devkit::runtime::ReleaseToolPins::parse(&fs::read(
+        release.join("runtime/toolchains.env"),
+    )?)?;
     let budget = devkit::resources::HostResourceBudget::probe_with_docker(
         &runner,
         &mut Command::new("docker"),

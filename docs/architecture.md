@@ -25,6 +25,8 @@ A Devkit repository contains at least one registered component across two direct
 
 `.devkit/manifest.json` records only environment identity (`version`, `releaseIdentity`), managed file digests, component roles/profiles, inter-component DAG edges (`dependencies`), and the exact `toolDependencies` subset managed inside each Node component's `devDependencies`.
 
+Starting with `0.6.0`, the accepted component profiles determine which desktop assets belong in the checkout. A registered `electron` component adds the desktop Dockerfile, seccomp profile, its Apache license and notice, the desktop recipe pin and the desktop tool service. The release always carries the complete set so registration can use the accepted payload. The checkout records the digests of its rendered pins and Compose files.
+
 Devkit deliberately avoids duplicating native package metadata in `.devkit/manifest.json`:
 
 - **Node components** share one root pnpm workspace (`pnpm-workspace.yaml` + `pnpm-lock.yaml`) with `nodeLinker: isolated` and `packageImportMethod: hardlink`. Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.

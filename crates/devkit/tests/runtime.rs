@@ -1,10 +1,28 @@
 use devkit::{
+    delivery::EnginePin,
     model::ProjectState,
     projections::render_app_compose_value,
-    runtime::{ToolPins, bind_mount, development_components, validate_compose_version},
+    runtime::{
+        CheckoutToolPins, ReleaseToolPins, bind_mount, development_components,
+        validate_compose_version,
+    },
 };
 use serde_json::json;
 use std::path::Path;
+
+fn write_runtime_stub(root: &Path, path: &str) {
+    let contents = if path.ends_with("/compose.tools.yaml") {
+        devkit::projections::render_headless_tool_compose(include_bytes!(
+            "../../../runtime/compose.tools.yaml"
+        ))
+        .unwrap()
+    } else if path.ends_with("/LICENSE") {
+        include_bytes!("../../../LICENSE").to_vec()
+    } else {
+        b"{}\n".to_vec()
+    };
+    devkit::files::write_atomic(&root.join(path), &contents, 0o644).unwrap();
+}
 
 fn modernize_node_fixture(root: &Path, state: &ProjectState) {
     if !root.join("package-lock.json").is_file() {
@@ -91,64 +109,151 @@ fn desktop_projection_always_mounts_accepted_native_engine_read_only() {
         );
     }
 }
-#[test]
-fn tool_pin_parser_never_evaluates_shell_and_requires_pinned_engine_and_images() {
-    let source = format!(
-        "DEVKIT_VERSION=0.5.0\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
+fn toolchains(ver: &str) -> String {
+    format!(
+        "DEVKIT_VERSION={ver}\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n",
         "a".repeat(64),
         "b".repeat(64),
         "c".repeat(64),
         "d".repeat(64)
-    );
-    let parsed = ToolPins::parse(source.as_bytes()).unwrap();
-    assert_eq!(parsed.engine.version, "0.5.0");
-    assert!(ToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\n").as_bytes()).is_ok());
-    assert!(ToolPins::parse(format!("{source}UNTRUSTED_PIN=1\n").as_bytes()).is_err());
+    )
+}
+
+#[test]
+fn dispatch_admits_engine_identity_and_checks_every_record_before_delegating() {
+    let source = toolchains("0.5.0");
+    let engine_only = source
+        .lines()
+        .filter(|line| line.starts_with("DEVKIT_ENGINE_") || line.starts_with("DEVKIT_VERSION="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pin = EnginePin::from_toolchains(engine_only.as_bytes()).unwrap();
+    assert_eq!(pin.version, "0.5.0");
     assert!(
-        ToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\nDEVKIT_FUTURE_PIN=2\n").as_bytes())
-            .is_err()
+        EnginePin::from_toolchains(
+            format!("{engine_only}\nDEVKIT_FUTURE_PIN=1\nDEVKIT_DESKTOP_RECIPE_HASH=future-pin\n")
+                .as_bytes()
+        )
+        .is_ok()
     );
+    for invalid in [
+        "UNTRUSTED_PIN=1",
+        "DEVKIT_FUTURE_PIN=1\nDEVKIT_FUTURE_PIN=2",
+        "DEVKIT_FUTURE_PIN=a b",
+        "DEVKIT_FUTURE_PIN='quoted'",
+        "DEVKIT_FUTURE_PIN=a\0b",
+        "DEVKIT_VERSION=0.5.0",
+    ] {
+        assert!(
+            EnginePin::from_toolchains(format!("{engine_only}\n{invalid}").as_bytes()).is_err(),
+            "{invalid}"
+        );
+    }
     let without_engine = source
         .lines()
         .filter(|line| !line.starts_with("DEVKIT_ENGINE_"))
         .collect::<Vec<_>>()
         .join("\n");
-    for ver in ["0.2.1", "0.4.1", "0.5.0"] {
+    for ver in ["0.2.1", "0.4.1", "0.5.0", "0.6.0"] {
         assert!(
-            ToolPins::parse(
+            EnginePin::from_toolchains(
                 without_engine
                     .replace("DEVKIT_VERSION=0.5.0", &format!("DEVKIT_VERSION={ver}"))
                     .as_bytes()
             )
-            .is_err(),
-            "missing DEVKIT_ENGINE_* must fail for {ver}"
+            .is_err()
         );
     }
     assert!(
-        ToolPins::parse(
+        EnginePin::from_toolchains(
             source
                 .replace("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl")
                 .as_bytes()
         )
         .is_err()
     );
-    assert!(ToolPins::parse(format!("{source}DEVKIT_VERSION=0.5.0\n").as_bytes()).is_err());
-    assert!(
-        ToolPins::parse(
-            source
-                .replace("node:24@sha256:", "$(touch/tmp/NO)@sha256:")
-                .as_bytes()
+}
+
+#[test]
+fn release_admits_required_immutable_tool_pins_and_allows_future_keys() {
+    let source = toolchains("0.6.0");
+    let pins = ReleaseToolPins::parse(source.as_bytes()).unwrap();
+    assert_eq!(pins.desktop_recipe, "c".repeat(64));
+    assert!(ReleaseToolPins::parse(format!("{source}DEVKIT_FUTURE_PIN=1\n").as_bytes()).is_ok());
+    for invalid in [
+        source.replace(&"c".repeat(64), "bad"),
+        source.replace("node:24@sha256:", "$(touch/tmp/NO)@sha256:"),
+        source.replace(&format!("@sha256:{}", "a".repeat(64)), ""),
+        source.replace("DEVKIT_DESKTOP_RECIPE_HASH=", "DEVKIT_OTHER="),
+    ] {
+        assert!(ReleaseToolPins::parse(invalid.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn checkout_admits_only_the_desktop_pin_for_its_accepted_profile_and_version() {
+    use devkit::{
+        files::{identity, write_atomic},
+        model::FileIdentity,
+    };
+
+    let checkout = tempfile::tempdir().unwrap();
+    let root = checkout.path();
+    let path = ".devkit/runtime/toolchains.env";
+    for (ver, electron, with_pin, admitted) in [
+        ("0.5.1", false, true, true),
+        ("0.5.1", false, false, false),
+        ("0.6.0", false, true, false),
+        ("0.6.0", false, false, true),
+        ("0.6.0-rc.1", false, false, true),
+        ("0.6.0", true, true, true),
+        ("0.6.0", true, false, false),
+    ] {
+        let mut state = state(ver);
+        if electron {
+            state.managed.insert(
+                ".devkit/runtime/desktop.Dockerfile".into(),
+                FileIdentity {
+                    sha256: "c".repeat(64),
+                    mode: 0o644,
+                },
+            );
+        } else {
+            state.components.remove("apps/desktop");
+        }
+        let mut pins = toolchains(ver);
+        if !with_pin {
+            pins = pins
+                .lines()
+                .filter(|line| !line.starts_with("DEVKIT_DESKTOP_RECIPE_HASH="))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        write_atomic(&root.join(path), pins.as_bytes(), 0o644).unwrap();
+        state
+            .managed
+            .insert(path.into(), identity(&root.join(path)).unwrap().unwrap());
+        assert_eq!(
+            CheckoutToolPins::admit(root, &state).is_ok(),
+            admitted,
+            "{ver}, electron={electron}, with_pin={with_pin}"
+        );
+        if admitted && electron {
+            state
+                .managed
+                .get_mut(".devkit/runtime/desktop.Dockerfile")
+                .unwrap()
+                .sha256 = "a".repeat(64);
+            assert!(CheckoutToolPins::admit(root, &state).is_err());
+        }
+        write_atomic(
+            &root.join(path),
+            format!("{pins}\n# drift\n").as_bytes(),
+            0o644,
         )
-        .is_err()
-    );
-    assert!(
-        ToolPins::parse(
-            source
-                .replace(&format!("@sha256:{}", "a".repeat(64)), "")
-                .as_bytes()
-        )
-        .is_err()
-    );
+        .unwrap();
+        assert!(CheckoutToolPins::admit(root, &state).is_err());
+    }
 }
 #[test]
 fn mount_paths_are_csv_quoted_without_shell_interpretation() {
@@ -255,7 +360,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -283,8 +388,9 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
-        write_atomic(&root.join(stub), b"{}\n", 0o644).unwrap();
+        write_runtime_stub(&root, stub);
     }
     write_json(
         &root.join("apps/web/package.json"),
@@ -301,6 +407,7 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
     ] {
@@ -461,7 +568,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
+        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -485,8 +592,9 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
-        write_atomic(&root.join(stub), b"{}\n", 0o644).unwrap();
+        write_runtime_stub(&root, stub);
     }
     write_json(
         &root.join(".devkit/tooling-profiles.json"),
@@ -565,6 +673,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
     ] {
@@ -818,11 +927,10 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     let ver = env!("CARGO_PKG_VERSION");
     let rust_dockerfile = b"FROM rust:1.99.1-bookworm\n";
     let rust_recipe = digest(rust_dockerfile);
-    let desktop_recipe = "c".repeat(64);
     let node_image = "node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205";
 
     let toolchains = format!(
-        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_recipe}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_recipe}\n"
+        "DEVKIT_VERSION={ver}\nDEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE={node_image}\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_recipe}\n"
     );
     write_atomic(
         &root.join(".devkit/runtime/toolchains.env"),
@@ -840,8 +948,9 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
     ] {
-        write_atomic(&root.join(stub), b"{}\n", 0o644).unwrap();
+        write_runtime_stub(&root, stub);
     }
     write_json(
         &root.join(".devkit/tooling-profiles.json"),
@@ -923,6 +1032,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
         ".devkit/runtime/compose.tools.yaml",
+        ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/rust.Dockerfile",
         "apps/api/rust-toolchain.toml",

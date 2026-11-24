@@ -565,19 +565,21 @@ fn try_dispatch_info(
         let Some(expected_pins) = header.managed.get(pins_name) else {
             return Ok(None);
         };
-        let Some((pins_bytes, pins_id)) =
-            read_regular_file(&safe_path(&root, pins_name)?, 65536, "toolchain pins")?
+        let Some((pins_bytes, pins_id)) = read_regular_file(
+            &safe_path(&root, pins_name)?,
+            TOOLCHAIN_PINS_MAX_BYTES as u64,
+            "toolchain pins",
+        )?
         else {
             return Ok(None);
         };
         if !pins_id.matches_git_tracked(expected_pins) {
             return Ok(None);
         }
-        let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
-        if pins.version != header.version {
+        let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
+        if pin.version != header.version {
             return Ok(None);
         }
-        let pin = pins.engine;
         if delivery::current_engine_digest()? == pin.sha256 {
             return Ok(None);
         }
@@ -661,18 +663,18 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     };
     let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
     let (pins_bytes, pins_id) =
-        read_regular_file(&path, 65536, "toolchain pins")?.with_context(conflict_msg)?;
+        read_regular_file(&path, TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins")?
+            .with_context(conflict_msg)?;
     ensure!(
         pins_id.matches_git_tracked(expected_pins),
         "{}",
         conflict_msg()
     );
-    let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+    let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
     ensure!(
-        pins.version == header.version,
+        pin.version == header.version,
         "Accepted version differs from toolchain pins"
     );
-    let pin = pins.engine;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(

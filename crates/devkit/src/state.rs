@@ -13,6 +13,34 @@ pub const PENDING_PATH: &str = ".devkit/update-pending.json";
 pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
 pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const RUNTIME_LICENSES: &str = ".devkit/runtime/licenses";
+
+// Paths within a release payload. The seccomp notices travel with the profile.
+pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 4] = [
+    "runtime/devkit.mk",
+    "runtime/devkit.sh",
+    "runtime/toolchains.env",
+    "runtime/compose.tools.yaml",
+];
+pub(crate) const RUNTIME_LICENSE_FILE: &str = "runtime/LICENSE";
+pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
+    "runtime/desktop.Dockerfile",
+    "runtime/desktop-seccomp.json",
+    "runtime/licenses/Apache-2.0.txt",
+    "runtime/licenses/moby-profiles.NOTICE",
+];
+
+pub fn uses_profile_scoped_runtime(version: &str) -> Result<bool> {
+    let v = SemVer::parse(version)?;
+    Ok((v.major, v.minor, v.patch) >= (0, 6, 0))
+}
+
+pub fn has_electron(state: &ProjectState) -> bool {
+    state
+        .components
+        .values()
+        .any(|c| c.tooling_profile == ToolingProfile::Electron)
+}
 
 pub fn check_manifest_regular_bounded(path: &Path) -> Result<()> {
     let info = match fs::symlink_metadata(path) {
@@ -345,6 +373,76 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
         rows
     ]))?))
 }
+
+/// Compare the live runtime namespace before reading file contents or accepting
+/// a new manifest. The project snapshot deliberately excludes some names.
+pub(crate) fn verify_runtime_inventory(root: &Path, state: &ProjectState) -> Result<()> {
+    verify_runtime_inventory_with_incoming(root, state, &BTreeSet::new())
+}
+
+pub(crate) fn verify_runtime_inventory_with_incoming(
+    root: &Path,
+    state: &ProjectState,
+    incoming: &BTreeSet<String>,
+) -> Result<()> {
+    let root = project_root(root)?;
+    let mut files: BTreeSet<&Path> = state
+        .managed
+        .keys()
+        .map(Path::new)
+        .filter(|name| name.starts_with(".devkit/runtime"))
+        .collect();
+    let directories: BTreeSet<_> = files
+        .iter()
+        .copied()
+        .flat_map(|name| name.ancestors().skip(1))
+        .collect();
+    let mut pending = vec![safe_path(&root, ".devkit/runtime")?];
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.strip_prefix(&root)?;
+            let typ = entry.file_type()?;
+            if typ.is_dir() {
+                if !directories.contains(name) {
+                    if name == Path::new(RUNTIME_LICENSES) {
+                        // Sync can restore the notices of a registered Electron
+                        // component when their identities are also missing.
+                        ensure!(
+                            has_electron(state),
+                            "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
+                        );
+                    } else {
+                        anyhow::bail!("Unlisted runtime directory: {}", name.display());
+                    }
+                }
+                pending.push(path);
+            } else {
+                if !files.remove(name) {
+                    let display = name.to_string_lossy();
+                    if incoming.contains(display.as_ref()) {
+                        anyhow::bail!("New managed file conflicts with project content: {display}");
+                    }
+                    anyhow::bail!("Unlisted runtime file: {display}");
+                }
+                ensure!(
+                    typ.is_file(),
+                    "Managed file conflict: {}; expected a regular runtime file",
+                    name.display()
+                );
+            }
+        }
+    }
+    if let Some(missing) = files.first() {
+        anyhow::bail!(
+            "Managed file conflict: {}; restore the missing runtime file",
+            missing.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
     for required in [
         CHECKSUM_PATH,
@@ -352,23 +450,56 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
         ".devkit/compose.workspace.json",
-        ".devkit/runtime/devkit.mk",
-        ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
-        ".devkit/runtime/toolchains.env",
     ] {
         ensure!(
             state.managed.contains_key(required),
             "Missing managed runtime identity: {required}"
         );
     }
-    let runtime = safe_path(root, ".devkit/runtime")?;
-    for (name, _) in file_map(&runtime)? {
-        let path = format!(".devkit/runtime/{name}");
+    for name in REQUIRED_RUNTIME_FILES {
+        let required = format!(".devkit/{name}");
         ensure!(
-            state.managed.contains_key(&path),
-            "Unlisted runtime file: {path}"
+            state.managed.contains_key(&required),
+            "Missing managed runtime identity: {required}"
         );
+    }
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
+    if scoped {
+        let license = format!(".devkit/{RUNTIME_LICENSE_FILE}");
+        ensure!(
+            state.managed.contains_key(&license),
+            "Missing managed runtime identity: {license}"
+        );
+        for name in state
+            .managed
+            .keys()
+            .filter(|name| name.starts_with(".devkit/runtime/licenses/"))
+        {
+            ensure!(
+                DESKTOP_RUNTIME_FILES
+                    .iter()
+                    .any(|desktop| name.strip_prefix(".devkit/") == Some(*desktop)),
+                "Unclassified managed runtime attribution: {name}"
+            );
+        }
+    }
+    verify_runtime_inventory(root, state)?;
+    let electron = has_electron(state);
+    if electron || scoped {
+        for name in DESKTOP_RUNTIME_FILES {
+            let path = format!(".devkit/{name}");
+            if electron {
+                ensure!(
+                    state.managed.contains_key(&path),
+                    "Missing managed Electron file: {path}"
+                );
+            } else {
+                ensure!(
+                    !state.managed.contains_key(&path),
+                    "Unexpected managed Electron file: {path}"
+                );
+            }
+        }
     }
     let mut seen = BTreeSet::new();
     for line in fs::read_to_string(safe_path(root, CHECKSUM_PATH)?)?.lines() {
@@ -396,6 +527,7 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
 pub struct RuntimeAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
+    pub pins: crate::runtime::CheckoutToolPins,
     pub native: crate::native::NativeAdmission,
     pub manifest_identity: FileIdentity,
 }
@@ -431,13 +563,26 @@ pub fn admit_runtime_snapshot(
     s: ProjectState,
     manifest_identity: FileIdentity,
 ) -> Result<RuntimeAdmission> {
+    admit_runtime_snapshot_with_pins(root, s, manifest_identity, None)
+}
+pub(crate) fn admit_runtime_snapshot_with_pins(
+    root: &Path,
+    s: ProjectState,
+    manifest_identity: FileIdentity,
+    admitted_pins: Option<crate::runtime::CheckoutToolPins>,
+) -> Result<RuntimeAdmission> {
     assert_managed(root, &s)?;
     verify_managed_set(root, &s)?;
+    let pins = match admitted_pins {
+        Some(pins) => pins,
+        None => crate::runtime::CheckoutToolPins::admit(root, &s)?,
+    };
     let native = crate::native::admit_native_components(root, &s)?;
     crate::projections::assert_projections(root, &s, &native.inputs)?;
     let snapshot = RuntimeAdmission {
         root: root.to_path_buf(),
         state: s,
+        pins,
         native,
         manifest_identity,
     };

@@ -306,9 +306,9 @@ impl<'a> ReleaseCache<'a> {
                 .sha256
                 .clone(),
         };
-        let pins = crate::runtime::ToolPins::parse(&release.bytes("runtime/toolchains.env")?)?;
+        let recorded = EnginePin::from_toolchains(&release.bytes("runtime/toolchains.env")?)?;
         ensure!(
-            pins.engine == pin,
+            recorded == pin,
             "Release engine pin differs from its actual payload"
         );
         let lock_path = self.lock_path(&format!(
@@ -474,42 +474,42 @@ impl<'a> ReleaseCache<'a> {
             "Downloaded release differs from the accepted project identity"
         );
         let _lock = self.lock(&format!("release:{version}:{identity}"))?;
-        if let Some(release) = self.cached(version, &identity)? {
-            drop(_lock);
+        let release = if let Some(release) = self.cached(version, &identity)? {
             self.prime_engine(&release)?;
-            return Ok(release);
-        }
-        self.fetch(
-            &format!("{base}/{archive_name}"),
-            &archive,
-            archive::MAX_COMPRESSED,
-        )?;
-        ensure!(
-            file_digest(&archive)? == archive_hash,
-            "Downloaded archive checksum mismatch"
-        );
-        let unpacked = stage.path().join("payload");
-        archive::extract_archive_with(
-            &archive,
-            &unpacked,
-            &format!("devkit-{version}"),
-            Some(self.runner),
-        )?;
-        payload_budget(&unpacked)?;
-        let release = release::admit_release(&unpacked)?;
-        ensure!(
-            release.identity == identity && release.manifest.version == version,
-            "Downloaded payload differs from release metadata"
-        );
-        let target = self.release_path(version, &identity)?;
-        create_dir_all_durable(target.parent().unwrap())?;
-        self.runner.check_cancelled()?;
-        release.recheck()?;
-        publish_new_directory(&unpacked, &target)?;
-        let release = release::admit_release(&target)?;
+            release
+        } else {
+            self.fetch(
+                &format!("{base}/{archive_name}"),
+                &archive,
+                archive::MAX_COMPRESSED,
+            )?;
+            ensure!(
+                file_digest(&archive)? == archive_hash,
+                "Downloaded archive checksum mismatch"
+            );
+            let unpacked = stage.path().join("payload");
+            archive::extract_archive_with(
+                &archive,
+                &unpacked,
+                &format!("devkit-{version}"),
+                Some(self.runner),
+            )?;
+            payload_budget(&unpacked)?;
+            let release = release::admit_release(&unpacked)?;
+            ensure!(
+                release.identity == identity && release.manifest.version == version,
+                "Downloaded payload differs from release metadata"
+            );
+            self.prime_engine(&release)?;
+            let target = self.release_path(version, &identity)?;
+            create_dir_all_durable(target.parent().unwrap())?;
+            self.runner.check_cancelled()?;
+            release.recheck()?;
+            publish_new_directory(&unpacked, &target)?;
+            release::admit_release(&target)?
+        };
         self.remember(&release)?;
         drop(_lock);
-        self.prime_engine(&release)?;
         Ok(release)
     }
     pub fn import(
@@ -549,8 +549,10 @@ impl<'a> ReleaseCache<'a> {
             "Source release changed during import"
         );
         let release = if let Some(release) = self.cached(version, &identity)? {
+            self.prime_engine(&release)?;
             release
         } else {
+            self.prime_engine(&admitted)?;
             let target = self.release_path(version, &identity)?;
             create_dir_all_durable(target.parent().unwrap())?;
             self.runner.check_cancelled()?;
@@ -560,7 +562,6 @@ impl<'a> ReleaseCache<'a> {
         };
         self.remember(&release)?;
         drop(_lock);
-        self.prime_engine(&release)?;
         Ok(release)
     }
 }

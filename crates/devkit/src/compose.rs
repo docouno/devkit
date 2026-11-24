@@ -8,7 +8,7 @@ use std::{
 };
 
 pub const ENTRYPOINTS: [&str; 2] = [".devkit/compose.apps.yaml", "compose.yaml"];
-const MAX_YAML_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_YAML_BYTES: usize = 4 * 1024 * 1024;
 pub fn parse_compose(bytes: &[u8]) -> Result<Value> {
     ensure!(
         bytes.len() <= MAX_YAML_BYTES,

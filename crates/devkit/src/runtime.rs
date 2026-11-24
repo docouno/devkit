@@ -2,6 +2,10 @@
 use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
+mod pins;
+pub(crate) use pins::render_headless_toolchains;
+pub use pins::{CheckoutToolPins, ReleaseToolPins};
+
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,77 +83,6 @@ pub struct ExecRequest {
     pub write: bool,
     pub network: String,
     pub prepare: bool,
-}
-#[derive(Clone, Debug)]
-pub struct ToolPins {
-    pub version: String,
-    pub node_image: String,
-    pub node_version: String,
-    pub rust_version: String,
-    pub rust_recipe: String,
-    pub desktop_recipe: String,
-    pub engine: crate::delivery::EnginePin,
-}
-impl ToolPins {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut values = BTreeMap::new();
-        for line in std::str::from_utf8(bytes)?.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (k, v) = line
-                .split_once('=')
-                .context("Invalid toolchains.env record")?;
-            ensure!(
-                k.starts_with("DEVKIT_")
-                    && k.bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
-                    && !v.is_empty()
-                    && !v
-                        .chars()
-                        .any(|c| c.is_whitespace() || ['\'', '"', '\0'].contains(&c))
-                    && values.insert(k, v).is_none(),
-                "Invalid/duplicate toolchain key: {k}"
-            );
-        }
-        let get = |k| -> Result<String> {
-            Ok(values.get(k).context("Missing toolchain pin")?.to_string())
-        };
-        let release_version = get("DEVKIT_VERSION")?;
-        let engine = crate::delivery::EnginePin {
-            version: release_version.clone(),
-            target: get("DEVKIT_ENGINE_TARGET")?,
-            sha256: get("DEVKIT_ENGINE_SHA256")?,
-        };
-        engine.validate()?;
-        let s = Self {
-            version: release_version,
-            node_image: get("DEVKIT_NODE_IMAGE")?,
-            node_version: get("DEVKIT_NODE_VERSION")?,
-            rust_version: get("DEVKIT_RUST_VERSION")?,
-            rust_recipe: get("DEVKIT_RUST_RECIPE_HASH")?,
-            desktop_recipe: get("DEVKIT_DESKTOP_RECIPE_HASH")?,
-            engine,
-        };
-        version(&s.version)?;
-        version(&s.node_version)?;
-        version(&s.rust_version)?;
-        let (name, hash) = s
-            .node_image
-            .rsplit_once("@sha256:")
-            .context("Node image must be digest pinned")?;
-        ensure!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"./:-".contains(&c))
-                && SHA256_RE.is_match(hash)
-                && SHA256_RE.is_match(&s.rust_recipe)
-                && SHA256_RE.is_match(&s.desktop_recipe),
-            "Invalid immutable tool pins"
-        );
-        Ok(s)
-    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PnpmPin {
@@ -251,7 +184,7 @@ impl PnpmPin {
 pub struct ToolAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
-    pub pins: ToolPins,
+    pub pins: CheckoutToolPins,
     pub manifest_identity: FileIdentity,
 }
 impl ToolAdmission {
@@ -305,14 +238,7 @@ impl ToolAdmission {
             // tooling payloads still retain their exact ownership boundary.
             assert_managed(&root, &state)?;
         }
-        let pins = ToolPins::parse(&fs::read(safe_path(
-            &root,
-            ".devkit/runtime/toolchains.env",
-        )?)?)?;
-        ensure!(
-            pins.version == state.version,
-            "Manifest version differs from accepted toolchains.env"
-        );
+        let pins = CheckoutToolPins::admit(&root, &state)?;
         if allow_older_accepted {
             ensure!(
                 SemVer::parse(&state.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?,
@@ -412,6 +338,7 @@ enum TaskAccess {
 struct ContainerTask<'a> {
     component: Option<&'a str>,
     profile: ToolingProfile,
+    electron_cache: bool,
     image: &'a str,
     argv: &'a [OsString],
     network: &'a str,
@@ -559,6 +486,7 @@ impl<'a> PreparedContext<'a> {
             self.task(ContainerTask {
                 component: Some(path),
                 profile: ToolingProfile::Node,
+                electron_cache: true,
                 image: &self.admission.pins.node_image,
                 argv: &node_argv(
                     self,
@@ -788,19 +716,23 @@ impl<'a> PreparedContext<'a> {
         let (recipe, pin, label) = if kind == "rust" {
             (
                 "rust.Dockerfile",
-                &self.admission.pins.rust_recipe,
+                self.admission.pins.rust_recipe.as_str(),
                 "io.docouno.devkit.rust-recipe",
             )
         } else {
             (
                 "desktop.Dockerfile",
-                &self.admission.pins.desktop_recipe,
+                self.admission
+                    .pins
+                    .desktop_recipe
+                    .as_deref()
+                    .context("Missing desktop recipe pin for Electron")?,
                 "io.docouno.devkit.desktop-recipe",
             )
         };
         let recipe_path = safe_path(&self.admission.root, &format!(".devkit/runtime/{recipe}"))?;
         ensure!(
-            identity(&recipe_path)?.is_some_and(|id| &id.sha256 == pin),
+            identity(&recipe_path)?.is_some_and(|id| id.sha256 == pin),
             "{recipe} differs from the accepted recipe"
         );
         let derived_tag = format!("devkit-derived-{kind}:{pin}");
@@ -910,6 +842,24 @@ impl<'a> PreparedContext<'a> {
         self.set_image(kind, image.clone());
         Ok(image)
     }
+    fn load_recorded_images(&mut self) -> Result<()> {
+        for kind in ["rust", "desktop"] {
+            if kind == "desktop" && !has_electron(&self.admission.state) {
+                continue;
+            }
+            let path = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
+            if let Some((bytes, _)) = read_regular_file(&path, 4096, "image receipt")? {
+                let image = std::str::from_utf8(&bytes)?.trim();
+                if image
+                    .strip_prefix("sha256:")
+                    .is_some_and(|h| SHA256_RE.is_match(h))
+                {
+                    self.set_image(kind, image.to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
     fn set_image(&mut self, kind: &str, image: String) {
         if kind == "rust" {
             self.rust_image = Some(image);
@@ -929,6 +879,7 @@ impl<'a> PreparedContext<'a> {
         let ContainerTask {
             component,
             profile,
+            electron_cache,
             image,
             argv,
             network,
@@ -984,7 +935,7 @@ impl<'a> PreparedContext<'a> {
         } else {
             None
         };
-        let electron_cache = if node {
+        let electron_cache_dir = if electron_cache {
             Some(self.cache_directory("electron")?)
         } else {
             None
@@ -1154,7 +1105,7 @@ impl<'a> PreparedContext<'a> {
             for (source, target) in [
                 (cargo_cache.as_deref(), "/cache/cargo"),
                 (pnpm_cache.as_deref(), "/cache/pnpm"),
-                (electron_cache.as_deref(), "/cache/electron"),
+                (electron_cache_dir.as_deref(), "/cache/electron"),
             ] {
                 if let Some(source) = source {
                     crate::shared_cache::mount(&mut c, source, Path::new(target), false)?;
@@ -1212,11 +1163,13 @@ impl<'a> PreparedContext<'a> {
                 "NPM_CONFIG_UPDATE_NOTIFIER=false",
                 "NPM_CONFIG_FUND=false",
                 "NPM_CONFIG_AUDIT=false",
-                "ELECTRON_CACHE=/cache/electron",
                 "CARGO_HOME=/cache/cargo",
                 "RUSTUP_AUTO_INSTALL=0",
             ] {
                 c.args(["--env", value]);
+            }
+            if electron_cache {
+                c.args(["--env", "ELECTRON_CACHE=/cache/electron"]);
             }
             env_plan.write_docker_args(&mut c);
             c.args([
@@ -1261,13 +1214,8 @@ impl<'a> PreparedContext<'a> {
                 c.args(["--env", "VITE_API_ENABLED=true"]);
             }
             if profile == ToolingProfile::Electron {
-                c.args([
-                    "--security-opt",
-                    &format!(
-                        "seccomp={}",
-                        safe_path(root, ".devkit/runtime/desktop-seccomp.json")?.display()
-                    ),
-                ]);
+                let seccomp = verify_managed_seccomp(root, &self.admission.state)?;
+                c.args(["--security-opt", &format!("seccomp={}", seccomp.display())]);
             }
             c.arg(image).args(argv);
             if setup {
@@ -1555,6 +1503,20 @@ pub fn bind_mount(source: &Path, target: &Path, readonly: bool) -> Result<String
         if readonly { ",readonly" } else { "" }
     ))
 }
+fn verify_managed_seccomp(root: &Path, state: &ProjectState) -> Result<PathBuf> {
+    let seccomp_name = ".devkit/runtime/desktop-seccomp.json";
+    let expected = state
+        .managed
+        .get(seccomp_name)
+        .context("Missing managed desktop-seccomp.json")?;
+    let seccomp = safe_path(root, seccomp_name)?;
+    ensure!(
+        identity(&seccomp)?.is_some_and(|actual| actual.matches_git_tracked(expected)),
+        "Managed desktop-seccomp.json differs from the accepted profile"
+    );
+    Ok(seccomp)
+}
+
 fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
     for d in [".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store"] {
         ensure_directory(&safe_path(&admission.root, d)?)?;
@@ -1564,7 +1526,16 @@ fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
         ".devkit/state/rust-image",
         ".devkit/state/desktop-image",
     ] {
-        identity(&safe_path(&admission.root, p)?)?;
+        let path = safe_path(&admission.root, p)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_file(),
+                "Expected a regular file: {}",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
@@ -1735,10 +1706,11 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     let full = if service {
         None
     } else {
-        Some(admit_runtime_snapshot(
+        Some(admit_runtime_snapshot_with_pins(
             &tool.root,
             tool.state.clone(),
             tool.manifest_identity.clone(),
+            Some(tool.pins.clone()),
         )?)
     };
     let target = tool.target(&request)?;
@@ -1847,6 +1819,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.task(ContainerTask {
             component: None,
             profile: ToolingProfile::Node,
+            electron_cache: false,
             image: &ctx.admission.pins.node_image,
             argv: &node_argv(
                 &ctx,
@@ -1877,6 +1850,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                     ctx.task(ContainerTask {
                         component: Some(path),
                         profile: c.tooling_profile,
+                        electron_cache: c.tooling_profile == ToolingProfile::Electron,
                         image: &ctx.admission.pins.node_image,
                         argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                         network: "none",
@@ -1890,6 +1864,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
                 ctx.task(ContainerTask {
                     component: None,
                     profile: ToolingProfile::Node,
+                    electron_cache: has_electron(&full.state),
                     image: &ctx.admission.pins.node_image,
                     argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), hook.into()]),
                     network: "none",
@@ -1927,7 +1902,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         runner.check_cancelled()?;
         println!(
             "Devkit {}; Node {}; Rust {}; accepted components verified.",
-            ctx.admission.pins.version,
+            ctx.admission.pins.engine.version,
             ctx.admission.pins.node_version,
             ctx.admission.pins.rust_version
         );
@@ -1951,6 +1926,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.task(ContainerTask {
             component: Some(&target),
             profile: component.tooling_profile,
+            electron_cache: false,
             image: &image,
             argv: &[
                 "/devkit/devkit".into(),
@@ -2012,6 +1988,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             ctx.task(ContainerTask {
                 component: Some(&target),
                 profile: component.tooling_profile,
+                electron_cache: component.tooling_profile == ToolingProfile::Electron,
                 image: &image,
                 argv: &node_argv(&ctx, vec!["pnpm".into(), "run".into(), command.into()]),
                 network: "none",
@@ -2067,8 +2044,12 @@ fn cleanup_without_stand(
     }
     let state = read_accepted_header(root)?;
     let pin_path = safe_path(root, ".devkit/runtime/toolchains.env")?;
-    let (bytes, actual) = read_regular_file(&pin_path, 65536, "accepted engine pins")?
-        .context("Missing accepted engine pins")?;
+    let (bytes, actual) = read_regular_file(
+        &pin_path,
+        TOOLCHAIN_PINS_MAX_BYTES as u64,
+        "accepted engine pins",
+    )?
+    .context("Missing accepted engine pins")?;
     ensure!(
         state
             .managed
@@ -2076,12 +2057,12 @@ fn cleanup_without_stand(
             .is_some_and(|id| actual.matches_git_tracked(id)),
         "Managed engine pins changed"
     );
-    let pins = ToolPins::parse(&bytes)?;
+    let pin = crate::delivery::EnginePin::from_toolchains(&bytes)?;
     ensure!(
-        pins.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
+        pin.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
         "Accepted engine version differs from its build"
     );
-    crate::delivery::verify_current_engine(&pins.engine)?;
+    crate::delivery::verify_current_engine(&pin)?;
     let mut ports = crate::stand::ports::Ports::read(root)?;
     if let Some(ledger) = &ledger {
         ensure!(
@@ -2193,6 +2174,11 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         } else {
             ToolingProfile::Node
         },
+        electron_cache: toolchain != Toolchain::Rust
+            && target.as_deref().map_or_else(
+                || has_electron(&ctx.admission.state),
+                |p| ctx.admission.state.components[p].tooling_profile == ToolingProfile::Electron,
+            ),
         image: &image,
         argv: &request.argv,
         network: &request.network,
@@ -2269,18 +2255,7 @@ fn run_service(
     let mut command = ctx.compose()?;
     // Existing recorded derived image IDs allow interpolation; never inspect or
     // acquire tool images for service status/logs/down.
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
+    ctx.load_recorded_images()?;
     ctx.env(&mut command);
     if request.command == "down"
         && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
@@ -2949,6 +2924,7 @@ fn run_development(
     );
     let state_dir = safe_path(&ctx.admission.root, ".devkit/state")?;
     let mut overlays = Vec::new();
+    let mut uses_desktop = false;
     for path in reached {
         let c = &full.state.components[&path];
         if c.toolchain == Toolchain::Rust {
@@ -2960,6 +2936,7 @@ fn run_development(
             node_ready(ctx, fingerprint)?;
         }
         if c.tooling_profile == ToolingProfile::Electron {
+            uses_desktop = true;
             ctx.derived_image("desktop", false)?;
             let spec = crate::desktop::display_overlay(service_name(&path, c), request.headless)?;
             let mut file = tempfile::Builder::new()
@@ -3439,6 +3416,9 @@ fn run_development(
                 }
             };
             full.recheck()?;
+            if uses_desktop {
+                verify_managed_seccomp(&ctx.admission.root, &ctx.admission.state)?;
+            }
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let mut create = compose()?;
@@ -3621,11 +3601,12 @@ pub fn enrich_describe(full: &RuntimeAdmission) -> Result<Value> {
         obj.insert("exposedContainerPort".into(), json!(exposed_port));
         components.insert(path.clone(), Value::Object(obj));
     }
-    let receipts = crate::doctor::local_receipts(
+    let receipts = crate::doctor::local_receipts_with_pins(
         &full.root,
         &full.state,
+        &full.pins,
         Some(&full.native.node_inputs.digest),
-    )?;
+    );
     Ok(json!({
         "root": full.root,
         "version": full.state.version,
@@ -3649,18 +3630,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
     ctx.prerequisite_service()?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service_to_component = app_service_component_map(&ctx.admission.state);
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
+    ctx.load_recorded_images()?;
     let mut command = ctx.compose()?;
     ctx.env(&mut command);
     command.args(["--profile", "*", "ps", "--all", "--format", "json"]);
@@ -3674,7 +3644,12 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
         &mut services,
     )?;
     assert_compose_inventory(&ctx.admission.root, &inventory)?;
-    let receipts = crate::doctor::local_receipts(&ctx.admission.root, &ctx.admission.state, None)?;
+    let receipts = crate::doctor::local_receipts_with_pins(
+        &ctx.admission.root,
+        &ctx.admission.state,
+        &ctx.admission.pins,
+        None,
+    );
     ctx.admission.recheck()?;
     runner.check_cancelled()?;
     drop(lock);

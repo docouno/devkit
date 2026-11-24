@@ -281,6 +281,8 @@ pub fn identity(path: &Path) -> Result<Option<FileIdentity>> {
     identity_for(path, path)
 }
 
+pub(crate) const TOOLCHAIN_PINS_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const SECCOMP_PROFILE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const PNPM_YAML_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn is_pnpm_yaml(path: &Path) -> bool {
@@ -290,13 +292,27 @@ pub(crate) fn is_pnpm_yaml(path: &Path) -> bool {
     )
 }
 
+fn input_budget(path: &Path) -> Option<(u64, &'static str)> {
+    if is_pnpm_yaml(path) {
+        Some((PNPM_YAML_MAX_BYTES as u64, "pnpm YAML"))
+    } else if path.ends_with(".devkit/runtime/toolchains.env") {
+        Some((TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins"))
+    } else if path.ends_with(".devkit/runtime/desktop-seccomp.json") {
+        Some((SECCOMP_PROFILE_MAX_BYTES as u64, "desktop seccomp profile"))
+    } else if path.ends_with(".devkit/runtime/compose.tools.yaml") {
+        Some((
+            crate::compose::MAX_YAML_BYTES as u64,
+            "Tool Compose projection",
+        ))
+    } else {
+        None
+    }
+}
+
 /// Saved transaction slots retain the acquisition policy of their original input.
 pub(crate) fn identity_for(path: &Path, original: &Path) -> Result<Option<FileIdentity>> {
-    if is_pnpm_yaml(original) {
-        return Ok(
-            read_regular_file(path, PNPM_YAML_MAX_BYTES as u64, "pnpm YAML")?
-                .map(|(_, identity)| identity),
-        );
+    if let Some((limit, label)) = input_budget(original) {
+        return Ok(read_regular_file(path, limit, label)?.map(|(_, identity)| identity));
     }
     let info = match fs::symlink_metadata(path) {
         Ok(i) => i,
@@ -319,12 +335,10 @@ pub(crate) fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn read_input_bytes_for(path: &Path, original: &Path) -> Result<Vec<u8>> {
-    if is_pnpm_yaml(original) {
-        return Ok(
-            read_regular_file(path, PNPM_YAML_MAX_BYTES as u64, "pnpm YAML")?
-                .with_context(|| format!("Missing pnpm YAML input: {}", path.display()))?
-                .0,
-        );
+    if let Some((limit, label)) = input_budget(original) {
+        return Ok(read_regular_file(path, limit, label)?
+            .with_context(|| format!("Missing {label} input: {}", path.display()))?
+            .0);
     }
     Ok(fs::read(path)?)
 }
@@ -521,6 +535,28 @@ pub fn remove_empty_dir_durable(path: &Path) -> Result<()> {
             .unwrap_or(Path::new(".")),
     )
 }
+/// Prune only directories below the managed runtime. Recovery recreates each
+/// removed parent durably when restoring its first backed-up file.
+pub(crate) fn remove_file_and_empty_runtime_parents(root: &Path, name: &str) -> Result<()> {
+    remove_file(&safe_path(root, name)?)?;
+    for parent in Path::new(name).ancestors().skip(1) {
+        let name = parent.to_str().context("Non-UTF8 runtime path")?;
+        if !name.starts_with(".devkit/runtime/") {
+            break;
+        }
+        let path = safe_path(root, name)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => ensure!(meta.is_dir(), "Expected a regular directory: {name}"),
+            Err(e) if absent(&e) => break,
+            Err(e) => return Err(e.into()),
+        }
+        if !sorted_entries(&path)?.is_empty() {
+            break;
+        }
+        remove_empty_dir_durable(&path)?;
+    }
+    Ok(())
+}
 pub fn remove_tree_durable(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => (),
@@ -601,4 +637,43 @@ pub fn copy_tree(
         Ok(())
     }
     copy(source, source, target, ignore, preserve_links)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_runtime_limits_apply_to_files_and_their_transaction_slots() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let slot = project.path().join("saved-file");
+        let file = File::create(&slot)?;
+        for (name, limit) in [
+            ("toolchains.env", TOOLCHAIN_PINS_MAX_BYTES),
+            ("desktop-seccomp.json", SECCOMP_PROFILE_MAX_BYTES),
+            ("compose.tools.yaml", crate::compose::MAX_YAML_BYTES),
+        ] {
+            file.set_len(limit as u64 + 1)?;
+            let relative = Path::new(".devkit/runtime").join(name);
+            let managed = project.path().join(&relative);
+            create_dir_all_durable(managed.parent().unwrap())?;
+            fs::hard_link(&slot, &managed)?;
+
+            for result in [
+                identity(&managed).map(|_| ()),
+                read_input_bytes(&managed).map(|_| ()),
+                identity_for(&slot, &relative).map(|_| ()),
+                read_input_bytes_for(&slot, &relative).map(|_| ()),
+            ] {
+                let error = result.unwrap_err().downcast::<io::Error>()?;
+                assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+            }
+
+            // The same name at the project root is a project-owned file.
+            let product = project.path().join(name);
+            fs::hard_link(&slot, &product)?;
+            assert_eq!(read_input_bytes(&product)?.len(), limit + 1);
+        }
+        Ok(())
+    }
 }

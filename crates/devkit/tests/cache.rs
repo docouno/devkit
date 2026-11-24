@@ -1,3 +1,6 @@
+#[path = "support/runtime.rs"]
+mod runtime_fixture;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     cache::ReleaseCache, files::*, model::*, processes::ProcessRunner, release::admit_release,
@@ -159,6 +162,101 @@ fn fixture(root: &Path, marker: &[u8]) -> String {
     )
     .unwrap();
     admit_release(root).unwrap().identity
+}
+
+#[test]
+fn rejected_scoped_runtime_preserves_the_working_offline_release() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source");
+    fixture(&source, b"working");
+    let version = "0.6.0-rc.1";
+    let mut manifest: Release = read_json(&source.join("release.json")).unwrap();
+    manifest.version = version.into();
+    manifest.environment.version = version.into();
+    runtime_fixture::write_runtime(&source, version, &manifest.files["devkit"].sha256);
+    write_atomic(
+        &source.join("runtime/extra-guide.md"),
+        b"Shared runtime guide\n",
+        0o644,
+    )
+    .unwrap();
+    let seal = |root: &Path| {
+        let mut release = manifest.clone();
+        release.files = file_map(root).unwrap();
+        release.files.remove("release.json");
+        write_json(&root.join("release.json"), &release).unwrap();
+    };
+    seal(&source);
+    let runner = ProcessRunner::new().unwrap();
+    let cache = ReleaseCache::new(Some(&temp.path().join("cache")), &runner).unwrap();
+    let good = cache.import(&source, version, None).unwrap();
+    let reference = cache.root.join(format!("refs/{version}.json"));
+    let saved = fs::read(&reference).unwrap();
+
+    for (path, replacement) in [
+        (
+            "runtime/licenses/extra.NOTICE",
+            Some(b"Additional notice\n".as_slice()),
+        ),
+        (
+            "runtime/licenses/vendor/NOTICE",
+            Some(b"Nested notice\n".as_slice()),
+        ),
+        ("runtime/LICENSE", None),
+        ("runtime/LICENSE", Some(b"".as_slice())),
+        ("runtime/licenses/Apache-2.0.txt", Some(b"".as_slice())),
+        (
+            "runtime/licenses/moby-profiles.NOTICE",
+            Some(b"".as_slice()),
+        ),
+        ("runtime/devkit.mk", None),
+        ("devkit", Some(b"invalid engine".as_slice())),
+        (
+            "runtime/compose.tools.yaml",
+            Some(b"services: {}\n".as_slice()),
+        ),
+        (
+            "runtime/desktop.Dockerfile",
+            Some(b"FROM changed\n".as_slice()),
+        ),
+    ] {
+        let bad = tempfile::tempdir_in(temp.path()).unwrap();
+        copy_tree(&source, bad.path(), &|_| false, false).unwrap();
+        match replacement {
+            Some(bytes) => write_atomic(&bad.path().join(path), bytes, 0o644).unwrap(),
+            None => fs::remove_file(bad.path().join(path)).unwrap(),
+        }
+        seal(bad.path());
+        let bad_identity = devkit::release::release_identity(bad.path()).unwrap();
+        assert!(
+            cache
+                .acquire(version, None, Some(bad.path()), true)
+                .is_err(),
+            "{path}"
+        );
+        assert!(
+            !cache.release_path(version, &bad_identity).unwrap().exists(),
+            "rejected release must not be published into cache: {path}"
+        );
+        assert_eq!(fs::read(&reference).unwrap(), saved, "{path}");
+        assert_eq!(
+            cache.acquire(version, None, None, true).unwrap().identity,
+            good.identity,
+            "{path}"
+        );
+    }
+
+    // Removing the version reference must heal when the cached release is re-admitted.
+    fs::remove_file(&reference).unwrap();
+    assert!(cache.acquire(version, None, None, true).is_err());
+    assert_eq!(
+        cache.import(&source, version, None).unwrap().identity,
+        good.identity
+    );
+    assert_eq!(
+        cache.acquire(version, None, None, true).unwrap().identity,
+        good.identity
+    );
 }
 
 #[test]

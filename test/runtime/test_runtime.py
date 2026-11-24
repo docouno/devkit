@@ -247,16 +247,20 @@ def fixture_tool(root, script):
                "node", "--input-type=module", "-e", script, timeout=35)
 
 
-def write_fixture(root, apps=("main",), packages=(), package_profiles=None):
+def write_fixture_runtime(root):
     runtime = root / ".devkit/runtime"
     shutil.copytree(RUNTIME_SOURCE, runtime)
+    shutil.copy2(REPO / "LICENSE", runtime / "LICENSE")
     (runtime / "toolchains.env").write_text(
         f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
         f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
-        f"DEVKIT_RUST_RECIPE_HASH={hashlib.sha256((runtime / 'rust.Dockerfile').read_bytes()).hexdigest()}\n"
-        f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
+        f"DEVKIT_RUST_RECIPE_HASH={hashlib.sha256((runtime / 'rust.Dockerfile').read_bytes()).hexdigest()}\n")
     (runtime / "pnpm.env").write_text("DEVKIT_PNPM_PACKAGE=@pnpm/exe.linux-x64-musl\n" + "".join(f"{key}={PINS[key]}\n" for key in ("DEVKIT_PNPM_SHA256", "DEVKIT_PNPM_TARBALL_SHA256", "DEVKIT_PNPM_VERSION")))
     (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
+
+
+def write_fixture(root, apps=("main",), packages=(), package_profiles=None):
+    write_fixture_runtime(root)
     for area, app in [("apps", name) for name in apps] + [("packages", name) for name in packages]:
         path = root / area / app
         path.mkdir(parents=True)
@@ -340,6 +344,26 @@ def seal_runtime(root):
     state_path.write_text(json.dumps(state) + "\n")
 
 
+def select_fixture_runtime(runtime, electron):
+    for relative in ("desktop.Dockerfile", "desktop-seccomp.json", "licenses/Apache-2.0.txt",
+                     "licenses/moby-profiles.NOTICE"):
+        path = runtime / relative
+        if electron:
+            path.parent.mkdir(exist_ok=True)
+            shutil.copy2(RUNTIME_SOURCE / relative, path)
+        else:
+            path.unlink(missing_ok=True)
+    if not electron and (runtime / "licenses").exists():
+        (runtime / "licenses").rmdir()
+    pins = runtime / "toolchains.env"
+    lines = [line for line in pins.read_text().splitlines(keepends=True)
+             if not line.startswith("DEVKIT_DESKTOP_RECIPE_HASH=")]
+    if electron:
+        recipe = hashlib.sha256((runtime / "desktop.Dockerfile").read_bytes()).hexdigest()
+        lines.append(f"DEVKIT_DESKTOP_RECIPE_HASH={recipe}\n")
+    pins.write_text("".join(lines))
+
+
 def accept_runtime(root, native=False, package_profiles=None):
     package_profiles = package_profiles or {}
     state_path = root / ".devkit/manifest.json"
@@ -358,8 +382,8 @@ def accept_runtime(root, native=False, package_profiles=None):
                 continue
             name = area + "/" + path.name
             role = "app" if area == "apps" else "library"
-            default_lib_profile = package_profiles.get(name) or previous.get(name, {}).get("toolingProfile") or "react-library"
-            profile = "rust" if rust else package_profiles.get(name, "node") if role == "app" else default_lib_profile
+            default_profile = "node" if role == "app" else previous.get(name, {}).get("toolingProfile", "react-library")
+            profile = "rust" if rust else package_profiles.get(name, default_profile)
             default_template = "rust-api" if rust else "node-api" if role == "app" else (
                 profile if profile in ("ts-library", "react-ui") else "react-client")
             components[name] = {"role": role, "toolchain": "rust" if rust else "node",
@@ -367,7 +391,8 @@ def accept_runtime(root, native=False, package_profiles=None):
                 "toolDependencies": {}, "dependencies": [], **previous.get(name, {})}
             components[name].update({"role": role, "toolchain": "rust" if rust else "node", "toolingProfile": profile})
             if role == "app":
-                components[name].setdefault("development", {"owner": "project", "kind": "compose", "service": path.name})
+                development = components[name].setdefault("development", {"owner": "project", "service": path.name})
+                development["kind"] = "desktop" if profile == "electron" else "compose"
     state["components"] = components
     state_path.write_text(json.dumps(state) + "\n")
     # Pinned pnpm selects fixture resolutions; the Rust helper renders production projections.
@@ -388,24 +413,16 @@ def accept_runtime(root, native=False, package_profiles=None):
         else:
             for filename in ("package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
                 (root / filename).unlink(missing_ok=True)
+    select_fixture_runtime(root / ".devkit/runtime", any(c["toolingProfile"] == "electron" for c in components.values()))
     run(str(FIXTURE), str(root))
     seal_runtime(root)
 
 
 def write_rust_fixture(root):
-    runtime = root / ".devkit/runtime"
-    shutil.copytree(RUNTIME_SOURCE, runtime)
-    recipe = hashlib.sha256((runtime / "rust.Dockerfile").read_bytes()).hexdigest()
-    (runtime / "toolchains.env").write_text(
-        f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
-        f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
-        f"DEVKIT_RUST_RECIPE_HASH={recipe}\n"
-        f"DEVKIT_DESKTOP_RECIPE_HASH={hashlib.sha256((runtime / 'desktop.Dockerfile').read_bytes()).hexdigest()}\n")
-    (runtime / "pnpm.env").write_text("DEVKIT_PNPM_PACKAGE=@pnpm/exe.linux-x64-musl\n" + "".join(f"{key}={PINS[key]}\n" for key in ("DEVKIT_PNPM_SHA256", "DEVKIT_PNPM_TARBALL_SHA256", "DEVKIT_PNPM_VERSION")))
-    (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
+    write_fixture_runtime(root)
     shutil.copytree(REPO / "templates/rust-api", root / "apps/api", ignore=shutil.ignore_patterns("target"))
     accept_runtime(root, native=True)
-    return recipe
+    return hashlib.sha256((root / ".devkit/runtime/rust.Dockerfile").read_bytes()).hexdigest()
 
 
 class EngineVersionAdmissionTests(unittest.TestCase):
@@ -3558,6 +3575,78 @@ if (priv.value !== 'from-private-gitlab-registry') {
                 os.killpg(logs_proc.pid, signal.SIGTERM)
                 logs_proc.communicate(timeout=10)
             self.make("down", check=False)
+
+    def test_headless_task_omits_electron_cache_and_electron_task_verifies_seccomp_digest(self):
+        write_fixture(self.root)
+        fresh_cache = self.base / "headless-cache"
+        isolated = dict(env(), DEVKIT_CACHE_DIR=str(fresh_cache))
+        self.make("setup", env=isolated)
+        self.make("check", env=isolated)
+        self.make(
+            "exec",
+            "command=sh -c 'test -z \"${ELECTRON_CACHE:-}\" && test ! -e /cache/electron'",
+            env=isolated,
+        )
+        self.assertFalse(
+            (fresh_cache / "electron").exists(),
+            "headless tasks must not create the host Electron cache directory",
+        )
+
+        # Verify desktop-seccomp.json digest is rechecked before docker run even
+        # when tampered after admission during image inspection.
+        accept_runtime(self.root, native=False, package_profiles={"apps/main": "electron"})
+        desc = json.loads(run(str(ENGINE), "describe", str(self.root), "--json", env=isolated).stdout)["result"]
+        node_files = {k: v for k, v in desc["inputs"]["files"].items() if not k.endswith("Cargo.toml")}
+        node_inputs = hashlib.sha256(json.dumps({
+            "domain": "devkit-node-inputs-v1",
+            "files": node_files,
+            "directories": desc["inputs"]["directories"],
+        }, separators=(",", ":")).encode()).hexdigest()
+        node_receipt = hashlib.sha256(f"{desc['releaseIdentity']}\n{node_inputs}".encode()).hexdigest()
+        (self.root / ".devkit/state/node-workspace.lock").write_text(node_receipt + "\n")
+        desktop_pin = hashlib.sha256(
+            (self.root / ".devkit/runtime/desktop.Dockerfile").read_bytes()
+        ).hexdigest()
+        desktop_id = "sha256:" + "e" * 64
+        (self.root / ".devkit/state/desktop-image").write_text(desktop_id + "\n")
+        fake_bin = self.base / "tamper-seccomp-bin"
+        fake_bin.mkdir()
+        docker_run_log = self.base / "tamper-docker-run.log"
+        seccomp_path = self.root / ".devkit/runtime/desktop-seccomp.json"
+        real_docker = shutil.which("docker")
+        (fake_bin / "docker").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "case \"$1 ${2:-}\" in\n"
+            "  'image inspect')\n"
+            "    for arg in \"$@\"; do\n"
+            f"      if [ \"$arg\" = \"{desktop_id}\" ]; then\n"
+            f"        printf '{{\"defaultAction\":\"SCMP_ACT_ALLOW\"}}\\n' > \"{seccomp_path}\"\n"
+            f"        printf '{desktop_pin}\\n'\n"
+            "        exit 0\n"
+            "      fi\n"
+            "    done\n"
+            f"    exec \"{real_docker}\" \"$@\"\n"
+            "    ;;\n"
+            "  'run '*)\n"
+            f"    echo ran >> \"{docker_run_log}\"\n"
+            "    exit 99\n"
+            "    ;;\n"
+            f"  *) exec \"{real_docker}\" \"$@\" ;;\n"
+            "esac\n"
+        )
+        (fake_bin / "docker").chmod(0o755)
+        tamper_env = dict(isolated, PATH=f"{fake_bin}:{os.environ['PATH']}")
+        refused = self.make("check", "app=main", env=tamper_env, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "Managed desktop-seccomp.json differs from the accepted profile",
+            refused.stderr,
+        )
+        self.assertFalse(
+            docker_run_log.exists(),
+            "docker run executed with a tampered desktop-seccomp.json",
+        )
 
 
 if __name__ == "__main__":

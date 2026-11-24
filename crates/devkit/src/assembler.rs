@@ -743,8 +743,11 @@ pub fn verify_rust_template(root: &Path, rust_version: &str) -> Result<()> {
 }
 
 pub fn verify_runtime_notices(root: &Path) -> Result<()> {
-    for name in ["Apache-2.0.txt", "moby-profiles.NOTICE"] {
-        let path = safe_path(root, &format!("runtime/licenses/{name}"))?;
+    for name in crate::state::DESKTOP_RUNTIME_FILES
+        .into_iter()
+        .filter(|name| name.starts_with("runtime/licenses/"))
+    {
+        let path = safe_path(root, name)?;
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("Missing runtime notice: {name}"))?;
         ensure!(
@@ -1167,6 +1170,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))
         .collect::<String>();
+    crate::runtime::ReleaseToolPins::parse(encoded_pins.as_bytes())?;
     write_atomic(
         &safe_path(&payload, "runtime/toolchains.env")?,
         encoded_pins.as_bytes(),

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.6.0]
+
+### Changed
+
+- Install the desktop runtime, seccomp notices and Compose tool service only in projects with a registered Electron component. Upgrading a headless checkout removes its old desktop assets. Use Make, the checked-in loader or CLI `0.6.0+` with the new headless format.
+- Register existing Electron apps as project-owned desktop services so stand reservation and checkout inspection recognize them.
+
 ## [0.5.1]
 
 ### Fixed

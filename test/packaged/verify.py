@@ -46,7 +46,7 @@ def native_release(release):
 
 
 def semver_tuple(value):
-    parts = value.split("-", 1)[0].split(".")
+    parts = value.split("+", 1)[0].split("-", 1)[0].split(".")
     require(len(parts) == 3 and all(part.isdigit() for part in parts), f"Invalid version: {value}")
     return tuple(int(part) for part in parts)
 
@@ -81,6 +81,36 @@ def assert_node_workspace(root, paths):
         require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
     else:
         require((root / 'package-lock.json').is_file(), 'Missing legacy npm lock')
+
+
+def assert_desktop_runtime(root, state):
+    scoped = semver_tuple(state["version"]) >= (0, 6, 0)
+    present = not scoped or any(c["toolingProfile"] == "electron" for c in state["components"].values())
+    runtime = root / ".devkit/runtime"
+    pins = dict(line.split("=", 1) for line in (runtime / "toolchains.env").read_text().splitlines()
+                if line and not line.startswith("#"))
+    checksums = {name: digest for digest, name in
+                 (line.split("  ", 1) for line in (root / ".devkit/runtime.sha256").read_text().splitlines())}
+    for name in ("desktop.Dockerfile", "desktop-seccomp.json", "licenses/Apache-2.0.txt",
+                 "licenses/moby-profiles.NOTICE", "LICENSE", "toolchains.env", "compose.tools.yaml"):
+        path = runtime / name
+        key = str(path.relative_to(root))
+        expected = present or name in ("LICENSE", "toolchains.env", "compose.tools.yaml")
+        require(path.is_file() == expected and (key in state["managed"]) == expected
+                and (key in checksums) == expected, f"Wrong managed runtime inventory for {key}")
+        if expected:
+            digest = sha256(path.read_bytes())
+            require(state["managed"][key] == {"sha256": digest, "mode": stat.S_IMODE(path.stat().st_mode)}
+                    and checksums[key] == digest, f"Wrong managed identity for {key}")
+    require((runtime / "licenses").exists() == present, "Wrong desktop license directory presence")
+    expected_pin = sha256((runtime / "desktop.Dockerfile").read_bytes()) if present else None
+    require(pins.get("DEVKIT_DESKTOP_RECIPE_HASH") == expected_pin, "Wrong checkout desktop recipe pin")
+    workspace = json.loads((root / ".devkit/compose.workspace.json").read_text())
+    require(("desktop" in workspace["services"]) == present, "Wrong workspace desktop projection")
+    if not present:
+        tools = (runtime / "compose.tools.yaml").read_text()
+        require("desktop-seccomp.json" not in tools and "ELECTRON_CACHE" not in tools,
+                "Headless tool Compose retains Electron configuration")
 
 
 def source_snapshot(root):
@@ -344,7 +374,8 @@ class Verification:
         self.projects.append(root)
         state = json.loads((root / ".devkit/manifest.json").read_text())
         require(state["schemaVersion"] == 2 and state["version"] == selected_version and state["packageMode"] == self.package_source, "Wrong accepted v2 release")
-        self.created_versions[kind] = state["version"]
+        self.created_versions.setdefault(kind, state["version"])
+        self.verify_tool_compose(root, state, f"{parent}-init")
         if self.package_source == "registry":
             require(not (root / ".devkit/npm").exists(), "Registry consumer copied a local environment archive")
         components = state["components"]
@@ -372,6 +403,37 @@ class Verification:
                 require(components[path]["dependencies"] == ["packages/client"], "Shared dependency not derived")
         (root / ".env").write_text("PRODUCT_SECRET=consumer-owned-fixture-value\n")
         return root
+
+    def verify_tool_compose(self, root, state, label):
+        assert_desktop_runtime(root, state)
+        if semver_tuple(state["version"]) < (0, 6, 0):
+            return
+        runtime = root / ".devkit/runtime"
+        pins = dict(line.split("=", 1) for line in (runtime / "toolchains.env").read_text().splitlines()
+                    if line and not line.startswith("#"))
+        component = next(iter(state["components"]))
+        environment = dict(self.environment, **pins, DEVKIT_UID=str(os.getuid()), DEVKIT_GID=str(os.getgid()),
+                           DEVKIT_PROJECT_NAME="consumer", DEVKIT_PROJECT_ROOT=str(root),
+                           DEVKIT_COMPONENT_ROOT=str(root / component), DEVKIT_CURRENT_COMPONENT=component,
+                           DEVKIT_WORKDIR="/workspace/" + component)
+        output = self.run(label + "-tool-compose",
+                          ["docker", "compose", "-p", "consumer", "-f", runtime / "compose.tools.yaml",
+                           "-f", root / ".devkit/compose.workspace.json", "config", "--format", "json"],
+                          environment=environment)
+        services = json.loads(output)["services"]
+        electron = any(c["toolingProfile"] == "electron" for c in state["components"].values())
+        require(("desktop" in services) == electron, "Wrong normalized desktop service presence")
+        node = services["node"]
+        require("ELECTRON_CACHE" not in node["environment"]
+                and all(v["target"] != "/cache/electron" for v in node["volumes"]), "Electron cache leaked to Node")
+        if electron:
+            desktop = services["desktop"]
+            require(desktop["environment"]["HOME"] == node["environment"]["HOME"]
+                    and desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
+                    and {"/workspace", "/devkit/bin/pnpm", "/cache/electron"} <= {v["target"] for v in desktop["volumes"]}
+                    and {"no-new-privileges:true", f"seccomp={runtime}/desktop-seccomp.json"} <= set(desktop["security_opt"])
+                    and desktop["cap_drop"] == ["ALL"] and int(desktop["shm_size"]) == 256 * 1024 ** 2,
+                    "Electron tool Compose lost its runtime mounts, environment or sandbox settings")
 
     def healthy(self, root, kind):
         before = source_snapshot(root)
@@ -511,7 +573,7 @@ class Verification:
                 "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--network", f"container:{network_container}", "--read-only", "--tmpfs", "/tmp:mode=1777",
                 "--env", "HOME=/tmp/devkit-browser-home", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges:true", "--security-opt", f"seccomp={root}/.devkit/runtime/desktop-seccomp.json",
+                "--security-opt", "no-new-privileges:true", "--security-opt", f"seccomp={runtime_root}/.devkit/runtime/desktop-seccomp.json",
                 "--shm-size", "256m", "--volume", f"{Path(__file__).parent}:/harness:ro,z",
                 "--volume", f"{output}:/evidence:z", "--env", f"PROBE_MODE={mode}",
                 "--env", f"PROBE_HEADING={heading}", "--env", f"PROBE_NAME={label}"]
@@ -857,6 +919,95 @@ class Verification:
         self.make(root, "setup", label="electron-fifo-restored-setup")
         require(source_snapshot(root) == before, "Electron marker validation changed product inputs")
 
+    def verify_readiness(self, root, label, readiness, desktop_ready):
+        info = json.loads(self.make(root, "info", "json=1", label=label + "-info"))["result"]
+        require(info["readiness"] == readiness, f"{label}: unexpected checkout readiness")
+        for command in ("describe", "doctor", "status"):
+            result = json.loads(self.run(label + "-" + command, [
+                "sh", ".devkit/runtime/devkit.sh", "cli", command, ".", "--json"], cwd=root))["result"]
+            if command in ("describe", "status"):
+                require(result["receipts"]["desktopImageReady"] is desktop_ready, "Wrong desktop image receipt")
+            if command == "doctor":
+                checkout = next(check for check in result["checks"] if check["id"] == "checkout_state")
+                require(checkout["details"]["receipts"]["desktopImageReady"] is desktop_ready, "Wrong doctor receipt")
+
+    def verify_headless_tasks(self, root, label):
+        self.verify_readiness(root, label + "-before-setup", "setup-required", False)
+        self.healthy(root, label)
+        self.verify_readiness(root, label + "-after-setup", "ready", False)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        before = source_snapshot(root)
+        self.make(root, "sync", label=label + "-sync")
+        self.make(root, "update", "to=" + state["version"], label=label + "-update")
+        require(source_snapshot(root) == before, "Headless sync/update rewrote accepted inputs")
+        self.make(root, "down", "cleanup=1", label=label + "-down")
+
+    def first_electron(self, kind, adopt):
+        label = kind + ("-register-electron" if adopt else "-add-electron")
+        root = self.create(kind, label, release=self.manager)
+        self.verify_headless_tasks(root, label)
+        compose = root / "compose.yaml"
+        compose.write_bytes(compose.read_bytes() + b"\n# Project-owned Compose settings.\n")
+        compose_before = compose.read_bytes()
+        if adopt:
+            directory = root / "apps/shell"
+            shutil.copytree(self.manager / "templates/electron-react", directory, ignore=shutil.ignore_patterns("variants"))
+            if self.package_source == "local":
+                release = json.loads((self.manager / "release.json").read_text())
+                archive = Path(release["environment"]["archive"]).name
+                manifest = directory / "package.json"
+                package = json.loads(manifest.read_text())
+                package["devDependencies"]["@docouno/env"] = "file:../../.devkit/npm/" + archive
+                manifest.write_text(json.dumps(package, indent=2) + "\n")
+            targets = ["register", "app=shell", "profile=electron"]
+        else:
+            targets = ["add-app", "name=shell", "template=electron-react"]
+        self.make(root, *targets, label=label)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        shell = state["components"]["apps/shell"]
+        require(shell["toolingProfile"] == "electron" and shell["development"]["kind"] == "desktop"
+                and shell["development"]["owner"] == ("project" if adopt else "managed"), "Wrong Electron registration")
+        apps = json.loads((root / ".devkit/compose.apps.yaml").read_text())
+        require(("shell" in apps["services"]) != adopt and compose.read_bytes() == compose_before,
+                "Electron registration changed ownership of the application service")
+        self.verify_tool_compose(root, state, label)
+        before = source_snapshot(root)
+        self.make(root, *targets, label=label + "-repeat")
+        require(before == source_snapshot(root), "Repeated Electron registration changed checkout inputs")
+        # An empty DISPLAY skips Electron in aggregate stands and can mask a wrong Compose registration.
+        self.run(label + "-reserve", ["sh", ".devkit/runtime/devkit.sh", "cli", "stand", "reserve", "."],
+                 cwd=root, environment=dict(self.environment, DISPLAY=":0"))
+        self.make(root, "setup", label=label + "-setup-with-electron")
+        self.verify_readiness(root, label + "-prepared", "ready", True)
+        self.make(root, "check", "test", "build", "package", "app=shell", label=label + "-package")
+        require((root / "apps/shell/release/app-linux.tar.gz").is_file(), "Electron application archive is missing")
+        self.run(label + "-remove", ["sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", "."], cwd=root)
+
+    def apply_upgrade(self, root, label):
+        before = source_snapshot(root)
+        preview = json.loads(self.run(label + "-preview", self.cli(
+            self.next_release, "update", root, "--preview", "--json")))["result"]
+        require(not preview["applied"] and source_snapshot(root) == before, "Upgrade preview changed checkout inputs")
+        applied = json.loads(self.run(label, self.cli(self.next_release, "update", root, "--json")))["result"]
+        require(applied["applied"], "Upgrade did not accept the target release")
+
+        def changes(report):
+            # The manifest's fresh generation makes its final digest unique to each transaction.
+            return {item["path"]: (item["before"], item["after"] if item["path"] != ".devkit/manifest.json"
+                                   else item["after"]["mode"]) for item in report["files"]}
+
+        require(changes(preview) == changes(applied), "Upgrade file changes differ from preview")
+        after = source_snapshot(root)
+        changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
+        require(changed == {item["path"] for item in applied["files"]}, "Reported upgrade paths differ from disk")
+        for item in applied["files"]:
+            for phase, snapshot in (("before", before), ("after", after)):
+                identity = item[phase]
+                expected = [identity["mode"], identity["sha256"]] if identity else None
+                require(snapshot.get(item["path"]) == expected, f"Wrong {phase} identity for {item['path']}")
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        self.verify_tool_compose(root, state, label)
+
     def upgrade(self, root):
         if self.next_release is None:
             return
@@ -877,7 +1028,7 @@ class Verification:
             self.run("upgrade-managed-conflict", self.cli(self.next_release, "update", root),
                      expected="Managed file conflict")
             require(source_snapshot(root) == before, "Conflicting update wrote project files")
-        self.run("node-upgrade", self.cli(self.next_release, "update", root))
+        self.apply_upgrade(root, "node-upgrade")
         state = json.loads((root / ".devkit/manifest.json").read_text())
         require(state["version"] == next_version and state["packageMode"] == self.package_source, "Update changed package mode or wrong version")
         require((root / ".devkit/manifest.json").read_bytes() != old_state, "Update retained old accepted state")
@@ -989,10 +1140,7 @@ class Verification:
                 native_packages[path] = {key: value for key, value in package.items() if key != "devDependencies"}
                 native_dev_dependencies[path] = dict(package.get("devDependencies", {}))
         state_file.write_text(json.dumps(state, indent=2) + "\n")
-        before = source_snapshot(root)
-        self.run(f"{kind}-upgrade-preview", self.cli(self.next_release, "update", root, "--preview"))
-        require(source_snapshot(root) == before, f"{kind} preview changed project bytes")
-        self.run(f"{kind}-upgrade", self.cli(self.next_release, "update", root))
+        self.apply_upgrade(root, f"{kind}-upgrade")
         after = json.loads(state_file.read_text())
         require(after["version"] == version and after["packageMode"] == self.package_source,
                 f"{kind} accepted wrong environment")
@@ -1057,7 +1205,10 @@ class Verification:
         tslib = self.create("tslib", "e-tslib", release=self.manager)
         state = json.loads((tslib / ".devkit/manifest.json").read_text())
         require(set(state["components"]) == {"packages/lib"}, "ts-library init registered wrong components")
-        self.healthy(tslib, "tslib")
+        if core_parts >= (0, 6, 0):
+            self.verify_headless_tasks(tslib, "tslib")
+        else:
+            self.healthy(tslib, "tslib")
         self.make(tslib, "dev", expected="Project has no runnable apps", label="tslib-dev-refused")
         self.make(tslib, "down", label="tslib-down-noop")
         self.make(tslib, "status", label="tslib-status-noop")
@@ -1208,8 +1359,12 @@ class Verification:
             self.add_app(node)
             self.upgrade(node)
             self.recovery(node)
-            if semver_tuple(json.loads((self.manager / "release.json").read_text())["version"]) >= (0, 5, 0):
+            manager_version = semver_tuple(json.loads((self.manager / "release.json").read_text())["version"])
+            if manager_version >= (0, 5, 0):
                 self.fullstack_web()
+            if manager_version >= (0, 6, 0):
+                self.first_electron("rust", adopt=True)
+                self.first_electron("node", adopt=False)
             self.electron_cache_corruption(fullstack)
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
