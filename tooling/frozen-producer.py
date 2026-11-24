@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -105,7 +104,7 @@ def write_regular_nofollow(path, data):
     if st is not None:
         if not stat.S_ISREG(st.st_mode):
             return
-        if not (st.st_mode & 0o200):
+        if st.st_nlink > 1 or not (st.st_mode & 0o200):
             os.unlink(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
     try:
@@ -120,9 +119,15 @@ def write_regular_nofollow(path, data):
 def sync_cargo_cache(lockfile, src, dst):
     """Copy Cargo registry/git cache entries without following symlinks on either
     source or destination, verifying every .crate tarball SHA-256 against Cargo.lock."""
-    src_root = Path(src).resolve()
-    dst_root = Path(dst).resolve()
+    src_path = Path(src)
+    dst_path = Path(dst)
+    if src_path.is_symlink() or dst_path.is_symlink():
+        return
+    src_root = src_path.resolve()
+    dst_root = dst_path.resolve()
     if src_root == dst_root or not src_root.is_dir():
+        return
+    if dst_root.exists() and not dst_root.is_dir():
         return
     expected = None
     for rel in ("registry/index", "registry/cache", "git/db"):

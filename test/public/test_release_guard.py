@@ -228,16 +228,41 @@ class NativeProducerGuard(unittest.TestCase):
             (dst_leaf_sym / "registry/index/index.crates.io-test").mkdir(parents=True)
             (dst_leaf_sym / "registry/cache/index.crates.io-test/demo-1.0.0.crate").symlink_to(secret)
             (dst_leaf_sym / "registry/index/index.crates.io-test/config.json").symlink_to(secret)
+            # Non-allowlisted source leaf symlink in registry/index must also be ignored.
+            (idx_dir / "leak.json").symlink_to(secret)
+            # Hardlinked destination regular file must be unlinked instead of mutating shared inode.
+            shared_inode = base / "shared-inode"
+            shared_inode.write_bytes(b"original-shared")
             ro_src = src / "git/db/sample"
             ro_src.mkdir(parents=True)
             (ro_src / "pack").write_bytes(b"new-pack")
+            (ro_src / "hard").write_bytes(b"new-hard")
             ro_dst = dst_leaf_sym / "git/db/sample"
             ro_dst.mkdir(parents=True)
             (ro_dst / "pack").write_bytes(b"old-pack")
             (ro_dst / "pack").chmod(0o444)
+            os.link(shared_inode, ro_dst / "hard")
             producer["sync_cargo_cache"](lock, src, dst_leaf_sym)
             self.assertEqual(secret.read_text(), "host-secret")
+            self.assertFalse((dst_leaf_sym / "registry/index/index.crates.io-test/leak.json").exists())
             self.assertEqual((ro_dst / "pack").read_bytes(), b"new-pack")
+            self.assertEqual((ro_dst / "hard").read_bytes(), b"new-hard")
+            self.assertEqual(shared_inode.read_bytes(), b"original-shared")
+            # Symlinked src or dst roots (valid or dangling) must be refused before resolution.
+            dst_root_sym = base / "dst-root-sym"
+            dst_root_sym.symlink_to(outside)
+            producer["sync_cargo_cache"](lock, src, dst_root_sym)
+            self.assertFalse((outside / "registry").exists())
+            dangling_target = base / "must-not-be-created"
+            dst_root_dangling = base / "dst-root-dangling"
+            dst_root_dangling.symlink_to(dangling_target)
+            producer["sync_cargo_cache"](lock, src, dst_root_dangling)
+            self.assertFalse(dangling_target.exists())
+            src_root_sym = base / "src-root-sym"
+            src_root_sym.symlink_to(src)
+            dst_from_root_sym = base / "dst-from-root-sym"
+            producer["sync_cargo_cache"](lock, src_root_sym, dst_from_root_sym)
+            self.assertFalse(dst_from_root_sym.exists())
 
 
 class RequiredNativeCheckGuard(unittest.TestCase):
