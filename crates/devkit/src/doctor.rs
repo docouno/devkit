@@ -8,7 +8,7 @@ use crate::{
     resources::{
         DelegationState, DockerDaemonInfo, GIB, HostResourceBudget, MIB, ProbeEnvironment,
     },
-    runtime::{ToolPins, validate_compose_version},
+    runtime::{CheckoutToolPins, validate_compose_version},
     state,
 };
 use anyhow::{Context, ensure};
@@ -138,15 +138,7 @@ pub fn local_receipts(
     project_state: &ProjectState,
     node_inputs_digest: Option<&str>,
 ) -> Result<Value> {
-    let pins_path = ".devkit/runtime/toolchains.env";
-    let pins = safe_path(root, pins_path).ok().and_then(|path| {
-        let (bytes, id) = read_regular_file(&path, 65536, "toolchain pins").ok()??;
-        project_state
-            .managed
-            .get(pins_path)
-            .filter(|pin| id.matches_git_tracked(pin))?;
-        ToolPins::parse(&bytes).ok()
-    });
+    let pins = CheckoutToolPins::admit(root, project_state)?;
 
     let computed_node_digest = match node_inputs_digest {
         Some(d) => Some(d.to_owned()),
@@ -172,19 +164,12 @@ pub fn local_receipts(
         false
     };
 
-    let (rust_image_ready, desktop_image_ready) = if let Some(pins) = &pins {
-        (
-            recorded_derived_image_ready(root, "rust", "rust.Dockerfile", &pins.rust_recipe),
-            recorded_derived_image_ready(
-                root,
-                "desktop",
-                "desktop.Dockerfile",
-                &pins.desktop_recipe,
-            ),
-        )
-    } else {
-        (false, false)
-    };
+    let rust_image_ready =
+        recorded_derived_image_ready(root, "rust", "rust.Dockerfile", &pins.rust_recipe);
+    let desktop_image_ready = state::has_electron(project_state)
+        && pins.desktop_recipe.as_deref().is_some_and(|pin| {
+            recorded_derived_image_ready(root, "desktop", "desktop.Dockerfile", pin)
+        });
 
     Ok(json!({
         "nodeWorkspaceReady": node_workspace_ready,
@@ -896,27 +881,17 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
         };
     }
 
-    let admitted = (|| -> Result<(ProjectState, String, Value)> {
+    let admitted = (|| -> Result<(ProjectState, Value)> {
         let manifest_path = safe_path(&root, state::MANIFEST_PATH)?;
         state::check_manifest_regular_bounded(&manifest_path)?;
         let manifest_id = identity(&manifest_path)?.context("Missing project manifest")?;
         let s = state::read_project_state(&root)?;
-        state::assert_managed(&root, &s)?;
-        state::verify_managed_set(&root, &s)?;
-        let pins = ToolPins::parse(&fs::read(safe_path(
-            &root,
-            ".devkit/runtime/toolchains.env",
-        )?)?)?;
-        ensure!(
-            pins.version == s.version,
-            "Manifest version differs from accepted toolchains.env"
-        );
-        if SemVer::parse(&s.version)? >= SemVer::parse("0.5.0")? {
+        let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
+        if SemVer::parse(&full.state.version)? >= SemVer::parse("0.5.0")? {
             crate::runtime::PnpmPin::from_checkout(&root)?;
         }
-        let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
         let receipts = local_receipts(&root, &full.state, Some(&full.native.node_inputs.digest))?;
-        Ok((full.state, pins.version, receipts))
+        Ok((full.state, receipts))
     })();
 
     match admitted {
@@ -950,7 +925,8 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                 remediation: Some(rem),
             }
         }
-        Ok((project_state, version, receipts)) => {
+        Ok((project_state, receipts)) => {
+            let version = &project_state.version;
             let need_node = project_state
                 .components
                 .values()
@@ -959,10 +935,7 @@ fn inspect_checkout_lockfree(target: &Path) -> DoctorCheck {
                 .components
                 .values()
                 .any(|c| c.toolchain == Toolchain::Rust);
-            let need_desktop = project_state
-                .components
-                .values()
-                .any(|c| c.tooling_profile == ToolingProfile::Electron);
+            let need_desktop = state::has_electron(&project_state);
 
             let node_ok = !need_node
                 || receipts

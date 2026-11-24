@@ -1,6 +1,6 @@
 # Daily Workflows
 
-This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.5.1`.
+This guide covers day-to-day repository creation, component wiring, dependency management, local development, and workspace synchronization in Devkit `0.6.0`.
 
 ## 1. Create a New Repository
 
@@ -9,19 +9,19 @@ This guide covers day-to-day repository creation, component wiring, dependency m
 Initialize a single-app or multi-app workspace:
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-product --app web=react-web
+npx @docouno/devkit@0.6.0 init my-product --app web=react-web
 ```
 
 For a web-only fullstack stand (`apps/api` Rust API + `apps/web` React SPA):
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-web --preset fullstack-web
+npx @docouno/devkit@0.6.0 init my-web --preset fullstack-web
 ```
 
 Or scaffold the fullstack preset (`apps/api` Rust API + `apps/web` React SPA + `apps/desktop` Electron app + `packages/client` shared React library):
 
 ```sh
-npx @docouno/devkit@0.5.1 init my-suite --preset fullstack-desktop
+npx @docouno/devkit@0.6.0 init my-suite --preset fullstack-desktop
 ```
 
 ### Standalone Libraries (Zero-App Workspace)
@@ -29,13 +29,13 @@ npx @docouno/devkit@0.5.1 init my-suite --preset fullstack-desktop
 Create a package-only repository without scaffolding a dummy runnable application:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-sdk --package sdk=ts-library
+npx @docouno/devkit@0.6.0 init acme-sdk --package sdk=ts-library
 ```
 
 Create a React component library repository:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-ui --package ui=react-ui
+npx @docouno/devkit@0.6.0 init acme-ui --package ui=react-ui
 ```
 
 ### Design System with Interactive Playground
@@ -43,7 +43,7 @@ npx @docouno/devkit@0.5.1 init acme-ui --package ui=react-ui
 Scaffold `packages/ui` (`react-ui`) pre-wired to `apps/playground` (`react-web`) with instant source HMR:
 
 ```sh
-npx @docouno/devkit@0.5.1 init acme-design --preset design-system
+npx @docouno/devkit@0.6.0 init acme-design --preset design-system
 ```
 
 After initialization, prepare pinned toolchains and workspace dependencies:
@@ -100,7 +100,9 @@ make sync reconcile=1
 make setup
 ```
 
-You can also invoke `npx @docouno/devkit@0.5.1 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
+For headless projects on `0.6.0` or newer, use Make, the checkout loader, or CLI `0.6.0+`. Older external engines require a desktop recipe pin.
+
+You can also invoke `npx @docouno/devkit@0.6.0 sync . [--preview] [--reconcile-lock]` or `sh .devkit/runtime/devkit.sh cli sync . --json`.
 
 ## 5. Run Daily Gates and Development Services
 
@@ -208,7 +210,7 @@ To share a template across a clone, put it in the root `.env` of a Devkit worktr
 
 `{port}` is a published host port, `{service}` is the Compose service, and `{branch}`/`{slug}` is a lower-case DNS-safe slug of the branch (checkout basename outside Git; detached commits use a short revision). Userinfo, wildcard hosts and unknown placeholders are rejected. The template does not provision a proxy, DNS or TLS.
 
-Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make info` and `devkit status --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down (rendering the current checkout template for stopped services while preserving the applied snapshot on running services so an unapplied template is never advertised as already running).
+Preview links are rendered for actual published TCP endpoints of all services, including APIs. Every published TCP port of registered web/Electron frontends contributes an exact Vite host, including non-default targets, explicit ranges and replicas. APIs and UDP bindings do not become Vite hosts. Local addresses remain available alongside previews, with IPv6 loopback preserved. Both `make info` and `sh .devkit/runtime/devkit.sh cli status . --json` report applied endpoints, metadata verification and whether changed preview settings need a restart. JSON `standPorts` and retained-lease lines remain available after ordinary down (rendering the current checkout template for stopped services while preserving the applied snapshot on running services so an unapplied template is never advertised as already running).
 
 Devkit mounts one immutable, digest-checked JSON host set read-only at `/run/devkit/preview-hosts.json`, falling back to `/devkit/preview-hosts.json`. The file is limited to 32 MiB and 65,535 sorted unique hosts. Managed launches clear the legacy `DEVKIT_PREVIEW_HOSTS` CSV carrier. Short `DEVKIT_PREVIEW_HOSTS_FILE`, `DEVKIT_PREVIEW_HOSTS_SHA256`, `DEVKIT_PREVIEW_URL`, `DEVKIT_SERVICE` and `DEVKIT_BRANCH` variables describe it; automatic host sets are never expanded into a large environment variable.
 

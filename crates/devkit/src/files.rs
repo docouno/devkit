@@ -521,6 +521,28 @@ pub fn remove_empty_dir_durable(path: &Path) -> Result<()> {
             .unwrap_or(Path::new(".")),
     )
 }
+/// Prune only directories below the managed runtime. Recovery recreates each
+/// removed parent durably when restoring its first backed-up file.
+pub(crate) fn remove_file_and_empty_runtime_parents(root: &Path, name: &str) -> Result<()> {
+    remove_file(&safe_path(root, name)?)?;
+    for parent in Path::new(name).ancestors().skip(1) {
+        let name = parent.to_str().context("Non-UTF8 runtime path")?;
+        if !name.starts_with(".devkit/runtime/") {
+            break;
+        }
+        let path = safe_path(root, name)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => ensure!(meta.is_dir(), "Expected a regular directory: {name}"),
+            Err(e) if absent(&e) => break,
+            Err(e) => return Err(e.into()),
+        }
+        if !sorted_entries(&path)?.is_empty() {
+            break;
+        }
+        remove_empty_dir_durable(&path)?;
+    }
+    Ok(())
+}
 pub fn remove_tree_durable(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => (),

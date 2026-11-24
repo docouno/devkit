@@ -1,4 +1,11 @@
-use crate::{Result, catalog::*, files::*, model::*};
+use crate::{
+    Result,
+    catalog::*,
+    compose::{MAX_YAML_BYTES, parse_compose},
+    files::*,
+    model::*,
+    state::{has_electron, uses_profile_scoped_runtime},
+};
 use anyhow::{Context, ensure};
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, fs, path::Path};
@@ -346,7 +353,11 @@ pub fn render_workspace_compose_value(
         .iter()
         .map(|p| project_volume(p))
         .collect::<Vec<_>>();
-    Ok(json!({"services":{"node":{"volumes":volumes},"desktop":{"volumes":volumes}}}))
+    let mut services = json!({"node":{"volumes":volumes}});
+    if !uses_profile_scoped_runtime(&state.version)? || has_electron(state) {
+        services["desktop"] = services["node"].clone();
+    }
+    Ok(json!({"services":services}))
 }
 pub fn render_workspace_compose(
     state: &ProjectState,
@@ -354,6 +365,89 @@ pub fn render_workspace_compose(
 ) -> Result<Vec<u8>> {
     json_bytes(&render_workspace_compose_value(state, inputs)?)
 }
+
+fn checked_tool_compose(bytes: &[u8], electron: bool) -> Result<Value> {
+    let model = parse_compose(bytes)?;
+    let services = object(&model["services"], "Tool Compose services")?;
+    let node = services.get("node").context("Missing node tool service")?;
+    let node_settings = object(node, "Node tool service")?;
+    let node_settings = serde_json::to_string(node_settings)?;
+    ensure!(
+        !node_settings.contains("ELECTRON_CACHE") && !node_settings.contains("/cache/electron"),
+        "The node tool service contains an Electron cache"
+    );
+    if electron {
+        let desktop = services
+            .get("desktop")
+            .context("Missing desktop tool service")?;
+        let security = desktop["security_opt"]
+            .as_array()
+            .context("Missing desktop security options")?;
+        let volumes = desktop["volumes"]
+            .as_array()
+            .context("Missing desktop volumes")?;
+        ensure!(
+            desktop["shm_size"] == "256m"
+                && desktop["cap_drop"] == json!(["ALL"])
+                && security.iter().any(|opt| opt == "no-new-privileges:true")
+                && security.iter().any(|opt| opt
+                    == "seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"),
+            "Invalid desktop tool service security settings"
+        );
+        ensure!(
+            desktop["environment"]["HOME"].is_string()
+                && desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
+                && ["/workspace", "/devkit/bin/pnpm", "/cache/electron"]
+                    .iter()
+                    .all(|target| volumes.iter().any(|volume| volume["target"] == *target)),
+            "Invalid desktop tool environment or mounts"
+        );
+    } else {
+        let source = std::str::from_utf8(bytes)?;
+        ensure!(
+            !services.contains_key("desktop")
+                && !source.contains("desktop-seccomp.json")
+                && !source.contains("ELECTRON_CACHE"),
+            "Headless tool Compose contains desktop runtime references"
+        );
+    }
+    Ok(model)
+}
+
+pub fn render_headless_tool_compose(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut expected = checked_tool_compose(bytes, true)?;
+    expected["services"]
+        .as_object_mut()
+        .unwrap()
+        .remove("desktop");
+
+    // Keep the release YAML's comments and anchors. Check the parsed models so
+    // a change in the release layout cannot silently alter another service.
+    let source = std::str::from_utf8(bytes)?;
+    let (prefix, desktop_body) = source
+        .split_once("\n  desktop:\n")
+        .context("Missing desktop service block in release tool Compose")?;
+    let body_len: usize = desktop_body
+        .split_inclusive('\n')
+        .take_while(|line| line.starts_with("   ") || line.trim().is_empty())
+        .map(str::len)
+        .sum();
+    let headless = format!("{prefix}\n{}", &desktop_body[body_len..]).into_bytes();
+    ensure!(
+        checked_tool_compose(&headless, false)? == expected,
+        "Removing desktop changed other tool Compose settings"
+    );
+    Ok(headless)
+}
+
+fn assert_tool_compose(root: &Path, electron: bool) -> Result<()> {
+    let path = safe_path(root, ".devkit/runtime/compose.tools.yaml")?;
+    let (bytes, _) = read_regular_file(&path, MAX_YAML_BYTES as u64, "Tool Compose projection")?
+        .context("Missing tool Compose projection")?;
+    checked_tool_compose(&bytes, electron)?;
+    Ok(())
+}
+
 pub fn assert_projections(
     root: &Path,
     state: &ProjectState,
@@ -373,5 +467,34 @@ pub fn assert_projections(
         workspace == render_workspace_compose_value(state, inputs)?,
         "Workspace mount projection is stale; run devkit sync"
     );
+    if uses_profile_scoped_runtime(&state.version)? {
+        assert_tool_compose(root, has_electron(state))
+            .context("Tool Compose projection is stale; run devkit sync")?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_projection_rejects_stale_desktop_mounts_and_security() {
+        let full = include_bytes!("../../../runtime/compose.tools.yaml");
+        let mut model = checked_tool_compose(full, true).unwrap();
+        assert!(checked_tool_compose(full, false).is_err());
+        model["services"]["desktop"]["volumes"] = model["services"]["node"]["volumes"].clone();
+        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), true).is_err());
+
+        let mut model = parse_compose(full).unwrap();
+        model["services"]["desktop"]["cap_drop"] = json!([]);
+        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), true).is_err());
+        let headless = render_headless_tool_compose(full).unwrap();
+        let mut model = checked_tool_compose(&headless, false).unwrap();
+        model["services"]["node"]["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("cache:/cache/electron"));
+        assert!(checked_tool_compose(&json_bytes(&model).unwrap(), false).is_err());
+    }
 }

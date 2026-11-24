@@ -433,7 +433,7 @@ impl PreparedTransaction {
                         file.after.as_ref().unwrap().mode,
                     )?;
                 } else {
-                    remove_file(&p)?;
+                    remove_file_and_empty_runtime_parents(root, &file.path)?;
                 }
                 if let Some(h) = hooks {
                     h.after_write(i + 1, &file.path)?;

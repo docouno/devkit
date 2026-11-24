@@ -1,11 +1,12 @@
 //! Bounded checkout metadata for `make info`. All observations are read-only.
 use crate::{
     Result,
+    delivery::EnginePin,
     doctor::ComposeServiceStatus,
     files::*,
     model::{DevelopmentKind, Role, Toolchain, ToolingProfile},
     processes::ProcessRunner,
-    runtime::ToolPins,
+    runtime::CheckoutToolPins,
     stand::{epoch::Physical, ledger, ports::Ports, preview},
     state,
 };
@@ -334,18 +335,18 @@ pub(crate) fn inspect(
     let mut condition = "unknown";
     let mut services = Vec::new();
     let mut reservations = Vec::new();
-    let pins_path = ".devkit/runtime/toolchains.env";
-    let pins = read_regular_file(&safe_path(&root, pins_path)?, 65536, "toolchain pins")
-        .ok()
-        .flatten();
-    let pins_version = pins
-        .as_ref()
-        .and_then(|(bytes, _)| ToolPins::parse(bytes).ok())
-        .map(|pins| pins.version);
-    let version = accepted
-        .as_ref()
-        .map(|s| s.version.as_str())
-        .or(pins_version.as_deref());
+    let version = match &accepted {
+        Some(state) => Some(state.version.clone()),
+        None => safe_path(&root, ".devkit/runtime/toolchains.env")
+            .ok()
+            .and_then(|path| {
+                read_regular_file(&path, 65536, "toolchain pins")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|(bytes, _)| EnginePin::from_toolchains(&bytes).ok())
+            .map(|pin| pin.version),
+    };
     let pending = state::assert_no_pending(&root).is_err();
     if let Some(state) = &accepted {
         for (path, c) in &state.components {
@@ -373,14 +374,8 @@ pub(crate) fn inspect(
             None
         };
         if !pending
-            && pins.as_ref().is_some_and(|(_, id)| {
-                state
-                    .managed
-                    .get(pins_path)
-                    .is_some_and(|expected| id.matches_git_tracked(expected))
-            })
-            && pins_version.as_deref() == Some(&state.version)
             && state.version == env!("CARGO_PKG_VERSION")
+            && CheckoutToolPins::admit(&root, state).is_ok()
         {
             if !busy {
                 readiness = local_readiness(&root, state)?;
@@ -448,7 +443,7 @@ pub(crate) fn inspect(
         format!("Branch: {}", branch.as_deref().unwrap_or("none")),
         format!(
             "Devkit: {} ({}, lock {lock_state})",
-            version.unwrap_or("unknown"),
+            version.as_deref().unwrap_or("unknown"),
             readiness.replace('-', " ")
         ),
         format!("Apps: {}", list(&apps)),

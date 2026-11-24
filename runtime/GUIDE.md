@@ -8,6 +8,8 @@ This repository uses a pinned Devkit development environment. Daily commands run
 - `packages/<name>` (`1..M`): Reusable workspace libraries (`ts-library`, `react-ui`, `react-client`).
 - `.devkit/`: Pinned runtime scripts, Docker/Compose definitions, `.devkit/manifest.json`, and generated Make/Compose projections.
 
+From Devkit `0.6.0`, adding or registering the first Electron app installs `.devkit/runtime/desktop.Dockerfile`, `desktop-seccomp.json`, their `licenses/` attributions and the desktop tool service. Headless projects omit these files and the desktop recipe pin. Use Make, the checkout loader or CLI `0.6.0+` for these projects. Older external CLI versions require the desktop pin.
+
 ## File Ownership Boundaries
 
 - **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/compose.workspace.json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and `{rust-component}/rust-toolchain.toml`.

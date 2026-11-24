@@ -573,11 +573,10 @@ fn try_dispatch_info(
         if !pins_id.matches_git_tracked(expected_pins) {
             return Ok(None);
         }
-        let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
-        if pins.version != header.version {
+        let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
+        if pin.version != header.version {
             return Ok(None);
         }
-        let pin = pins.engine;
         if delivery::current_engine_digest()? == pin.sha256 {
             return Ok(None);
         }
@@ -667,12 +666,11 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         "{}",
         conflict_msg()
     );
-    let pins = crate::runtime::ToolPins::parse(&pins_bytes)?;
+    let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
     ensure!(
-        pins.version == header.version,
+        pin.version == header.version,
         "Accepted version differs from toolchain pins"
     );
-    let pin = pins.engine;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(

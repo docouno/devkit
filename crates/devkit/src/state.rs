@@ -14,6 +14,26 @@ pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
 pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.4.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
+// Paths within a release payload. The seccomp notices travel with the profile.
+pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
+    "runtime/desktop.Dockerfile",
+    "runtime/desktop-seccomp.json",
+    "runtime/licenses/Apache-2.0.txt",
+    "runtime/licenses/moby-profiles.NOTICE",
+];
+
+pub fn uses_profile_scoped_runtime(version: &str) -> Result<bool> {
+    let v = SemVer::parse(version)?;
+    Ok((v.major, v.minor, v.patch) >= (0, 6, 0))
+}
+
+pub fn has_electron(state: &ProjectState) -> bool {
+    state
+        .components
+        .values()
+        .any(|c| c.tooling_profile == ToolingProfile::Electron)
+}
+
 pub fn check_manifest_regular_bounded(path: &Path) -> Result<()> {
     let info = match fs::symlink_metadata(path) {
         Ok(i) => i,
@@ -370,6 +390,29 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
             "Unlisted runtime file: {path}"
         );
     }
+    let electron = has_electron(state);
+    if electron || uses_profile_scoped_runtime(&state.version)? {
+        for name in DESKTOP_RUNTIME_FILES {
+            let path = format!(".devkit/{name}");
+            if electron {
+                ensure!(
+                    state.managed.contains_key(&path),
+                    "Missing managed Electron file: {path}"
+                );
+            } else {
+                ensure!(
+                    !state.managed.contains_key(&path),
+                    "Unexpected managed Electron file: {path}"
+                );
+            }
+        }
+        if !electron {
+            ensure!(
+                !exists(&safe_path(root, ".devkit/runtime/licenses")?)?,
+                "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
+            );
+        }
+    }
     let mut seen = BTreeSet::new();
     for line in fs::read_to_string(safe_path(root, CHECKSUM_PATH)?)?.lines() {
         if line.is_empty() {
@@ -433,6 +476,7 @@ pub fn admit_runtime_snapshot(
 ) -> Result<RuntimeAdmission> {
     assert_managed(root, &s)?;
     verify_managed_set(root, &s)?;
+    crate::runtime::CheckoutToolPins::admit(root, &s)?;
     let native = crate::native::admit_native_components(root, &s)?;
     crate::projections::assert_projections(root, &s, &native.inputs)?;
     let snapshot = RuntimeAdmission {

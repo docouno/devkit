@@ -1,3 +1,6 @@
+#[path = "support/runtime.rs"]
+mod runtime_fixture;
+
 use devkit::{
     files::*,
     state::{MANIFEST_PATH, PENDING_PATH},
@@ -1284,29 +1287,7 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
         let elf_sha = digest(&elf_bytes);
         write_atomic(&rel.join("devkit"), &elf_bytes, 0o755).unwrap();
 
-        let rust_df = b"FROM scratch\n";
-        let desktop_df = b"FROM scratch\n";
-        write_atomic(&rel.join("runtime/rust.Dockerfile"), rust_df, 0o644).unwrap();
-        write_atomic(&rel.join("runtime/desktop.Dockerfile"), desktop_df, 0o644).unwrap();
-        let rust_hash = digest(rust_df);
-        let desktop_hash = digest(desktop_df);
-        let toolchains = format!(
-            "DEVKIT_VERSION={version}\nDEVKIT_ENGINE_SHA256={elf_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={rust_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={desktop_hash}\n"
-        );
-        write_atomic(
-            &rel.join("runtime/toolchains.env"),
-            toolchains.as_bytes(),
-            0o644,
-        )
-        .unwrap();
-        for name in ["devkit.mk", "devkit.sh", "compose.tools.yaml"] {
-            write_atomic(
-                &rel.join(format!("runtime/{name}")),
-                b"services: {}\n",
-                0o644,
-            )
-            .unwrap();
-        }
+        runtime_fixture::write_runtime(&rel, version, &elf_sha);
         for (name, body) in [
             (
                 "Cargo.toml",
@@ -1376,6 +1357,7 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     let rel_040 = build_release("0.4.0", false);
     let rel_041 = build_release("0.4.1", false);
     let current_version = env!("CARGO_PKG_VERSION");
+    let rel_051 = build_release("0.5.1", false);
     let rel_current = build_release(current_version, true);
     let rel_990 = build_release("99.0.0", false);
 
@@ -1424,6 +1406,7 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     };
     let proj_040 = make_proj(&rel_040, "proj-040");
     let proj_041 = make_proj(&rel_041, "proj-041");
+    let proj_051 = make_proj(&rel_051, "proj-051");
     let proj_current = make_proj(&rel_current, "proj-current");
     let proj_990 = make_proj(&rel_990, "proj-990");
 
@@ -1497,10 +1480,14 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
     }
 
     // 4. With EMPTY cache and dead network proxy, describe and status NEVER touch the network:
-    //    - 0.4.1 and the current version succeed locally;
+    //    - accepted 0.4.x, 0.5.x and current projects succeed locally;
     //    - unprimed 99.0.0 fails locally with "run make setup".
     let empty_cache = temp.path().join("empty-cache");
-    for (proj, expected_ver) in [(&proj_041, "0.4.1"), (&proj_current, current_version)] {
+    for (proj, expected_ver) in [
+        (&proj_041, "0.4.1"),
+        (&proj_051, "0.5.1"),
+        (&proj_current, current_version),
+    ] {
         let desc = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args([
                 "--json",
@@ -1521,6 +1508,25 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
             String::from_utf8_lossy(&desc.stdout)
         );
         assert_eq!(decoded(&desc)["result"]["version"], expected_ver);
+
+        let doctor = Command::new(env!("CARGO_BIN_EXE_devkit"))
+            .args(["--json", "--cache-dir"])
+            .arg(&empty_cache)
+            .arg("doctor")
+            .arg(proj)
+            .env_clear()
+            .env("PATH", &fake_bin)
+            .output()
+            .unwrap();
+        let report = decoded(&doctor);
+        let checkout = report["result"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "checkout_state")
+            .unwrap();
+        assert_eq!(checkout["details"]["version"], expected_ver, "{checkout}");
+        assert_eq!(checkout["details"]["receipts"]["desktopImageReady"], false);
 
         let stat = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args([
@@ -1570,72 +1576,53 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
         );
     }
 
-    // 5. If the genuine v0.4.1 baseline ELF is staged locally, prove it parses 0.5.0 release.json
-    //    with minSupportedFromVersion and forward-delegates cleanly to 0.5.0.
-    let genuine_041 = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.artifacts/baseline/v0.4.1/payload/devkit");
-    if genuine_041.is_file() {
-        let rel_050_marker = temp.path().join("release-0.5.0-marker");
-        fs::create_dir_all(&rel_050_marker).unwrap();
-        let marker_elf = minimal_static_x86_64_elf(
-            b"{\"schemaVersion\":1,\"ok\":true,\"command\":\"delegated\",\"result\":{\"engine\":\"0.5.0-target\"}}\n",
-        );
-        let marker_sha = digest(&marker_elf);
-        write_atomic(&rel_050_marker.join("devkit"), &marker_elf, 0o755).unwrap();
-        let recipe_hash = "c".repeat(64);
-        let tc = format!(
-            "DEVKIT_VERSION=0.5.0\nDEVKIT_ENGINE_SHA256={marker_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\nDEVKIT_NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205\nDEVKIT_NODE_VERSION=24.22.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={recipe_hash}\nDEVKIT_DESKTOP_RECIPE_HASH={recipe_hash}\n"
-        );
-        write_atomic(
-            &rel_050_marker.join("runtime/toolchains.env"),
-            tc.as_bytes(),
-            0o644,
-        )
-        .unwrap();
-        let env_b = b"env-0.5.0";
-        let env_s = format!("sha512-{}", STANDARD.encode(Sha512::digest(env_b)));
-        write_atomic(&rel_050_marker.join("npm/env-0.5.0.tgz"), env_b, 0o644).unwrap();
-        write_json(
-            &rel_050_marker.join("release.json"),
-            &devkit::model::Release {
-                schema_version: 1,
-                version: "0.5.0".into(),
-                min_supported_from_version: Some("0.4.0".into()),
-                rust_version: "1.99.1".into(),
-                environment: devkit::model::Environment {
-                    name: "@docouno/env".into(),
-                    version: "0.5.0".into(),
-                    archive: "npm/env-0.5.0.tgz".into(),
-                    integrity: env_s,
-                },
-                files: file_map(&rel_050_marker).unwrap(),
-                migrations: vec![],
-            },
-        )
-        .unwrap();
-        let from_041 = Command::new(&genuine_041)
-            .args([
-                "--json",
-                "--cache-dir",
-                temp.path().join("genuine-041-cache").to_str().unwrap(),
-                "update",
-                proj_041.to_str().unwrap(),
-                "--to",
-                "0.5.0",
-                "--release-root",
-                rel_050_marker.to_str().unwrap(),
-            ])
+    // Old engines read all release pins before delegating to the newer binary.
+    // Use a single local cache so both upgrades share the same current payload.
+    let genuine_cache = temp.path().join("genuine-upgrade");
+    let baseline = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.artifacts/baseline");
+    // The author debug build includes symbols and exceeds the release entry budget.
+    // Keep its executable code, then reseal the fixture before old engines import it.
+    let engine_path = rel_current.join("devkit");
+    assert!(
+        Command::new("strip")
+            .arg(&engine_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let stripped_sha = identity(&engine_path).unwrap().unwrap().sha256;
+    runtime_fixture::write_runtime(&rel_current, current_version, &stripped_sha);
+    let manifest_path = rel_current.join("release.json");
+    let mut release: devkit::model::Release = read_json(&manifest_path).unwrap();
+    release.files = file_map(&rel_current).unwrap();
+    release.files.remove("release.json");
+    write_json(&manifest_path, &release).unwrap();
+    for (version, project) in [("0.4.1", &proj_041), ("0.5.1", &proj_051)] {
+        let old_engine = baseline.join(format!("v{version}/payload/devkit"));
+        if !old_engine.is_file() {
+            continue;
+        }
+        let updated = Command::new(old_engine)
+            .args(["--json", "--offline", "--cache-dir"])
+            .arg(&genuine_cache)
+            .arg("update")
+            .arg(project)
+            .args(["--to", current_version, "--release-root"])
+            .arg(&rel_current)
             .env_clear()
             .env("CI", "true")
             .output()
             .unwrap();
         assert!(
-            from_041.status.success(),
-            "genuine 0.4.1 failed to forward-delegate to 0.5.0: stdout={} stderr={}",
-            String::from_utf8_lossy(&from_041.stdout),
-            String::from_utf8_lossy(&from_041.stderr)
+            updated.status.success(),
+            "genuine {version} upgrade: {updated:?}"
         );
-        assert_eq!(decoded(&from_041)["result"]["engine"], "0.5.0-target");
+        assert_eq!(decoded(&updated)["ok"], true);
+        assert_eq!(
+            read_json::<Value>(&project.join(MANIFEST_PATH)).unwrap()["version"],
+            current_version
+        );
+        assert!(!project.join(".devkit/runtime/licenses").exists());
     }
 }
 

@@ -9,6 +9,7 @@ use crate::{
     processes::{OutputMode, OwnedContainer, ProcessRunner},
     projections::*,
     release::*,
+    runtime::{CheckoutToolPins, ReleaseToolPins},
     state::*,
     transaction::*,
 };
@@ -294,22 +295,7 @@ impl LockResolver for DockerPnpmResolver {
         release: &AdmittedRelease,
         registry: Option<&str>,
     ) -> Result<()> {
-        let pins = String::from_utf8(release.bytes("runtime/toolchains.env")?)?;
-        let mut image = None;
-        for line in pins.lines() {
-            if let Some(value) = line.strip_prefix("DEVKIT_NODE_IMAGE=") {
-                ensure!(image.is_none(), "Duplicate Node image pin");
-                let (name, hash) = value
-                    .rsplit_once("@sha256:")
-                    .context("Node image must be digest-pinned")?;
-                ensure!(
-                    !name.is_empty() && SHA256_RE.is_match(hash),
-                    "Invalid Node image pin"
-                );
-                image = Some(value.to_string());
-            }
-        }
-        let image = image.context("Missing digest-pinned Node image")?;
+        let image = ReleaseToolPins::parse(&release.bytes("runtime/toolchains.env")?)?.node_image;
         let root = project_root(root)?;
         let npmrc_policy = parse_manifest_npmrc_policy(
             &root,
@@ -825,22 +811,59 @@ pub fn render_component(
     };
     Ok((path, state, Some(seed)))
 }
-pub fn write_managed(
+fn stage_runtime_files(
     release: &AdmittedRelease,
     destination: &Path,
     state: &ProjectState,
 ) -> Result<BTreeMap<String, FileIdentity>> {
     let mut managed = BTreeMap::new();
-    for (name, id) in &release.manifest.files {
-        if name.starts_with("runtime/") {
-            let target = format!(".devkit/{name}");
-            write_atomic(
-                &safe_path(destination, &target)?,
-                &release.bytes(name)?,
-                id.mode,
-            )?;
-            managed.insert(target, id.clone());
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
+    let electron = has_electron(state);
+    let omit_desktop = scoped && !electron;
+    if scoped && electron {
+        for name in DESKTOP_RUNTIME_FILES {
+            ensure!(
+                release.manifest.files.contains_key(name),
+                "Missing release {name}"
+            );
         }
+    }
+    for (name, id) in &release.manifest.files {
+        if !name.starts_with("runtime/")
+            || (omit_desktop && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
+        {
+            continue;
+        }
+        let mut bytes = release.bytes(name)?;
+        if scoped && name == "runtime/toolchains.env" {
+            let pins = ReleaseToolPins::parse(&bytes)?;
+            ensure!(
+                pins.engine.version == state.version,
+                "Release toolchain version differs from manifest"
+            );
+            if omit_desktop {
+                bytes = std::str::from_utf8(&bytes)?
+                    .split_inclusive('\n')
+                    .filter(|line| !line.starts_with("DEVKIT_DESKTOP_RECIPE_HASH="))
+                    .collect::<String>()
+                    .into_bytes();
+            } else {
+                ensure!(
+                    pins.desktop_recipe
+                        == release.manifest.files["runtime/desktop.Dockerfile"].sha256,
+                    "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
+                );
+            }
+        } else if omit_desktop && name == "runtime/compose.tools.yaml" {
+            bytes = render_headless_tool_compose(&bytes)?;
+        }
+        let target = format!(".devkit/{name}");
+        let path = safe_path(destination, &target)?;
+        write_atomic(&path, &bytes, id.mode)?;
+        managed.insert(
+            target,
+            identity(&path)?.context("Missing staged runtime file")?,
+        );
     }
     for required in [
         "devkit.mk",
@@ -853,6 +876,15 @@ pub fn write_managed(
             "Missing release runtime/{required}"
         );
     }
+    Ok(managed)
+}
+
+pub fn write_managed(
+    release: &AdmittedRelease,
+    destination: &Path,
+    state: &ProjectState,
+) -> Result<BTreeMap<String, FileIdentity>> {
+    let mut managed = stage_runtime_files(release, destination, state)?;
     if state.package_mode == PackageMode::Local {
         let target = format!(
             ".devkit/npm/{}",
@@ -956,6 +988,33 @@ pub fn write_managed(
     );
     Ok(managed)
 }
+
+fn check_new_managed_files(
+    root: &Path,
+    old: &ProjectState,
+    next: &ProjectState,
+    adopted_toolchain: Option<&str>,
+) -> Result<()> {
+    for (name, id) in &next.managed {
+        if !old.managed.contains_key(name)
+            && let Some(actual) = identity(&safe_path(root, name)?)?
+        {
+            ensure!(
+                adopted_toolchain == Some(name.as_str()) && actual.matches_git_tracked(id),
+                "New managed file conflicts with project content: {name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_project(root: &Path, state: &ProjectState) -> Result<()> {
+    validate_project_state(state)?;
+    verify_managed_set(root, state)?;
+    let native = admit_native_components(root, state)?;
+    assert_projections(root, state, &native.inputs)
+}
+
 fn empty_target(target: &Path) -> Result<()> {
     ensure!(
         !exists(target)? || {
@@ -1202,8 +1261,7 @@ pub fn init_project(
     let readme = project_readme(&name, &state);
     write_atomic(&stage.path().join("README.md"), readme.as_bytes(), 0o644)?;
     write_json(&safe_path(stage.path(), MANIFEST_PATH)?, &state)?;
-    assert_native_components(stage.path(), &state)?;
-    validate_project_state(&state)?;
+    validate_staged_project(stage.path(), &state)?;
     release.recheck()?;
     if let Some(h) = options.hooks {
         h.after_stage()?;
@@ -1521,6 +1579,8 @@ fn mutate(
         && old.release_identity == release.identity
         && mode == old.package_mode
     {
+        verify_managed_set(root, old)?;
+        CheckoutToolPins::admit(root, old)?;
         match assert_native_components(root, old)
             .and_then(|()| assert_projections(root, old, &snapshot.inputs))
         {
@@ -1659,8 +1719,13 @@ fn mutate(
                     },
                     tool_dependencies: profile_tools(&release, *profile, mode)?,
                     dependencies: vec![],
-                    development: (*role == Role::App)
-                        .then(|| development(name, DevelopmentOwner::Project, false)),
+                    development: (*role == Role::App).then(|| {
+                        development(
+                            name,
+                            DevelopmentOwner::Project,
+                            *profile == ToolingProfile::Electron,
+                        )
+                    }),
                     extra: BTreeMap::new(),
                 },
             );
@@ -1758,7 +1823,7 @@ fn mutate(
         next.managed = write_managed(&release, &staged_root, &next)?;
         for name in old.managed.keys() {
             if !next.managed.contains_key(name) {
-                remove_file(&safe_path(&staged_root, name)?)?;
+                remove_file_and_empty_runtime_parents(&staged_root, name)?;
             }
         }
         let mut lock_reconciliation = None;
@@ -1798,20 +1863,19 @@ fn mutate(
             c.dependencies = deps[path].clone();
         }
         next.managed = write_managed(&release, &staged_root, &next)?;
-        for (name, id) in &next.managed {
-            if !old.managed.contains_key(name) && identity(&safe_path(root, name)?)?.is_some() {
-                let adopting = matches!(&change,Some(Change::Register{role,name:component,..}) if name==&format!("{}/rust-toolchain.toml",component_path(*role,component)?));
-                ensure!(
-                    adopting
-                        && identity(&safe_path(root, name)?)?
-                            .as_ref()
-                            .is_some_and(|actual| actual.matches_git_tracked(id)),
-                    "New managed file conflicts with project content: {name}"
-                );
-            }
-        }
-        validate_project_state(&next)?;
-        assert_native_components(&staged_root, &next)?;
+        let adopted_toolchain = match &change {
+            Some(Change::Register {
+                role,
+                name,
+                profile: ToolingProfile::Rust,
+            }) => Some(format!(
+                "{}/rust-toolchain.toml",
+                component_path(*role, name)?
+            )),
+            _ => None,
+        };
+        check_new_managed_files(root, old, &next, adopted_toolchain.as_deref())?;
+        validate_staged_project(&staged_root, &next)?;
         write_json(&safe_path(&staged_root, MANIFEST_PATH)?, &next)?;
         let mut paths = old
             .managed
@@ -2327,11 +2391,11 @@ pub fn sync_project(
         next.managed = write_managed(&release, &staged_root, &next)?;
         for name in old.managed.keys() {
             if !next.managed.contains_key(name) {
-                remove_file(&safe_path(&staged_root, name)?)?;
+                remove_file_and_empty_runtime_parents(&staged_root, name)?;
             }
         }
-        validate_project_state(&next)?;
-        assert_native_components(&staged_root, &next)?;
+        check_new_managed_files(root, old, &next, None)?;
+        validate_staged_project(&staged_root, &next)?;
         let mut paths = old
             .managed
             .keys()

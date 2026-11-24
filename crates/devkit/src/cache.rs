@@ -306,9 +306,9 @@ impl<'a> ReleaseCache<'a> {
                 .sha256
                 .clone(),
         };
-        let pins = crate::runtime::ToolPins::parse(&release.bytes("runtime/toolchains.env")?)?;
+        let recorded = EnginePin::from_toolchains(&release.bytes("runtime/toolchains.env")?)?;
         ensure!(
-            pins.engine == pin,
+            recorded == pin,
             "Release engine pin differs from its actual payload"
         );
         let lock_path = self.lock_path(&format!(

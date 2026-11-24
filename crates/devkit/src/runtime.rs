@@ -2,6 +2,9 @@
 use crate::{
     Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
 };
+mod pins;
+pub use pins::{CheckoutToolPins, ReleaseToolPins};
+
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,77 +82,6 @@ pub struct ExecRequest {
     pub write: bool,
     pub network: String,
     pub prepare: bool,
-}
-#[derive(Clone, Debug)]
-pub struct ToolPins {
-    pub version: String,
-    pub node_image: String,
-    pub node_version: String,
-    pub rust_version: String,
-    pub rust_recipe: String,
-    pub desktop_recipe: String,
-    pub engine: crate::delivery::EnginePin,
-}
-impl ToolPins {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut values = BTreeMap::new();
-        for line in std::str::from_utf8(bytes)?.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (k, v) = line
-                .split_once('=')
-                .context("Invalid toolchains.env record")?;
-            ensure!(
-                k.starts_with("DEVKIT_")
-                    && k.bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
-                    && !v.is_empty()
-                    && !v
-                        .chars()
-                        .any(|c| c.is_whitespace() || ['\'', '"', '\0'].contains(&c))
-                    && values.insert(k, v).is_none(),
-                "Invalid/duplicate toolchain key: {k}"
-            );
-        }
-        let get = |k| -> Result<String> {
-            Ok(values.get(k).context("Missing toolchain pin")?.to_string())
-        };
-        let release_version = get("DEVKIT_VERSION")?;
-        let engine = crate::delivery::EnginePin {
-            version: release_version.clone(),
-            target: get("DEVKIT_ENGINE_TARGET")?,
-            sha256: get("DEVKIT_ENGINE_SHA256")?,
-        };
-        engine.validate()?;
-        let s = Self {
-            version: release_version,
-            node_image: get("DEVKIT_NODE_IMAGE")?,
-            node_version: get("DEVKIT_NODE_VERSION")?,
-            rust_version: get("DEVKIT_RUST_VERSION")?,
-            rust_recipe: get("DEVKIT_RUST_RECIPE_HASH")?,
-            desktop_recipe: get("DEVKIT_DESKTOP_RECIPE_HASH")?,
-            engine,
-        };
-        version(&s.version)?;
-        version(&s.node_version)?;
-        version(&s.rust_version)?;
-        let (name, hash) = s
-            .node_image
-            .rsplit_once("@sha256:")
-            .context("Node image must be digest pinned")?;
-        ensure!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"./:-".contains(&c))
-                && SHA256_RE.is_match(hash)
-                && SHA256_RE.is_match(&s.rust_recipe)
-                && SHA256_RE.is_match(&s.desktop_recipe),
-            "Invalid immutable tool pins"
-        );
-        Ok(s)
-    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PnpmPin {
@@ -251,7 +183,7 @@ impl PnpmPin {
 pub struct ToolAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
-    pub pins: ToolPins,
+    pub pins: CheckoutToolPins,
     pub manifest_identity: FileIdentity,
 }
 impl ToolAdmission {
@@ -305,14 +237,7 @@ impl ToolAdmission {
             // tooling payloads still retain their exact ownership boundary.
             assert_managed(&root, &state)?;
         }
-        let pins = ToolPins::parse(&fs::read(safe_path(
-            &root,
-            ".devkit/runtime/toolchains.env",
-        )?)?)?;
-        ensure!(
-            pins.version == state.version,
-            "Manifest version differs from accepted toolchains.env"
-        );
+        let pins = CheckoutToolPins::admit(&root, &state)?;
         if allow_older_accepted {
             ensure!(
                 SemVer::parse(&state.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?,
@@ -788,19 +713,23 @@ impl<'a> PreparedContext<'a> {
         let (recipe, pin, label) = if kind == "rust" {
             (
                 "rust.Dockerfile",
-                &self.admission.pins.rust_recipe,
+                self.admission.pins.rust_recipe.as_str(),
                 "io.docouno.devkit.rust-recipe",
             )
         } else {
             (
                 "desktop.Dockerfile",
-                &self.admission.pins.desktop_recipe,
+                self.admission
+                    .pins
+                    .desktop_recipe
+                    .as_deref()
+                    .context("Missing desktop recipe pin for Electron")?,
                 "io.docouno.devkit.desktop-recipe",
             )
         };
         let recipe_path = safe_path(&self.admission.root, &format!(".devkit/runtime/{recipe}"))?;
         ensure!(
-            identity(&recipe_path)?.is_some_and(|id| &id.sha256 == pin),
+            identity(&recipe_path)?.is_some_and(|id| id.sha256 == pin),
             "{recipe} differs from the accepted recipe"
         );
         let derived_tag = format!("devkit-derived-{kind}:{pin}");
@@ -909,6 +838,24 @@ impl<'a> PreparedContext<'a> {
         write_atomic(&state, format!("{image}\n").as_bytes(), 0o644)?;
         self.set_image(kind, image.clone());
         Ok(image)
+    }
+    fn load_recorded_images(&mut self) -> Result<()> {
+        for kind in ["rust", "desktop"] {
+            if kind == "desktop" && !has_electron(&self.admission.state) {
+                continue;
+            }
+            let path = safe_path(&self.admission.root, &format!(".devkit/state/{kind}-image"))?;
+            if let Some((bytes, _)) = read_regular_file(&path, 4096, "image receipt")? {
+                let image = std::str::from_utf8(&bytes)?.trim();
+                if image
+                    .strip_prefix("sha256:")
+                    .is_some_and(|h| SHA256_RE.is_match(h))
+                {
+                    self.set_image(kind, image.to_owned());
+                }
+            }
+        }
+        Ok(())
     }
     fn set_image(&mut self, kind: &str, image: String) {
         if kind == "rust" {
@@ -1261,13 +1208,12 @@ impl<'a> PreparedContext<'a> {
                 c.args(["--env", "VITE_API_ENABLED=true"]);
             }
             if profile == ToolingProfile::Electron {
-                c.args([
-                    "--security-opt",
-                    &format!(
-                        "seccomp={}",
-                        safe_path(root, ".devkit/runtime/desktop-seccomp.json")?.display()
-                    ),
-                ]);
+                let seccomp = safe_path(root, ".devkit/runtime/desktop-seccomp.json")?;
+                ensure!(
+                    identity(&seccomp)?.is_some(),
+                    "Missing managed desktop-seccomp.json"
+                );
+                c.args(["--security-opt", &format!("seccomp={}", seccomp.display())]);
             }
             c.arg(image).args(argv);
             if setup {
@@ -1564,7 +1510,16 @@ fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
         ".devkit/state/rust-image",
         ".devkit/state/desktop-image",
     ] {
-        identity(&safe_path(&admission.root, p)?)?;
+        let path = safe_path(&admission.root, p)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_file(),
+                "Expected a regular file: {}",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
@@ -1927,7 +1882,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
         runner.check_cancelled()?;
         println!(
             "Devkit {}; Node {}; Rust {}; accepted components verified.",
-            ctx.admission.pins.version,
+            ctx.admission.pins.engine.version,
             ctx.admission.pins.node_version,
             ctx.admission.pins.rust_version
         );
@@ -2076,12 +2031,12 @@ fn cleanup_without_stand(
             .is_some_and(|id| actual.matches_git_tracked(id)),
         "Managed engine pins changed"
     );
-    let pins = ToolPins::parse(&bytes)?;
+    let pin = crate::delivery::EnginePin::from_toolchains(&bytes)?;
     ensure!(
-        pins.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
+        pin.version == state.version && state.version == env!("CARGO_PKG_VERSION"),
         "Accepted engine version differs from its build"
     );
-    crate::delivery::verify_current_engine(&pins.engine)?;
+    crate::delivery::verify_current_engine(&pin)?;
     let mut ports = crate::stand::ports::Ports::read(root)?;
     if let Some(ledger) = &ledger {
         ensure!(
@@ -2269,18 +2224,7 @@ fn run_service(
     let mut command = ctx.compose()?;
     // Existing recorded derived image IDs allow interpolation; never inspect or
     // acquire tool images for service status/logs/down.
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
+    ctx.load_recorded_images()?;
     ctx.env(&mut command);
     if request.command == "down"
         && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
@@ -3649,18 +3593,7 @@ pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, Str
     ctx.prerequisite_service()?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service_to_component = app_service_component_map(&ctx.admission.state);
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
+    ctx.load_recorded_images()?;
     let mut command = ctx.compose()?;
     ctx.env(&mut command);
     command.args(["--profile", "*", "ps", "--all", "--format", "json"]);

@@ -1167,6 +1167,7 @@ pub fn assemble(options: &AssemblyOptions, runner: &ProcessRunner) -> Result<Rel
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))
         .collect::<String>();
+    crate::runtime::ReleaseToolPins::parse(encoded_pins.as_bytes())?;
     write_atomic(
         &safe_path(&payload, "runtime/toolchains.env")?,
         encoded_pins.as_bytes(),

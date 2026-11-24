@@ -10,8 +10,8 @@ importers:
         version: "4.6.7"
     devDependencies:
       "@docouno/env":
-        specifier: "0.5.1"
-        version: 0.5.1(eslint@10.13.0)(typescript@6.0.3)
+        specifier: "0.6.0"
+        version: 0.6.0(eslint@10.13.0)(typescript@6.0.3)
       "@types/node":
         specifier: "24.19.2"
         version: "24.19.2"
@@ -132,10 +132,10 @@ packages:
     resolution:
       integrity: >-
         sha512-buipgOVDkkPXNR5+xBpDw7Zk2n1EvU7qBJCNUcL7rhQ//kfpOXPAvQ511Os0vpLYJ1pZnvudNytkQt2hst3wqA==
-  "@docouno/env@0.5.1":
+  "@docouno/env@0.6.0":
     resolution:
       integrity: >-
-        sha512-e2p/E7NJcT6x510ydTb336rSfjdSs195MjVif0dcjbxlKCFTDtt+jdG1NjUFDG7SKQMCsylfuq81keL4YWs8cg==
+        sha512-1GsLxcDioE1gEKfp8UzPcw5172nAFNK/ODOGRt5vUXlX80p8t6YvQsvLS4+4qsGFWdjyy340CORvElVMIb7imw==
     engines:
       node: ^24.22.1
     peerDependencies:
@@ -978,7 +978,7 @@ snapshots:
     dependencies:
       hashery: "1.5.1"
       keyv: "5.6.0"
-  "@docouno/env@0.5.1(eslint@10.13.0)(typescript@6.0.3)":
+  "@docouno/env@0.6.0(eslint@10.13.0)(typescript@6.0.3)":
     dependencies:
       "@eslint/js": 10.0.1(eslint@10.13.0)
       eslint-plugin-react-hooks: 7.1.1(eslint@10.13.0)
