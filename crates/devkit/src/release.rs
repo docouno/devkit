@@ -290,6 +290,19 @@ pub fn read_release(root: &Path) -> Result<Release> {
 }
 impl AdmittedRelease {
     fn check_scoped_runtime(&self) -> Result<Vec<u8>> {
+        // Every attribution in this directory needs a declared profile. A
+        // headless checkout omits the directory together with the seccomp file.
+        for name in self
+            .manifest
+            .files
+            .keys()
+            .filter(|name| name.starts_with("runtime/licenses/"))
+        {
+            ensure!(
+                crate::state::DESKTOP_RUNTIME_FILES.contains(&name.as_str()),
+                "Unclassified release runtime attribution: {name}"
+            );
+        }
         let empty = digest(b"");
         for name in REQUIRED_RUNTIME_FILES
             .into_iter()

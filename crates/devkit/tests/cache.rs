@@ -174,6 +174,12 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
     manifest.version = version.into();
     manifest.environment.version = version.into();
     runtime_fixture::write_runtime(&source, version, &manifest.files["devkit"].sha256);
+    write_atomic(
+        &source.join("runtime/extra-guide.md"),
+        b"Shared runtime guide\n",
+        0o644,
+    )
+    .unwrap();
     let seal = |root: &Path| {
         let mut release = manifest.clone();
         release.files = file_map(root).unwrap();
@@ -188,6 +194,14 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
     let saved = fs::read(&reference).unwrap();
 
     for (path, replacement) in [
+        (
+            "runtime/licenses/extra.NOTICE",
+            Some(b"Additional notice\n".as_slice()),
+        ),
+        (
+            "runtime/licenses/vendor/NOTICE",
+            Some(b"Nested notice\n".as_slice()),
+        ),
         ("runtime/LICENSE", None),
         ("runtime/LICENSE", Some(b"".as_slice())),
         ("runtime/licenses/Apache-2.0.txt", Some(b"".as_slice())),
