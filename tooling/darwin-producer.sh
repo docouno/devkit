@@ -8,6 +8,10 @@ case "$1" in
   --build-frozen|--test-only|/*) arg=$1 ;;
   *) arg=$PWD/$1 ;;
 esac
+case "${DEVKIT_DARWIN_CARGO_HOME:-}" in
+  ''|/*) ;;
+  *) DEVKIT_DARWIN_CARGO_HOME=$PWD/$DEVKIT_DARWIN_CARGO_HOME ;;
+esac
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 case "$arg" in
@@ -24,26 +28,13 @@ target=aarch64-apple-darwin
 work="$root/.artifacts/darwin-host"
 export CARGO_TARGET_DIR="$work/target" CARGO_HOME="$work/cargo-home"
 mkdir -p "$CARGO_HOME"
-sync_cargo_cache() {
-  src=$1
-  dst=$2
-  python3 - "$src" "$dst" <<'PY'
-import shutil, sys
-from pathlib import Path
-src, dst = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
-if src != dst:
-    for rel in ("registry/index", "registry/cache", "git/db"):
-        if (src / rel).is_dir():
-            shutil.copytree(src / rel, dst / rel, dirs_exist_ok=True)
-PY
-}
 if [ -n "${DEVKIT_DARWIN_CARGO_HOME:-}" ]; then
   mkdir -p "$DEVKIT_DARWIN_CARGO_HOME"
-  sync_cargo_cache "$DEVKIT_DARWIN_CARGO_HOME" "$CARGO_HOME"
+  python3 tooling/frozen-producer.py --sync-cargo-cache "$root/Cargo.lock" "$DEVKIT_DARWIN_CARGO_HOME" "$CARGO_HOME"
 fi
 cargo fetch --locked --target "$target"
 if [ -n "${DEVKIT_DARWIN_CARGO_HOME:-}" ]; then
-  sync_cargo_cache "$CARGO_HOME" "$DEVKIT_DARWIN_CARGO_HOME"
+  python3 tooling/frozen-producer.py --sync-cargo-cache "$root/Cargo.lock" "$CARGO_HOME" "$DEVKIT_DARWIN_CARGO_HOME"
 fi
 cargo test --locked --offline --target "$target" --lib --test archive --test delivery --test processes -- --test-threads=1
 rss_test=pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks

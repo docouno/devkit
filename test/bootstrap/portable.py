@@ -76,7 +76,7 @@ def verify(directory=None):
                 # Even a syntactically valid CLI assignment has the wrong origin.
                 assert "cannot read accepted Make projection" in make(
                     "setup", f"DEVKIT_EXPECTED_PLAN={invalid}", ok=False)
-        # Ambient env vars (manifest cache, registered/desktop lists, Perl hooks) cannot hijack Make or devkit.sh.
+        # Ambient env vars (manifest cache, registered/desktop lists, DISPLAY, Perl hooks) cannot hijack Make or devkit.sh.
         pwned = project / "pwned"
         hostile_env = dict(
             env,
@@ -84,7 +84,9 @@ def verify(directory=None):
             devkit_manifest_loaded="1",
             DEVKIT_DESKTOP_APPS=f"$(shell touch '{pwned}') ; touch '{pwned}'",
             DEVKIT_REGISTERED_APPS=f"$(shell touch '{pwned}')",
+            DEVKIT_REGISTERED_PACKAGES=f"$(shell touch '{pwned}')",
             DEVKIT_PACKAGEABLE_PACKAGES=f"$(shell touch '{pwned}')",
+            DISPLAY=f"$(shell touch '{pwned}')",
             PERL5LIB="/nonexistent/devkit-evil",
             PERL5OPT='-MNonExistentDevkitEvil',
             PERL_UNICODE="SDA",
@@ -95,12 +97,25 @@ def verify(directory=None):
         hostile_out = make("setup", environment=hostile_env)
         assert f"1 {sha} {manifest_sha} task snapshot --root" in hostile_out, hostile_out
         assert not pwned.exists(), "ambient Make variable triggered shell execution"
-        # CLI overrides of DEVKIT_REGISTERED_APPS / DEVKIT_DESKTOP_APPS do not have file origin.
-        help_cli = make("help", "DEVKIT_REGISTERED_APPS=injected",
-                        f"DEVKIT_DESKTOP_APPS=; touch '{pwned}'",
-                        environment=dict(hostile_env, DEVKIT_ENGINE_PATH=""))
-        assert "injected" not in help_cli, help_cli
-        assert not pwned.exists(), "CLI override triggered shell execution"
+        # CLI overrides of DEVKIT_REGISTERED_APPS / DEVKIT_DESKTOP_APPS cannot hijack real DAG targets or recipes.
+        cli_setup = make("setup", "DEVKIT_REGISTERED_APPS=injected",
+                         f"DEVKIT_DESKTOP_APPS=$(shell touch '{pwned}')",
+                         environment=hostile_env)
+        assert "injected" not in cli_setup, cli_setup
+        assert not pwned.exists(), "CLI override triggered shell execution during setup"
+        # Exercise devkit-dev-selection & DISPLAY evaluation on a 2-app projection with desktop app.
+        projection.write_text(f"DEVKIT_REGISTERED_APPS := api web\n"
+                              f"DEVKIT_REGISTERED_PACKAGES :=\n"
+                              f"DEVKIT_DESKTOP_APPS := web\n"
+                              f"DEVKIT_EXPECTED_PLAN := {sha}\n")
+        cli_up = make("up", f"DEVKIT_DESKTOP_APPS=x' ; touch '{pwned}' #",
+                      environment=dict(hostile_env, DISPLAY=""))
+        assert "task dev-snapshot --root" in cli_up, cli_up
+        assert not pwned.exists(), "CLI DEVKIT_DESKTOP_APPS override triggered shell execution"
+        # Ambient DISPLAY='$(shell ...)' is never expanded recursively even when desktop probe runs.
+        display_up = make("up", environment=hostile_env)
+        assert "task dev-snapshot --root" in display_up, display_up
+        assert not pwned.exists(), "ambient DISPLAY triggered shell execution"
         # Hostile Perl environment variables are scrubbed on devkit.sh digest and cache checks.
         assert run("/bin/sh", loader, "make-manifest", environment=hostile_env).strip() == manifest_sha
 

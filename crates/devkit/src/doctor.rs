@@ -1061,7 +1061,15 @@ fn inspect_checkout_lockfree(
                 .unwrap_or(Target::LinuxX64);
             if let Err(err) = crate::runtime::PnpmPin::from_checkout_for_target(&root, target) {
                 if err.to_string().contains("Missing pnpm pin for ") {
-                    return Err(crate::distribution::missing_target(&s.version, target));
+                    let hint = Target::host().unwrap_or(target).checkout_upgrade_hint();
+                    return Err(crate::cli::error(
+                        "UNSUPPORTED_HOST_TARGET",
+                        format!(
+                            "Devkit {} has no pnpm pin for {}. {hint}",
+                            s.version,
+                            target.triple()
+                        ),
+                    ));
                 }
                 return Err(err);
             }
@@ -1089,9 +1097,9 @@ fn inspect_checkout_lockfree(
                 })
                 .unwrap_or_else(|| {
                     if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET"
-                        && let Some(target) = daemon_platform
-                            .and_then(Target::from_docker_platform)
-                            .or_else(|| Target::host().ok())
+                        && let Some(target) = Target::host()
+                            .ok()
+                            .or_else(|| daemon_platform.and_then(Target::from_docker_platform))
                     {
                         target.checkout_upgrade_hint()
                     } else if msg.contains("Managed file conflict") {

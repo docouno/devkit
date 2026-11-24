@@ -118,9 +118,18 @@ darwin_file() {
     sub resolve_no_symlinks {
       my ($raw) = @_;
       my @parts;
+      my $aliased = 0;
       for my $name (split m{/}, $raw) {
         next if $name eq "" || $name eq ".";
-        if ($name eq "..") { pop @parts; next; }
+        if ($name eq "..") {
+          if ($aliased && @parts == 2) {
+            @parts = ();
+            $aliased = 0;
+          } else {
+            pop @parts;
+          }
+          next;
+        }
         my $cur = join "/", "", @parts, $name;
         my @info = lstat($cur);
         return undef if !@info && !$!{ENOENT};
@@ -132,6 +141,7 @@ darwin_file() {
           my $dest = readlink($cur);
           return undef unless defined($dest) && ($dest eq "private/$alias" || $dest eq "/private/$alias");
           push @parts, "private";
+          $aliased = 1;
           $name = $alias;
           @info = lstat("/private/$name");
           return undef unless @info && S_ISDIR($info[2]);
@@ -180,7 +190,7 @@ darwin_file() {
       my $parent = resolve_no_symlinks($path);
       exit 1 unless defined($parent);
       print $parent;
-      exit 4 if $parent =~ m{\A/engines/};
+      exit 4 if $parent =~ m{\A/engines/[^/]+/[^/]+/[^/]+\z};
       exit verify_engine_file("$parent/devkit", $limit, $expected, $require_755);
     }
     if ($op eq "verify") {
@@ -439,15 +449,16 @@ else
     parent=$(darwin_file resolve-verify "$cache/engines/$target/$version/$expected" 134217728 "$expected" 1) || rc=$?
     case "$rc" in
       0) engine=$parent/devkit; engine_ready=1 ;;
+      1) fail 'the cache path contains a symbolic link' ;;
       2) engine=$parent/devkit ;;
       3) fail "cached engine integrity differs: $parent/devkit" ;;
       4) fail 'the filesystem root cannot be the cache directory' ;;
-      *) fail 'the cache path contains a symbolic link' ;;
+      *) fail 'cached engine verification timed out or failed' ;;
     esac
   else
     parent=$(cache_path "$cache/engines/$target/$version/$expected") || fail 'the cache path contains a symbolic link'
     case "$parent" in
-      /engines/*) fail 'the filesystem root cannot be the cache directory' ;;
+      "/engines/$target/$version/$expected") fail 'the filesystem root cannot be the cache directory' ;;
     esac
     engine=$parent/devkit
   fi

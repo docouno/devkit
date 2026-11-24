@@ -163,8 +163,7 @@ def verify(helper, module, index, from_version, environment, products):
     require(module.source_snapshot(root) == before, "Native upgrade preview changed project inputs")
     cli("native-upgrade-apply", "update", ".", "--to", to_version)
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
-    if stable_version(from_version) < (0,5,0) <= stable_version(to_version):
-        module.assert_node_workspace(root,[path for path,c in after['components'].items() if c['toolchain']=='node'])
+    module.assert_node_workspace(root, [path for path, c in after["components"].items() if c["toolchain"] == "node"])
     require(new_pins["DEVKIT_ENGINE_SHA256_" + host_target().upper().replace("-", "_")] == index["files"][engine_asset(index)]["sha256"],
             "Updated project accepted another target engine")
     require(after["nativeUpgradeOwner"] == state["nativeUpgradeOwner"], "Native upgrade lost top-level owner metadata")

@@ -71,7 +71,7 @@ ifeq ($(devkit_host_os),Darwin)
 devkit_skip_gui := 1
 devkit_skip_reason = on macOS; use headless=1.
 else
-devkit_skip_gui := $(if $(DISPLAY),,1)
+devkit_skip_gui := $(if $(value DISPLAY),,1)
 devkit_skip_reason = without DISPLAY; use headless=1 or app=$(desktop).
 endif
 else

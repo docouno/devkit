@@ -118,7 +118,7 @@ jobs:
           key: pnpm-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.env') }}
       - name: Cache consumer Rust image
         id: rust_cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .artifacts/cache/consumer-images.tar
           key: consumer-images-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('runtime/rust.Dockerfile', 'toolchains.env') }}
@@ -366,7 +366,7 @@ jobs:
           controller_sha256: ${{ fromJSON(inputs.amd64).controller_sha256 }}
       - name: Cache consumer Rust image for performance baseline
         id: consumer_rust_cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .artifacts/cache/consumer-images.tar
           key: consumer-images-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('runtime/rust.Dockerfile', 'toolchains.env') }}

@@ -95,31 +95,49 @@ pub fn verify_executable(
         "Invalid executable SHA256"
     );
     let path = project_root(path)?;
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= EXECUTABLE_VERIFY_LIMIT,
-        "Native engine must be a bounded regular file"
-    );
-    ensure!(
-        !require_mode_0755 || metadata.permissions().mode() & 0o7777 == 0o755,
-        "Cached executable mode differs from canonical 0755"
-    );
-    executable_access(&path)?;
-    ensure!(
-        hash_reader(&mut file)? == expected_sha256,
-        "Native engine checksum differs from accepted pin"
-    );
-    verify_format(&mut file, target)?;
-    let stamp = FileStamp::of(&metadata);
-    ensure!(
-        stamp.matches(&path)? && FileStamp::of(&file.metadata()?) == stamp,
-        "Native executable changed while verifying"
-    );
-    Ok(())
+    for attempt in 0..2 {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= EXECUTABLE_VERIFY_LIMIT,
+            "Native engine must be a bounded regular file"
+        );
+        ensure!(
+            !require_mode_0755 || metadata.permissions().mode() & 0o7777 == 0o755,
+            "Cached executable mode differs from canonical 0755"
+        );
+        executable_access(&path)?;
+        ensure!(
+            hash_reader(&mut file)? == expected_sha256,
+            "Native engine checksum differs from accepted pin"
+        );
+        verify_format(&mut file, target)?;
+        let stamp = FileStamp::of(&metadata);
+        if stamp.matches(&path)? && FileStamp::of(&file.metadata()?) == stamp {
+            return Ok(());
+        }
+        // Mirror devkit.sh's engine_link_settled: concurrent `ln` + `rm` drops
+        // nlink from 2 to 1 and bumps ctime on the same inode.
+        if attempt == 0
+            && metadata.nlink() == 2
+            && let Ok(now) = fs::symlink_metadata(&path)
+            && now.is_file()
+            && now.nlink() == 1
+            && now.dev() == metadata.dev()
+            && now.ino() == metadata.ino()
+            && now.len() == metadata.len()
+            && (now.mode() & 0o7777) == (metadata.mode() & 0o7777)
+            && now.mtime() == metadata.mtime()
+            && now.mtime_nsec() == metadata.mtime_nsec()
+        {
+            continue;
+        }
+        anyhow::bail!("Native executable changed while verifying");
+    }
+    anyhow::bail!("Native executable changed while verifying")
 }
 fn executable_access(path: &Path) -> Result<()> {
     let encoded = CString::new(path.as_os_str().as_bytes())?;

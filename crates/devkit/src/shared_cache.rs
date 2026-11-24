@@ -41,9 +41,8 @@ const MASKED_CACHE_FILES: [&str; 3] = ["empty-file-mask", "port-leases.json", "p
 pub fn prepare_mount_masks(cache: &Path) -> Result<()> {
     crate::cache::ensure_cache_root(cache)?;
     let tmp = safe_path(cache, ".tmp")?;
-    let tmp_absent = !exists(&tmp)?;
     directory(&tmp)?;
-    if tmp_absent {
+    if fs::symlink_metadata(&tmp)?.mode() & 0o7777 != 0o700 {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700))?;
     }
     for name in MASKED_CACHE_DIRS {
@@ -519,17 +518,21 @@ pub fn check_guest_hardlink(source: &Path, link: &Path, token: &str) -> Result<(
 }
 
 fn contains_exact_path(text: &str, path: &str) -> bool {
-    let mut rest = text;
-    while let Some(idx) = rest.find(path) {
-        let before = rest[..idx].chars().next_back();
-        let after = rest[idx + path.len()..].chars().next();
+    if path.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = text[start..].find(path) {
+        let idx = start + rel;
+        let before = text[..idx].chars().next_back();
+        let after = text[idx + path.len()..].chars().next();
         let left_ok = before.is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '"' | '\''));
         let right_ok =
             after.is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '.' | ',' | ':'));
         if left_ok && right_ok {
             return true;
         }
-        rest = &rest[idx + path.len()..];
+        start = idx + text[idx..].chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -900,5 +903,24 @@ mod tests {
         fs::remove_file(&common).unwrap();
         fs::write(&common, "../..\n").unwrap();
         assert_eq!(git_common_dir(&checkout).unwrap(), Some(repository));
+    }
+
+    #[test]
+    fn contains_exact_path_preserves_left_boundary_across_repeated_segments() {
+        assert!(contains_exact_path(
+            "bind source path does not exist: /work",
+            "/work"
+        ));
+        assert!(contains_exact_path("path \"/work\" is not shared", "/work"));
+        assert!(!contains_exact_path(
+            "bind source path does not exist: /work/work",
+            "/work"
+        ));
+        assert!(!contains_exact_path(
+            "bind source path does not exist: /work/sub",
+            "/work"
+        ));
+        assert!(!contains_exact_path("foo/a/a bar", "/a"));
+        assert!(!contains_exact_path("anything", ""));
     }
 }

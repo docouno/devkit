@@ -380,5 +380,6 @@ fn write_staged_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .open(path)?;
     output.write_all(bytes)?;
     output.set_permissions(fs::Permissions::from_mode(mode))?;
+    flush_file_pages(&output)?;
     Ok(())
 }

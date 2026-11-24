@@ -1,6 +1,7 @@
 """Build a verified native contribution from committed files in a fresh Cargo target."""
 import argparse
 import filecmp
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,14 +46,73 @@ def checkout(root, snapshot):
     return commit, tree
 
 
+def cargo_lock_checksums(lockfile):
+    expected = {}
+    name = version = checksum = None
+    for raw in Path(lockfile).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line == "[[package]]":
+            if name and version and checksum:
+                expected[f"{name}-{version}.crate"] = checksum
+            name = version = checksum = None
+        elif line.startswith('name = "') and line.endswith('"'):
+            name = line[8:-1]
+        elif line.startswith('version = "') and line.endswith('"'):
+            version = line[11:-1]
+        elif line.startswith('checksum = "') and line.endswith('"'):
+            checksum = line[12:-1]
+    if name and version and checksum:
+        expected[f"{name}-{version}.crate"] = checksum
+    if not expected:
+        raise SystemExit(f"No verified package checksums found in {lockfile}")
+    return expected
+
+
+def sync_cargo_cache(lockfile, src, dst):
+    """Copy Cargo registry/git cache entries without following symlinks,
+    verifying every .crate tarball SHA-256 against Cargo.lock before trusting it."""
+    src_root = Path(src).resolve()
+    dst_root = Path(dst).resolve()
+    if src_root == dst_root or not src_root.is_dir():
+        return
+    expected = None
+    for rel in ("registry/index", "registry/cache", "git/db"):
+        base = src_root / rel
+        if base.is_symlink() or not base.is_dir():
+            continue
+        is_crate_cache = rel == "registry/cache"
+        if is_crate_cache and expected is None:
+            expected = cargo_lock_checksums(lockfile)
+        for current, dirs, files in os.walk(base, followlinks=False):
+            current_path = Path(current)
+            # Refuse symlinks inside cached directories.
+            dirs[:] = [d for d in dirs if not (current_path / d).is_symlink()]
+            rel_dir = current_path.relative_to(src_root)
+            target_dir = dst_root / rel_dir
+            for name in files:
+                source_file = current_path / name
+                if source_file.is_symlink() or not source_file.is_file():
+                    continue
+                if is_crate_cache:
+                    want = expected.get(name)
+                    if want is None:
+                        continue
+                    data = source_file.read_bytes()
+                    if hashlib.sha256(data).hexdigest() != want:
+                        continue
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    (target_dir / name).write_bytes(data)
+                else:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_file, target_dir / name, follow_symlinks=False)
+
+
 def linux_build(snapshot, env):
-    # Seed only downloaded registry inputs. Re-extract crates against Cargo.lock and
+    # Seed only verified registry inputs. Re-extract crates against Cargo.lock and
     # compile into the new checkout's empty target directory.
     home = snapshot / ".artifacts/author/cargo-home"
     prepared = Path(env["DEVKIT_AUTHOR_CARGO_HOME"])
-    for rel in ("registry/index", "registry/cache", "git/db"):
-        if (prepared / rel).is_dir():
-            shutil.copytree(prepared / rel, home / rel)
+    sync_cargo_cache(snapshot / "Cargo.lock", prepared, home)
     env["DEVKIT_AUTHOR_CARGO_HOME"] = str(home)
     subprocess.run(["make", "--no-print-directory", "frozen-notices", "build_id=native"],
                    cwd=snapshot, env=env, check=True)
@@ -63,8 +123,14 @@ def linux_build(snapshot, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output", type=Path)
+    parser.add_argument("--sync-cargo-cache", nargs=3, metavar=("LOCKFILE", "SRC", "DST"))
+    parser.add_argument("output", nargs="?", type=Path)
     args = parser.parse_args()
+    if args.sync_cargo_cache:
+        sync_cargo_cache(*args.sync_cargo_cache)
+        return
+    if args.output is None:
+        parser.error("output is required")
     root = Path.cwd()
     scratch = root / ".artifacts"
     scratch.mkdir(exist_ok=True)

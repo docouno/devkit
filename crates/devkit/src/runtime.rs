@@ -2191,6 +2191,44 @@ fn service_name<'a>(path: &'a str, c: &'a ComponentState) -> &'a str {
         .and_then(|d| d.service.as_deref())
         .unwrap_or_else(|| path.rsplit('/').next().expect("component basename"))
 }
+fn load_recorded_images(ctx: &mut PreparedContext<'_>, allow_legacy: bool) -> Result<()> {
+    // Existing recorded derived image IDs allow interpolation; never inspect or
+    // acquire tool images for service status/logs/down.
+    for kind in ["rust", "desktop"] {
+        let json_path = safe_path(
+            &ctx.admission.root,
+            &format!(".devkit/state/{kind}-image.json"),
+        )?;
+        if let Some((bytes, _)) = read_regular_file(&json_path, 4096, "image receipt")?
+            && let Ok(receipt) =
+                serde_json::from_slice::<crate::doctor::DerivedImageReceipt>(&bytes)
+            && receipt.schema_version == 1
+            && receipt
+                .image_id
+                .strip_prefix("sha256:")
+                .is_some_and(|h| SHA256_RE.is_match(h))
+        {
+            ctx.set_image(kind, receipt.image_id);
+            continue;
+        }
+        if allow_legacy {
+            let legacy = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
+            if let Some((bytes, _)) = read_regular_file(&legacy, 4096, "legacy image receipt")?
+                && let Ok(text) = std::str::from_utf8(&bytes)
+            {
+                let image = text.trim();
+                if image
+                    .strip_prefix("sha256:")
+                    .is_some_and(|h| SHA256_RE.is_match(h))
+                {
+                    ctx.set_image(kind, image.to_owned());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_service(
     request: &RuntimeRequest,
     target: Option<&str>,
@@ -2199,6 +2237,7 @@ fn run_service(
 ) -> Result<()> {
     use crate::stand::history::{History, ResourceDeclarations};
     use std::time::{Duration, Instant};
+    load_recorded_images(ctx, false)?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let mut resource_history = if request.command == "down" {
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -2230,20 +2269,6 @@ fn run_service(
         None
     };
     let mut command = ctx.compose()?;
-    // Existing recorded derived image IDs allow interpolation; never inspect or
-    // acquire tool images for service status/logs/down.
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
     ctx.env(&mut command);
     if request.command == "down"
         && let Some(mut ledger) = crate::stand::ledger::Ledger::read(&ctx.admission.root)?
@@ -3613,18 +3638,7 @@ pub fn inspect_status_with_cache(
     ctx.prerequisite_service()?;
     let inventory = capture_compose_inputs(&ctx.admission.root)?;
     let service_to_component = app_service_component_map(&ctx.admission.state);
-    for kind in ["rust", "desktop"] {
-        let p = safe_path(&ctx.admission.root, &format!(".devkit/state/{kind}-image"))?;
-        if identity(&p)?.is_some() {
-            let image = fs::read_to_string(p)?.trim().to_owned();
-            if image
-                .strip_prefix("sha256:")
-                .is_some_and(|h| SHA256_RE.is_match(h))
-            {
-                ctx.set_image(kind, image);
-            }
-        }
-    }
+    load_recorded_images(&mut ctx, true)?;
     let mut command = ctx.compose()?;
     ctx.env(&mut command);
     command.args(["--profile", "*", "ps", "--all", "--format", "json"]);

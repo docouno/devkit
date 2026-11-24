@@ -153,7 +153,11 @@ pub fn extract_archive_with(
 ) -> Result<()> {
     prefix(root_name)?;
     let archive = project_root(archive)?;
-    let source = fs::symlink_metadata(&archive)?;
+    let archive_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&archive)?;
+    let source = archive_file.metadata()?;
     ensure!(
         source.is_file() && source.len() <= MAX_COMPRESSED,
         "Invalid or oversized release archive"
@@ -169,7 +173,7 @@ pub fn extract_archive_with(
     let payload = stage.path().join("payload");
     fs::create_dir(&payload)?;
     let mut stream = BudgetReader {
-        reader: MultiGzDecoder::new(File::open(&archive)?),
+        reader: MultiGzDecoder::new(archive_file),
         remaining: MAX_EXPANDED,
         deadline: Instant::now() + ARCHIVE_DEADLINE,
         runner,
@@ -249,6 +253,8 @@ pub fn extract_archive_with(
                 "Truncated archive entry: {encoded}"
             );
             output.set_permissions(fs::Permissions::from_mode(mode))?;
+            #[cfg(target_os = "macos")]
+            flush_file_pages(&output)?;
             #[cfg(not(target_os = "macos"))]
             output.sync_all()?;
             files.insert(relative.to_owned());
@@ -277,7 +283,8 @@ pub fn extract_archive_with(
         );
     }
     ensure!(
-        source_stamp.matches(&archive)?,
+        source_stamp.matches(&archive)?
+            && FileStamp::of(&stream.reader.into_inner().metadata()?) == source_stamp,
         "Archive changed during extraction"
     );
     #[cfg(target_os = "macos")]

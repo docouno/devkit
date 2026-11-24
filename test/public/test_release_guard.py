@@ -171,6 +171,37 @@ class NativeProducerGuard(unittest.TestCase):
                 (source / "engine.rs").write_text("committed")
                 git("update-index", "--no-" + flag, "engine.rs")
 
+    def test_sync_cargo_cache_verifies_crate_checksums_and_ignores_symlinks(self):
+        import hashlib
+        producer = runpy.run_path(str(REPO / "tooling/frozen-producer.py"))
+        with tempfile.TemporaryDirectory(prefix="devkit-cargo-cache-") as temporary:
+            base = Path(temporary)
+            good = b"verified-crate-bytes"
+            good_sha = hashlib.sha256(good).hexdigest()
+            lock = base / "Cargo.lock"
+            lock.write_text(
+                'version = 4\n\n[[package]]\nname = "demo"\nversion = "1.0.0"\n'
+                f'checksum = "{good_sha}"\n'
+            )
+            src, dst = base / "src", base / "dst"
+            cache = src / "registry/cache/index.crates.io-test"
+            cache.mkdir(parents=True)
+            (cache / "demo-1.0.0.crate").write_bytes(good)
+            (cache / "extra-0.1.0.crate").write_bytes(b"unlisted")
+            secret = base / "secret.txt"
+            secret.write_text("host-secret")
+            (cache / "link-1.0.0.crate").symlink_to(secret)
+            producer["sync_cargo_cache"](lock, src, dst)
+            dst_cache = dst / "registry/cache/index.crates.io-test"
+            self.assertEqual((dst_cache / "demo-1.0.0.crate").read_bytes(), good)
+            self.assertFalse((dst_cache / "extra-0.1.0.crate").exists())
+            self.assertFalse((dst_cache / "link-1.0.0.crate").exists())
+            # Tampered bytes with the locked filename must not be seeded.
+            (cache / "demo-1.0.0.crate").write_bytes(b"tampered")
+            dst2 = base / "dst2"
+            producer["sync_cargo_cache"](lock, src, dst2)
+            self.assertFalse((dst2 / "registry/cache/index.crates.io-test/demo-1.0.0.crate").exists())
+
 
 class RequiredNativeCheckGuard(unittest.TestCase):
     def job(self, name, workflow="verify"):

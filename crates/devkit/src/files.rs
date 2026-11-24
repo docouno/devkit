@@ -430,6 +430,24 @@ pub fn sync_directory(path: &Path) -> Result<()> {
         .sync_all()
         .with_context(|| format!("Cannot synchronize directory: {}", path.display()))
 }
+
+/// Flush dirty file data pages from kernel UBC to the storage controller on
+/// macOS without issuing a per-file F_FULLFSYNC hardware cache flush. Pair
+/// with a single `sync_directory` (`F_FULLFSYNC`) barrier at the end of a batch.
+#[cfg(target_os = "macos")]
+pub(crate) fn flush_file_pages(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: `file` owns a live open descriptor for the duration of the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
 /// Install each new directory entry durably, not only the final file's parent.
 /// A journal may be published from a different directory than its saved data.
 pub fn create_dir_all_durable(path: &Path) -> Result<()> {
