@@ -233,7 +233,8 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
     let mut manifest: Release = read_json(&source.join("release.json")).unwrap();
     manifest.version = version.into();
     manifest.environment.version = version.into();
-    runtime_fixture::write_runtime(&source, version, &manifest.files["devkit"].sha256);
+    let host_payload = Target::host().unwrap().payload_name();
+    runtime_fixture::write_runtime(&source, version, &manifest.files[host_payload].sha256);
     write_atomic(
         &source.join("runtime/extra-guide.md"),
         b"Shared runtime guide\n",
@@ -270,7 +271,7 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
             Some(b"".as_slice()),
         ),
         ("runtime/devkit.mk", None),
-        ("devkit", Some(b"invalid engine".as_slice())),
+        (host_payload, Some(b"invalid engine".as_slice())),
         (
             "runtime/compose.tools.yaml",
             Some(b"services: {}\n".as_slice()),

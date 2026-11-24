@@ -1232,7 +1232,7 @@ class Verification:
         tslib = self.create("tslib", "e-tslib", release=self.manager)
         state = json.loads((tslib / ".devkit/manifest.json").read_text())
         require(set(state["components"]) == {"packages/lib"}, "ts-library init registered wrong components")
-        if core_parts >= (0, 6, 0):
+        if semver_tuple(state["version"]) >= (0, 6, 0):
             self.verify_headless_tasks(tslib, "tslib")
         else:
             self.healthy(tslib, "tslib")

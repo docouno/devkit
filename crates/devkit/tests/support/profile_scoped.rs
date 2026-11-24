@@ -146,7 +146,9 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
     let mut engines = vec![PathBuf::from(env!("CARGO_BIN_EXE_devkit"))];
     let genuine = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.artifacts/baseline/v0.5.1/payload/devkit");
-    if genuine.is_file() {
+    if devkit::distribution::Target::host().unwrap() == devkit::distribution::Target::LinuxX64
+        && genuine.is_file()
+    {
         engines.push(genuine);
     }
     for (i, engine) in engines.iter().enumerate() {

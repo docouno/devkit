@@ -846,9 +846,6 @@ fn stage_runtime_files(
     destination: &Path,
     state: &ProjectState,
 ) -> Result<BTreeMap<String, FileIdentity>> {
-    if SemVer::parse(&release.manifest.version)? >= SemVer::parse("0.6.0")? {
-        crate::runtime::ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?;
-    }
     let mut managed = BTreeMap::new();
     let scoped = uses_profile_scoped_runtime(&state.version)?;
     ensure!(

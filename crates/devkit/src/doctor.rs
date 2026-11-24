@@ -239,11 +239,11 @@ pub fn local_receipts(
     daemon_platform: Option<&str>,
     cache_dir: Option<&Path>,
 ) -> Result<Value> {
-    let pins = ToolPins::admit(root, project_state).ok();
-    local_receipts_impl(
+    let pins = ToolPins::admit(root, project_state)?;
+    local_receipts_with_pins(
         root,
         project_state,
-        pins.as_ref(),
+        &pins,
         node_inputs_digest,
         daemon_platform,
         cache_dir,
@@ -254,24 +254,6 @@ pub(crate) fn local_receipts_with_pins(
     root: &Path,
     project_state: &ProjectState,
     pins: &ToolPins,
-    node_inputs_digest: Option<&str>,
-    daemon_platform: Option<&str>,
-    cache_dir: Option<&Path>,
-) -> Result<Value> {
-    local_receipts_impl(
-        root,
-        project_state,
-        Some(pins),
-        node_inputs_digest,
-        daemon_platform,
-        cache_dir,
-    )
-}
-
-fn local_receipts_impl(
-    root: &Path,
-    project_state: &ProjectState,
-    pins: Option<&ToolPins>,
     node_inputs_digest: Option<&str>,
     daemon_platform: Option<&str>,
     cache_dir: Option<&Path>,
@@ -287,13 +269,11 @@ fn local_receipts_impl(
         }) && safe_path(root, "node_modules")
             .is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
     });
-    let rust = pins
-        .map(|p| read_image_receipt(root, "rust", &p.rust_recipe))
-        .transpose()?
-        .flatten();
+    let rust = read_image_receipt(root, "rust", &pins.rust_recipe)?;
     let has_electron = state::has_electron(project_state);
     let desktop = if has_electron {
-        pins.and_then(|p| p.desktop_recipe.as_deref())
+        pins.desktop_recipe
+            .as_deref()
             .map(|pin| read_image_receipt(root, "desktop", pin))
             .transpose()?
             .flatten()
@@ -325,10 +305,10 @@ fn local_receipts_impl(
     let helper_check = daemon_platform
         .or(prepared)
         .map(|platform| -> Result<bool> {
-            let Some((p, target)) = pins.zip(Target::from_docker_platform(platform)) else {
+            let Some(target) = Target::from_docker_platform(platform) else {
                 return Ok(false);
             };
-            let pin = p.engines.for_target(target)?;
+            let pin = pins.engines.for_target(target)?;
             crate::cache::linux_helper_ready(&crate::cache::cache_root(cache_dir)?, &pin)
         });
     let helper_ready = helper_check.as_ref().map(|check| matches!(check, Ok(true)));
