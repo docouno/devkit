@@ -15,20 +15,22 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    env:
-      DEVKIT_CACHE_DIR: ${{ runner.temp }}/devkit-cache
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Docker Compose v5+
-        run: |
-          docker compose version
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a # v2.4.0
+        with:
+          version: v5.6.0
+
+      - name: Configure Devkit cache directory
+        run: echo "DEVKIT_CACHE_DIR=${RUNNER_TEMP}/devkit-cache" >> "$GITHUB_ENV"
 
       - name: Cache Devkit engine and project caches
         uses: actions/cache@v4
         with:
           path: |
-            ${{ runner.temp }}/devkit-cache
+            ${{ env.DEVKIT_CACHE_DIR }}
             .devkit/cache
           key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
           restore-keys: |
