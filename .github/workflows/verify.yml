@@ -3,6 +3,12 @@ name: Verify one frozen set
 on:
   workflow_call:
     inputs:
+      assembly_result:
+        required: true
+        type: string
+      state:
+        required: true
+        type: string
       frozen:
         required: true
         type: string
@@ -24,7 +30,30 @@ permissions:
   contents: read
 
 jobs:
+  handoff:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate the completed assembly handoff
+        env:
+          ASSEMBLY_RESULT: ${{ inputs.assembly_result }}
+          STATE: ${{ inputs.state }}
+          FROZEN: ${{ inputs.frozen }}
+        run: |
+          set -euo pipefail
+          test "$ASSEMBLY_RESULT" = success || { echo "Assembly result was $ASSEMBLY_RESULT" >&2; exit 1; }
+          jq -e --arg state "$STATE" '
+            (.frozen_set_artifact | capture("^devkit-frozen-set-(?<attempt>[1-9][0-9]*)\\z").attempt) as $attempt |
+            (.version | type == "string" and length > 0) and
+            (.source_commit | test("^[0-9a-f]{40}\\z")) and (.source_tree | test("^[0-9a-f]{40}\\z")) and
+            (.index_sha256 | test("^[0-9a-f]{64}\\z")) and
+            (if $state == "fresh" then
+               .preview_artifact == ("devkit-darwin-preview-" + $attempt) and
+               (.preview_index_sha256 | test("^[0-9a-f]{64}\\z"))
+             else $state == "restored" or $state == "incomplete" end)
+          ' <<< "$FROZEN" || { echo "Invalid frozen or preview identity for state $STATE" >&2; exit 1; }
+
   source-linux-amd64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -33,6 +62,7 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   source-linux-arm64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -43,7 +73,7 @@ jobs:
   source:
     name: source
     if: always()
-    needs: [source-linux-amd64, source-linux-arm64, darwin-host]
+    needs: [handoff, source-linux-amd64, source-linux-arm64, darwin-host]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -52,6 +82,7 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   runtime-linux-amd64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -60,6 +91,7 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   runtime-linux-arm64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -70,7 +102,7 @@ jobs:
   runtime:
     name: runtime
     if: always()
-    needs: [runtime-linux-amd64, runtime-linux-arm64]
+    needs: [handoff, runtime-linux-amd64, runtime-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -79,6 +111,7 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   delivery-linux-amd64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -99,7 +132,7 @@ jobs:
   delivery:
     name: delivery
     if: always()
-    needs: [delivery-linux-amd64, delivery-linux-arm64]
+    needs: [handoff, delivery-linux-amd64, delivery-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -108,6 +141,7 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   packaged-linux-amd64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -128,7 +162,7 @@ jobs:
   packaged:
     name: packaged
     if: always()
-    needs: [packaged-linux-amd64, packaged-linux-arm64]
+    needs: [handoff, packaged-linux-amd64, packaged-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -137,6 +171,7 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   registry-linux-amd64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -145,6 +180,7 @@ jobs:
       native: ${{ inputs.amd64 }}
 
   registry-linux-arm64:
+    needs: handoff
     uses: ./.github/workflows/verify-group.yml
     with:
       frozen: ${{ inputs.frozen }}
@@ -155,7 +191,7 @@ jobs:
   registry:
     name: registry
     if: always()
-    needs: [registry-linux-amd64, registry-linux-arm64]
+    needs: [handoff, registry-linux-amd64, registry-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -177,22 +213,22 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: env.PREVIEW_ARTIFACT != ''
+        if: inputs.state == 'fresh'
         with:
           name: ${{ env.PREVIEW_ARTIFACT }}
           path: .artifacts/preview
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: env.PREVIEW_ARTIFACT != ''
+        if: inputs.state == 'fresh'
         with:
           name: ${{ needs.source-linux-amd64.outputs.legacy_checkout_artifact }}
           path: .artifacts/legacy-handoff
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
-        if: env.PREVIEW_ARTIFACT != ''
+        if: inputs.state == 'fresh'
         with:
           node-version: 24.22.1
           package-manager-cache: false
       - name: Verify the unpublished native package, bootstrap and checkout
-        if: env.PREVIEW_ARTIFACT != ''
+        if: inputs.state == 'fresh'
         run: |
           set -euo pipefail
           dir="$PWD/.artifacts/preview"
@@ -205,10 +241,11 @@ jobs:
           python3 test/darwin/verify.py --build-set "$dir"
           python3 test/bootstrap/legacy_checkout.py verify --release "$dir/payload" --bundle .artifacts/legacy-handoff/legacy.bundle
       - name: Verify stock host entry points for a restored Linux release
-        if: env.PREVIEW_ARTIFACT == ''
+        if: inputs.state == 'restored' || inputs.state == 'incomplete'
         run: python3 test/bootstrap/portable.py
 
   performance:
+    needs: handoff
     if: inputs.run_performance
     runs-on: ubuntu-24.04
     timeout-minutes: 90

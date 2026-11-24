@@ -168,9 +168,11 @@ jobs:
       darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}
 
   verify:
-    needs: [assemble, build-linux-amd64, build-linux-arm64]
+    needs: [admit-and-inspect, assemble, build-linux-amd64, build-linux-arm64]
     uses: ./.github/workflows/verify.yml
     with:
+      state: ${{ needs.admit-and-inspect.outputs.state }}
+      assembly_result: ${{ needs.assemble.result }}
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}

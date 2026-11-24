@@ -49,6 +49,8 @@ jobs:
     if: always()
     uses: ./.github/workflows/verify.yml
     with:
+      state: fresh
+      assembly_result: ${{ needs.assemble.result }}
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}

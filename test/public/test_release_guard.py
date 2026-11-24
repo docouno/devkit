@@ -173,24 +173,83 @@ class NativeProducerGuard(unittest.TestCase):
 
 
 class RequiredNativeCheckGuard(unittest.TestCase):
+    def job(self, name, workflow="verify"):
+        source = (REPO / ".github/workflows" / (workflow + ".yml")).read_text()
+        return re.search(r"(?ms)^  " + name + r":\n(.*?)(?=^  [\w-]+:|\Z)", source).group(1)
+
+    def test_only_an_explicit_successful_assembly_may_start_workers(self):
+        ci, release = self.job("verify", "ci"), self.job("verify", "release")
+        for caller in (ci, release):
+            self.assertIn("assembly_result: ${{ needs.assemble.result }}", caller)
+            self.assertIn("frozen: ${{ toJSON(needs.assemble.outputs) }}", caller)
+        self.assertIn("if: always()", ci)
+        self.assertIn("state: fresh", ci)
+        self.assertIn("state: ${{ needs.admit-and-inspect.outputs.state }}", release)
+        handoff = self.job("handoff")
+        for env, arg in (("STATE", "state"), ("ASSEMBLY_RESULT", "assembly_result"), ("FROZEN", "frozen")):
+            self.assertIn(env + ": ${{ inputs." + arg + " }}", handoff)
+        script = textwrap.dedent(handoff.split("        run: |\n", 1)[1])
+        frozen = dict(version="0.6.0", source_commit="a" * 40, source_tree="b" * 40,
+                      index_sha256="c" * 64, frozen_set_artifact="devkit-frozen-set-2")
+        preview = dict(preview_artifact="devkit-darwin-preview-2", preview_index_sha256="d" * 64)
+        complete = {**frozen, **preview}
+        cases = [
+            ("success", "fresh", complete, True),
+            ("success", "restored", frozen, True),
+            ("success", "incomplete", frozen, True),
+            ("success", "fresh", frozen, False),
+            ("success", "fresh", {**complete, "preview_artifact": ""}, False),
+            ("success", "fresh", {**complete, "preview_artifact": "devkit-darwin-preview-3"}, False),
+            ("success", "fresh", {**complete, "preview_index_sha256": ""}, False),
+            ("success", "fresh", {**complete, "preview_index_sha256": "z" * 64}, False),
+            ("success", "restored", {}, False),
+            ("success", "unknown", complete, False),
+            # Failure during preview assembly leaves only the Linux outputs.
+            ("failure", "fresh", frozen, False),
+        ]
+        # An upload may fail after both sets of step outputs have been written.
+        for result in ("failure", "skipped", "cancelled"):
+            cases.append((result, "fresh", complete, False))
+        for result, state, outputs, valid in cases:
+            env = dict(os.environ, STATE=state, ASSEMBLY_RESULT=result, FROZEN=json.dumps(outputs),
+                       GITHUB_RUN_ATTEMPT="3")
+            with self.subTest(result=result, state=state, outputs=outputs):
+                run = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.returncode == 0, valid, run.stderr)
+
+        darwin = self.job("darwin-host")
+        self.assertNotIn("if: env.PREVIEW_ARTIFACT", darwin)
+        self.assertIn("if: inputs.state == 'fresh'\n        run: |", darwin)
+        self.assertIn("if: inputs.state == 'restored' || inputs.state == 'incomplete'\n"
+                      "        run: python3 test/bootstrap/portable.py", darwin)
+
     def test_each_required_check_rejects_an_unsuccessful_or_skipped_worker(self):
-        source = (REPO / ".github/workflows/verify.yml").read_text()
+        workers = {"performance"}
         for group in ("source", "runtime", "delivery", "packaged", "registry"):
-            job = re.search(r"(?ms)^  " + group + r":\n(.*?)(?=^  [\w-]+:|\Z)", source).group(1)
+            job = self.job(group)
             self.assertIn(f"    name: {group}\n", job)
             self.assertIn("    if: always()\n", job)
             dependencies = re.search(r"(?m)^    needs: \[(.+)\]$", job).group(1).split(", ")
             expected = [group + "-linux-amd64", group + "-linux-arm64"]
             if group == "source":
                 expected.append("darwin-host")
-            self.assertCountEqual(dependencies, expected)
+            self.assertCountEqual(dependencies, ["handoff", *expected])
+            workers.update(expected)
             predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
-            for status in ("success", "failure", "cancelled", "skipped"):
-                results = {worker: {"result": "success"} for worker in dependencies}
-                results[dependencies[-1]]["result"] = status
-                probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
-                                       capture_output=True, text=True, timeout=5)
-                self.assertEqual(probe.returncode == 0, status == "success", (group, status, probe.stderr))
+            for worker in ("handoff", expected[-1]):
+                for status in ("success", "failure", "cancelled", "skipped"):
+                    results = {name: {"result": "success"} for name in dependencies}
+                    results[worker]["result"] = status
+                    probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(probe.returncode == 0, status == "success", (group, worker, status, probe.stderr))
+        for name in workers:
+            # The cross-host consumers inherit the gate through their export worker.
+            worker = self.job(name)
+            self.assertNotRegex(worker, r"(?m)^    if: .*always\(")
+            parent = re.search(r"(?m)^    needs: ([\w-]+)$", worker).group(1)
+            if parent != "handoff":
+                self.assertIn("    needs: handoff\n", self.job(parent), name)
 
 
 class EventSourceGuard(unittest.TestCase):
