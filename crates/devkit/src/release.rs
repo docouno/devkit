@@ -291,15 +291,10 @@ pub fn read_release(root: &Path) -> Result<Release> {
 impl AdmittedRelease {
     fn check_scoped_runtime(&self) -> Result<Vec<u8>> {
         let empty = digest(b"");
-        for name in [
-            "runtime/LICENSE",
-            "runtime/devkit.mk",
-            "runtime/devkit.sh",
-            "runtime/compose.tools.yaml",
-            "runtime/toolchains.env",
-        ]
-        .into_iter()
-        .chain(crate::state::DESKTOP_RUNTIME_FILES)
+        for name in REQUIRED_RUNTIME_FILES
+            .into_iter()
+            .chain(crate::state::DESKTOP_RUNTIME_FILES)
+            .chain(["runtime/LICENSE"])
         {
             let file = self
                 .manifest

@@ -852,7 +852,10 @@ fn stage_runtime_files(
         );
     }
     for name in REQUIRED_RUNTIME_FILES {
-        ensure!(managed.contains_key(&format!(".devkit/{name}")), "Missing release {name}");
+        ensure!(
+            managed.contains_key(&format!(".devkit/{name}")),
+            "Missing release {name}"
+        );
     }
     Ok(managed)
 }
