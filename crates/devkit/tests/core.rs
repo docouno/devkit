@@ -1985,6 +1985,13 @@ fn successful_unlink(line: &str, path: &str) -> bool {
         && line.contains(&format!("\"{path}\""))
         && line.trim_end().ends_with("= 0")
 }
+fn successful_rmdir(line: &str, path: &str) -> bool {
+    (line.contains(&format!("rmdir(\"{path}\")"))
+        || (line.contains("unlinkat(")
+            && line.contains(&format!("\"{path}\""))
+            && line.contains("AT_REMOVEDIR")))
+        && line.trim_end().ends_with("= 0")
+}
 fn assert_durable_transaction_trace(trace: &str) {
     let lines = trace.lines().collect::<Vec<_>>();
     let rename = regex::Regex::new(r#"rename(?:at2?)?\((?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)", (?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)"(?:, [^)]*)?\)\s+= 0"#).unwrap();
@@ -2103,10 +2110,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             let licenses = format!("{devkit}/runtime/licenses");
             let removed = lines[published + 1..manifest]
                 .iter()
-                .position(|line| {
-                    line.contains(&format!("rmdir(\"{licenses}\")"))
-                        && line.trim_end().ends_with("= 0")
-                })
+                .position(|line| successful_rmdir(line, &licenses))
                 .map(|i| i + published + 1)
                 .expect("Expected empty licenses directory removal before manifest");
             assert!(
@@ -2165,6 +2169,32 @@ fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
         fs::write(output, &bytes).unwrap();
     }
     assert_durable_transaction_trace(std::str::from_utf8(&bytes).unwrap());
+}
+
+#[test]
+fn durability_trace_recognizes_both_x86_rmdir_and_aarch64_unlinkat_removedir() {
+    let dir = "/tmp/checkout/.devkit/runtime/licenses";
+    assert!(successful_rmdir(&format!("15 rmdir(\"{dir}\") = 0"), dir));
+    assert!(successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD</tmp>, \"{dir}\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", 0) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}/file\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", AT_REMOVEDIR) = -1 ENOTEMPTY"),
+        dir
+    ));
 }
 
 // Ports of the source scenarios retained when the former TS factory was removed.
