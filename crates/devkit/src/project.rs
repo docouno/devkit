@@ -826,9 +826,6 @@ fn stage_runtime_files(
         release.ensure_scoped_runtime()?;
     }
     let headless = scoped && !has_electron(state);
-    let headless_tools = headless
-        .then(|| render_headless_tool_compose(&release.bytes("runtime/compose.tools.yaml")?))
-        .transpose()?;
     for (name, id) in &release.manifest.files {
         if !name.starts_with("runtime/")
             || (headless && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
@@ -845,10 +842,7 @@ fn stage_runtime_files(
                 (bytes, staged_id)
             }
             (true, "runtime/compose.tools.yaml") => {
-                let bytes = headless_tools
-                    .as_deref()
-                    .context("Missing headless tool Compose projection")?
-                    .to_vec();
+                let bytes = render_headless_tool_compose(&release.bytes(name)?)?;
                 let staged_id = FileIdentity {
                     sha256: digest(&bytes),
                     mode: id.mode,
@@ -1302,14 +1296,50 @@ pub struct AdmissionSnapshot {
     pub source_signature: String,
     pub manifest_identity: FileIdentity,
 }
+fn expected_incoming_runtime_files(
+    release: &AdmittedRelease,
+    old: &ProjectState,
+    next_has_electron: bool,
+) -> Result<BTreeSet<String>> {
+    let headless = uses_profile_scoped_runtime(&release.manifest.version)? && !next_has_electron;
+    Ok(release
+        .manifest
+        .files
+        .keys()
+        .filter(|name| {
+            name.starts_with("runtime/")
+                && !(headless && DESKTOP_RUNTIME_FILES.contains(&name.as_str()))
+        })
+        .map(|name| format!(".devkit/{name}"))
+        .filter(|target| !old.managed.contains_key(target))
+        .collect())
+}
+
 impl AdmissionSnapshot {
     pub fn capture(root: &Path) -> Result<Self> {
+        Self::capture_checked(root, &|_| Ok(BTreeSet::new()))
+    }
+    fn capture_for_mutation(
+        root: &Path,
+        release: &AdmittedRelease,
+        adds_electron: bool,
+    ) -> Result<Self> {
+        Self::capture_checked(root, &|old| {
+            expected_incoming_runtime_files(release, old, has_electron(old) || adds_electron)
+        })
+    }
+    fn capture_checked(
+        root: &Path,
+        incoming_runtime: &dyn Fn(&ProjectState) -> Result<BTreeSet<String>>,
+    ) -> Result<Self> {
         let root = project_root(root)?;
         assert_no_pending(&root)?;
         let manifest_identity =
             identity(&safe_path(&root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
         let state = read_project_state(&root)?;
         assert_managed(&root, &state)?;
+        let incoming = incoming_runtime(&state)?;
+        verify_runtime_inventory_with_incoming(&root, &state, &incoming)?;
         assert_tool_profiles(&root, &state)?;
         let inputs = collect_native_input_closure(&root, &state)?;
         let source_signature = source_signature(&root, Some(&state))?;
@@ -1483,7 +1513,19 @@ fn mutate_with_release(
             );
         }
     }
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let adds_electron = matches!(
+        &change,
+        Some(Change::Add { spec, .. })
+            if template(&spec.template)
+                .is_ok_and(|t| t.profile == ToolingProfile::Electron)
+    ) || matches!(
+        &change,
+        Some(Change::Register {
+            profile: ToolingProfile::Electron,
+            ..
+        })
+    );
+    let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, adds_electron)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -1812,7 +1854,7 @@ fn mutate_with_release(
                 &staged_root,
                 &next,
                 &seeds,
-                existing_pnpm_lock.as_ref(),
+                existing_pnpm_lock,
                 options.reconcile_lock,
             )?;
         }
@@ -2297,7 +2339,7 @@ pub(crate) fn sync_project_with_release(
         .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
     ensure_supported_checkout_floor(&root_candidate, false, min_from)?;
     let lock = CheckoutLock::acquire(target)?;
-    let snapshot = AdmissionSnapshot::capture(&lock.root)?;
+    let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, false)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
@@ -2352,7 +2394,7 @@ pub(crate) fn sync_project_with_release(
                     prefix: String::new(),
                     lock: old_lock.clone(),
                 }],
-                existing_pnpm_lock.as_ref(),
+                existing_pnpm_lock,
                 options.reconcile_lock,
             )?;
             let seeded_packages = if NodeLockKind::for_state(&next)? == NodeLockKind::Pnpm {

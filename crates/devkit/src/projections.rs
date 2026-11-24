@@ -366,35 +366,33 @@ pub fn render_workspace_compose(
     json_bytes(&render_workspace_compose_value(state, inputs)?)
 }
 
-fn node_leaks_electron_cache(node: &Map<String, Value>) -> bool {
-    let env_leaks = match node.get("environment") {
-        Some(Value::Object(map)) => {
-            map.contains_key("ELECTRON_CACHE")
-                || map
-                    .values()
-                    .any(|v| v.as_str().is_some_and(|s| s.contains("/cache/electron")))
-        }
-        Some(Value::Array(items)) => items.iter().any(|v| {
-            v.as_str()
-                .is_some_and(|s| s.contains("ELECTRON_CACHE") || s.contains("/cache/electron"))
+fn value_mentions_electron_cache(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("ELECTRON_CACHE") || text.contains("/cache/electron"),
+        Value::Array(items) => items.iter().any(value_mentions_electron_cache),
+        Value::Object(map) => map.iter().any(|(key, item)| {
+            key.contains("ELECTRON_CACHE")
+                || key.contains("/cache/electron")
+                || value_mentions_electron_cache(item)
         }),
         _ => false,
-    };
-    let volume_leaks = node
-        .get("volumes")
-        .and_then(Value::as_array)
-        .is_some_and(|volumes| {
-            volumes.iter().any(|volume| {
-                volume["target"] == "/cache/electron"
-                    || volume["source"]
-                        .as_str()
-                        .is_some_and(|s| s.contains("ELECTRON_CACHE"))
-                    || volume
-                        .as_str()
-                        .is_some_and(|s| s.contains("/cache/electron"))
-            })
-        });
-    env_leaks || volume_leaks
+    }
+}
+
+fn node_leaks_electron_cache(node: &Map<String, Value>) -> bool {
+    let inherits_desktop_volumes = node.get("volumes_from").is_some_and(|value| match value {
+        Value::Array(items) => items.iter().any(|item| {
+            item.as_str()
+                .is_none_or(|entry| entry == "desktop" || entry.starts_with("desktop:"))
+        }),
+        _ => true,
+    });
+    inherits_desktop_volumes
+        || node.iter().any(|(key, value)| {
+            key.contains("ELECTRON_CACHE")
+                || key.contains("/cache/electron")
+                || value_mentions_electron_cache(value)
+        })
 }
 
 fn checked_tool_compose_profile(bytes: &[u8], electron: bool) -> Result<Value> {
@@ -533,11 +531,39 @@ mod tests {
         model["services"]["desktop"]["cap_drop"] = json!([]);
         assert!(checked_release_tool_compose(&json_bytes(&model).unwrap()).is_err());
         let headless = render_headless_tool_compose(full).unwrap();
-        let mut model = checked_tool_compose_profile(&headless, false).unwrap();
-        model["services"]["node"]["volumes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("cache:/cache/electron"));
-        assert!(checked_tool_compose_profile(&json_bytes(&model).unwrap(), false).is_err());
+        for mutation in [
+            |node: &mut Value| {
+                node["volumes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("cache:/cache/electron"));
+            },
+            |node: &mut Value| {
+                node["volumes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "bind", "source": "/host", "target": "/cache/electron/"}));
+            },
+            |node: &mut Value| {
+                node["volumes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("${DEVKIT_ELECTRON_CACHE_DIR}:/tmp/ec"));
+            },
+            |node: &mut Value| {
+                node["environment"]["CUSTOM"] = json!("${DEVKIT_ELECTRON_CACHE_DIR}");
+            },
+            |node: &mut Value| {
+                node["volumes_from"] = json!(["desktop:ro"]);
+            },
+        ] {
+            let mut model = checked_tool_compose_profile(&headless, false).unwrap();
+            mutation(&mut model["services"]["node"]);
+            assert!(checked_tool_compose_profile(&json_bytes(&model).unwrap(), false).is_err());
+
+            let mut full_model = parse_compose(full).unwrap();
+            mutation(&mut full_model["services"]["node"]);
+            assert!(checked_release_tool_compose(&json_bytes(&full_model).unwrap()).is_err());
+        }
     }
 }

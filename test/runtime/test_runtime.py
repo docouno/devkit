@@ -3578,7 +3578,6 @@ if (priv.value !== 'from-private-gitlab-registry') {
 
     def test_headless_task_omits_electron_cache_and_electron_task_verifies_seccomp_digest(self):
         write_fixture(self.root)
-        accept_runtime(self.root, native=True)
         fresh_cache = self.base / "headless-cache"
         isolated = dict(env(), DEVKIT_CACHE_DIR=str(fresh_cache))
         self.make("setup", env=isolated)

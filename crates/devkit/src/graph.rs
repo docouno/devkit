@@ -439,7 +439,7 @@ pub(crate) fn seed_workspace_lock_preserving(
     root: &Path,
     state: &ProjectState,
     seeds: &[LockSeed],
-    existing_lock: Option<&crate::pnpm::Lock>,
+    existing_lock: Option<crate::pnpm::Lock>,
     reconcile: bool,
 ) -> Result<()> {
     if crate::files::SemVer::parse(&state.version)? < crate::files::SemVer::parse("0.5.0")? {
@@ -552,7 +552,7 @@ pub(crate) fn seed_workspace_lock_preserving(
     };
     if regular_non_exec {
         let unchanged = match existing_lock {
-            Some(current) => *current == lock,
+            Some(current) => current == lock,
             None => crate::pnpm::read_yaml::<crate::pnpm::Lock>(root, "pnpm-lock.yaml")? == lock,
         };
         if unchanged {

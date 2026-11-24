@@ -1214,18 +1214,7 @@ impl<'a> PreparedContext<'a> {
                 c.args(["--env", "VITE_API_ENABLED=true"]);
             }
             if profile == ToolingProfile::Electron {
-                let seccomp_name = ".devkit/runtime/desktop-seccomp.json";
-                let expected = self
-                    .admission
-                    .state
-                    .managed
-                    .get(seccomp_name)
-                    .context("Missing managed desktop-seccomp.json")?;
-                let seccomp = safe_path(root, seccomp_name)?;
-                ensure!(
-                    identity(&seccomp)?.is_some_and(|actual| actual.matches_git_tracked(expected)),
-                    "Managed desktop-seccomp.json differs from the accepted profile"
-                );
+                let seccomp = verify_managed_seccomp(root, &self.admission.state)?;
                 c.args(["--security-opt", &format!("seccomp={}", seccomp.display())]);
             }
             c.arg(image).args(argv);
@@ -1514,6 +1503,20 @@ pub fn bind_mount(source: &Path, target: &Path, readonly: bool) -> Result<String
         if readonly { ",readonly" } else { "" }
     ))
 }
+fn verify_managed_seccomp(root: &Path, state: &ProjectState) -> Result<PathBuf> {
+    let seccomp_name = ".devkit/runtime/desktop-seccomp.json";
+    let expected = state
+        .managed
+        .get(seccomp_name)
+        .context("Missing managed desktop-seccomp.json")?;
+    let seccomp = safe_path(root, seccomp_name)?;
+    ensure!(
+        identity(&seccomp)?.is_some_and(|actual| actual.matches_git_tracked(expected)),
+        "Managed desktop-seccomp.json differs from the accepted profile"
+    );
+    Ok(seccomp)
+}
+
 fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
     for d in [".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store"] {
         ensure_directory(&safe_path(&admission.root, d)?)?;
@@ -2921,6 +2924,7 @@ fn run_development(
     );
     let state_dir = safe_path(&ctx.admission.root, ".devkit/state")?;
     let mut overlays = Vec::new();
+    let mut uses_desktop = false;
     for path in reached {
         let c = &full.state.components[&path];
         if c.toolchain == Toolchain::Rust {
@@ -2932,6 +2936,7 @@ fn run_development(
             node_ready(ctx, fingerprint)?;
         }
         if c.tooling_profile == ToolingProfile::Electron {
+            uses_desktop = true;
             ctx.derived_image("desktop", false)?;
             let spec = crate::desktop::display_overlay(service_name(&path, c), request.headless)?;
             let mut file = tempfile::Builder::new()
@@ -3411,6 +3416,9 @@ fn run_development(
                 }
             };
             full.recheck()?;
+            if uses_desktop {
+                verify_managed_seccomp(&ctx.admission.root, &ctx.admission.state)?;
+            }
             let before = crate::stand::ledger::observe(&ctx.project, ctx.runner)?;
             assert_compose_inventory(&ctx.admission.root, &inventory)?;
             let mut create = compose()?;

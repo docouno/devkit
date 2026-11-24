@@ -377,6 +377,14 @@ pub fn source_signature(root: &Path, state: Option<&ProjectState>) -> Result<Str
 /// Compare the live runtime namespace before reading file contents or accepting
 /// a new manifest. The project snapshot deliberately excludes some names.
 pub(crate) fn verify_runtime_inventory(root: &Path, state: &ProjectState) -> Result<()> {
+    verify_runtime_inventory_with_incoming(root, state, &BTreeSet::new())
+}
+
+pub(crate) fn verify_runtime_inventory_with_incoming(
+    root: &Path,
+    state: &ProjectState,
+    incoming: &BTreeSet<String>,
+) -> Result<()> {
     let root = project_root(root)?;
     let mut files: BTreeSet<&Path> = state
         .managed
@@ -411,11 +419,13 @@ pub(crate) fn verify_runtime_inventory(root: &Path, state: &ProjectState) -> Res
                 }
                 pending.push(path);
             } else {
-                ensure!(
-                    files.remove(name),
-                    "Unlisted runtime file: {}",
-                    name.display()
-                );
+                if !files.remove(name) {
+                    let display = name.to_string_lossy();
+                    if incoming.contains(display.as_ref()) {
+                        anyhow::bail!("New managed file conflicts with project content: {display}");
+                    }
+                    anyhow::bail!("Unlisted runtime file: {display}");
+                }
                 ensure!(
                     typ.is_file(),
                     "Managed file conflict: {}; expected a regular runtime file",

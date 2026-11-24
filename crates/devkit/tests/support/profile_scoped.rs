@@ -599,12 +599,78 @@ fn sync_preserves_pnpm_lock_comments_and_empty_packages_map() {
 
     let lock_path = root.join("pnpm-lock.yaml");
     let original = fs::read_to_string(&lock_path).unwrap();
-    let commented = format!("# preserved header\n{original}");
+    assert!(original.contains("apps/main:\n"));
+    let commented = format!(
+        "# preserved header\n{}",
+        original.replacen("apps/main:\n", "apps/main:\n    dependencies: {}\n", 1)
+    );
     fs::write(&lock_path, &commented).unwrap();
 
-    let synced =
-        sync_project(&release, &root, &UpdateOptions::default(), &FixtureResolver).unwrap();
+    let synced = sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap();
     assert!(synced.no_op);
     assert_eq!(synced.state.generation, initial.generation);
     assert_eq!(fs::read_to_string(&lock_path).unwrap(), commented);
+}
+
+#[test]
+fn dirty_runtime_is_rejected_before_node_lock_resolver_runs() {
+    struct FailIfCalledResolver;
+    impl LockResolver for FailIfCalledResolver {
+        fn regenerate(&self, _: &Path, _: &AdmittedRelease, _: Option<&str>) -> Result<()> {
+            panic!("resolver must not run on an invalid runtime directory");
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let old = fixture_release(temp.path(), "0.5.1");
+    let new = fixture_release(temp.path(), "0.6.0");
+
+    let legacy = temp.path().join("legacy-node");
+    init(&old, &legacy, "node", PackageMode::Registry);
+    fs::create_dir(legacy.join(".devkit/runtime/licenses/.git")).unwrap();
+    for preview in [true, false] {
+        let err = update_project(
+            &new,
+            &legacy,
+            &UpdateOptions {
+                preview,
+                ..Default::default()
+            },
+            &FailIfCalledResolver,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(".devkit/runtime/licenses/.git"),
+            "{err:#}"
+        );
+    }
+
+    let headless = temp.path().join("headless-node");
+    init(&new, &headless, "node", PackageMode::Registry);
+    put(
+        &headless,
+        ".devkit/runtime/licenses/.artifacts/owner",
+        b"owned",
+    );
+    let inventory = capture_compose_inputs(&headless).unwrap();
+    let err = add_project_component(
+        &new,
+        &headless,
+        Role::App,
+        ComponentSpec {
+            name: "shell".into(),
+            template: "electron-react".into(),
+            uses: vec![],
+        },
+        &UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        },
+        &FailIfCalledResolver,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains(".devkit/runtime/licenses"),
+        "{err:#}"
+    );
 }
