@@ -240,9 +240,11 @@ if (mode === 'serve') {
         '--ignore-scripts',
         '--trust-lockfile',
         '--store-dir',
-        '/proof/pnpm-store',
+        '/proof/pnpm-neg-store',
         '--virtual-store-dir',
         '/proof/pnpm-neg-modules',
+        // Keep the cold downloads below the loopback registry's connection limit.
+        '--config.network-concurrency=4',
         '--config.fetch-retries=0',
       ],
       target,

@@ -131,7 +131,9 @@ def verify(helper, module, index, from_version, environment, products):
         component["nativeUpgradeOwner"] = {"component": path}
         component["origin"]["nativeUpgradeOwner"] = {"origin": "retained"}
     (root / ".devkit/manifest.json").write_text(json.dumps(state, indent=2) + "\n")
-    product_files = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml", cargo, root / "apps/api/Cargo.lock")}
+    cargo_lock = root / ("Cargo.lock" if module.root_cargo_project(root) else "apps/api/Cargo.lock")
+    selected_crates = module.cargo_packages(cargo_lock)
+    product_files = {path: path.read_bytes() for path in (root / ".env", root / "Makefile", root / "compose.yaml", cargo)}
     for source_dir in (root / "apps/web/src", root / "apps/api/src", root / "apps/api/tests"):
         if source_dir.is_dir():
             product_files.update({path: path.read_bytes() for path in source_dir.rglob("*") if path.is_file()})
@@ -166,6 +168,8 @@ def verify(helper, module, index, from_version, environment, products):
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
     helper.verify_tool_compose(root, after, "native-upgrade-applied")
     module.assert_node_workspace(root, [path for path, c in after["components"].items() if c["toolchain"] == "node"])
+    require(module.cargo_packages(root / "Cargo.lock") == selected_crates
+            and not (root / "apps/api/Cargo.lock").exists(), "Upgrade changed the Rust dependency selection")
     require(new_pins["DEVKIT_ENGINE_SHA256_" + host_target().upper().replace("-", "_")] == index["files"][engine_asset(index)]["sha256"],
             "Updated project accepted another target engine")
     require(after["nativeUpgradeOwner"] == state["nativeUpgradeOwner"], "Native upgrade lost top-level owner metadata")

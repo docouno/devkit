@@ -103,8 +103,10 @@ test: test-native test-special test-env test-npm-inputs
 test-native:
 	$(call author_rust,cargo test --workspace --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" -- --test-threads=1)
 test-special:
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --lib pinned_cargo_metadata -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core git_tracks_output_named_component_sources_and_ignores_scoped_outputs -- --ignored --exact --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test native pinned_cargo_metadata -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core pinned_cargo_metadata -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test assembler -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test notices -- --ignored --test-threads=1)
 	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core linux_strace_checks_actual_commit_and_recovery_durability_order -- --ignored --exact --test-threads=1)

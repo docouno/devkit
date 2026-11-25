@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
+const HELP: &str = "Usage:\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME | --toolchain node|rust] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit task COMMAND [--root PATH] [--component apps/NAME|packages/NAME]\n  devkit catalog\n  devkit --version\n\nRun delegates the real root Make DAG. Make exec command= uses shellwords quoting\nwithout variable/command expansion; native exec -- ARGV preserves exact arguments.\n";
 fn string(arg: &OsStr) -> Result<&str> {
     arg.to_str().context("Expected UTF-8 command option")
 }
@@ -42,7 +42,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
     if command == "catalog" {
         ensure!(args.len() == 1, "catalog takes no arguments");
         println!(
-            "node-api\nrust-api\nreact-web\nelectron-react\nts-library\nreact-ui\nreact-client"
+            "node-api\nrust-api\nrust-library\nreact-web\nelectron-react\nts-library\nreact-ui\nreact-client"
         );
         return Ok(());
     }
@@ -93,6 +93,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             .parse()
             .context("Invalid logs tail")?;
     }
+    let mut toolchain = None;
     let mut write = false;
     let mut network = "none".to_owned();
     let mut prepare = false;
@@ -108,7 +109,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         ensure!(seen.insert(key.to_owned()), "Repeated option: {key}");
         let permitted = match key {
             "--root" => true,
-            "--component" | "--write" | "--prepare" | "--network" => {
+            "--component" | "--write" | "--prepare" | "--network" | "--toolchain" => {
                 command == "exec" || key == "--component" && command == "task"
             }
             "--expected-manifest" => command == "task",
@@ -124,6 +125,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
             "--prepare" if command == "exec" => prepare = true,
             "--root"
             | "--component"
+            | "--toolchain"
             | "--app"
             | "--package"
             | "--expected-manifest"
@@ -143,6 +145,13 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
                 let value = string(value)?.to_owned();
                 match key {
                     "--component" => request.component = Some(value),
+                    "--toolchain" => {
+                        toolchain = Some(match value.as_str() {
+                            "node" => crate::model::Toolchain::Node,
+                            "rust" => crate::model::Toolchain::Rust,
+                            _ => bail!("Unknown toolchain {value:?}; choose node or rust"),
+                        })
+                    }
                     "--app" => request.app = Some(value),
                     "--package" => request.package = Some(value),
                     "--expected-manifest" => request.expected_manifest = Some(value),
@@ -182,6 +191,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner, cache_dir: Option<&Path
         return runtime::exec(
             ExecRequest {
                 runtime: request,
+                toolchain,
                 argv,
                 write,
                 network,
@@ -250,10 +260,7 @@ fn internal(args: &[OsString], runner: &ProcessRunner) -> Result<()> {
         .transpose()?
         .context("Expected internal command")?;
     match command {
-        "rust" => {
-            ensure!(args.len() == 2, "internal rust expects a task command");
-            crate::rust_gate::run(string(&args[1])?, runner)
-        }
+        "rust" => crate::rust_gate::run(&args[1..], runner),
         "desktop" => {
             ensure!(args.len() == 1, "internal desktop takes no arguments");
             crate::desktop::run(runner)

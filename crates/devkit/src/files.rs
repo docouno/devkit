@@ -232,9 +232,17 @@ pub fn project_root(path: &Path) -> Result<PathBuf> {
     Ok(result)
 }
 fn check_ancestors(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    let count = path.components().count();
-    for (i, c) in path.components().enumerate() {
+    check_ancestors_from(Path::new(""), path)
+}
+fn check_ancestors_from(base: &Path, path: &Path) -> Result<()> {
+    let suffix = if base.as_os_str().is_empty() {
+        path
+    } else {
+        path.strip_prefix(base)?
+    };
+    let mut current = base.to_path_buf();
+    let count = suffix.components().count();
+    for (i, c) in suffix.components().enumerate() {
         current.push(c.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(m) => {
@@ -263,7 +271,7 @@ pub fn input_path(root: &Path, name: impl AsRef<Path>) -> Result<PathBuf> {
         "Native input escapes the project: {}",
         name.as_ref().display()
     );
-    check_ancestors(&path)?;
+    check_ancestors_from(&root, &path)?;
     Ok(path)
 }
 pub fn safe_path(root: &Path, name: &str) -> Result<PathBuf> {
@@ -301,19 +309,27 @@ pub(crate) fn is_pnpm_yaml(path: &Path) -> bool {
 
 fn input_budget(path: &Path) -> Option<(u64, &'static str)> {
     if is_pnpm_yaml(path) {
-        Some((PNPM_YAML_MAX_BYTES as u64, "pnpm YAML"))
-    } else if path.ends_with(".devkit/runtime/toolchains.env") {
-        Some((TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins"))
-    } else if path.ends_with(".devkit/runtime/desktop-seccomp.json") {
-        Some((SECCOMP_PROFILE_MAX_BYTES as u64, "desktop seccomp profile"))
-    } else if path.ends_with(".devkit/runtime/compose.tools.yaml") {
-        Some((
+        return Some((PNPM_YAML_MAX_BYTES as u64, "pnpm YAML"));
+    }
+    if path.ends_with(".devkit/runtime/toolchains.env") {
+        return Some((TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins"));
+    }
+    if path.ends_with(".devkit/runtime/desktop-seccomp.json") {
+        return Some((SECCOMP_PROFILE_MAX_BYTES as u64, "desktop seccomp profile"));
+    }
+    if path.ends_with(".devkit/runtime/compose.tools.yaml") {
+        return Some((
             crate::compose::MAX_YAML_BYTES as u64,
             "Tool Compose projection",
-        ))
-    } else {
-        None
+        ));
     }
+    let cargo_config = path.ends_with(".cargo/config") || path.ends_with(".cargo/config.toml");
+    (cargo_config
+        || matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("Cargo.toml" | "Cargo.lock" | "rustfmt.toml" | "rust-toolchain.toml")
+        ))
+    .then_some((32 * 1024 * 1024, "Cargo metadata"))
 }
 
 /// Saved transaction slots retain the acquisition policy of their original input.
@@ -479,6 +495,7 @@ pub fn create_dir_all_durable(path: &Path) -> Result<()> {
                     "Expected a regular directory: {}",
                     current.display()
                 );
+                check_ancestors(&current)?;
                 break;
             }
             Err(error) if absent(&error) => {
@@ -631,12 +648,60 @@ pub fn copy_tree(
     ignore: &dyn Fn(&str) -> bool,
     preserve_links: bool,
 ) -> Result<()> {
+    copy_tree_inner(source, target, ignore, preserve_links, true)
+}
+
+/// Fast symlink-safe copy for unpublished scratch staging trees that are never
+/// committed in place. Final transaction durability lives in PreparedTransaction.
+pub(crate) fn copy_tree_scratch(
+    source: &Path,
+    target: &Path,
+    ignore: &dyn Fn(&str) -> bool,
+    preserve_links: bool,
+) -> Result<()> {
+    copy_tree_inner(source, target, ignore, preserve_links, false)
+}
+
+fn copy_file_scratch(source: &Path, target: &Path, mode: u32) -> Result<()> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)
+        .with_context(|| format!("Cannot open {}", source.display()))?;
+    ensure!(
+        input.metadata()?.is_file(),
+        "Expected regular file: {}",
+        source.display()
+    );
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(target)
+        .with_context(|| format!("Cannot create staged copy {}", target.display()))?;
+    io::copy(&mut input, &mut output)?;
+    output.set_permissions(fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+fn copy_tree_inner(
+    source: &Path,
+    target: &Path,
+    ignore: &dyn Fn(&str) -> bool,
+    preserve_links: bool,
+    durable: bool,
+) -> Result<()> {
     fn copy(
         root: &Path,
         p: &Path,
         t: &Path,
         ignore: &dyn Fn(&str) -> bool,
         links: bool,
+        durable: bool,
     ) -> Result<()> {
         let n = relative_name(root, p)?;
         if !n.is_empty() && ignore(&n) {
@@ -650,10 +715,22 @@ pub fn copy_tree(
         } else if info.is_dir() {
             fs::create_dir_all(t)?;
             for e in sorted_entries(p)? {
-                copy(root, &e.path(), &t.join(e.file_name()), ignore, links)?;
+                copy(
+                    root,
+                    &e.path(),
+                    &t.join(e.file_name()),
+                    ignore,
+                    links,
+                    durable,
+                )?;
             }
         } else if info.is_file() {
-            write_atomic(t, &read_input_bytes(p)?, info.permissions().mode() & 0o777)?;
+            let mode = info.permissions().mode() & 0o777;
+            if durable {
+                write_atomic(t, &read_input_bytes(p)?, mode)?;
+            } else {
+                copy_file_scratch(p, t, mode)?;
+            }
         } else if links && (info.file_type().is_socket() || info.file_type().is_fifo()) {
             return Ok(());
         } else {
@@ -661,7 +738,7 @@ pub fn copy_tree(
         }
         Ok(())
     }
-    copy(source, source, target, ignore, preserve_links)
+    copy(source, source, target, ignore, preserve_links, durable)
 }
 
 #[cfg(test)]

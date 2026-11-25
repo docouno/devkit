@@ -131,9 +131,98 @@ fn compose_selected_profiles_and_optional_dependencies_match_native_reachability
     );
 }
 #[test]
+fn cargo_projection_uses_one_setup_and_shared_target_for_registered_apps_and_libraries() {
+    use devkit::{
+        native::{CargoMember, CargoPackageId, CargoWorkspaceModel},
+        projections::render_project_make,
+    };
+    let mut state = state("0.6.0");
+    let mut library = state.components["apps/api"].clone();
+    library.role = devkit::model::Role::Library;
+    library.development = None;
+    state.components.insert("packages/core".into(), library);
+    let make = render_project_make(&state);
+    assert!(make.contains("setup-api: setup-rust-workspace\n"));
+    assert!(make.contains("setup/packages/core: setup-rust-workspace\n"));
+    assert!(make.contains("setup-web: setup-node-workspace\n"));
+
+    let member = CargoMember {
+        rel_dir: "apps/api/crates/$server".into(),
+        id: CargoPackageId {
+            name: "api-server".into(),
+            version: "0.1.0".into(),
+            source: None,
+        },
+        dependencies: vec![],
+    };
+    let mut workspace = CargoWorkspaceModel::default();
+    workspace
+        .components
+        .insert("apps/api".into(), vec![member.clone()]);
+    let rendered = render_app_compose_value(&state, Some(&workspace)).unwrap();
+    let service = &rendered["services"]["api"];
+    assert_eq!(
+        service["environment"]["CARGO_TARGET_DIR"],
+        "/workspace/target"
+    );
+    assert_eq!(service["working_dir"], "/workspace/apps/api");
+    assert!(
+        service["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["target"] == "/workspace/target"
+                && v["source"] == "${DEVKIT_PROJECT_ROOT:?}/target"
+                && v["read_only"] == false
+                && v["bind"]["create_host_path"] == false)
+    );
+    let command = json!([
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/Cargo.toml",
+        "--locked",
+        "--offline"
+    ]);
+    let mut selected = command.clone();
+    assert_eq!(
+        member.pkgid().unwrap(),
+        "path+file:///workspace/apps/api/crates/$server#api-server@0.1.0"
+    );
+    selected.as_array_mut().unwrap().extend([
+        json!("-p"),
+        json!("path+file:///workspace/apps/api/crates/$$server#api-server@0.1.0"),
+    ]);
+    assert_eq!(service["command"], selected);
+
+    let mut second = member.clone();
+    second.id.name = "api-admin".into();
+    second.rel_dir = "apps/api/admin".into();
+    workspace
+        .components
+        .get_mut("apps/api")
+        .unwrap()
+        .push(second);
+    assert_eq!(
+        render_app_compose_value(&state, Some(&workspace)).unwrap()["services"]["api"]["command"],
+        command
+    );
+    state.version = "0.5.1".into();
+    assert!(!render_project_make(&state).contains("setup-rust-workspace"));
+    let old = render_app_compose_value(&state, None).unwrap();
+    assert_eq!(
+        old["services"]["api"]["environment"]["CARGO_TARGET_DIR"],
+        "/workspace/apps/api/target"
+    );
+    assert_eq!(
+        old["services"]["api"]["command"],
+        json!(["cargo", "run", "--locked", "--offline"])
+    );
+}
+#[test]
 fn desktop_projection_always_mounts_the_accepted_linux_helper_read_only() {
     for ver in ["0.4.1", "0.5.0", "0.6.0"] {
-        let rendered = render_app_compose_value(&state(ver)).unwrap();
+        let rendered = render_app_compose_value(&state(ver), None).unwrap();
         assert_eq!(
             rendered["services"]["desktop"]["command"],
             json!(["/devkit/devkit", "internal", "desktop"])
@@ -716,7 +805,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     .unwrap();
     write_json(
         &root.join(".devkit/compose.apps.yaml"),
-        &render_app_compose_value(&seed_state).unwrap(),
+        &render_app_compose_value(&seed_state, native.cargo_workspace.as_ref()).unwrap(),
     )
     .unwrap();
     write_atomic(
@@ -1022,29 +1111,30 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     )
     .unwrap();
     write_atomic(
+        &root.join("Cargo.toml"),
+        b"[workspace]\nresolver = \"3\"\nmembers = [\"apps/api\"]\n",
+        0o644,
+    )
+    .unwrap();
+    write_atomic(
         &root.join("apps/api/Cargo.toml"),
         b"[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         0o644,
     )
     .unwrap();
     write_atomic(
-        &root.join("apps/api/Cargo.lock"),
+        &root.join("Cargo.lock"),
         b"version = 4\n\n[[package]]\nname = \"api\"\nversion = \"0.1.0\"\n",
         0o644,
     )
     .unwrap();
     write_atomic(
-        &root.join("apps/api/rust-toolchain.toml"),
+        &root.join("rust-toolchain.toml"),
         b"[toolchain]\nchannel = \"1.99.1\"\n",
         0o644,
     )
     .unwrap();
-    write_atomic(
-        &root.join("apps/api/rustfmt.toml"),
-        b"edition = \"2024\"\n",
-        0o644,
-    )
-    .unwrap();
+    write_atomic(&root.join("rustfmt.toml"), b"edition = \"2024\"\n", 0o644).unwrap();
     write_atomic(&root.join("apps/api/src/main.rs"), b"fn main() {}\n", 0o644).unwrap();
 
     let seed_state: ProjectState = serde_json::from_value(json!({
@@ -1077,7 +1167,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     .unwrap();
     write_json(
         &root.join(".devkit/compose.apps.yaml"),
-        &render_app_compose_value(&seed_state).unwrap(),
+        &render_app_compose_value(&seed_state, native.cargo_workspace.as_ref()).unwrap(),
     )
     .unwrap();
     write_atomic(
@@ -1099,7 +1189,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/rust.Dockerfile",
-        "apps/api/rust-toolchain.toml",
+        "rust-toolchain.toml",
     ] {
         managed.insert(
             path.to_string(),
@@ -1137,6 +1227,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     fs::create_dir_all(&fake_bin).unwrap();
     let docker_log = temp.path().join("docker.log");
     let mode_file = temp.path().join("tag-mode");
+    let fetch_failure = temp.path().join("fail-fetch");
     fs::write(&mode_file, "present").unwrap();
     let docker_script = fake_bin.join("docker");
     let script = format!(
@@ -1191,6 +1282,9 @@ if [ "$1" = "build" ]; then
   exit 0
 fi
 if [ "$1" = "run" ]; then
+  case "$*" in
+    *"internal rust setup"*) if [ -e "{fetch_failure}" ]; then exit 21; fi ;;
+  esac
   exit 0
 fi
 exit 0
@@ -1200,6 +1294,7 @@ exit 0
         pin = rust_recipe,
         tag = derived_tag,
         mode = mode_file.display(),
+        fetch_failure = fetch_failure.display(),
     );
     fs::write(&docker_script, script).unwrap();
     fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1222,6 +1317,7 @@ exit 0
             "true",
         ])
         .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -1235,6 +1331,41 @@ exit 0
         "non-prepare tagged image: {log1}"
     );
     assert!(!log1.contains("build "), "non-prepare built image: {log1}");
+    assert!(log1.contains("--workdir /workspace/apps/api"));
+    assert!(log1.contains("CARGO_TARGET_DIR=/tmp/cargo-target"));
+    assert!(log1.contains("CARGO_INCREMENTAL=0"));
+    assert!(log1.contains("\"target=/cache/cargo\",readonly"));
+    assert!(!root.join("target").exists());
+    assert!(!root.join(".devkit/state/rust-workspace.lock").exists());
+
+    // Read-only exec with --network bridge (without --write) still keeps /cache/cargo read-only.
+    fs::write(&docker_log, "").unwrap();
+    let bridge_ro = Command::new(exe)
+        .args([
+            "exec",
+            "--toolchain",
+            "rust",
+            "--network",
+            "bridge",
+            "--root",
+            root.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        bridge_ro.status.success(),
+        "bridge ro exec failed: {}",
+        String::from_utf8_lossy(&bridge_ro.stderr)
+    );
+    let log_bridge = fs::read_to_string(&docker_log).unwrap();
+    assert!(
+        log_bridge.contains("\"target=/cache/cargo\",readonly"),
+        "read-only exec --network bridge must keep /cache/cargo read-only:\n{log_bridge}"
+    );
 
     let foreign = if platform == "linux/amd64" {
         "linux/arm64"
@@ -1270,9 +1401,9 @@ exit 0
     // 2. Prepare (`task setup`) hits `.devkit/state/rust-image` and idempotently applies `devkit-derived-rust:<pin>`.
     fs::write(&docker_log, "").unwrap();
     let setup_hit = Command::new(exe)
-        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .args(["task", "setup-rust", "--root", root.to_str().unwrap()])
         .env("PATH", &path_env)
-        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -1290,13 +1421,168 @@ exit 0
         "prepare on existing state ran build: {log2}"
     );
 
+    assert!(log2.contains("internal rust setup --workspace-root /workspace"));
+    assert!(log2.contains("--workdir /workspace "));
+    assert!(!log2.contains("target=/workspace/target"));
+    let receipt = root.join(".devkit/state/rust-workspace.lock");
+    assert!(receipt.is_file());
+    let setup_in = |cache| {
+        Command::new(exe)
+            .args(["task", "setup-rust", "--root", root.to_str().unwrap()])
+            .env("PATH", &path_env)
+            .env("DEVKIT_CACHE_DIR", temp.path().join(cache))
+            .output()
+            .unwrap()
+    };
+    assert!(setup_in("alternate-cache").status.success());
+    fs::write(&fetch_failure, "").unwrap();
+    assert!(!setup_in("alternate-cache").status.success());
+    fs::remove_file(fetch_failure).unwrap();
+    assert!(setup_in("cache").status.success());
+    let stale = Command::new(exe)
+        .args([
+            "task",
+            "setup",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("alternate-cache"))
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr)
+            .contains("rust workspace dependencies are absent/stale")
+    );
+    fs::write(&docker_log, "").unwrap();
+    let setup_component = Command::new(exe)
+        .args([
+            "task",
+            "setup",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        setup_component.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup_component.stderr)
+    );
+    assert!(
+        !fs::read_to_string(&docker_log)
+            .unwrap()
+            .contains("internal rust setup")
+    );
+    fs::write(&docker_log, "").unwrap();
+    let component_fix = Command::new(exe)
+        .args([
+            "task",
+            "fix",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        component_fix.status.success(),
+        "{}",
+        String::from_utf8_lossy(&component_fix.stderr)
+    );
+    let log = fs::read_to_string(&docker_log).unwrap();
+    assert!(log.contains("target=/workspace/target"));
+    assert!(log.contains("\"target=/cache/cargo\",readonly"));
+    assert!(log.contains("RUSTC=/usr/local/cargo/bin/rustc"));
+    assert!(log.contains("CARGO_NET_GIT_FETCH_WITH_CLI=false"));
+    assert!(log.contains("--network none"));
+    assert!(log.contains("--workdir /workspace "));
+    assert!(log.contains("internal rust fix --workspace-root /workspace --component apps/api --member apps/api --fmt-package api --package path+file:///workspace/apps/api#api@0.1.0"));
+    // Setup receipt must live in cargo-receipts/, never inside CARGO_HOME (/cache/cargo).
+    assert!(temp.path().join("cache/cargo-receipts").is_dir());
+    assert!(!temp.path().join("cache/cargo/.devkit").exists());
+    assert!(
+        !fs::read_dir(temp.path().join("cache/cargo"))
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("devkit-cargo-cache")),
+        "receipt must not live inside CARGO_HOME"
+    );
+    // Poisoned CARGO_HOME config.toml is rejected before launching Docker.
+    let poison = temp.path().join("cache/cargo/config.toml");
+    fs::write(&poison, "[build]\nrustc-wrapper = '/bin/sh'\n").unwrap();
+    fs::write(&docker_log, "").unwrap();
+    let poisoned_fix = Command::new(exe)
+        .args([
+            "task",
+            "fix",
+            "--component",
+            "apps/api",
+            "--root",
+            root.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(!poisoned_fix.status.success());
+    assert!(
+        String::from_utf8_lossy(&poisoned_fix.stderr)
+            .contains("Refusing unexpected Cargo configuration in shared cache"),
+        "{}",
+        String::from_utf8_lossy(&poisoned_fix.stderr)
+    );
+    assert!(!fs::read_to_string(&docker_log).unwrap().contains("run "));
+    fs::remove_file(&poison).unwrap();
+    let root_exec = Command::new(exe)
+        .args([
+            "exec",
+            "--write",
+            "--root",
+            root.to_str().unwrap(),
+            "--",
+            "cargo",
+            "update",
+            "--workspace",
+        ])
+        .env("PATH", &path_env)
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        root_exec.status.success(),
+        "{}",
+        String::from_utf8_lossy(&root_exec.stderr)
+    );
+    assert!(!receipt.exists());
+    assert_eq!(
+        fs::read_dir(temp.path().join("cache/cargo-receipts"))
+            .unwrap()
+            .count(),
+        0,
+        "exec --write must also remove the cargo-receipts marker"
+    );
+
     // 3. Fresh checkout without `.devkit/state/rust-image.json` reuses local tag without `docker build`.
     fs::remove_file(root.join(".devkit/state/rust-image.json")).unwrap();
     fs::write(&docker_log, "").unwrap();
     let setup_tag_hit = Command::new(exe)
-        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .args(["task", "setup-rust", "--root", root.to_str().unwrap()])
         .env("PATH", &path_env)
-        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -1319,9 +1605,9 @@ exit 0
     fs::write(&mode_file, "absent").unwrap();
     fs::write(&docker_log, "").unwrap();
     let setup_cold = Command::new(exe)
-        .args(["task", "setup", "--root", root.to_str().unwrap()])
+        .args(["task", "setup-rust", "--root", root.to_str().unwrap()])
         .env("PATH", &path_env)
-        .env("DEVKIT_TARGET_COMPONENT", "apps/api")
+        .env("DEVKIT_CACHE_DIR", temp.path().join("cache"))
         .output()
         .unwrap();
     assert!(

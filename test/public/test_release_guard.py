@@ -312,22 +312,30 @@ class RequiredNativeCheckGuard(unittest.TestCase):
                 self.assertEqual(run.returncode == 0, valid, run.stderr)
 
         self.assertIn("legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}", handoff)
-        # Publishable Linux assembly must not wait on the unpublished Darwin preview runner.
-        ci_assemble = self.job("assemble", "ci")
-        self.assertEqual(
-            re.search(r"(?m)^    needs: \[(.+)\]$", ci_assemble).group(1).split(", "),
-            ["build-linux-amd64", "build-linux-arm64"],
+        # Publishable Linux assembly and verification must not wait on the unpublished Darwin preview runner.
+        def needs_of(job_block):
+            return [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", job_block).group(1).split(",") if item.strip()]
+
+        self.assertCountEqual(
+            needs_of(ci),
+            ["assemble", "build-linux-amd64", "build-linux-arm64", "source-linux-amd64", "source-linux-arm64"],
         )
+        ci_assemble = self.job("assemble", "ci")
+        self.assertCountEqual(needs_of(ci_assemble), ["build-linux-amd64", "build-linux-arm64"])
         self.assertNotIn("darwin:", ci_assemble)
-        assemble_wf = (REPO / ".github/workflows/assemble.yml").read_text()
-        self.assertIn("python3 .github/scripts/check-contributions.py amd64 arm64", assemble_wf)
-        self.assertNotIn("build-darwin", assemble_wf)
-        self.assertNotIn("darwin:", assemble_wf)
+        for wf in ("assemble", "verify", "release"):
+            wf_text = (REPO / ".github/workflows" / (wf + ".yml")).read_text()
+            self.assertNotIn("darwin", wf_text.lower(), wf)
+            self.assertNotIn("macos-", wf_text.lower(), wf)
+        self.assertIn(
+            "python3 .github/scripts/check-contributions.py amd64 arm64",
+            (REPO / ".github/workflows/assemble.yml").read_text(),
+        )
 
         # Darwin preview stays a parallel non-blocking CI pipeline with full digest verification.
         ci_preview = self.job("darwin-preview", "ci")
-        self.assertEqual(
-            re.search(r"(?m)^    needs: \[(.+)\]$", ci_preview).group(1).split(", "),
+        self.assertCountEqual(
+            needs_of(ci_preview),
             ["build-linux-amd64", "build-linux-arm64", "build-darwin-arm64"],
         )
         preview_assemble = self.job("assemble", "darwin-preview")
@@ -336,6 +344,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
         self.assertIn("legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}", preview_assemble)
         preview_host = self.job("host", "darwin-preview")
         self.assertIn("PREVIEW_SHA256: ${{ needs.assemble.outputs.preview_index_sha256 }}", preview_host)
+        self.assertIn('test "$(shasum -a 256 "$dir/release-index.json" | cut -d \' \' -f 1)" = "$PREVIEW_SHA256"', preview_host)
         self.assertIn("LEGACY_SHA256: ${{ needs.assemble.outputs.legacy_checkout_sha256 }}", preview_host)
         self.assertIn('test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d \' \' -f 1)" = "$LEGACY_SHA256"', preview_host)
         self.assertIn('python3 test/darwin/verify.py --build-set "$dir"', preview_host)
@@ -347,6 +356,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
                 capture_output=True, text=True, timeout=5,
             )
             self.assertNotEqual(check.returncode, 0, bad_args)
+            self.assertIn("Usage:", check.stderr, bad_args)
 
     def test_each_required_check_rejects_an_unsuccessful_or_skipped_worker(self):
         workers = {"performance", "cross-host-checkout"}

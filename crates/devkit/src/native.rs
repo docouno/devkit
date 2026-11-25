@@ -14,9 +14,19 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry},
     fs,
     path::Path,
+};
+
+mod cargo_workspace;
+pub(crate) use cargo_workspace::cargo_template_recipe;
+pub use cargo_workspace::{
+    CargoDeclaration, CargoMember, CargoPatch, CargoWorkspaceKind, CargoWorkspaceModel,
+    rust_component_owner,
+};
+pub(crate) use cargo_workspace::{
+    CargoReplacementSpec, cargo_patch_origin, cargo_proof_matches, cargo_registries,
 };
 
 pub const DEPENDENCY_FIELDS: [&str; 4] = [
@@ -279,7 +289,7 @@ pub fn dependency_table(data: &Fields, field: &str) -> Result<Fields> {
     }
 }
 
-const NATIVE_METADATA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const NATIVE_METADATA_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 fn stable_bytes(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
     if crate::files::is_pnpm_yaml(path) {
@@ -300,7 +310,7 @@ fn identity(path: &Path) -> Result<Option<FileIdentity>> {
         Some("toml" | "json" | "lock")
     ) || matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some(".npmrc" | "config")
+        Some(".npmrc" | "config" | "rust-toolchain")
     ) {
         return bounded_identity(path, NATIVE_METADATA_MAX_BYTES);
     }
@@ -587,94 +597,14 @@ struct CargoInputs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct CargoPackageId {
-    name: String,
-    version: String,
-    source: Option<String>,
-}
-#[derive(Clone)]
-struct LockedCargoPackage {
-    id: CargoPackageId,
-    dependencies: Vec<String>,
-    replacement: Option<String>,
-}
-#[derive(Clone)]
-struct CargoLockGraph {
-    packages: Vec<LockedCargoPackage>,
-}
-impl CargoLockGraph {
-    fn package_ref(&self, component: &str, reference: &str, replacement: bool) -> Result<usize> {
-        let (identity, source) = if let Some((identity, source)) = reference.split_once(" (") {
-            (
-                identity,
-                Some(
-                    source
-                        .strip_suffix(')')
-                        .context("Invalid Cargo lock dependency source")?,
-                ),
-            )
-        } else {
-            (reference, None)
-        };
-        let parts: Vec<_> = identity.split_whitespace().collect();
-        ensure!(
-            (1..=2).contains(&parts.len()),
-            "Unsupported Cargo lock dependency reference: {reference}"
-        );
-        // Cargo's version-qualified reference without a source denotes an
-        // existing local lock record when one shares its name/version with a
-        // source-qualified registry/Git record. Do not infer this from a nearby
-        // manifest, and keep unversioned or remote-only ambiguity fail-closed.
-        let compact_local = source.is_none()
-            && parts.len() == 2
-            && self.packages.iter().any(|package| {
-                package.id.name == parts[0]
-                    && package.id.version == parts[1]
-                    && package.id.source.is_none()
-            });
-        let selected: Vec<_> = self
-            .packages
-            .iter()
-            .enumerate()
-            .filter(|(_, package)| {
-                package.id.name == parts[0]
-                    && (parts.len() == 1 || package.id.version == parts[1])
-                    && source.is_none_or(|source| package.id.source.as_deref() == Some(source))
-                    && (!compact_local || package.id.source.is_none())
-                    // A compact replacement ref denotes the local target;
-                    // Cargo also retains the replaced registry record with
-                    // the same name/version and an explicit source.
-                    && (!replacement || source.is_some() || package.id.source.is_none())
-            })
-            .map(|(index, _)| index)
-            .collect();
-        ensure!(
-            selected.len() == 1,
-            "Cargo lock dependency reference is missing or ambiguous: {reference}; refresh the component Cargo.lock with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile"
-        );
-        Ok(selected[0])
-    }
-    fn local_id(&self, component: &str, identity: &CargoPackageId) -> Result<usize> {
-        let selected: Vec<_> = self
-            .packages
-            .iter()
-            .enumerate()
-            .filter(|(_, package)| &package.id == identity)
-            .map(|(index, _)| index)
-            .collect();
-        ensure!(
-            selected.len() == 1,
-            "Cargo.lock does not uniquely identify workspace package {} {}; refresh the component Cargo.lock with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile",
-            identity.name,
-            identity.version
-        );
-        Ok(selected[0])
-    }
+pub struct CargoPackageId {
+    pub name: String,
+    pub version: String,
+    pub source: Option<String>,
 }
 #[derive(Default)]
 struct CargoLocalContext {
     paths: BTreeSet<String>,
-    config_paths: BTreeSet<String>,
 }
 struct DerivedDependencies {
     projected: BTreeMap<String, Vec<String>>,
@@ -686,6 +616,7 @@ struct DerivedDependencies {
 /// manifest identities detect native manifests added to an existing directory.
 #[derive(Clone, Serialize)]
 struct NativeStructure {
+    registered: BTreeSet<String>,
     namespaces: BTreeMap<String, Option<BTreeMap<String, String>>>,
     manifests: BTreeMap<String, Option<FileIdentity>>,
 }
@@ -743,18 +674,25 @@ impl NativeStructure {
             }
         }
         Ok(Self {
+            registered: state.components.keys().cloned().collect(),
             namespaces,
             manifests,
         })
     }
-    fn assert_registered(&self, state: &ProjectState) -> Result<()> {
+    fn assert_registered(
+        &self,
+        state: &ProjectState,
+        workspace: Option<&CargoWorkspaceModel>,
+    ) -> Result<()> {
         for (path, component) in &state.components {
             let node = self.manifests[&format!("{path}/package.json")].is_some();
             let rust = self.manifests[&format!("{path}/Cargo.toml")].is_some();
             ensure!(!(node && rust), "Ambiguous native manifests: {path}");
             ensure!(
                 (component.toolchain == Toolchain::Node && node)
-                    || (component.toolchain == Toolchain::Rust && rust),
+                    || (component.toolchain == Toolchain::Rust
+                        && !node
+                        && workspace.map_or(rust, |model| model.components.contains_key(path))),
                 "Missing expected native {} manifest: {path}",
                 component.toolchain
             );
@@ -785,6 +723,7 @@ impl NativeStructure {
                     }
                     let removed = now_entries.and_then(|m| m.get(name)).is_none();
                     let was_plain_dir = old_kind == "directory"
+                        && !self.registered.contains(&format!("{area}/{name}"))
                         && self.manifests.get(&format!("{area}/{name}/package.json"))
                             == Some(&None)
                         && self.manifests.get(&format!("{area}/{name}/Cargo.toml")) == Some(&None);
@@ -841,8 +780,15 @@ struct ReadContext<'a> {
     manifests: BTreeMap<String, Fields>,
     cargo: BTreeMap<String, Fields>,
     cargo_configs: BTreeMap<String, Fields>,
-    cargo_locks: BTreeMap<String, CargoLockGraph>,
+    cargo_config_order: Vec<String>,
+    cargo_locks: BTreeMap<String, crate::cargo_lock::Lock>,
+    cargo_workspace_dirs: BTreeMap<String, String>,
     node_inputs: Option<InputIdentitySet>,
+    root_members: Option<BTreeSet<String>>,
+    cargo_defaults: BTreeSet<String>,
+    root_cargo_files: Option<BTreeMap<String, Option<FileIdentity>>>,
+    rust_inputs: Option<InputIdentitySet>,
+    cargo_workspace: Option<CargoWorkspaceModel>,
     read_identities: BTreeMap<String, FileIdentity>,
     dependency_byte_limit: Option<u64>,
 }
@@ -856,8 +802,15 @@ impl<'a> ReadContext<'a> {
             manifests: BTreeMap::new(),
             cargo: BTreeMap::new(),
             cargo_configs: BTreeMap::new(),
+            cargo_config_order: Vec::new(),
             cargo_locks: BTreeMap::new(),
+            cargo_workspace_dirs: BTreeMap::new(),
             node_inputs: None,
+            rust_inputs: None,
+            cargo_workspace: None,
+            root_members: None,
+            cargo_defaults: BTreeSet::new(),
+            root_cargo_files: None,
             read_identities: BTreeMap::new(),
             dependency_byte_limit: None,
         }
@@ -925,18 +878,38 @@ impl<'a> ReadContext<'a> {
         }
         Ok(self.manifests[path].clone())
     }
-    fn cargo_manifest(&mut self, path: &str) -> Result<Fields> {
+    fn read_cargo_manifest(&self, name: &str) -> Result<Option<(Fields, FileIdentity)>> {
+        let Some((bytes, identity)) = read_regular_file(
+            &input_path(self.root, name)?,
+            NATIVE_METADATA_MAX_BYTES,
+            "Cargo manifest",
+        )?
+        else {
+            return Ok(None);
+        };
+        let parsed: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
+            .with_context(|| format!("Invalid Cargo manifest: {name}"))?;
+        let value = serde_json::to_value(parsed)?;
+        Ok(Some((object(&value, "Cargo manifest")?.clone(), identity)))
+    }
+    fn ensure_cargo_manifest(&mut self, path: &str) -> Result<()> {
         if !self.cargo.contains_key(path) {
             let name = prefixed(path, "Cargo.toml");
-            let (bytes, identity) = stable_bytes(&input_path(self.root, &name)?)?;
-            let parsed: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)
-                .with_context(|| format!("Invalid Cargo manifest: {path}"))?;
-            let value = serde_json::to_value(parsed)?;
-            self.cargo
-                .insert(path.to_owned(), object(&value, "Cargo manifest")?.clone());
+            let (manifest, identity) = self
+                .read_cargo_manifest(&name)?
+                .with_context(|| format!("Missing native input: {name}"))?;
+            self.cargo.insert(path.to_owned(), manifest);
             self.read_identities.insert(name, identity);
         }
+        Ok(())
+    }
+    fn cargo_manifest(&mut self, path: &str) -> Result<Fields> {
+        self.ensure_cargo_manifest(path)?;
         Ok(self.cargo[path].clone())
+    }
+    fn cargo_manifest_ref(&mut self, path: &str) -> Result<&Fields> {
+        self.ensure_cargo_manifest(path)?;
+        Ok(&self.cargo[path])
     }
     fn cargo_inputs(&mut self, path: &str) -> Result<CargoInputs> {
         let manifest = self.cargo_manifest(path)?;
@@ -972,7 +945,7 @@ impl<'a> ReadContext<'a> {
         result: &mut CargoInputs,
         inherited: bool,
     ) -> Result<()> {
-        for field in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        for field in self.dependency_tables(base, data)? {
             for (name, dependency) in dependency_table(data, field)? {
                 let Some(table) = dependency.as_object() else {
                     continue;
@@ -983,10 +956,13 @@ impl<'a> ReadContext<'a> {
                         cargo_local_path(self.root, base, text(path, "Cargo dependency path")?)?;
                     result.dependencies.insert(path);
                 } else if inherited && table.get("workspace") == Some(&Value::Bool(true)) {
-                    let (workspace_root, workspace) = self.find_cargo_workspace(base)?;
-                    let dependencies = dependency_table(&workspace, "dependencies")?;
-                    let inherited = dependencies
-                        .get(&name)
+                    let workspace_root = self.find_cargo_workspace_dir(base)?;
+                    let inherited = self.cargo[&workspace_root]
+                        .get("workspace")
+                        .and_then(Value::as_object)
+                        .and_then(|w| w.get("dependencies"))
+                        .and_then(Value::as_object)
+                        .and_then(|deps| deps.get(&name))
                         .with_context(|| format!("Missing inherited Cargo dependency: {name}"))?;
                     if let Some(declaration) = inherited.as_object() {
                         reject_local_cargo_git(declaration)?;
@@ -1058,15 +1034,27 @@ impl<'a> ReadContext<'a> {
         seen: &mut BTreeSet<String>,
         active: &mut BTreeSet<String>,
         targets: &mut BTreeSet<String>,
-        config_paths: &mut BTreeSet<String>,
+        depth: usize,
     ) -> Result<()> {
-        if seen.contains(name) {
-            return Ok(());
-        }
+        ensure!(
+            depth <= 32,
+            "Cargo config include nesting exceeds limit: {name}"
+        );
         ensure!(
             active.insert(name.to_owned()),
             "Cargo config include cycle: {name}"
         );
+        if depth == 0 {
+            if seen.contains(name) {
+                active.remove(name);
+                return Ok(());
+            }
+        } else {
+            ensure!(
+                !seen.contains(name),
+                "Duplicate Cargo config include: {name}"
+            );
+        }
         record(self.root, files, name, true)?;
         let data = self.cargo_config(name)?;
         let path = input_path(self.root, name)?;
@@ -1105,11 +1093,19 @@ impl<'a> ReadContext<'a> {
                     )
                 };
                 ensure!(
+                    !Path::new(reference).is_absolute(),
+                    "Cargo config include must be a relative path: {reference}"
+                );
+                ensure!(
                     reference.ends_with(".toml"),
                     "Cargo config include must name a .toml file: {reference}"
                 );
                 let target = input_path(self.root, directory.join(reference))?;
                 let target_name = relative_name(&project_root(self.root)?, &target)?;
+                ensure!(
+                    target_name.contains('/'),
+                    "Cargo config include must live in a subdirectory below the checkout root: {target_name}"
+                );
                 record(self.root, files, &target_name, !optional)?;
                 if identity(&target)?.is_some() {
                     self.cargo_config_inputs(
@@ -1118,9 +1114,60 @@ impl<'a> ReadContext<'a> {
                         seen,
                         active,
                         targets,
-                        config_paths,
+                        depth + 1,
                     )?;
                 }
+            }
+        }
+        ensure!(
+            !data.contains_key("paths"),
+            "Unsupported Cargo config paths override in {name}; use [patch] instead"
+        );
+        for forbidden in ["env", "alias", "http"] {
+            ensure!(
+                !data.contains_key(forbidden),
+                "Unsupported Cargo config section [{forbidden}] in {name}"
+            );
+        }
+        let build = dependency_table(&data, "build")?;
+        for forbidden in [
+            "rustc",
+            "rustc-wrapper",
+            "rustc-workspace-wrapper",
+            "rustdoc",
+            "target-dir",
+            "build-dir",
+            "rustflags",
+            "rustdocflags",
+        ] {
+            ensure!(
+                !build.contains_key(forbidden),
+                "Unsupported Cargo config build.{forbidden} in {name}"
+            );
+        }
+        let net = dependency_table(&data, "net")?;
+        ensure!(
+            !net.contains_key("git-fetch-with-cli"),
+            "Unsupported Cargo config net.git-fetch-with-cli in {name}"
+        );
+        let registry = dependency_table(&data, "registry")?;
+        for forbidden in [
+            "global-credential-providers",
+            "credential-provider",
+            "token",
+        ] {
+            ensure!(
+                !registry.contains_key(forbidden),
+                "Unsupported Cargo config registry.{forbidden} in {name}"
+            );
+        }
+        for target_cfg in dependency_table(&data, "target")?.values() {
+            let target_cfg = object(target_cfg, "Cargo target config")?;
+            for forbidden in ["runner", "linker", "rustflags", "rustdocflags"] {
+                ensure!(
+                    !target_cfg.contains_key(forbidden),
+                    "Unsupported Cargo config target.{forbidden} in {name}"
+                );
             }
         }
         // Cargo resolves file-defined values relative to two levels above the
@@ -1130,17 +1177,6 @@ impl<'a> ReadContext<'a> {
             .context("Cargo config value base")?
             .to_str()
             .context("Non-UTF8 Cargo config base")?;
-        if let Some(paths) = data.get("paths") {
-            for value in paths
-                .as_array()
-                .context("Cargo config paths must be an array")?
-            {
-                let target =
-                    cargo_local_path(self.root, base, text(value, "Cargo config override path")?)?;
-                config_paths.insert(target.clone());
-                targets.insert(target);
-            }
-        }
         self.collect_cargo_overrides(base, &data, targets)?;
         for source in dependency_table(&data, "source")?.values() {
             let source = object(source, "Cargo source")?;
@@ -1151,58 +1187,86 @@ impl<'a> ReadContext<'a> {
                 );
             }
             reject_local_cargo_git(source)?;
-            ensure!(
-                !source
-                    .get("registry")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.starts_with("file:")),
-                "Unsupported local Cargo registry source: source.registry"
-            );
+            if let Some(url) = source.get("registry").and_then(Value::as_str) {
+                reject_local_cargo_url(url, "source.registry")?;
+            }
         }
         for registry in dependency_table(&data, "registries")?.values() {
             let registry = object(registry, "Cargo registry")?;
-            ensure!(
-                !registry
-                    .get("index")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.starts_with("file:")),
-                "Unsupported local Cargo registry source: registries.index"
-            );
+            for forbidden in ["credential-provider", "token"] {
+                ensure!(
+                    !registry.contains_key(forbidden),
+                    "Unsupported Cargo config registries.{forbidden} in {name}"
+                );
+            }
+            if let Some(index) = registry.get("index").and_then(Value::as_str) {
+                reject_local_cargo_url(index, "registries.index")?;
+            }
         }
         ensure!(
             !dependency_table(&data, "resolver")?.contains_key("lockfile-path"),
             "Unsupported Cargo resolver.lockfile-path: the accepted native lock is Cargo.lock"
         );
         active.remove(name);
+        self.cargo_config_order.push(name.to_owned());
         seen.insert(name.to_owned());
         Ok(())
     }
-    fn find_cargo_workspace(&mut self, base: &str) -> Result<(String, Fields)> {
-        let own = self.cargo_manifest(base)?;
-        let package = dependency_table(&own, "package")?;
-        if let Some(workspace) = package.get("workspace") {
+    fn find_cargo_workspace_dir(&mut self, base: &str) -> Result<String> {
+        if let Some(cached) = self.cargo_workspace_dirs.get(base) {
+            return Ok(cached.clone());
+        }
+        let explicit = {
+            let own = self.cargo_manifest_ref(base)?;
+            own.get("package")
+                .and_then(Value::as_object)
+                .and_then(|p| p.get("workspace"))
+                .map(|v| text(v, "Cargo package.workspace").map(str::to_owned))
+                .transpose()?
+        };
+        if let Some(raw) = explicit {
+            ensure!(
+                !Path::new(&raw).is_absolute(),
+                "Cargo package.workspace must be a relative path: {raw}"
+            );
             // A Cargo workspace may live at the checkout root. Constrain the
             // manifest file rather than treating the root directory as an input.
-            let manifest_path = input_path(
-                self.root,
-                Path::new(base)
-                    .join(text(workspace, "Cargo package.workspace")?)
-                    .join("Cargo.toml"),
-            )?;
+            let manifest_path =
+                input_path(self.root, Path::new(base).join(&raw).join("Cargo.toml"))?;
             let target = relative_name(
                 &project_root(self.root)?,
                 manifest_path.parent().context("Cargo workspace parent")?,
             )?;
-            let manifest = self.cargo_manifest(&target)?;
-            return Ok((target, dependency_table(&manifest, "workspace")?));
+            self.ensure_cargo_manifest(&target)?;
+            ensure!(
+                self.cargo[&target]
+                    .get("workspace")
+                    .and_then(Value::as_object)
+                    .is_some(),
+                "Expected [workspace] in {}/Cargo.toml",
+                target
+            );
+            self.assert_workspace_inheritance(base, &target)?;
+            self.cargo_workspace_dirs
+                .insert(base.to_owned(), target.clone());
+            return Ok(target);
         }
         let mut directory = base.to_owned();
         loop {
             let path = input_path(self.root, prefixed(&directory, "Cargo.toml"))?;
             if exists(&path)? {
-                let manifest = self.cargo_manifest(&directory)?;
-                if let Some(workspace) = manifest.get("workspace") {
-                    return Ok((directory, object(workspace, "Cargo workspace")?.clone()));
+                self.ensure_cargo_manifest(&directory)?;
+                if self.cargo[&directory].get("workspace").is_some() {
+                    object(
+                        self.cargo[&directory]
+                            .get("workspace")
+                            .expect("checked workspace"),
+                        "Cargo workspace",
+                    )?;
+                    self.assert_workspace_inheritance(base, &directory)?;
+                    self.cargo_workspace_dirs
+                        .insert(base.to_owned(), directory.clone());
+                    return Ok(directory);
                 }
             }
             if directory.is_empty() {
@@ -1212,58 +1276,60 @@ impl<'a> ReadContext<'a> {
         }
         bail!("Cargo workspace dependency has no project-local workspace: {base}")
     }
-    fn cargo_lock_graph(&mut self, component: &str) -> Result<CargoLockGraph> {
+    fn assert_workspace_inheritance(&self, base: &str, workspace: &str) -> Result<()> {
+        ensure!(
+            !workspace.is_empty()
+                || self
+                    .root_members
+                    .as_ref()
+                    .is_none_or(|members| members.contains(base)),
+            "Cargo package outside workspace.members cannot inherit the root workspace: {base}/Cargo.toml"
+        );
+        Ok(())
+    }
+    fn cargo_lock(&mut self, component: &str) -> Result<crate::cargo_lock::Lock> {
         if !self.cargo_locks.contains_key(component) {
             let name = prefixed(component, "Cargo.lock");
             let (bytes, identity) = stable_bytes(&input_path(self.root, &name)?)?;
-            let parsed: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)?;
-            let raw = serde_json::to_value(parsed)?;
-            let data = object(&raw, "Cargo lock")?;
-            ensure!(
-                matches!(data.get("version").and_then(Value::as_u64), Some(3 | 4)),
-                "Selected Cargo component graph requires component Cargo.lock version 3 or 4"
-            );
-            let mut packages = Vec::new();
-            let mut seen = BTreeSet::new();
-            for package in data.get("package").and_then(Value::as_array).with_context(|| format!("Cargo.lock cannot prove the selected component graph without package records; refresh it with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile"))? {
-                let package = object(package, "locked Cargo package")?;
-                let id = CargoPackageId {
-                    name: text(package.get("name").context("Missing locked Cargo package name")?, "locked Cargo package name")?.to_owned(),
-                    version: text(package.get("version").context("Missing locked Cargo version")?, "locked Cargo version")?.to_owned(),
-                    source: package.get("source").map(|value| text(value,"locked Cargo source").map(str::to_owned)).transpose()?,
-                };
-                ensure!(seen.insert(id.clone()), "Duplicate Cargo lock package identity: {} {}",id.name,id.version);
-                let dependencies = package.get("dependencies").map(|value| value.as_array().context("Cargo lock dependencies must be an array")).transpose()?.into_iter().flatten()
-                    .map(|value| text(value,"Cargo lock dependency").map(str::to_owned)).collect::<Result<Vec<_>>>()?;
-                let replacement = package.get("replace").map(|value| text(value,"Cargo lock replacement").map(str::to_owned)).transpose()?;
-                packages.push(LockedCargoPackage {id,dependencies,replacement});
-            }
-            self.cargo_locks
-                .insert(component.to_owned(), CargoLockGraph { packages });
+            let lock = crate::cargo_lock::Lock::parse(&bytes).map_err(|err| {
+                anyhow::anyhow!(
+                    "Invalid component Cargo.lock at {name}: {err}; refresh it with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile"
+                )
+            })?;
+            self.cargo_locks.insert(component.to_owned(), lock);
             self.read_identities.insert(name, identity);
         }
         Ok(self.cargo_locks[component].clone())
     }
     fn cargo_package_id(&mut self, path: &str) -> Result<Option<CargoPackageId>> {
-        let data = self.cargo_manifest(path)?;
-        let Some(package) = data.get("package") else {
-            return Ok(None);
+        self.ensure_cargo_manifest(path)?;
+        let (name, version_field) = {
+            let data = &self.cargo[path];
+            let Some(package) = data.get("package") else {
+                return Ok(None);
+            };
+            let package = object(package, "Cargo package identity")?;
+            let name = text(
+                package.get("name").context("Missing Cargo package name")?,
+                "Cargo package name",
+            )?
+            .to_owned();
+            (name, package.get("version").cloned())
         };
-        let package = object(package, "Cargo package identity")?;
-        let name = text(
-            package.get("name").context("Missing Cargo package name")?,
-            "Cargo package name",
-        )?
-        .to_owned();
-        let version = match package.get("version") {
+        let version = match version_field {
             None => "0.0.0".to_owned(),
-            Some(Value::String(version)) if !version.is_empty() => version.clone(),
+            Some(Value::String(version)) if !version.is_empty() => version,
             Some(value)
                 if value.as_object().and_then(|v| v.get("workspace"))
                     == Some(&Value::Bool(true)) =>
             {
-                let (_, workspace) = self.find_cargo_workspace(path)?;
-                let inherited = dependency_table(&workspace, "package")?;
+                let ws_dir = self.find_cargo_workspace_dir(path)?;
+                let inherited = self.cargo[&ws_dir]
+                    .get("workspace")
+                    .and_then(Value::as_object)
+                    .and_then(|w| w.get("package"))
+                    .and_then(Value::as_object)
+                    .context("Missing workspace.package")?;
                 text(
                     inherited
                         .get("version")
@@ -1320,11 +1386,11 @@ impl<'a> ReadContext<'a> {
         state: &ProjectState,
         local: &CargoLocalContext,
         deps: &mut BTreeSet<String>,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<CargoPackageId, String>> {
         // The selected lock graph is an admission boundary even when every
         // local package belongs to this component. Component ownership only
         // controls edge projection below, never whether the lock is validated.
-        let lock = self.cargo_lock_graph(component)?;
+        let lock = self.cargo_lock(component)?;
         let workspace = self.cargo_workspace_packages(component)?;
         let mut candidates: BTreeMap<CargoPackageId, BTreeSet<String>> = BTreeMap::new();
         for path in &local.paths {
@@ -1336,14 +1402,19 @@ impl<'a> ReadContext<'a> {
         let mut queue = VecDeque::new();
         for path in workspace {
             if let Some(id) = self.cargo_package_id(&path)? {
-                let index = lock.local_id(component, &id)?;
                 ensure!(
-                    pinned.insert(index, path.clone()).is_none(),
+                    lock.packages.contains_key(&id),
+                    "Cargo.lock does not uniquely identify workspace package {} {}; refresh the component Cargo.lock with pinned Cargo: devkit exec --component {component} --write --network bridge -- cargo generate-lockfile",
+                    id.name,
+                    id.version
+                );
+                ensure!(
+                    pinned.insert(id.clone(), path.clone()).is_none(),
                     "Ambiguous local Cargo workspace package identity: {} {}",
                     id.name,
                     id.version
                 );
-                queue.push_back(index);
+                queue.push_back(id);
             }
         }
         ensure!(
@@ -1351,64 +1422,36 @@ impl<'a> ReadContext<'a> {
             "Component Cargo.lock has no identifiable workspace package roots: {component}"
         );
         let mut seen = BTreeSet::new();
-        while let Some(index) = queue.pop_front() {
-            if !seen.insert(index) {
+        while let Some(current) = queue.pop_front() {
+            if !seen.insert(current.clone()) {
                 continue;
             }
-            let package = &lock.packages[index];
-            for (reference, replacement) in package
-                .dependencies
-                .iter()
-                .map(|reference| (reference, false))
-                .chain(
-                    package
-                        .replacement
-                        .iter()
-                        .map(|reference| (reference, true)),
-                )
-            {
-                let target = lock.package_ref(component, reference, replacement)?;
-                let id = &lock.packages[target].id;
-                // paths overrides can replace code while the lock preserves a
-                // registry source. Do not silently relabel such a record.
-                for path in &local.config_paths {
-                    if id.source.is_some()
-                        && component_owner(state, path).is_some()
-                        && self
-                            .cargo_package_id(path)?
-                            .as_ref()
-                            .is_some_and(|candidate| {
-                                candidate.name == id.name && candidate.version == id.version
-                            })
-                    {
-                        bail!(
-                            "Cannot prove registered Cargo paths override {path} from Cargo.lock; use an explicit path/patch dependency or remove that paths override"
-                        );
-                    }
-                }
-                if id.source.is_none() {
-                    let target_path = if let Some(path) = pinned.get(&target) {
-                        path.clone()
-                    } else {
-                        let paths=candidates.get(id).with_context(||format!("Cargo.lock selected a local package without an admitted manifest candidate: {} {}",id.name,id.version))?;
-                        ensure!(
-                            paths.len() == 1,
-                            "Ambiguous local Cargo target {} {}: multiple admitted paths; make the chosen local source explicit",
-                            id.name,
-                            id.version
-                        );
-                        paths.iter().next().expect("one local candidate").clone()
+            let package = &lock.packages[&current];
+            for target in package.dependencies.iter().chain(&package.replacement) {
+                if target.source.is_none() {
+                    let target_path = match pinned.entry(target.clone()) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let paths = candidates.get(target).with_context(|| format!("Cargo.lock selected a local package without an admitted manifest candidate: {} {}", target.name, target.version))?;
+                            ensure!(
+                                paths.len() == 1,
+                                "Ambiguous local Cargo target {} {}: multiple admitted paths; make the chosen local source explicit",
+                                target.name,
+                                target.version
+                            );
+                            entry.insert(paths.first().expect("one local candidate").clone())
+                        }
                     };
-                    if let Some(owner) = component_owner(state, &target_path)
+                    if let Some(owner) = component_owner(state, target_path)
                         && owner != component
                     {
                         register_edge(state, component, owner.to_owned(), deps)?;
                     }
                 }
-                queue.push_back(target);
+                queue.push_back(target.clone());
             }
         }
-        Ok(())
+        Ok(pinned)
     }
     fn derive(&mut self, state: &ProjectState) -> Result<DerivedDependencies> {
         if !node_components(state).is_empty() {
@@ -1420,6 +1463,11 @@ impl<'a> ReadContext<'a> {
         }
         let mut projected = BTreeMap::new();
         let mut effective = BTreeMap::new();
+        let rust_deps = if CargoWorkspaceKind::root_with_rust(state)? {
+            self.root_cargo_graph(state)?
+        } else {
+            BTreeMap::new()
+        };
         for (path, component) in &state.components {
             let mut deps = BTreeSet::new();
             if component.toolchain == Toolchain::Node {
@@ -1442,6 +1490,8 @@ impl<'a> ReadContext<'a> {
                         }
                     }
                 }
+            } else if let Some(edges) = rust_deps.get(path) {
+                deps.clone_from(edges);
             } else {
                 self.cargo_inputs(path)?;
                 let mut files = BTreeMap::new();
@@ -1501,7 +1551,6 @@ impl<'a> ReadContext<'a> {
         state: &ProjectState,
         files: &mut BTreeMap<String, Option<FileIdentity>>,
     ) -> Result<CargoLocalContext> {
-        let roots: BTreeSet<_> = rust_queue.iter().cloned().collect();
         let mut result = CargoLocalContext::default();
         let mut rust_seen = BTreeSet::new();
         let mut seen_configs = BTreeSet::new();
@@ -1523,7 +1572,6 @@ impl<'a> ReadContext<'a> {
             // presence, so adding a new config cannot reuse a previous receipt.
             let mut directory = path.clone();
             let mut override_targets = BTreeSet::new();
-            let mut config_paths = BTreeSet::new();
             loop {
                 for name in [".cargo/config.toml", ".cargo/config", ".rustfmt.toml"] {
                     record(self.root, files, &prefixed(&directory, name), false)?;
@@ -1541,7 +1589,7 @@ impl<'a> ReadContext<'a> {
                         &mut seen_configs,
                         &mut active_configs,
                         &mut override_targets,
-                        &mut config_paths,
+                        0,
                     )?;
                 }
                 if directory != path {
@@ -1564,9 +1612,6 @@ impl<'a> ReadContext<'a> {
                 directory = parent_name(&directory);
             }
             let native = self.cargo_inputs(&path)?;
-            if roots.contains(&path) {
-                result.config_paths.extend(config_paths);
-            }
             result.paths.insert(path);
             rust_queue.extend(native.dependencies);
             rust_queue.extend(native.members);
@@ -1749,17 +1794,37 @@ impl<'a> ReadContext<'a> {
         files.extend(node.files.clone());
         let directories = node.directories.clone();
         self.node_inputs = Some(node);
-        let rust_queue = state
-            .components
-            .iter()
-            .filter(|(_, component)| component.toolchain == Toolchain::Rust)
-            .map(|(path, _)| path.clone())
-            .collect();
-        self.cargo_local_context(rust_queue, state, &mut files)?;
+        let mut rust_files = BTreeMap::new();
+        if CargoWorkspaceKind::root_with_rust(state)? {
+            // Derivation and closure must bind the same manifest bytes. The
+            // pre-staging closure also captures incomplete membership for sync.
+            self.capture_root_cargo(state, &mut rust_files, self.cargo_workspace.is_some())?;
+        } else {
+            let rust_queue = state
+                .components
+                .iter()
+                .filter(|(_, c)| c.toolchain == Toolchain::Rust)
+                .map(|(path, _)| path.clone())
+                .collect();
+            self.cargo_local_context(rust_queue, state, &mut rust_files)?;
+        }
         // Bind workspace parent manifests read to resolve inherited dependencies.
         for path in self.cargo.keys() {
-            record(self.root, &mut files, &prefixed(path, "Cargo.toml"), true)?;
+            let name = prefixed(path, "Cargo.toml");
+            rust_files.insert(name.clone(), Some(self.read_identities[&name].clone()));
         }
+        let mut rust_evidence = json!({"domain": "devkit-rust-inputs-v1", "files": rust_files});
+        if !self.cargo_defaults.is_empty() {
+            rust_evidence["defaultMembers"] = json!(self.cargo_defaults);
+        }
+        let rust_digest = digest(serde_json::to_vec(&rust_evidence)?);
+        files.extend(rust_files.clone());
+        self.rust_inputs = Some(InputIdentitySet {
+            schema_version: 1,
+            files: rust_files,
+            directories: vec![],
+            digest: rust_digest,
+        });
         // Parsed data and raw identities must describe the same input stage.
         // In particular, do not pair a cached old manifest with a newly read
         // identity if a user edits it during admission.
@@ -1778,9 +1843,11 @@ impl<'a> ReadContext<'a> {
             );
         }
         structure.recheck(self.root)?;
-        let digest = digest(serde_json::to_vec(
-            &json!({"domain":"devkit-native-inputs-v3-structural", "files":files, "directories":directories, "namespaces":structure.namespaces}),
-        )?);
+        let mut evidence = json!({"domain":"devkit-native-inputs-v3-structural", "files":files, "directories":directories, "namespaces":structure.namespaces});
+        if !self.cargo_defaults.is_empty() {
+            evidence["cargoDefaultMembers"] = json!(self.cargo_defaults);
+        }
+        let digest = digest(serde_json::to_vec(&evidence)?);
         Ok(InputIdentitySet {
             schema_version: 1,
             files,
@@ -1799,8 +1866,8 @@ fn prefixed(directory: &str, name: &str) -> String {
 }
 fn cargo_local_path(root: &Path, base: &str, value: &str) -> Result<String> {
     ensure!(
-        !value.is_empty() && !value.contains('\0'),
-        "Invalid Cargo local path"
+        !value.is_empty() && !value.contains('\0') && !Path::new(value).is_absolute(),
+        "Invalid Cargo local path: {value}"
     );
     let root = project_root(root)?;
     let manifest = input_path(&root, Path::new(base).join(value).join("Cargo.toml"))?;
@@ -1813,14 +1880,33 @@ fn cargo_local_path(root: &Path, base: &str, value: &str) -> Result<String> {
         manifest.parent().context("Cargo local manifest parent")?,
     )
 }
-fn reject_local_cargo_git(dependency: &Fields) -> Result<()> {
+fn reject_local_cargo_url(raw: &str, label: &str) -> Result<()> {
     ensure!(
-        !dependency
-            .get("git")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v.starts_with("file:")),
-        "Unsupported local Cargo git source: use a confined path dependency or patch"
+        !raw.is_empty() && raw.trim() == raw && !raw.chars().any(char::is_control),
+        "Invalid Cargo source URL in {label}: {raw}"
     );
+    let lower = raw.to_ascii_lowercase();
+    let stripped = if let Some(rest) = lower.strip_prefix("sparse+") {
+        &raw[raw.len() - rest.len()..]
+    } else if let Some(rest) = lower.strip_prefix("registry+") {
+        &raw[raw.len() - rest.len()..]
+    } else if let Some(rest) = lower.strip_prefix("git+") {
+        &raw[raw.len() - rest.len()..]
+    } else {
+        raw
+    };
+    let parsed = url::Url::parse(stripped)
+        .with_context(|| format!("Invalid Cargo source URL in {label}: {raw}"))?;
+    ensure!(
+        parsed.scheme() != "file" && matches!(parsed.scheme(), "https" | "http" | "ssh" | "git"),
+        "Unsupported local Cargo {label} source: use a confined path dependency or patch"
+    );
+    Ok(())
+}
+fn reject_local_cargo_git(dependency: &Fields) -> Result<()> {
+    if let Some(git) = dependency.get("git").and_then(Value::as_str) {
+        reject_local_cargo_url(git, "git")?;
+    }
     Ok(())
 }
 fn parent_name(path: &str) -> String {
@@ -1936,6 +2022,39 @@ fn assert_acyclic(deps: &BTreeMap<String, Vec<String>>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+pub(crate) struct LegacyCargoInputs {
+    pub groups: BTreeMap<String, BTreeSet<String>>,
+    pub paths: BTreeSet<String>,
+    pub selected: BTreeSet<(CargoPackageId, String)>,
+}
+
+pub(crate) fn legacy_cargo_inputs(root: &Path, state: &ProjectState) -> Result<LegacyCargoInputs> {
+    let mut context = ReadContext::new(root, NodeLockKind::for_state(state)?);
+    let mut inputs = LegacyCargoInputs::default();
+    for (path, component) in &state.components {
+        if component.toolchain != Toolchain::Rust {
+            continue;
+        }
+        inputs
+            .groups
+            .insert(path.clone(), context.legacy_members(path)?);
+        let local = context.cargo_local_context(
+            VecDeque::from([path.clone()]),
+            state,
+            &mut BTreeMap::new(),
+        )?;
+        inputs.selected.extend(context.cargo_selected_edges(
+            path,
+            state,
+            &local,
+            &mut BTreeSet::new(),
+        )?);
+        inputs.paths.extend(local.paths);
+    }
+    Ok(inputs)
+}
+
 pub fn derive_component_dependencies(
     root: &Path,
     state: &ProjectState,
@@ -1952,13 +2071,16 @@ pub fn native_input_digest(root: &Path, state: &ProjectState) -> Result<String> 
 }
 
 pub fn assert_component_manifests(root: &Path, state: &ProjectState) -> Result<()> {
+    let root_workspace = CargoWorkspaceKind::root_with_rust(state)?;
     for (path, component) in &state.components {
         let node = identity(&input_path(root, format!("{path}/package.json"))?)?.is_some();
         let rust = identity(&input_path(root, format!("{path}/Cargo.toml"))?)?.is_some();
         ensure!(!(node && rust), "Ambiguous native manifests: {path}");
         ensure!(
             (component.toolchain == Toolchain::Node && node)
-                || (component.toolchain == Toolchain::Rust && rust),
+                || (component.toolchain == Toolchain::Rust
+                    && !node
+                    && (rust || (root_workspace && input_path(root, path)?.is_dir()))),
             "Missing expected native {} manifest: {path}",
             component.toolchain
         );
@@ -2001,6 +2123,8 @@ pub struct NativeAdmission {
     /// Exact Node subset produced by the same parsed context, before Cargo and
     /// namespace identities are combined into the full safety snapshot.
     pub node_inputs: InputIdentitySet,
+    pub rust_inputs: InputIdentitySet,
+    pub cargo_workspace: Option<CargoWorkspaceModel>,
     pub dependencies: BTreeMap<String, Vec<String>>,
     /// Complete admitted graph. Public 0.2 projections retain their original
     /// literal-path shape, while role/cycle safety always checks this graph.
@@ -2059,7 +2183,9 @@ fn admit_native_with_dependency_limit(
     dependency_byte_limit: Option<u64>,
 ) -> Result<NativeAdmission> {
     let structure = NativeStructure::capture(root, state)?;
-    structure.assert_registered(state)?;
+    if !CargoWorkspaceKind::root_with_rust(state)? {
+        structure.assert_registered(state, None)?;
+    }
     assert_tool_profiles(root, state)?;
     let lock_kind = NodeLockKind::for_state(state)?;
     let mut context = ReadContext::new(root, lock_kind);
@@ -2127,6 +2253,9 @@ fn admit_native_with_dependency_limit(
     }
     for (path, component) in &state.components {
         if component.toolchain == Toolchain::Rust {
+            if CargoWorkspaceKind::for_state(state)? == CargoWorkspaceKind::Root {
+                continue;
+            }
             for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
                 ensure!(
                     identity(&input_path(root, format!("{path}/{name}"))?)?.is_some(),
@@ -2248,6 +2377,9 @@ fn admit_native_with_dependency_limit(
         }
     }
     let dependencies = context.derive(state)?;
+    if context.cargo_workspace.is_some() {
+        structure.assert_registered(state, context.cargo_workspace.as_ref())?;
+    }
     for (path, actual) in &dependencies.projected {
         ensure!(
             actual == &state.components[path].dependencies,
@@ -2269,6 +2401,8 @@ fn admit_native_with_dependency_limit(
     Ok(NativeAdmission {
         inputs,
         node_inputs,
+        rust_inputs: context.rust_inputs.context("Missing Rust input snapshot")?,
+        cargo_workspace: context.cargo_workspace,
         dependencies: dependencies.projected,
         effective_dependencies: dependencies.effective,
         npmrc_policy,

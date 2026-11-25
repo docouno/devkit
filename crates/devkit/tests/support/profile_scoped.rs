@@ -143,21 +143,28 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
     let temp = TempDir::new().unwrap();
     let old = fixture_release(temp.path(), "0.5.1");
     let new = fixture_release(temp.path(), "0.6.0");
-    let mut engines = vec![PathBuf::from(env!("CARGO_BIN_EXE_devkit"))];
+    // 0.6.0 recovers both Cargo-migrating Rust and Node profile transitions.
+    // The 0.5.1 engine predates root Cargo journal paths (docs/migrations/0.6.0.md
+    // directs Rust recovery to the cached 0.6.0 engine), while still recovering
+    // Node profile transitions cleanly offline.
+    let mut cases = vec![
+        (PathBuf::from(env!("CARGO_BIN_EXE_devkit")), "rust"),
+        (PathBuf::from(env!("CARGO_BIN_EXE_devkit")), "node"),
+    ];
     let genuine = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.artifacts/baseline/v0.5.1/payload/devkit");
     if devkit::distribution::Target::host().unwrap() == devkit::distribution::Target::LinuxX64
         && genuine.is_file()
     {
-        engines.push(genuine);
+        cases.push((genuine, "node"));
     }
-    for (i, engine) in engines.iter().enumerate() {
+    for (i, (engine, template)) in cases.iter().enumerate() {
         for add in [true, false] {
-            let project = temp.path().join(format!("checkout-{i}-{add}"));
+            let project = temp.path().join(format!("checkout-{i}-{template}-{add}"));
             init(
                 if add { &new } else { &old },
                 &project,
-                "rust",
+                template,
                 PackageMode::Registry,
             );
             let before = author_port_payload(&project);
@@ -194,7 +201,8 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
             if add {
                 add_electron(&new, &project, "shell", None).unwrap();
             } else {
-                update_project(&new, &project, &UpdateOptions::default(), &NoResolver).unwrap();
+                update_project(&new, &project, &UpdateOptions::default(), &FixtureResolver)
+                    .unwrap();
             }
             assert_scoped_checkout(&project, add);
         }

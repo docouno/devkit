@@ -24,7 +24,7 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
   [ "$#" -eq 2 ] || fail 'worktree-hook requires reserve, start, or remove'
   unset MAKEFLAGS MFLAGS MAKEOVERRIDES GNUMAKEFLAGS MAKEFILES MAKELEVEL MAKECMDGOALS
   unset app package component follow tail headless cleanup reconcile preview json
-  unset name template api use profile to command cmd write network prepare
+  unset name template api use profile to command cmd write network prepare toolchain
   unset DEVKIT_APP DEVKIT_PACKAGE DEVKIT_TARGET_COMPONENT DEVKIT_FOLLOW DEVKIT_TAIL
   unset DEVKIT_HEADLESS DEVKIT_CLEANUP DEVKIT_PACKAGE_AGGREGATE DEVKIT_DEV_GROUP
   unset DEVKIT_SYNC_RECONCILE DEVKIT_SYNC_PREVIEW DEVKIT_INFO_JSON DEVKIT_EXPECTED_MANIFEST
@@ -32,7 +32,7 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
   unset DEVKIT_LIFECYCLE_NAME DEVKIT_LIFECYCLE_TEMPLATE DEVKIT_LIFECYCLE_API
   unset DEVKIT_LIFECYCLE_USE DEVKIT_LIFECYCLE_PROFILE DEVKIT_LIFECYCLE_TO
   unset DEVKIT_EXEC_COMMAND DEVKIT_EXEC_COMPONENT DEVKIT_EXEC_CONFLICT
-  unset DEVKIT_EXEC_WRITE DEVKIT_EXEC_NETWORK DEVKIT_EXEC_PREPARE
+  unset DEVKIT_EXEC_WRITE DEVKIT_EXEC_NETWORK DEVKIT_EXEC_PREPARE DEVKIT_EXEC_TOOLCHAIN
   cd -- "$root"
   case "$2" in
     reserve)
@@ -260,12 +260,12 @@ if [ "$mode" = project ] && [ "$command" = help ]; then
     'make doctor                            Check the host and checkout' \
     'make check | fix | test | build [app=NAME | package=NAME]  Check, format, test or build' \
     'make package [app=DESKTOP | package=NAME]  Package a desktop app or public library' \
-    'make exec [app=NAME | package=NAME | component=PATH] command=ARGV' \
-    '          [write=1] [network=bridge] [prepare=1]  Run in the root Node workspace or a component' \
+    'make exec [app=NAME | package=NAME | component=PATH | toolchain=node|rust] command=ARGV' \
+    '          [write=1] [network=bridge] [prepare=1]  Run in the workspace or a selected component' \
     'make add-app name=NAME template=ID [api=NAME] [use="NAME ..."] [reconcile=1]' \
     'make add-package name=NAME template=ID [use="NAME ..."] [reconcile=1]' \
     '          App templates: node-api, rust-api, react-web, electron-react' \
-    '          Package templates: ts-library, react-ui, react-client' \
+    '          Package templates: ts-library, react-ui, react-client, rust-library' \
     'make register app=NAME|package=NAME profile=ID [reconcile=1]  Register existing source' \
     'make sync [reconcile=1] [preview=1]       Reconcile project metadata and generated files' \
     'make update to=VERSION [preview=1] [reconcile=1]  Upgrade the pinned Devkit release' \
@@ -316,7 +316,7 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
         add-app|add-package)
           slug name "${DEVKIT_LIFECYCLE_NAME:-}"
           case "$command:${DEVKIT_LIFECYCLE_TEMPLATE:-}" in
-            add-app:node|add-app:node-app|add-app:node-api|add-app:rust|add-app:rust-app|add-app:rust-api|add-app:react|add-app:react-app|add-app:react-web|add-app:electron-react|add-package:ts-library|add-package:react-ui|add-package:react-client) ;;
+            add-app:node|add-app:node-app|add-app:node-api|add-app:rust|add-app:rust-app|add-app:rust-api|add-app:react|add-app:react-app|add-app:react-web|add-app:electron-react|add-package:ts-library|add-package:react-ui|add-package:react-client|add-package:rust-library) ;;
             *) fail 'set template to a supported id from make help' ;;
           esac
           set -- "$@" --name "$DEVKIT_LIFECYCLE_NAME" --template "$DEVKIT_LIFECYCLE_TEMPLATE"
@@ -377,6 +377,11 @@ if [ "$mode" = project ] && [ "$#" -eq 1 ]; then
           set -- "$@" --component "$DEVKIT_EXEC_COMPONENT" ;;
         *) fail 'choose at most one of app=, package=, or component=' ;;
       esac
+      if [ -n "${DEVKIT_EXEC_TOOLCHAIN:-}" ]; then
+        [ -z "${DEVKIT_APP:-}${DEVKIT_PACKAGE:-}${DEVKIT_EXEC_COMPONENT:-}" ] || fail 'remove toolchain= when selecting a component'
+        case "$DEVKIT_EXEC_TOOLCHAIN" in node|rust) ;; *) fail 'toolchain must be node or rust' ;; esac
+        set -- "$@" --toolchain "$DEVKIT_EXEC_TOOLCHAIN"
+      fi
       [ "${DEVKIT_EXEC_WRITE:-0}" = 0 ] || set -- "$@" --write
       [ "${DEVKIT_EXEC_PREPARE:-0}" = 0 ] || set -- "$@" --prepare
       wrapped=1 ;;
@@ -486,7 +491,7 @@ if [ "$engine_ready" = 0 ] && ! valid_engine && ! { [ -e "$engine" ] && valid_en
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
   case "$mode:$command" in
-    bootstrap:*|project:setup|project:setup-node|project:doctor|project:info|project:status|project:down|project:sync|project:add-app|project:add-package|project:register|project:update|project:recover) ;;
+    bootstrap:*|project:setup|project:setup-node|project:setup-rust|project:doctor|project:info|project:status|project:down|project:sync|project:add-app|project:add-package|project:register|project:update|project:recover) ;;
     *) { [ "$command" = cli ] && [ "$cli_offline" = 0 ]; } || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup' ;;
   esac
   old_umask=$(umask)

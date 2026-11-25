@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from functools import partial
 import hashlib
 import http.client
+import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -22,7 +25,9 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -54,6 +59,27 @@ def semver_tuple(value):
     parts = value.split("+", 1)[0].split("-", 1)[0].split(".")
     require(len(parts) == 3 and all(part.isdigit() for part in parts), f"Invalid version: {value}")
     return tuple(int(part) for part in parts)
+
+
+def root_cargo_project(root):
+    return semver_tuple(json.loads((root / ".devkit/manifest.json").read_text())["version"]) >= (0, 6, 0)
+
+
+def cargo_packages(lockfile):
+    with lockfile.open("rb") as source:
+        packages = tomllib.load(source)["package"]
+    return {(p["name"], p["version"], p.get("source")): {**p, "dependencies": sorted(p.get("dependencies", []))}
+            for p in packages}
+
+
+def api_binary(root, kind):
+    if kind == "node":
+        return ["node", "/workspace/apps/main/dist/index.js"]
+    if root_cargo_project(root):
+        with (root / "apps/api/Cargo.toml").open("rb") as manifest:
+            name = tomllib.load(manifest)["package"]["name"]
+        return ["/workspace/target/debug/" + name]
+    return ["/workspace/apps/api/target/debug/devkit-api"]
 
 
 def verify_creation_hint(output):
@@ -118,9 +144,11 @@ def assert_desktop_runtime(root, state):
 def source_snapshot(root):
     """Include untracked inputs; ignore only native outputs and operational state."""
     records = {}
+    workspace_target = (root / ".devkit/manifest.json").is_file() and (root / "Cargo.toml").is_file()
     for directory, names, files in os.walk(root, followlinks=False):
         relative = Path(directory).relative_to(root)
         names[:] = sorted(name for name in names if name not in (".git", "node_modules")
+                          and not (workspace_target and not relative.parts and name == "target")
                           and not (len(relative.parts) == 2 and relative.parts[0] in ("apps", "packages")
                                    and name in ("dist", "target", "release"))
                           and not (relative == Path(".devkit") and name in ("state", "cache")))
@@ -144,6 +172,38 @@ def changed_files(changes):
                 path.unlink(missing_ok=True)
             else:
                 path.write_bytes(contents)
+
+
+def publish_links_crate(registry, name, links):
+    archive = registry / f"{name}-1.0.0.crate"
+    manifest = (f'[package]\nname="{name}"\nversion="1.0.0"\nedition="2024"\n'
+                f'links="{links}"\n')
+    files = {"Cargo.toml": manifest, "build.rs": "fn main() {}\n", "src/lib.rs": "pub fn value() -> u32 { 42 }\n"}
+    with tarfile.open(archive, "w:gz") as stream:
+        for path, contents in files.items():
+            data = contents.encode()
+            entry = tarfile.TarInfo(f"{name}-1.0.0/{path}")
+            entry.size = len(data)
+            stream.addfile(entry, io.BytesIO(data))
+    index = registry / name[:2] / name[2:4] / name
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_text(json.dumps({"name": name, "vers": "1.0.0", "deps": [], "features": {},
+                                 "links": links, "cksum": sha256(archive.read_bytes()), "yanked": False}) + "\n")
+
+
+@contextmanager
+def local_cargo_registry(directory):
+    handler = partial(http.server.SimpleHTTPRequestHandler, directory=str(directory.parent))
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+        url = f"http://127.0.0.1:{server.server_port}/{directory.name}/"
+        (directory / "config.json").write_text(json.dumps({"dl": url + "{crate}-{version}.crate"}))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield url
+        finally:
+            server.shutdown()
+            thread.join()
 
 
 class Verification:
@@ -407,6 +467,7 @@ class Verification:
         selected_version = json.loads((release / "release.json").read_text())["version"]
         selections = {"node": ["--app", "main=node-api"], "react": ["--app", "web=react-web"],
                       "rust": ["--app", "api=rust-api"], "fullstack-web": ["--preset", "fullstack-web"], "fullstack": ["--preset", "fullstack-desktop"],
+                      "rust-library": ["--template", "rust-library"],
                       "tslib": ["--template", "ts-library"], "design-system": ["--preset", "design-system"]}
         arguments = [*selections[kind], "--name", f"verification-{kind}"]
         if not self.public_bootstrap or self.package_source != "registry":
@@ -499,9 +560,10 @@ class Verification:
                     "});\n")
         else:
             probe = root / "apps/api/tests/readonly_mount.rs"
+            lockfile = "../../Cargo.lock" if root_cargo_project(root) else "Cargo.lock"
             code = ('#[test]\nfn source_and_lock_mounts_reject_writable_opens() {\n'
                     '    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));\n'
-                    '    for file in [root.join("Cargo.lock"), root.join("tests/readonly_mount.rs")] {\n'
+                    f'    for file in [root.join("{lockfile}"), root.join("tests/readonly_mount.rs")] {{\n'
                     '        let error = std::fs::OpenOptions::new().write(true).open(file).err();\n'
                     '        assert_eq!(error.and_then(|error| error.raw_os_error()), Some(30));\n'
                     '    }\n}\n')
@@ -553,17 +615,111 @@ class Verification:
         for path in files:
             contents = path.read_text().replace("#[test]", "#[test]\n    #[ignore]")
             contents = contents.replace("#[tokio::test]", "#[tokio::test]\n#[ignore]")
-            contents = contents.replace('/// ```\n/// assert_eq!', '/// ```ignore\n/// assert_eq!', 1)
+            contents = contents.replace('/// ```\n', '/// ```ignore\n', 1)
             skipped[path] = contents
         with changed_files(skipped):
             self.make(root, "test", expected="no non-ignored native Rust test cases", label="rust-skipped-tests-rejected")
+
+    def rust_workspace(self):
+        root = self.create("rust-library", "i-rust-workspace", release=self.manager)
+        for app in ("server", "worker"):
+            self.make(root, "add-app", "name=" + app, "template=rust-api", "use=core", label="rust-add-" + app)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(set(state["components"]) == {"apps/server", "apps/worker", "packages/core"}
+                and all(state["components"]["apps/" + app]["dependencies"] == ["packages/core"]
+                        for app in ("server", "worker")), "Expected both apps to depend on the shared library")
+        (root / ".cargo").mkdir(exist_ok=True)
+        (root / ".cargo/config.toml").write_text("[term]\nverbose = true\n")
+        before = source_snapshot(root)
+        self.make(root, "setup", label="rust-workspace-setup")
+        require(not (root / "target/debug/deps").is_dir(), "Setup unexpectedly compiled dependencies")
+        first = self.make(root, "build", "app=server", label="rust-build-first-app")
+        second = self.make(root, "build", "app=worker", label="rust-build-second-app")
+        require("Compiling tokio v" in first and "Fresh tokio v" in second and "Compiling tokio v" not in second,
+                "Second app build did not reuse the shared Tokio artifact")
+        require("Compiling app-worker v" in second and (root / "target/debug/app-worker").is_file()
+                and (root / "target/debug/app-server").is_file(), "Both app binaries must use the root target")
+        require(source_snapshot(root) == before, "Workspace setup/build changed source inputs")
+
+        server = root / "apps/server/src/main.rs"
+        worker = root / "apps/worker/src/main.rs"
+        with changed_files({p: p.read_text() + "\nfn  unformatted_probe ( ) {}\n" for p in (server, worker)}):
+            untouched = worker.read_bytes()
+            self.make(root, "fix", "app=server", label="rust-fix-selected-only")
+            require("fn unformatted_probe() {}" in server.read_text() and worker.read_bytes() == untouched,
+                    "A selected fix must format its own crate and preserve its sibling's bytes")
+        with changed_files({worker: worker.read_text() + '\n#[test]\nfn worker_fails() { panic!("worker-only failure"); }\n'}):
+            self.make(root, "test", "app=server", label="rust-test-selected-only")
+            self.make(root, "test", expected="worker-only failure", label="rust-test-aggregate")
+        with changed_files({root / "packages/core/src/lib.rs": "#[test]\n#[ignore]\nfn skipped() {}\n"}):
+            self.make(root, "test", "package=core", expected="no non-ignored native Rust test cases",
+                      label="rust-library-own-tests-required")
+        self.make(root, "check", "test", "build", label="rust-workspace-aggregate-gates")
+
+        # Choose the same name and version as a transitive registry crate.
+        # Cargo must distinguish both identities when checking and running the worker.
+        with (root / "Cargo.lock").open("rb") as source:
+            [registry] = [p for p in tomllib.load(source)["package"] if p["name"] == "itoa" and p.get("source")]
+        app = root / "apps/worker"
+        manifest = app / "Cargo.toml"
+        old = tomllib.loads(manifest.read_text())["package"]
+        manifest.write_text(manifest.read_text().replace(f'name = "{old["name"]}"', 'name = "itoa"', 1)
+                            .replace(f'version = "{old["version"]}"', f'version = "{registry["version"]}"', 1))
+        for directory in (app / "src", app / "tests"):
+            for path in directory.rglob("*.rs"):
+                path.write_text(path.read_text().replace("app_worker", "itoa"))
+        self.make(root, "sync", label="rust-sync-renamed-member")
+        self.make(root, "setup", "app=worker", label="rust-renamed-member-setup")
+        self.make(root, "fix", "check", "test", "build", "app=worker", label="rust-unambiguous-selected-gates")
+        # Managed apps can open files relative to the component directory.
+        (app / "worker.conf").write_text("ready")
+        main = app / "src/main.rs"
+        entry = "async fn main() -> io::Result<()> {"
+        source = main.read_text()
+        require(source.count(entry) == 1, "Expected a single worker entry point")
+        main.write_text(source.replace(entry, entry +
+                        '\n    assert_eq!(std::fs::read_to_string("worker.conf")?, "ready");'))
+        self.make(root, "up", "app=worker", label="rust-unambiguous-worker-start")
+        worker_service = self.service(root, "worker")
+        self.http(self.port(worker_service, 8080), "/health", {"status": "ok"})
+        logs = self.run("rust-renamed-worker-banner", ["docker", "logs", worker_service])
+        require("itoa listening on http://0.0.0.0:8080" in logs.splitlines(),
+                "The running worker must announce its new Cargo package name and listen address")
+        self.make(root, "down", label="rust-unambiguous-worker-stop")
+
+        # A second checkout shares the download cache but starts its own target.
+        other = root.parent / "other worktree"
+        self.run("rust-checkout-init", ["git", "init", "--quiet"], cwd=root)
+        self.run("rust-checkout-add", ["git", "add", "."], cwd=root)
+        self.run("rust-checkout-commit", ["git", "-c", "user.name=Devkit", "-c",
+                 "user.email=devkit@example.invalid", "-c", "commit.gpgSign=false",
+                 "commit", "--quiet", "-m", "Test Rust workspace"], cwd=root)
+        self.run("rust-worktree-add", ["git", "worktree", "add", "--detach", other, "HEAD"], cwd=root)
+        require(not (other / "target").exists(), "New worktree inherited compiled outputs")
+        self.make(other, "setup", "package=core", label="rust-worktree-setup")
+        built = self.make(other, "build", "package=core", label="rust-worktree-build")
+        require("Compiling lib-core v" in built and (other / "target/debug/liblib_core.rlib").is_file()
+                and not (other / "target/debug/app-server").exists()
+                and (root / "target/debug/app-server").is_file(),
+                "Rust target directory must belong to the worktree being built")
+
+        # Names are substituted into crate imports, including doctests.
+        # Every newly rendered source must pass rustfmt before any fix step.
+        longest = "a" * 63
+        for name in ("payment-service", longest):
+            self.make(root, "add-app", "name=" + name, "template=rust-api",
+                      label="rust-render-app-" + str(len(name)))
+        self.make(root, "add-package", "name=" + longest, "template=rust-library",
+                  label="rust-render-long-library")
+        self.make(root, "exec", "toolchain=rust", "command=cargo fmt --all -- --check",
+                  label="rust-render-format")
 
     def emitted(self, root, kind):
         settings = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if line and not line.startswith("#"))
         name = f"devkit-packaged-{self.token}-{kind}"
         self.containers.append(name)
         image = settings["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
-        command = ["node", "/workspace/apps/main/dist/index.js"] if kind == "node" else ["/workspace/apps/api/target/debug/devkit-api"]
+        command = api_binary(root, kind)
         self.run(f"{kind}-emitted-start", ["docker", "run", "--detach", "--pull", "never", "--name", name,
                  "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                  "--read-only", "--publish", "127.0.0.1::8080", "--volume", f"{root}:/workspace:ro,z", image, *command])
@@ -672,7 +828,7 @@ class Verification:
     def starter_bind_options(self, root, kind):
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
         image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
-        command = ["node", "/workspace/apps/main/dist/index.js"] if kind == "node" else ["/workspace/apps/api/target/debug/devkit-api"]
+        command = api_binary(root, kind)
         common = ["--pull", "never", "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                   "--network", "none", "--read-only", "--volume", f"{root}:/workspace:ro,z"]
         name = f"devkit-packaged-{self.token}-{kind}-bind-zero"
@@ -1048,6 +1204,69 @@ class Verification:
         state = json.loads((root / ".devkit/manifest.json").read_text())
         self.verify_tool_compose(root, state, label)
 
+    def legacy_cargo_links(self):
+        """Separate valid legacy locks can still compete for a native library."""
+        rust = json.loads((self.next_release / "release.json").read_bytes())["rustVersion"]
+        image = next(line.split()[1] for line in (self.next_release / "runtime/rust.Dockerfile").read_text().splitlines()
+                     if line.startswith("FROM "))
+        require("@sha256:" in image, "Expected the resolver's digest-pinned Rust base image")
+        if self.inspect("image", image) is None:
+            self.run("cargo-links-prepare-base", ["docker", "pull", image])
+        cargo_home = Path(self.environment["DEVKIT_CACHE_DIR"]) / "cargo"
+        cargo_home.mkdir(parents=True, exist_ok=True)
+        for case, second_links in [("compatible", "second_native_lib"), ("conflict", "shared_native_lib")]:
+            label = "cargo-links-" + case
+            root = self.scratch / label
+            self.run(label + "-init", self.cli(self.release, "init", root, "--offline", "--app", "first=rust-api",
+                                               "--app", "second=rust-api", "--package-source", "local"))
+            state_file = root / ".devkit/manifest.json"
+            require(json.loads(state_file.read_bytes())["version"] == self.version, "Unexpected legacy release")
+            registry = self.scratch / "cargo-links-index" / case
+            registry.mkdir(parents=True)
+            publish_links_crate(registry, "ffi-first", "shared_native_lib")
+            publish_links_crate(registry, "ffi-second", second_links)
+            originals = {}
+            def cargo(workdir, step, *args, warm=False):
+                name = f"devkit-packaged-{self.token}-{label}-{step}"
+                self.containers.append(name)
+                self.run(label + "-" + step, ["docker", "run", "--rm", "--pull", "never",
+                         "--name", name, "--label", f"{OWNERSHIP}={self.token}",
+                         "--network", "host" if warm else "none", "--user", f"{os.getuid()}:{os.getgid()}",
+                         "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                         "-v", f"{root}:/workspace", "-v", f"{cargo_home}:/cargo", "-e", "CARGO_HOME=/cargo",
+                         "-e", "HOME=/tmp", "-e", "NO_PROXY=127.0.0.1", "-e", "CARGO_TARGET_DIR=/tmp/target",
+                         "-e", f"RUSTUP_TOOLCHAIN={rust}", "-e", "RUSTUP_AUTO_INSTALL=0",
+                         "-w", workdir, image, "cargo", *args])
+            with local_cargo_registry(registry) as url:
+                (root / ".cargo").mkdir()
+                (root / ".cargo/config.toml").write_text(f'[registries.fixture]\nindex="sparse+{url}"\n')
+                for name in ("first", "second"):
+                    app = root / "apps" / name
+                    (app / "Cargo.toml").write_text(
+                        f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2024"\n'
+                        f'[dependencies]\nffi-{name}={{version="1",registry="fixture"}}\n')
+                    (app / "src/lib.rs").write_text(f'pub use ffi_{name}::value;\n')
+                    (app / "src/main.rs").write_text(f'fn main() {{ println!("{{}}", {name}::value()); }}\n')
+                    (app / "tests/api.rs").write_text(f'#[test]\nfn native_value() {{ assert_eq!({name}::value(), 42); }}\n')
+                    cargo("/workspace/apps/" + name, name + "-fetch", "fetch", warm=True)
+                    cargo("/workspace/apps/" + name, name + "-legacy-test", "test", "--locked", "--offline")
+                    originals.update(cargo_packages(app / "Cargo.lock"))
+
+            before = source_snapshot(root)
+            expected = "shared_native_lib" if case == "conflict" else None
+            command = self.cli(self.next_release, "update", root, "--offline")
+            self.run(label + "-preview", [*command, "--preview"], expected=expected)
+            require(source_snapshot(root) == before, "Cargo migration preview changed the checkout")
+            self.run(label + "-apply", command, expected=expected)
+            if expected:
+                require(source_snapshot(root) == before, "Conflicting Cargo migration changed the checkout")
+            else:
+                state = json.loads(state_file.read_bytes())
+                require(state["releaseIdentity"] == self.next_release_identity and state.get("cargoResolution"),
+                        "Compatible imported locks did not receive a verified resolution")
+                require(cargo_packages(root / "Cargo.lock") == originals, "Migration changed pinned Cargo packages")
+                cargo("/workspace", "workspace-test", "test", "--workspace", "--locked", "--offline")
+
     def upgrade(self, root):
         if self.next_release is None:
             return
@@ -1129,6 +1348,7 @@ class Verification:
         state = json.loads(state_file.read_text())
         require(version != state["version"], "Upgrade proof needs distinct versions")
         state["verificationExtension"] = {"kind": kind, "keep": [True, "opaque"]}
+        rust_selections = {}
         native_packages = {}
         native_dev_dependencies = {}
         manager_metadata = None
@@ -1168,9 +1388,11 @@ class Verification:
                     for source in source_dir.rglob("*"):
                         if source.is_file():
                             preserve[source] = source.read_bytes()
-            for native in (directory / "Cargo.toml", directory / "Cargo.lock"):
-                if native.is_file():
-                    preserve[native] = native.read_bytes()
+            if component["toolchain"] == "rust":
+                native = directory / "Cargo.toml"
+                preserve[native] = native.read_bytes()
+                lockfile = root / "Cargo.lock" if root_cargo_project(root) else directory / "Cargo.lock"
+                rust_selections.update(cargo_packages(lockfile))
             if component["toolchain"] == "node":
                 package_path = directory / "package.json"
                 package = json.loads(package_path.read_text())
@@ -1190,6 +1412,11 @@ class Verification:
                     "Migration changed consumer-owned packageManager metadata")
             require(json.loads(root_package.read_text())["devEngines"] == engine_metadata,
                     "Migration changed consumer-owned runtime metadata")
+        if rust_selections:
+            require(cargo_packages(root / "Cargo.lock") == rust_selections,
+                    f"{kind} upgrade changed resolved Cargo package identities or edges")
+            require(all(not (root / path / "Cargo.lock").exists() for path in after["components"]),
+                    f"{kind} upgrade retained a competing component lockfile")
         for path, old in state["components"].items():
             current = after["components"][path]
             require(current["verificationExtension"] == old["verificationExtension"]
@@ -1415,6 +1642,9 @@ class Verification:
             self.rust_negative(rust)
             self.emitted(rust, "rust")
             self.upgrade_product(rust, "rust")
+            if (self.next_release and not self.public_bootstrap and self.version == "0.5.1"
+                    and semver_tuple(json.loads((self.next_release / "release.json").read_text())["version"]) >= (0, 6, 0)):
+                self.legacy_cargo_links()
             fullstack = self.create("fullstack", "d-fullstack")
             self.healthy(fullstack, "fullstack")
             self.library_negative(fullstack)
@@ -1430,6 +1660,7 @@ class Verification:
             if manager_version >= (0, 6, 0):
                 self.first_electron("rust", adopt=True)
                 self.first_electron("node", adopt=False)
+                self.rust_workspace()
             self.electron_cache_corruption(fullstack)
             self.cross_host_checkout(export=os.environ.get("DEVKIT_VERIFY_EXPORT_CHECKOUT"),
                                      imported=os.environ.get("DEVKIT_VERIFY_IMPORT_CHECKOUT"))

@@ -249,7 +249,7 @@ fn local_readiness(
     state: &crate::model::ProjectState,
     pins: &ToolPins,
     cache_dir: Option<&Path>,
-) -> Result<(&'static str, Value)> {
+) -> Result<(&'static str, Option<Value>)> {
     let native = match crate::native::inspect_native_components(root, state) {
         Ok(native) => native,
         Err(error) => {
@@ -262,31 +262,25 @@ fn local_readiness(
                 } else {
                     "setup-required"
                 },
-                Value::Null,
+                None,
             ));
         }
     };
-    let receipts = crate::doctor::local_receipts_with_pins(
-        root,
-        state,
-        pins,
-        Some(&native.node_inputs.digest),
-        None,
-        cache_dir,
-    )?;
+    let receipts =
+        crate::doctor::local_receipts_with_pins(root, state, pins, Some(&native), None, cache_dir)?;
     let readiness = if receipts["ready"] == true {
         "ready"
     } else {
         "setup-required"
     };
-    Ok((readiness, receipts))
+    Ok((readiness, Some(receipts)))
 }
 
 pub(crate) fn inspect(
     root: &Path,
     app: Option<&str>,
-    runner: &ProcessRunner,
     cache_dir: Option<&Path>,
+    runner: &ProcessRunner,
 ) -> Result<(Value, String)> {
     let root = project_root(root)?;
     ensure!(root.is_dir(), "Checkout does not exist");
@@ -344,7 +338,7 @@ pub(crate) fn inspect(
     let mut apps = Vec::new();
     let mut packages = Vec::new();
     let mut readiness = "unknown";
-    let mut receipts = Value::Null;
+    let mut receipts = None;
     let mut condition = "unknown";
     let mut services = Vec::new();
     let mut reservations = Vec::new();
@@ -437,7 +431,7 @@ pub(crate) fn inspect(
         && state::assert_no_pending(&root).is_ok();
     if !stable {
         readiness = "unknown";
-        receipts = Value::Null;
+        receipts = None;
         condition = "unknown";
         apps.clear();
         packages.clear();
@@ -481,9 +475,19 @@ pub(crate) fn inspect(
         }
     }
     lines.extend(preview::reservation_lines(&reservations, &services));
+    let prepared_platform = receipts
+        .as_ref()
+        .and_then(|r| r.get("preparedPlatform"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let helper_ready = receipts
+        .as_ref()
+        .and_then(|r| r.get("helperReady"))
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok((
         json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,
-        "hostTarget":crate::distribution::Target::host()?.triple(),"preparedPlatform":receipts["preparedPlatform"],"helperReady":receipts["helperReady"],
+        "hostTarget":crate::distribution::Target::host()?.triple(),"preparedPlatform":prepared_platform,"helperReady":helper_ready,"receipts":receipts,
         "lock":{"state":lock_state,"owner":owner},"apps":apps,"packages":packages,
         "standState":condition,"services":services,"standPorts":reservations}),
         lines.join("\n"),

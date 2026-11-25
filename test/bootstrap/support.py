@@ -275,25 +275,24 @@ class Harness:
         require(worktree['standState'] == 'stopped' and len(worktree['standPorts']) == 1, 'Cold Worktrunk reservation was not available on return')
         run('worktrunk-remove-cold', [wt, 'remove', '--foreground', '--yes', 'approved'])
         require(not approved.exists(), 'Worktrunk did not complete removal')
-    def verify_node_recovery(self, target_source):
-        target = self.scratch / 'genuine-node-migration'
-        env = self.environment('genuine-node-migration')
-        sdk_env = {key: value for key, value in env.items() if key not in ('HTTPS_PROXY', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE')}
-        self.run('prime-genuine-node-pnpm', [self.engine, 'internal', 'ensure-pnpm', '--pin-file', self.payload / 'runtime/pnpm.env'], env=sdk_env, timeout=150)
-        self.run('genuine-node-init', [self.engine, 'init', target, '--to', self.old_version,
-                                     '--app', 'web=react-web', '--package-source', 'local', '--non-interactive'], env=env, timeout=360)
-        saved = self.scratch / 'genuine-node-before'
+    def verify_rust_recovery(self, target_source):
+        target = self.scratch / 'genuine-rust-migration'
+        env = self.environment('genuine-rust-migration')
+        self.run('genuine-rust-init', [self.engine, 'init', target, '--to', self.old_version,
+                                     '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], env=env)
+        saved = self.scratch / 'genuine-rust-before'
         shutil.copytree(target, saved)
         loader = '.devkit/runtime/devkit.sh'
-        projection = '.devkit/runtime/devkit.mk'
         manifest = '.devkit/manifest.json'
-        self.run('genuine-node-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive', *target_source],
+        self.run('genuine-rust-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive', *target_source],
                  cwd=target, env=env, timeout=360)
         old = json.loads((saved / manifest).read_bytes())
         new = json.loads((target / manifest).read_bytes())
-        require(old['version'] == self.old_version and new['version'] == self.version, 'Unexpected Node migration fixture pins')
-        paths = sorted(set(old['managed']) | set(new['managed']) | {
-            'package.json', 'apps/web/package.json', 'package-lock.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc'}) + [manifest]
+        require(old['version'] == self.old_version and new['version'] == self.version, 'Unexpected Rust migration fixture pins')
+        cargo_paths = ('Cargo.toml', 'Cargo.lock', 'rustfmt.toml', 'rust-toolchain.toml')
+        paths = sorted((set(old['managed']) | set(new['managed']) | set(cargo_paths)
+                        | {'apps/api/' + name for name in cargo_paths}) - {loader})
+        paths = [loader, *paths, manifest]
         def capture(root, path):
             absolute = root / path
             if absolute.is_file():
@@ -301,9 +300,15 @@ class Harness:
             return None
         before = {path: capture(saved, path) for path in paths}
         after = {path: capture(target, path) for path in paths}
-        require(before['pnpm-lock.yaml'] is not None and after['pnpm-lock.yaml'] is not None
-                and before['package-lock.json'] is None and after['package-lock.json'] is None,
-                'Expected a genuine pnpm-to-pnpm upgrade')
+        require(before['apps/api/Cargo.lock'] and not before['Cargo.lock']
+                and after['Cargo.lock'] and not after['apps/api/Cargo.lock'],
+                'Fixture did not migrate a genuine component lockfile')
+        pins = dict(line.split('=', 1) for line in (target / '.devkit/runtime/toolchains.env').read_text().splitlines() if '=' in line)
+        target_triple = host_target()
+        engine_sha = pins['DEVKIT_ENGINE_SHA256_' + target_triple.upper().replace('-', '_')]
+        engine = Path(env['DEVKIT_CACHE_DIR']) / 'engines' / target_triple / self.version / engine_sha / 'devkit'
+        require(engine.is_file(), 'Update did not prime the target engine before commit')
+        offline = dict(env, HTTPS_PROXY='http://127.0.0.1:1', DOCKER_HOST='unix:///unavailable.sock')
         def install(root, path, recorded):
             absolute = root / path
             if recorded is None:
@@ -314,8 +319,11 @@ class Harness:
             absolute.write_bytes(data)
             absolute.chmod(mode)
             return {'sha256': digest(data), 'mode': mode}
-        for variant, new_make, new_loader in [('old-old', False, False), ('new-old', True, False), ('new-new', True, True)]:
-            root = self.scratch / ('mixed-node-' + variant)
+        for variant, cutoff in [('old-old', -1), ('after-lock', paths.index('Cargo.lock')),
+                                ('before-lock-removal', paths.index('apps/api/Cargo.lock') - 1),
+                                ('after-lock-removal', paths.index('apps/api/Cargo.lock')),
+                                ('new-old', None), ('new-new', len(paths))]:
+            root = self.scratch / ('mixed-rust-' + variant)
             shutil.copytree(target, root)
             stage = '.devkit/state/update-' + str(uuid.uuid4())
             journal = {'schemaVersion': 2, 'stage': stage, 'files': [], 'createdDirectories': [], 'createdParents': []}
@@ -328,16 +336,16 @@ class Harness:
                 row = {'path': path, 'before': install(root, backup, before[path]) if backup else None,
                        'after': install(root, staged, after[path]) if staged else None, 'backup': backup, 'staged': staged}
                 journal['files'].append(row)
-            if not new_make:
-                install(root, projection, before[projection])
-            if not new_loader:
+            if cutoff is None:
                 install(root, loader, before[loader])
-            (root / '.devkit/update-pending.json').write_text(json.dumps(journal))
-            if new_loader:
-                self.run('make-recover-mixed-node-' + variant, ['make', 'recover'], cwd=root, env=env)
             else:
-                self.boot('bootstrap-recover-mixed-node-' + variant, 'recover', root, env=env)
-            require(all(capture(root, path) == before[path] for path in paths), 'Mixed-state rollback changed original Node files')
+                for path in paths[cutoff + 1:]:
+                    install(root, path, before[path])
+            (root / '.devkit/update-pending.json').write_text(json.dumps(journal))
+            command = [engine, 'recover', '.'] if cutoff in (-1, None) else ['make', 'recover']
+            self.run('recover-mixed-rust-' + variant, command, cwd=root, env=offline)
+            self.run('recover-repeat-rust-' + variant, [engine, 'recover', '.'], cwd=root, env=offline)
+            require(all(capture(root, path) == before[path] for path in paths), 'Mixed-state rollback changed original Rust files')
             require(not (root / '.devkit/update-pending.json').exists(), 'Mixed-state rollback left a pending journal')
     def execute(self):
         self.run('download-versioned-loader', ['curl', '--disable', '--fail', '--silent', '--show-error', '--output', self.script,
@@ -369,7 +377,8 @@ class Harness:
         source = baseline / 'apps/api/src/main.rs'
         source.write_text(source.read_text() + '\n// Preserve the product change.\n')
         (baseline / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
-        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml', baseline / 'AGENTS.md', baseline / '.config/wt.toml')}
+        before = {p: p.read_bytes() for p in (source, baseline / '.env', baseline / 'Makefile', baseline / 'compose.yaml',
+                                                  baseline / 'AGENTS.md', baseline / '.config/wt.toml')}
         self.run('native-accepted-baseline-add', [self.engine, 'add-app', baseline, '--name', 'worker', '--template', 'rust-api', '--non-interactive'], env=self.environment('genuine-baseline-http-init'))
         bridge_env = self.environment('genuine-baseline-http-init')
         old_loader = baseline / '.devkit/runtime/devkit.sh'
@@ -387,6 +396,15 @@ class Harness:
                     'Rejected online preview changed the accepted checkout')
             target_source = ['--release-root', self.payload]
             bridge.extend(target_source)
+        for mode, args in [('preview', [*bridge, '--preview']), ('apply', bridge)]:
+            failed = self.run('duplicate-crate-' + mode, args, cwd=baseline, env=bridge_env, expected='devkit-api')
+            for component in ('api', 'worker'):
+                require(f'apps/{component}' in failed.stdout + failed.stderr, 'Missing conflict path')
+            require(old_loader.read_bytes() == old_bytes and not (baseline / 'Cargo.toml').exists()
+                    and not (baseline / '.devkit/update-pending.json').exists(), 'Conflicting update mutated the checkout')
+        worker = baseline / 'apps/worker'
+        for path in [worker / 'Cargo.toml', worker / 'Cargo.lock', *worker.rglob('*.rs')]:
+            path.write_text(path.read_text().replace('devkit-api', 'worker').replace('devkit_api', 'worker'))
         self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
         require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
         self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
@@ -394,7 +412,7 @@ class Harness:
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
-        self.verify_node_recovery(target_source)
+        self.verify_rust_recovery(target_source)
 
     def verify_version_floor(self):
         pre_050 = self.scratch / 'pre-050-checkout'

@@ -34,7 +34,7 @@ fn ensure_supported_target_version(ver: &str) -> Result<()> {
         return Err(error(
             "UNSUPPORTED_PROJECT_VERSION",
             format!(
-                "Target version {ver} is older than the minimum supported version {}. Use @docouno/devkit@0.5.1 as the upgrade bridge for older releases.",
+                "Target version {ver} is older than the minimum supported version {}. Choose a supported target or use the entry point documented for {ver}.",
                 crate::state::MIN_SUPPORTED_PROJECT_VERSION
             ),
         ));
@@ -59,6 +59,10 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
     let resolver = DockerPnpmResolver {
         cache_dir: globals.cache_dir.clone(),
         offline: globals.offline,
+        runner: Some(runner.clone()),
+    };
+    let cargo_resolver = crate::cargo_lock::DockerCargoLockResolver {
+        cache_dir: globals.cache_dir.clone(),
         runner: Some(runner.clone()),
     };
     let args = if globals.args.is_empty() {
@@ -328,6 +332,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                 package_mode: mode,
                 name: options.value("--name")?.map(str::to_owned),
                 hooks: Some(&cancellation),
+                cargo_resolver: Some(&cargo_resolver),
+                offline: globals.offline,
                 no_agents_md: options.flag("--no-agents-md"),
                 no_worktrunk: options.flag("--no-worktrunk"),
                 ..Default::default()
@@ -400,6 +406,8 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         runner: runner.clone(),
     };
     let update = UpdateOptions {
+        cargo_resolver: Some(&cargo_resolver),
+        offline: globals.offline,
         api: if command == "add-app" {
             options.value("--api")?.map(str::to_owned)
         } else {
@@ -589,6 +597,7 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                         "Design system: React UI library + playground",
                         "TypeScript library (packages/*)",
                         "React UI library (packages/*)",
+                        "Rust library (packages/*)",
                     ],
                 )?;
                 if (4..=6).contains(&template) {
@@ -604,11 +613,14 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                 }
                 if template >= 7 {
                     let pkg_idx = template - 7;
-                    let name = prompt.ask("Package name", Some(["lib", "ui"][pkg_idx]))?;
+                    let name = prompt.ask("Package name", Some(["lib", "ui", "core"][pkg_idx]))?;
                     slug(&name)?;
                     options.add(
                         "--package",
-                        format!("{name}={}", ["ts-library", "react-ui"][pkg_idx]),
+                        format!(
+                            "{name}={}",
+                            ["ts-library", "react-ui", "rust-library"][pkg_idx]
+                        ),
                     );
                 } else {
                     let name = prompt.ask(
@@ -670,11 +682,12 @@ fn complete(command: &str, options: &mut Options, prompt: &mut Prompt<'_>) -> Re
                         "TypeScript library",
                         "React UI library",
                         "React shared client",
+                        "Rust library",
                     ],
                 )?;
                 options.set(
                     "--template",
-                    ["ts-library", "react-ui", "react-client"][selected],
+                    ["ts-library", "react-ui", "react-client", "rust-library"][selected],
                 );
             } else {
                 let selected = prompt.choose(

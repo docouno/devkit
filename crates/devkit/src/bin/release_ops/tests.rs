@@ -30,6 +30,7 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     let f = Fixture::native_update();
     let body = f.contract.body().unwrap();
     assert!(body.contains("Run the same checkout on Linux x86-64 and Linux ARM64"));
+    assert!(body.contains("Move registered Rust components into one virtual root Cargo workspace"));
     assert!(!body.contains("Compare Git-tracked managed files"));
     assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
     let set = f.set();
@@ -48,6 +49,12 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
         details
             > saved
                 .find("Run the same checkout on Linux x86-64 and Linux ARM64")
+                .unwrap()
+    );
+    assert!(
+        details
+            > saved
+                .find("Move registered Rust components into one virtual root Cargo workspace")
                 .unwrap()
     );
     assert!(saved.find("Public verification: passed.").unwrap() > details);

@@ -108,14 +108,23 @@ class RustCheckTests(unittest.TestCase):
                 or image["Config"]["Labels"].get(platform_label) != platform):
             raise AssertionError("derived image does not match the shipping recipe identity")
         cls.baseline = cls.base / "baseline"
-        (cls.baseline / "src").mkdir(parents=True)
+        app = cls.baseline / "apps/probe"
+        sibling = cls.baseline / "apps/sibling"
+        (app / "src").mkdir(parents=True)
+        (sibling / "src").mkdir(parents=True)
         (cls.baseline / "Cargo.toml").write_text(
+            '[workspace]\nmembers=["apps/probe","apps/sibling"]\nresolver="3"\n')
+        (sibling / "Cargo.toml").write_text(
+            '[package]\nname="sibling"\nversion="0.1.0"\nedition="2024"\n')
+        (sibling / "src/lib.rs").write_text(
+            '#[test]\nfn independent() { panic!("ran tests from a sibling component"); }\n')
+        (app / "Cargo.toml").write_text(
             '[package]\nname = "devkit-probe"\nversion = "0.1.0"\n'
             'edition = "2024"\nrust-version = "1.99.1"\npublish = false\n')
         (cls.baseline / "rust-toolchain.toml").write_text(
             '[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\n')
         (cls.baseline / "rustfmt.toml").write_text('edition = "2024"\nstyle_edition = "2024"\n')
-        (cls.baseline / "src/lib.rs").write_text(DEFAULT_SOURCE)
+        (app / "src/lib.rs").write_text(DEFAULT_SOURCE)
         result = cls.native(cls.baseline, ["cargo", "generate-lockfile", "--offline"], write=True)
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)
@@ -132,7 +141,7 @@ class RustCheckTests(unittest.TestCase):
         (cls.artifacts / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
     @classmethod
-    def native(cls, fixture, command, *, write=False, extra_env=None, cwd="/app"):
+    def native(cls, fixture, command, *, write=False, write_component=False, extra_env=None, cwd="/workspace"):
         index = len(cls.commands)
         name = "devkit-rust-check-" + cls.token + "-" + str(index)
         cache = cls.base / ("cache-" + str(index))
@@ -145,10 +154,12 @@ class RustCheckTests(unittest.TestCase):
                 "--env", "DEVKIT_RUST_VERSION=" + VERSION, "--env", "RUSTUP_AUTO_INSTALL=0",
                 "--env", "CARGO_HOME=/cache/cargo", "--env", "HOME=/tmp/devkit-home",
                 "--env", "CARGO_BUILD_JOBS=2", "--volume",
-                f"{fixture}:/app:" + ("rw,z" if write else "ro,z"),
+                f"{fixture}:/workspace:" + ("rw,z" if write else "ro,z"),
                 "--volume", f"{HELPER}:/runtime/devkit:ro,z",
                 "--volume", f"{cache}:/cache/cargo:rw,z",
-                "--volume", f"{fixture / 'target'}:/app/target:rw,z", "--workdir", cwd]
+                "--volume", f"{fixture / 'target'}:/workspace/target:rw,z", "--workdir", cwd]
+        if write_component:
+            args += ["--volume", f"{fixture / 'apps/probe'}:/workspace/apps/probe:rw,z"]
         for key, value in (extra_env or {}).items():
             args += ["--env", key + "=" + value]
         args += [cls.image, *command]
@@ -172,7 +183,7 @@ class RustCheckTests(unittest.TestCase):
                     raise AssertionError("owned container remains after cleanup: " + name)
         if result is None:
             raise AssertionError("native command did not complete")
-        stem = f"{index:02d}-" + fixture.name + "-" + command[-1]
+        stem = f"{index:02d}-{fixture.name}"
         stdout_file, stderr_file = stem + ".stdout", stem + ".stderr"
         (cls.artifacts / stdout_file).write_text(result.stdout)
         (cls.artifacts / stderr_file).write_text(result.stderr)
@@ -183,8 +194,11 @@ class RustCheckTests(unittest.TestCase):
         cls.write_receipt()
         if leaked:
             raise AssertionError("--rm container remained before outer cleanup: " + name)
-        if not write and before != after:
-            raise AssertionError("read-only native command changed fixture source/config/lock")
+        checked_paths = set(before) | set(after)
+        if write_component:
+            checked_paths = {p for p in checked_paths if not p.startswith("apps/probe/")}
+        if not write and any(before.get(p) != after.get(p) for p in checked_paths):
+            raise AssertionError("Rust command changed a read-only source/config/lock file")
         return result
 
     @classmethod
@@ -196,11 +210,17 @@ class RustCheckTests(unittest.TestCase):
         self.app = self.base / self._testMethodName
         shutil.copytree(self.baseline, self.app, ignore=shutil.ignore_patterns("target"))
 
-    def helper(self, command="test", **kwargs):
-        return self.native(self.app, ["/runtime/devkit", "internal", "rust", command], **kwargs)
+    def helper(self, command="test", members=(("apps/probe", "devkit-probe"),), **kwargs):
+        args = ["/runtime/devkit", "internal", "rust", command, "--workspace-root", "/workspace"]
+        if command != "setup":
+            args += ["--component", "apps/probe"]
+            for path, name in members:
+                args += ["--member", path, "--fmt-package", name, "--package",
+                         f"path+file:///workspace/{path}#{name}@0.1.0"]
+        return self.native(self.app, args, write_component=command == "fix", **kwargs)
 
     def source(self, text):
-        (self.app / "src/lib.rs").write_text(text)
+        (self.app / "apps/probe/src/lib.rs").write_text(text)
 
     def assert_failure(self, result, diagnostic):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -258,7 +278,7 @@ class RustCheckTests(unittest.TestCase):
                 self.source("pub fn value( )->u8{1}\n")
                 (self.app / "rustfmt.toml").write_text(config)
                 before = source_hashes(self.app)
-                self.assert_failure(self.helper("fix", write=True), diagnostic)
+                self.assert_failure(self.helper("fix"), diagnostic)
                 self.assertEqual(source_hashes(self.app), before, "invalid config mutated source before refusal")
 
     def test_hidden_format_configuration_is_an_explicit_conflict(self):
@@ -268,7 +288,7 @@ class RustCheckTests(unittest.TestCase):
         self.assert_failure(self.helper("check"), ".rustfmt.toml conflicts with the required rustfmt.toml")
 
     def test_missing_config_wrong_cwd_and_toolchain_overrides_fail(self):
-        self.assert_failure(self.helper("check", cwd="/"), "missing Cargo.toml")
+        self.assert_failure(self.helper("check", cwd="/"), "must run from /workspace")
         config = self.app / "rustfmt.toml"
         saved = config.read_text()
         config.unlink()
@@ -276,19 +296,104 @@ class RustCheckTests(unittest.TestCase):
         config.write_text(saved)
         self.assert_failure(self.helper("check", extra_env={"RUSTUP_TOOLCHAIN": VERSION}), "masks rust-toolchain.toml")
         (self.app / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.0.0"\n')
-        self.assert_failure(self.helper("check"), "the app toolchain is unavailable")
+        self.assert_failure(self.helper("check"), "the workspace toolchain is unavailable")
 
-    def test_outer_workspace_cannot_hide_the_accepted_component_lock(self):
-        member = self.app / "member"
-        (member / "src").mkdir(parents=True)
-        (member / "Cargo.toml").write_text('[package]\nname="workspace-member"\nversion="0.1.0"\nedition="2024"\n')
-        (member / "src/lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
-        for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"):
-            shutil.copy2(self.app / name, member / name)
-        with (self.app / "Cargo.toml").open("a") as manifest:
-            manifest.write('\n[workspace]\nmembers=["member"]\n')
-        result = self.helper("build", cwd="/app/member")
-        self.assert_failure(result, "Unsupported outer Cargo workspace/lock authority")
+    def test_component_and_ancestor_shadow_settings_fail_before_fix(self):
+        self.source("pub fn value( )->u8{1}\n")
+        for rel in ["apps/Cargo.lock", "apps/probe/.cargo/config", "apps/probe/rust-toolchain",
+                    "apps/probe/rustfmt.toml", "apps/.rustfmt.toml"]:
+            with self.subTest(path=rel):
+                path = self.app / rel
+                path.parent.mkdir(exist_ok=True)
+                path.write_text("")
+                before = source_hashes(self.app)
+                self.assert_failure(self.helper("fix"), rel)
+                self.assertEqual(source_hashes(self.app), before)
+                path.unlink()
+
+    def test_group_gate_checks_every_member_even_outside_default_members(self):
+        second = self.app / "apps/probe/extra"
+        (second / "src").mkdir(parents=True)
+        (second / "Cargo.toml").write_text(
+            '[package]\nname="extra"\nversion="0.1.0"\nedition="2024"\n')
+        (second / "src/lib.rs").write_text('#[test]\nfn second_member() { panic!("group member ran"); }\n')
+        (self.app / "Cargo.toml").write_text(
+            '[workspace]\nmembers=["apps/probe","apps/probe/extra","apps/sibling"]\n'
+            'default-members=["apps/sibling"]\nresolver="3"\n')
+        lock = self.native(self.app, ["cargo", "generate-lockfile", "--offline"], write=True)
+        self.assertEqual(lock.returncode, 0, lock.stdout + lock.stderr)
+        result = self.helper("test", members=(("apps/probe", "devkit-probe"), ("apps/probe/extra", "extra")))
+        self.assert_failure(result, "group member ran")
+        self.assertNotIn("ran tests from a sibling component", result.stdout + result.stderr)
+
+    def test_fix_changes_only_selected_app(self):
+        source = self.app / "apps/probe/src/lib.rs"
+        sibling = self.app / "apps/sibling/src/lib.rs"
+        self.source("pub fn value( )->u8{1}\n")
+        sibling.write_text("pub fn sibling( )->u8{2}\n")
+        before = source.read_bytes()
+        sibling_before = sibling.read_bytes()
+        result = self.helper("fix")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(source.read_bytes(), before)
+        self.assertEqual(sibling.read_bytes(), sibling_before)
+
+    def test_custom_harness_false_test_not_executed_during_check(self):
+        manifest = self.app / "apps/probe/Cargo.toml"
+        manifest.write_text(
+            manifest.read_text()
+            + '\n[[test]]\nname = "custom_harness"\nharness = false\n'
+        )
+        tests_dir = self.app / "apps/probe/tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / "custom_harness.rs").write_text(
+            'fn main() {\n'
+            '    if std::env::args().any(|a| a == "--list") {\n'
+            '        panic!("custom harness binary must not execute during make check");\n'
+            '    }\n'
+            '    println!("custom harness ran");\n'
+            '}\n'
+        )
+        self.source("pub fn value() -> u8 {\n    1\n}\n")
+        check = self.helper("check")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertNotIn("custom harness binary must not execute", check.stdout + check.stderr)
+        self.assertNotIn("custom harness ran", check.stdout + check.stderr)
+        test = self.helper("test")
+        self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
+        self.assertIn("custom harness ran", test.stdout + test.stderr)
+
+    def test_required_features_targets_with_custom_harness(self):
+        manifest = self.app / "apps/probe/Cargo.toml"
+        base = manifest.read_text()
+        tests_dir = self.app / "apps/probe/tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / "custom_harness.rs").write_text('fn main() {\n    println!("custom ok");\n}\n')
+        bin_dir = self.app / "apps/probe/src/bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "gated.rs").write_text('fn main() {}\n')
+        self.source("pub fn value() -> u8 {\n    1\n}\n")
+
+        # Valid: active custom-harness test + optional feature-gated bin.
+        manifest.write_text(
+            base
+            + '\n[features]\nextra = []\n'
+            + '\n[[bin]]\nname = "gated"\nrequired-features = ["extra"]\n'
+            + '\n[[test]]\nname = "custom_harness"\nharness = false\n'
+        )
+        check = self.helper("check")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        test = self.helper("test")
+        self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
+        self.assertIn("custom ok", test.stdout + test.stderr)
+
+        # Unmet required-features on the only harness=false test must fail check (0 runnable tests).
+        manifest.write_text(
+            base
+            + '\n[features]\nextra = []\n'
+            + '\n[[test]]\nname = "custom_harness"\nharness = false\nrequired-features = ["extra"]\n'
+        )
+        self.assert_failure(self.helper("check"), "non-ignored")
 
     def test_clippy_checks_test_targets(self):
         self.source("""#[cfg(test)]
@@ -302,9 +407,9 @@ mod tests {
         self.assert_failure(self.helper("check"), "clippy::bool-assert-comparison")
 
     def test_locked_build_refuses_unaccepted_path_dependency(self):
-        with (self.app / "Cargo.toml").open("a") as manifest:
+        with (self.app / "apps/probe/Cargo.toml").open("a") as manifest:
             manifest.write('\n[dependencies]\nlock-probe = { path = "lock-probe" }\n')
-        dependency = self.app / "lock-probe"
+        dependency = self.app / "apps/probe/lock-probe"
         (dependency / "src").mkdir(parents=True)
         (dependency / "Cargo.toml").write_text(
             '[package]\nname = "lock-probe"\nversion = "0.1.0"\nedition = "2024"\n')

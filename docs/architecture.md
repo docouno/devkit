@@ -11,19 +11,19 @@ A Devkit repository contains at least one registered component across two direct
 
 ### Tooling Profiles
 
-| Profile         | Default Template | Role               | Toolchain | Outputs           | Packaging                                               |
-| --------------- | ---------------- | ------------------ | --------- | ----------------- | ------------------------------------------------------- |
-| `node`          | `node-api`       | `app`              | `node`    | `dist`            | Application build                                       |
-| `web`           | `react-web`      | `app`              | `node`    | `dist`            | Vite static bundle                                      |
-| `electron`      | `electron-react` | `app`              | `node`    | `dist`, `release` | Linux Electron directory & archive                      |
-| `react-library` | `react-client`   | `library`          | `node`    | `dist`            | Internal workspace-only (`"private": true`)             |
-| `ts-library`    | `ts-library`     | `library`          | `node`    | `dist`, `release` | ESM + `.d.ts` via `tsdown`; optional `.tgz`             |
-| `react-ui`      | `react-ui`       | `library`          | `node`    | `dist`, `release` | React ESM + `.d.ts` + CSS via `tsdown`; optional `.tgz` |
-| `rust`          | `rust-api`       | `app` or `library` | `rust`    | `target`          | Cargo binary/library crate                              |
+| Profile         | Default Template           | Role               | Toolchain | Outputs           | Packaging                                               |
+| --------------- | -------------------------- | ------------------ | --------- | ----------------- | ------------------------------------------------------- |
+| `node`          | `node-api`                 | `app`              | `node`    | `dist`            | Application build                                       |
+| `web`           | `react-web`                | `app`              | `node`    | `dist`            | Vite static bundle                                      |
+| `electron`      | `electron-react`           | `app`              | `node`    | `dist`, `release` | Linux Electron directory & archive                      |
+| `react-library` | `react-client`             | `library`          | `node`    | `dist`            | Internal workspace-only (`"private": true`)             |
+| `ts-library`    | `ts-library`               | `library`          | `node`    | `dist`, `release` | ESM + `.d.ts` via `tsdown`; optional `.tgz`             |
+| `react-ui`      | `react-ui`                 | `library`          | `node`    | `dist`, `release` | React ESM + `.d.ts` + CSS via `tsdown`; optional `.tgz` |
+| `rust`          | `rust-api`, `rust-library` | `app` or `library` | `rust`    | root `target/`    | Cargo binaries and libraries                            |
 
 ## Native Manifest Authority
 
-`.devkit/manifest.json` records only environment identity (`version`, `releaseIdentity`), managed file digests, component roles/profiles, inter-component DAG edges (`dependencies`), and the exact `toolDependencies` subset managed inside each Node component's `devDependencies`.
+`.devkit/manifest.json` records environment identity (`version`, `releaseIdentity`), managed file digests, component roles/profiles, inter-component DAG edges (`dependencies`), and the exact `toolDependencies` subset managed inside each Node component's `devDependencies`. A root Cargo workspace can also record `cargoResolution`, which binds the accepted lock to the toolchain, manifests and checkout Cargo configuration. When the lock allows several local directories for one package ID, Devkit records which path Cargo selected. Committing this state with `Cargo.lock` lets an unchanged checkout run `make sync` before setup.
 
 Starting with `0.6.0`, the accepted component profiles determine which desktop assets belong in the checkout. A registered `electron` component adds the desktop Dockerfile, seccomp profile, its Apache license and notice, the desktop recipe pin and the desktop tool service. The release always carries the complete set so registration can use the accepted payload. The checkout records the digests of its rendered pins and Compose files.
 
@@ -31,9 +31,19 @@ Devkit deliberately avoids duplicating native package metadata in `.devkit/manif
 
 - **Node components** share one root pnpm workspace (`pnpm-workspace.yaml` + `pnpm-lock.yaml`) with `nodeLinker: isolated` and `packageImportMethod: hardlink`. Package names, versions, `"private": true | false`, `exports`, `files`, `publishConfig`, `dependencies` (including `npm:` aliases), and `peerDependencies` live exclusively in `{component}/package.json`.
   Devkit commands use the release's verified pnpm executable and container Node runtime with automatic manager and SDK installation disabled; user-owned `packageManager` and `devEngines` metadata is preserved.
-- **Rust components** own `{component}/Cargo.toml` and `{component}/Cargo.lock`. A single registered Rust component (for example `apps/api`) can organize multiple internal crates using a native Cargo `[workspace]` inside `apps/api/Cargo.toml` (`members = [".", "crates/*"]`) while preserving a single `{component}/rust-toolchain.toml` and `{component}/Cargo.lock`.
+- **Rust components** share one virtual root `Cargo.toml` and one `Cargo.lock`. The root `rust-toolchain.toml` comes from the accepted release. The project owns `rustfmt.toml` and Cargo manifests. A registered component can own several crates. List each member directory explicitly in `workspace.members`, including nested crates, and give each workspace package a unique name. Keep Cargo configuration in the checkout root.
 
-When manual edits to native manifests affect workspace projections or lockfile metadata, `devkit sync` reconciles `.devkit/*` projections and `pnpm-lock.yaml` transactionally without changing the accepted Devkit release.
+Cargo's selected local dependency graph determines Make prerequisites. An application or library can depend on a registered library. Edges into another application and inter-component dependency cycles are rejected. For a local dependency outside registered components, list its directory or an ancestor under `workspace.exclude`. Members, `workspace.default-members`, and exclusions use explicit paths. Every directory in `workspace.default-members` must be a workspace member. Exclusions must be disjoint from registered components.
+
+Setup runs one `cargo fetch --locked` for the workspace. Gates use package selectors for the chosen component, including native test discovery. Shared compiled dependencies live in the checkout's root `target/`. Managed Rust development services mount the same directory. Each worktree keeps its own build outputs.
+
+After manual manifest edits, `make sync` reconciles the native lock and the Make/Compose projections in the same transaction.
+
+If `make register` reports a change to an existing Cargo selection, reconcile pending edits in this order.
+
+1. Set aside dependency edits that require the incoming component. Restore the affected dependencies of registered components to their accepted values.
+2. If independent edits need to be synchronized first, temporarily move the incoming directory outside `apps/` and `packages/`. Save and remove its entries from `workspace.members` and `workspace.default-members` in the root `Cargo.toml`, run `make sync`, then restore the directory and the exact entries in both lists.
+3. Retry `make register` with all intended entries, including nested crate paths. Reapply the deferred dependency edits and run `make sync`.
 
 Local directory snapshots retain their exact artifact and peer-context identities in the lock graph. Component dependency checks use their physical directories, so application dependencies, library build ordering, and cycle detection apply equally to directory snapshots and workspace links.
 
@@ -51,20 +61,21 @@ Every task executes inside digest-pinned Linux containers (`DEVKIT_NODE_IMAGE`, 
 
 1. **Read-only offline gates (`check`, `test`, `build`)**:
    - `/workspace` is bind-mounted read-only.
-   - Component build directories (`dist/`, `target/`) are mounted writable only where needed.
+   - Node gates mount component output directories as needed. Rust gates mount the checkout's `target/` writable and mount the shared Cargo cache (`/cache/cargo`) read-only (managed Rust development services and offline Cargo validation also mount `/cache/cargo` read-only).
    - Network access is disabled (`--network none`).
 2. **Isolated library packaging (`package` for `ts-library` and `react-ui`)**:
    - Runs under `--network none` with `/workspace`, `node_modules`, and `{component}/dist` mounted read-only.
    - Only `{component}/release` (and `/tmp`) is writable, ensuring `pnpm pack`, `publint`, and `@arethetypeswrong/core` validate the exact `dist/` produced by `build` without mutating build outputs or workspace state.
 3. **Explicit write sessions (`make fix`, `devkit exec --write`)**:
-   - Formatting (`make fix`) mounts source writable under `--network none`.
-   - Dependency mutations (`devkit exec --component ... --write --network bridge`) allow explicit registry access and invalidate `.devkit/state/node-workspace.lock` so the next `make setup` verifies the updated lockfile cleanly.
+   - Rust formatting (`make fix app=NAME` or `package=NAME`) mounts the selected component writable under `--network none` and formats its members.
+   - Rust `exec --write` grants checkout-wide write access so Cargo can update the root lock and component manifests together. Read-only Rust exec sends build artifacts to `/tmp/cargo-target`. Run `make setup` after dependency edits to refresh readiness.
 4. **Registry secret and TLS CA isolation**:
    - Root `.npmrc` permits only HTTPS registries (`http://` is permitted solely on loopback `127.0.0.1` / `localhost` for local testing) and `${ENV_VAR}` placeholders — literal `_authToken`, `_auth`, `_password`, `token`, `certfile`, `keyfile`, and `strict-ssl=false` are rejected before container startup.
    - Referenced `${ENV_VAR}` tokens and `DEVKIT_CA_CERT` (`NODE_EXTRA_CA_CERTS=/devkit/ca.pem`) are injected **only** into networked Node containers (`make setup`, `devkit sync`, `devkit update`, and `devkit exec --network bridge`).
    - Offline Node containers receive dummy placeholder values (`devkit-offline-unused`) and no CA mount; Rust containers never receive npm registry tokens or `NODE_EXTRA_CA_CERTS`.
    - `DEVKIT_CA_CERT` extends the pinned Mozilla roots for native HTTPS and standalone pnpm. The native downloader preserves the replacement semantics of an explicit `SSL_CERT_FILE`.
    - Implicit `.pnpmfile.cjs`, `.pnpmfile.mjs`, and `.pnpmfile.js` hooks are unsupported and rejected before container startup. Automatic pnpm operations also disable these hooks; project installation scripts run in the separate offline phase.
+   - Root `.cargo/config.toml` rejects executable-hook, flag-override, and credential directives (`build.rustc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper`, `build.rustdoc`, `build.target-dir`, `build.build-dir`, `build.rustflags`, `build.rustdocflags`, `[env]`, `[alias]`, `[http]`, `net.git-fetch-with-cli`, `paths`, `registry.*`/`registries.*` credential/token keys, and `target.*.{runner,linker,rustflags,rustdocflags}`) as well as non-relative/file URLs and root-level or duplicate `include` directives. The shared `CARGO_HOME` cache must not contain Cargo config or credential files.
 5. **macOS APFS case-sensitivity boundary**:
    - On case-insensitive macOS APFS volumes, Devkit never mounts a unified ancestor above the checkout root (such as `$HOME`) into `/devkit/unified`, falling back to a checkout-local pnpm store instead so host siblings outside the checkout cannot be accessed through alternate casing over VirtioFS.
    - Electron binary installation (`setup_electron`) runs with `/workspace` mounted read-only, `/devkit/unified` unmounted, checkout secret files masked, and writes restricted to `node_modules` and `/cache/{electron,pnpm}`.
@@ -104,4 +115,4 @@ Metadata proof shares a 30-second deadline across external-provider reads, helpe
 
 The namespace model distinguishes a receiver's own mounts from Docker mountpoints inherited through `volumes_from`. File-backed Compose configs and secrets participate as read-only binds with Compose's default or explicit destinations. Provider tmpfs and devices are not inherited and cannot mask a source-backed ancestor for the receiver. A receiver's own deeper writable tmpfs can still provide a safe literal metadata slot.
 
-`development.api` relates Compose services. Modern projections add required startup ordering. The development Make DAG includes both frontend and connected API library builds while preserving native library dependency ordering. API bind defaults come from a managed Compose `env_file` before project-owned env files and explicit environment. Historical `0.4.x` projection bytes remain compatible.
+`development.api` relates Compose services. Modern projections add required startup ordering. The development Make DAG includes both frontend and connected API library builds while preserving native library dependency ordering. API bind defaults come from a managed Compose `env_file` before project-owned env files and explicit environment.

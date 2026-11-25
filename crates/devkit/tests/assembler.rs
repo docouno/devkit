@@ -304,11 +304,71 @@ fn an_existing_output_is_never_replaced_even_when_it_is_empty() {
 }
 
 #[test]
-fn rust_template_channel_must_match_the_release_pin_in_the_actual_toml_value() {
+fn rust_templates_and_the_resolver_image_must_match_the_release_toolchain() {
     let temp = TempDir::new().unwrap();
-    let path = temp.path().join("templates/rust-api/rust-toolchain.toml");
-    write_atomic(&path, b"[toolchain]\nchannel = '1.99.1'\n", 0o644).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in [
+        "runtime/rust.Dockerfile",
+        "templates/rust-api/rust-toolchain.toml",
+        "templates/rust-api/rustfmt.toml",
+        "templates/rust-api/Cargo.toml",
+        "templates/rust-api/Cargo.lock",
+        "templates/rust-library/Cargo.toml",
+        "templates/rust-library/Cargo.lock",
+    ] {
+        write_atomic(
+            &temp.path().join(name),
+            &fs::read(root.join(name)).unwrap(),
+            0o644,
+        )
+        .unwrap();
+    }
     verify_rust_template(temp.path(), "1.99.1").unwrap();
+    for (file, from, to) in [
+        ("runtime/rust.Dockerfile", "@sha256:", "@sha1:"),
+        ("runtime/rust.Dockerfile", "1.99.1-slim-", "1.98.0-slim-"),
+        (
+            "runtime/rust.Dockerfile",
+            "--toolchain 1.99.1",
+            "--toolchain 1.98.0",
+        ),
+        (
+            "templates/rust-api/rustfmt.toml",
+            "edition =",
+            "invalid = =",
+        ),
+        (
+            "templates/rust-library/Cargo.toml",
+            "publish = false",
+            "publish = true",
+        ),
+        (
+            "templates/rust-library/Cargo.toml",
+            "edition = \"2024\"",
+            "edition = \"2021\"",
+        ),
+        (
+            "templates/rust-library/Cargo.toml",
+            "[lints.clippy]",
+            "[dependencies]\nserde = \"1\"\n\n[lints.clippy]",
+        ),
+        ("templates/rust-api/Cargo.toml", "1.99.1", "1.98.0"),
+        (
+            "templates/rust-library/Cargo.lock",
+            "devkit-library",
+            "other-library",
+        ),
+    ] {
+        let path = temp.path().join(file);
+        let valid = fs::read_to_string(&path).unwrap();
+        fs::write(&path, valid.replace(from, to)).unwrap();
+        assert!(
+            verify_rust_template(temp.path(), "1.99.1").is_err(),
+            "{file}: {from}"
+        );
+        fs::write(path, valid).unwrap();
+    }
+    let path = temp.path().join("templates/rust-api/rust-toolchain.toml");
     write_atomic(
         &path,
         b"# channel = '1.99.1'\n[toolchain]\nchannel = '0.0.0'\n",
@@ -709,7 +769,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             .contains("Duplicate migration id")
     );
 
-    // Validate the actual migration index against the release being built.
+    // Validate all shipped migrations against the real source release.
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let repo_entries = verify_migration_index(&repo_root, env!("CARGO_PKG_VERSION")).unwrap();
     let ids: Vec<_> = repo_entries.iter().map(|e| e.id.as_str()).collect();
@@ -721,6 +781,7 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             "make-targets-and-worktrunk",
             "portable-linux-checkouts",
             "profile-scoped-desktop-runtime",
+            "root-cargo-workspace",
         ]
     );
     assert!(repo_entries[2].profiles.is_empty());

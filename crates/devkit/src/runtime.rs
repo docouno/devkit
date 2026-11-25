@@ -1,6 +1,7 @@
 //! Checkout admission and container-first daily operations. Make owns the DAG.
 use crate::{
-    Result, catalog::*, compose::*, files::*, model::*, processes::*, projections::*, state::*,
+    Result, catalog::*, compose::*, files::*, model::*, native::CargoMember, processes::*,
+    projections::*, state::*,
 };
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use std::{
     process::Command,
 };
 
-pub const HELP: &str = "make help\nmake info [app=<name>] [json=1]\nmake setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down [cleanup=1]  (preserves data; cleanup releases leases)\nmake exec [app=<name> | package=<name> | component=apps/<name>|packages/<name>] [write=1] [network=none|bridge] [prepare=1] command=ARGV\nmake doctor\ndevkit info [TARGET] [--app <name>] [--json]\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec [--component apps/web|packages/lib] [--write] [--network none|bridge] [--prepare] -- ARGV\n";
+pub const HELP: &str = "make help\nmake info [app=<name>] [json=1]\nmake setup|check|fix|test|build [app=<name> | package=<name>]\nmake dev|up [app=<name>] [headless=1]\nmake package [app=<desktop> | package=<name>]\nmake status|logs [app=<name>] [tail=100] [follow=1]\nmake down [cleanup=1]  (preserves data; cleanup releases leases)\nmake exec [app=<name> | package=<name> | component=apps/<name>|packages/<name> | toolchain=rust|node] [write=1] [network=none|bridge] [prepare=1] command=ARGV\nmake doctor\ndevkit info [TARGET] [--app <name>] [--json]\ndevkit status [TARGET] [--json]\ndevkit doctor [TARGET] [--json]\ndevkit describe [TARGET] [--json]\ndevkit exec [--component apps/web|packages/lib | --toolchain rust|node] [--write] [--network none|bridge] [--prepare] -- ARGV\n";
 /// Compose 5.0 fixed config --no-env-resolution reading inactive service env files.
 /// Desktop builds carry a packaging suffix; untested prereleases are not admitted.
 pub fn validate_compose_version(value: &str) -> Result<()> {
@@ -75,6 +76,7 @@ impl RuntimeRequest {
 #[derive(Clone, Debug)]
 pub struct ExecRequest {
     pub runtime: RuntimeRequest,
+    pub toolchain: Option<Toolchain>,
     pub argv: Vec<OsString>,
     pub write: bool,
     pub network: String,
@@ -235,6 +237,7 @@ impl ToolAdmission {
 enum TaskAccess {
     SetupNode,
     SetupElectron,
+    SetupRust,
     Finite,
     PackageLibrary,
     Fix,
@@ -898,6 +901,10 @@ impl<'a> PreparedContext<'a> {
         Ok(())
     }
     fn task(&self, task: ContainerTask<'_>) -> Result<()> {
+        self.run_task(task, OutputMode::TeeStderr(64 * 1024))
+            .map(|_| ())
+    }
+    fn run_task(&self, task: ContainerTask<'_>, mode: OutputMode) -> Result<ProcessOutput> {
         let ContainerTask {
             component,
             profile,
@@ -912,7 +919,7 @@ impl<'a> PreparedContext<'a> {
         let write_root = matches!(access, TaskAccess::ExecWrite);
         let setup = matches!(access, TaskAccess::SetupNode);
         let setup_electron = matches!(access, TaskAccess::SetupElectron);
-        let node = profile != ToolingProfile::Rust;
+        let node = profile_toolchain(profile) == Toolchain::Node;
         let fix = matches!(access, TaskAccess::Fix);
         let package_release_dir = if matches!(access, TaskAccess::PackageLibrary) {
             Some(format!(
@@ -924,27 +931,19 @@ impl<'a> PreparedContext<'a> {
         };
         let root = &self.admission.root;
         let mut writes = BTreeSet::new();
-        if let Some(inputs) = inputs {
-            writes.extend(workspace_write_directories(&self.admission.state, inputs)?);
-        }
-        for (path, c) in &self.admission.state.components {
-            if c.toolchain == Toolchain::Node {
+        if node {
+            if let Some(inputs) = inputs {
+                writes.extend(workspace_write_directories(&self.admission.state, inputs)?);
+            }
+            for (path, c) in node_components(&self.admission.state) {
                 writes.insert(format!("{path}/node_modules"));
                 for output in profile_outputs(c.tooling_profile) {
                     writes.insert(format!("{path}/{output}"));
                 }
-            } else {
-                writes.insert(format!("{path}/target"));
             }
-        }
-        if self
-            .admission
-            .state
-            .components
-            .values()
-            .any(|c| c.toolchain == Toolchain::Node)
-        {
             writes.insert("node_modules".into());
+        } else if !matches!(access, TaskAccess::ExecReadOnly | TaskAccess::SetupRust) {
+            writes.insert("target".into());
         }
         let policy = if node {
             let directories = self
@@ -1011,13 +1010,17 @@ impl<'a> PreparedContext<'a> {
         } else {
             None
         };
-        let ca_cert = if node && network != "none" && forward_npm_secrets {
+        let ca_cert = if network != "none" && (!node || forward_npm_secrets) {
             crate::native::resolve_ca_cert_path()?
                 .map(|p| crate::download::additional_ca_file_in(&p, &root_cache.join(".tmp")))
                 .transpose()?
         } else {
             None
         };
+        if let Some(cache) = cargo_cache.as_deref() {
+            assert_clean_cargo_home(cache)?;
+        }
+        let cargo_cache_readonly = !matches!(access, TaskAccess::SetupRust | TaskAccess::ExecWrite);
         let mut budget = self
             .budget
             .borrow()
@@ -1117,14 +1120,17 @@ impl<'a> PreparedContext<'a> {
                     )?;
                 }
             }
-            for (source, target) in [
-                (cargo_cache.as_deref(), "/cache/cargo"),
-                (pnpm_cache.as_deref(), "/cache/pnpm"),
-                (electron_cache_dir.as_deref(), "/cache/electron"),
+            for (source, target, readonly) in [
+                (cargo_cache.as_deref(), "/cache/cargo", cargo_cache_readonly),
+                (pnpm_cache.as_deref(), "/cache/pnpm", false),
+                (electron_cache_dir.as_deref(), "/cache/electron", false),
             ] {
                 if let Some(source) = source {
-                    crate::shared_cache::mount(&mut c, source, Path::new(target), false)?;
+                    crate::shared_cache::mount(&mut c, source, Path::new(target), readonly)?;
                 }
+            }
+            if !node && matches!(access, TaskAccess::SetupRust) {
+                mount_sensitive_workspace_masks(&mut c, root)?;
             }
             if let Some(pnpm) = &pnpm {
                 crate::shared_cache::mount(&mut c, pnpm, Path::new("/devkit/bin/pnpm"), true)?;
@@ -1160,6 +1166,15 @@ impl<'a> PreparedContext<'a> {
                 .as_ref()
                 .map(|p| p.checkout_container.clone())
                 .unwrap_or_else(|| PathBuf::from("/workspace"));
+            let workdir = match component {
+                Some(path)
+                    if node
+                        || matches!(access, TaskAccess::ExecReadOnly | TaskAccess::ExecWrite) =>
+                {
+                    work_root.join(path)
+                }
+                _ => work_root,
+            };
             c.args([
                 "--mount",
                 &bind_mount(
@@ -1168,11 +1183,8 @@ impl<'a> PreparedContext<'a> {
                     true,
                 )?,
                 "--workdir",
-                work_root
-                    .join(component.unwrap_or(""))
-                    .to_str()
-                    .context("Non-UTF8 container workdir")?,
-            ]);
+            ])
+            .arg(workdir);
             for value in [
                 "HOME=/tmp/devkit-home",
                 "CI=true",
@@ -1198,16 +1210,42 @@ impl<'a> PreparedContext<'a> {
                 c.args(["--env", "ELECTRON_CACHE=/cache/electron"]);
             }
             env_plan.write_docker_args(&mut c);
-            c.args([
-                "--env",
-                &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
-                "--env",
-                &format!(
-                    "CARGO_TARGET_DIR=/workspace/{}/target",
-                    component.unwrap_or(".")
-                ),
-            ]);
-            if profile != ToolingProfile::Rust {
+            if !node {
+                c.args([
+                    "--env",
+                    &format!("DEVKIT_RUST_VERSION={}", self.admission.pins.rust_version),
+                    "--env",
+                    if matches!(access, TaskAccess::ExecReadOnly) {
+                        "CARGO_TARGET_DIR=/tmp/cargo-target"
+                    } else {
+                        "CARGO_TARGET_DIR=/workspace/target"
+                    },
+                ]);
+                if matches!(access, TaskAccess::ExecReadOnly) {
+                    c.args(["--env", "CARGO_INCREMENTAL=0"]);
+                }
+                if matches!(
+                    access,
+                    TaskAccess::SetupRust | TaskAccess::Finite | TaskAccess::Fix
+                ) {
+                    for value in cargo_safety_env() {
+                        c.args(["--env", value]);
+                    }
+                }
+                if network != "none"
+                    && let Some(ca_cert) = &ca_cert
+                {
+                    c.args([
+                        "--mount",
+                        &bind_mount(ca_cert.path(), Path::new("/devkit/ca.pem"), true)?,
+                        "--env",
+                        "CARGO_HTTP_CAINFO=/devkit/ca.pem",
+                        "--env",
+                        "SSL_CERT_FILE=/devkit/ca.pem",
+                    ]);
+                }
+            }
+            if node {
                 let npmrc_policy = policy.as_ref().context("Missing Node npmrc policy")?;
                 if network != "none" && forward_npm_secrets {
                     crate::native::verify_required_npm_env_vars(npmrc_policy)?;
@@ -1253,20 +1291,18 @@ impl<'a> PreparedContext<'a> {
             }
             Ok(c)
         };
-        for attempt in 0..2 {
+        let mut retried = false;
+        loop {
             let token = uuid::Uuid::new_v4().to_string();
             let owned = OwnedContainer::new(format!("{}-task-{token}", self.project), token);
             let mut c = build_command(&budget, &owned)?;
-            let mut output = self.runner.run_owned_unchecked(
-                &mut c,
-                OutputMode::TeeStderr(64 * 1024),
-                &owned,
-                None,
-            )?;
+            let mut output = self
+                .runner
+                .run_owned_unchecked(&mut c, mode, &owned, None)?;
             if output.code == 0 {
-                return Ok(());
+                return Ok(output);
             }
-            if attempt == 0
+            if !retried
                 && crate::resources::is_cgroup_delegation_failure(output.code, &output.stderr)
             {
                 eprintln!(
@@ -1274,13 +1310,15 @@ impl<'a> PreparedContext<'a> {
                 );
                 budget.disable_cgroup_limits();
                 *self.budget.borrow_mut() = Some(budget.clone());
+                retried = true;
                 continue;
             }
-            output.stderr.clear();
-            output.success("Container task")?;
-            return Ok(());
+            if matches!(mode, OutputMode::TeeStderr(_)) {
+                // Streamed diagnostics are already visible to the operator.
+                output.stderr.clear();
+            }
+            return output.success("Container task");
         }
-        Ok(())
     }
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1569,19 +1607,11 @@ fn runtime_paths(admission: &ToolAdmission) -> Result<()> {
     }
     for p in [
         ".devkit/state/node-workspace.lock",
+        ".devkit/state/rust-workspace.lock",
         ".devkit/state/rust-image.json",
         ".devkit/state/desktop-image.json",
     ] {
-        let path = safe_path(&admission.root, p)?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => ensure!(
-                metadata.is_file(),
-                "Expected a regular file: {}",
-                path.display()
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        read_regular_file(&safe_path(&admission.root, p)?, 4096, "runtime receipt")?;
     }
     Ok(())
 }
@@ -1610,6 +1640,194 @@ fn node_ready(ctx: &PreparedContext<'_>, node_inputs_digest: &str) -> Result<()>
     ctx.node_ready_verified.set(true);
     Ok(())
 }
+
+fn workspace_fingerprint(state: &ProjectState, inputs: &InputIdentitySet) -> String {
+    digest(format!("{}\n{}", state.release_identity, inputs.digest))
+}
+
+/// Shared Cargo caches must never carry host-wide config or credential hooks
+/// that would execute arbitrary wrappers across unrelated checkouts.
+pub(crate) fn assert_clean_cargo_home(cache: &Path) -> Result<()> {
+    for name in ["config", "config.toml", "credentials", "credentials.toml"] {
+        let path = cache.join(name);
+        ensure!(
+            !exists(&path)?,
+            "Refusing unexpected Cargo configuration in shared cache: {}; remove it before continuing",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Pin Cargo's compiler and network-helper hooks so project .cargo/config.toml
+/// cannot substitute rustc/rustdoc/wrappers or spawn host git CLI helpers.
+pub(crate) fn cargo_safety_env() -> [&'static str; 9] {
+    [
+        "RUSTC=/usr/local/cargo/bin/rustc",
+        "RUSTDOC=/usr/local/cargo/bin/rustdoc",
+        "RUSTC_WRAPPER=",
+        "RUSTC_WORKSPACE_WRAPPER=",
+        "CARGO_NET_GIT_FETCH_WITH_CLI=false",
+        "RUSTFLAGS=",
+        "CARGO_ENCODED_RUSTFLAGS=",
+        "RUSTDOCFLAGS=",
+        "CARGO_ENCODED_RUSTDOCFLAGS=",
+    ]
+}
+
+/// Mask checkout-root and component-level secret files (.env, .env.*, .npmrc)
+/// with /dev/null inside automatic networked Rust containers (setup-rust and
+/// Cargo lock resolution), refusing symlinked secret files fail-closed.
+pub(crate) fn mount_sensitive_workspace_masks(command: &mut Command, root: &Path) -> Result<()> {
+    let mut rel_paths = BTreeSet::new();
+    let mut scan_dirs: Vec<(String, PathBuf)> = vec![(String::new(), root.to_path_buf())];
+    for group in ["apps", "packages"] {
+        let group_dir = root.join(group);
+        if fs::symlink_metadata(&group_dir)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        {
+            for entry in sorted_entries(&group_dir)? {
+                let path = entry.path();
+                if let Some(child) = entry.file_name().to_str()
+                    && fs::symlink_metadata(&path)
+                        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                {
+                    scan_dirs.push((format!("{group}/{child}"), path));
+                }
+            }
+        }
+    }
+    for (prefix, dir) in scan_dirs {
+        for entry in sorted_entries(&dir)? {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let sensitive = name == ".npmrc"
+                || name == ".env"
+                || (name.starts_with(".env.")
+                    && !matches!(
+                        name.as_str(),
+                        ".env.example" | ".env.sample" | ".env.template"
+                    ));
+            if !sensitive {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let meta = fs::symlink_metadata(entry.path())?;
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "Refusing symlinked sensitive file inside Rust workspace: {rel}"
+            );
+            if meta.is_file() {
+                rel_paths.insert(rel);
+            }
+        }
+    }
+    for rel in rel_paths {
+        crate::shared_cache::mount(
+            command,
+            Path::new("/dev/null"),
+            &Path::new("/workspace").join(rel),
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+/// One bounded record per checkout kept outside the container-mounted Cargo home.
+/// Checking receipts must never create the selected cache (including for info).
+fn cargo_cache_receipt(root: &Path, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let cache = crate::cache::cache_root(cache_dir)?;
+    let checkout = digest(root.as_os_str().as_encoded_bytes());
+    safe_path(&cache, &format!("cargo-receipts/{checkout}"))
+}
+
+pub(crate) fn workspace_ready(
+    root: &Path,
+    state: &ProjectState,
+    native: &crate::native::NativeAdmission,
+    toolchain: Toolchain,
+    cache_dir: Option<&Path>,
+) -> Result<bool> {
+    let inputs = match toolchain {
+        Toolchain::Node if safe_path(root, "node_modules")?.is_dir() => {
+            return Ok(crate::doctor::read_node_receipt(root)?.is_some_and(|r| {
+                r == crate::doctor::NodeWorkspaceReceipt::new(
+                    &r.platform,
+                    &state.release_identity,
+                    &native.node_inputs.digest,
+                )
+            }));
+        }
+        Toolchain::Rust if native.cargo_workspace.is_some() => &native.rust_inputs,
+        _ => return Ok(false),
+    };
+    let path = safe_path(root, &format!(".devkit/state/{toolchain}-workspace.lock"))?;
+    let expected = workspace_fingerprint(state, inputs);
+    let matches = |path: &Path| -> Result<bool> {
+        Ok(
+            read_regular_file(path, 4096, "workspace receipt")?.is_some_and(|(bytes, _)| {
+                std::str::from_utf8(&bytes).is_ok_and(|value| value.trim() == expected)
+            }),
+        )
+    };
+    Ok(matches(&path)?
+        && (toolchain == Toolchain::Node || matches(&cargo_cache_receipt(root, cache_dir)?)?))
+}
+
+fn require_workspace(
+    admission: &RuntimeAdmission,
+    toolchain: Toolchain,
+    cache_dir: Option<&Path>,
+) -> Result<()> {
+    ensure!(
+        workspace_ready(
+            &admission.root,
+            &admission.state,
+            &admission.native,
+            toolchain,
+            cache_dir
+        )?,
+        "{toolchain} workspace dependencies are absent/stale; run make setup"
+    );
+    Ok(())
+}
+
+fn rust_gate_argv(
+    command: &str,
+    selection: Option<(&str, &[CargoMember])>,
+) -> Result<Vec<OsString>> {
+    let mut argv: Vec<OsString> = [
+        "/devkit/devkit",
+        "internal",
+        "rust",
+        command,
+        "--workspace-root",
+        "/workspace",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    if let Some((component, members)) = selection {
+        argv.extend(["--component".into(), component.into()]);
+        for member in members {
+            argv.extend([
+                "--member".into(),
+                member.rel_dir.as_str().into(),
+                "--fmt-package".into(),
+                member.fmt_package().into(),
+                "--package".into(),
+                member.pkgid()?.into(),
+            ]);
+        }
+    }
+    Ok(argv)
+}
+
 fn node_argv(ctx: &PreparedContext<'_>, argv: Vec<OsString>) -> Vec<OsString> {
     [
         vec![
@@ -1681,6 +1899,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             "doctor",
             "setup",
             "setup-node",
+            "setup-rust",
             "check",
             "fix",
             "test",
@@ -1835,13 +2054,43 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     let full = full.context("Missing quality admission")?;
     let node_digest = &full.native.node_inputs.digest;
     if !full.state.components.is_empty() {
-        ctx.ensure_linux_helper(matches!(request.command.as_str(), "setup" | "setup-node"))?;
+        ctx.ensure_linux_helper(matches!(
+            request.command.as_str(),
+            "setup" | "setup-node" | "setup-rust"
+        ))?;
     }
-    ctx.dirs(workspace_write_directories(
-        &full.state,
-        &full.native.inputs,
-    )?)?;
     let command = request.command.as_str();
+    if command == "setup-rust" {
+        ensure!(
+            full.native.cargo_workspace.is_some(),
+            "Rust workspace is required"
+        );
+        let receipt = safe_path(&ctx.admission.root, ".devkit/state/rust-workspace.lock")?;
+        let cached = cargo_cache_receipt(&full.root, ctx.cache_dir.as_deref())?;
+        remove_file(&receipt)?;
+        remove_file(&cached)?;
+        let image = ctx.derived_image("rust", true)?;
+        ctx.task(ContainerTask {
+            component: None,
+            profile: ToolingProfile::Rust,
+            electron_cache: false,
+            image: &image,
+            argv: &rust_gate_argv("setup", None)?,
+            network: "bridge",
+            forward_npm_secrets: false,
+            access: TaskAccess::SetupRust,
+            inputs: None,
+        })?;
+        full.recheck()?;
+        runner.check_cancelled()?;
+        let fingerprint = format!(
+            "{}\n",
+            workspace_fingerprint(&full.state, &full.native.rust_inputs)
+        );
+        write_atomic(&cached, fingerprint.as_bytes(), 0o644)?;
+        write_atomic(&receipt, fingerprint.as_bytes(), 0o644)?;
+        return Ok(());
+    }
     if command == "setup-node" {
         if full.state.components.values().any(|c| c.role == Role::App) {
             let running = ctx.runner.capture(ctx.compose()?.args([
@@ -1939,17 +2188,25 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
     }
     if command == "doctor" {
         crate::doctor::ensure_disk_space(&ctx.admission.root)?;
-        for (path, c) in full.state.components.clone() {
+        let mut checked_rust = false;
+        let mut checked_node = false;
+        let mut checked_desktop = false;
+        for c in full.state.components.values().cloned().collect::<Vec<_>>() {
             if c.toolchain == Toolchain::Rust {
-                ctx.derived_image("rust", false)?;
-            } else {
+                if !checked_rust {
+                    ctx.derived_image("rust", false)?;
+                    require_workspace(&full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+                    checked_rust = true;
+                }
+            } else if !checked_node {
                 ctx.node_image(false)?;
                 node_ready(&ctx, node_digest)?;
+                checked_node = true;
             }
-            if c.tooling_profile == ToolingProfile::Electron {
+            if c.tooling_profile == ToolingProfile::Electron && !checked_desktop {
                 ctx.derived_image("desktop", false)?;
+                checked_desktop = true;
             }
-            let _ = path;
         }
         full.recheck()?;
         runner.check_cancelled()?;
@@ -1975,27 +2232,31 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             command != "package",
             "package is defined for desktop applications and publishable libraries"
         );
-        let image = ctx.derived_image("rust", setup)?;
-        ctx.task(ContainerTask {
-            component: Some(&target),
-            profile: component.tooling_profile,
-            electron_cache: false,
-            image: &image,
-            argv: &[
-                "/devkit/devkit".into(),
-                "internal".into(),
-                "rust".into(),
-                command.into(),
-            ],
-            network: if setup { "bridge" } else { "none" },
-            forward_npm_secrets: false,
-            access: if command == "fix" {
-                TaskAccess::Fix
-            } else {
-                TaskAccess::Finite
-            },
-            inputs: Some(&full.native.inputs),
-        })?;
+        let image = ctx.derived_image("rust", false)?;
+        require_workspace(&full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+        if !setup {
+            let workspace = full
+                .native
+                .cargo_workspace
+                .as_ref()
+                .context("Missing Cargo workspace")?;
+            let argv = rust_gate_argv(command, Some((&target, workspace.members(&target)?)))?;
+            ctx.task(ContainerTask {
+                component: Some(&target),
+                profile: component.tooling_profile,
+                electron_cache: false,
+                image: &image,
+                argv: &argv,
+                network: "none",
+                forward_npm_secrets: false,
+                access: if command == "fix" {
+                    TaskAccess::Fix
+                } else {
+                    TaskAccess::Finite
+                },
+                inputs: None,
+            })?;
+        }
     } else {
         ctx.node_image(false)?;
         node_ready(&ctx, node_digest)?;
@@ -2154,6 +2415,57 @@ fn cleanup_without_stand(
     }
     Ok(true)
 }
+fn read_cargo_manifest(directory: &Path) -> Result<toml::Value> {
+    let path = input_path(directory, "Cargo.toml")?;
+    let source =
+        read_input_bytes(&path).with_context(|| format!("Cannot read {}", path.display()))?;
+    toml::from_str(std::str::from_utf8(&source)?)
+        .with_context(|| format!("Invalid Cargo manifest: {}", path.display()))
+}
+
+/// Explicit Cargo commands can repair the lock and member manifests. Only
+/// require a virtual root and enough membership evidence to select the workdir.
+fn admit_cargo_exec(root: &Path, target: Option<&str>) -> Result<()> {
+    let manifest = read_cargo_manifest(root)?;
+    let workspace = manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .context("Rust exec requires a virtual root Cargo workspace")?;
+    ensure!(
+        manifest.get("package").is_none(),
+        "Rust exec requires a virtual root Cargo workspace"
+    );
+    if let Some(path) = target {
+        let directory = input_path(root, path)?;
+        ensure!(
+            directory.is_dir(),
+            "Missing registered Rust component: {path}"
+        );
+        ensure!(
+            identity(&input_path(root, format!("{path}/package.json"))?)?.is_none(),
+            "Ambiguous native component: {path}"
+        );
+        if identity(&input_path(root, format!("{path}/Cargo.toml"))?)?.is_none() {
+            let mut found = false;
+            for item in workspace
+                .get("members")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let member = item.as_str().context("Invalid workspace member path")?;
+                let manifest = input_path(root, Path::new(member).join("Cargo.toml"))?;
+                if manifest.starts_with(&directory) && manifest.is_file() {
+                    found = true;
+                    break;
+                }
+            }
+            ensure!(found, "No Cargo manifest or workspace member for {path}");
+        }
+    }
+    Ok(())
+}
+
 pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     ensure!(!request.argv.is_empty(), "exec requires ARGV after --");
     ensure!(
@@ -2171,8 +2483,10 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     let _lock = CheckoutLock::acquire_with(
         &request.runtime.root,
         lock_mode,
-        if lock_mode == CheckoutLockMode::Exclusive {
+        if request.write {
             "exec --write"
+        } else if request.prepare {
+            "exec --prepare"
         } else {
             "exec"
         },
@@ -2181,41 +2495,52 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
     let tool = ToolAdmission::capture(&request.runtime)?;
     runtime_paths(&tool)?;
     let target = tool.target(&request.runtime)?;
-    let toolchain = if let Some(target) = &target {
-        let toolchain = tool.state.components[target].toolchain;
-        let (native, competing) = match toolchain {
-            Toolchain::Node => ("package.json", "Cargo.toml"),
-            Toolchain::Rust => ("Cargo.toml", "package.json"),
-        };
+    let has_rust = tool
+        .state
+        .components
+        .values()
+        .any(|c| c.toolchain == Toolchain::Rust);
+    let has_node = !node_components(&tool.state).is_empty();
+    ensure!(
+        target.is_none() || request.toolchain.is_none(),
+        "Choose a component or a root toolchain; remove the extra selector"
+    );
+    let toolchain = target
+        .as_ref()
+        .map(|t| tool.state.components[t].toolchain)
+        .or(request.toolchain)
+        .unwrap_or(if has_node {
+            Toolchain::Node
+        } else {
+            Toolchain::Rust
+        });
+    ensure!(
+        match toolchain {
+            Toolchain::Node => has_node,
+            Toolchain::Rust => has_rust,
+        },
+        "No registered {toolchain} workspace for exec"
+    );
+    if toolchain == Toolchain::Rust {
+        admit_cargo_exec(&tool.root, target.as_deref())?;
+    } else if let Some(path) = &target {
         ensure!(
-            identity(&input_path(&tool.root, format!("{target}/{native}"))?)?.is_some(),
-            "Missing registered native manifest: {target}/{native}"
+            identity(&input_path(&tool.root, format!("{path}/package.json"))?)?.is_some(),
+            "Missing registered native manifest: {path}/package.json"
         );
         ensure!(
-            identity(&input_path(&tool.root, format!("{target}/{competing}"))?)?.is_none(),
-            "Ambiguous native component: {target}"
+            identity(&input_path(&tool.root, format!("{path}/Cargo.toml"))?)?.is_none(),
+            "Ambiguous native component: {path}"
         );
-        toolchain
     } else {
         ensure!(
-            !node_components(&tool.state).is_empty()
-                && identity(&input_path(&tool.root, "package.json")?)?.is_some(),
-            "Root exec requires a Node workspace; select an app or package with app=, package=, or --component"
+            identity(&input_path(&tool.root, "package.json")?)?.is_some(),
+            "Missing root package.json for Node workspace"
         );
-        Toolchain::Node
-    };
+    }
     let mut ctx = PreparedContext::new(tool, runner, request.runtime.cache_dir.as_deref())?;
     ctx.prerequisite()?;
     ctx.ensure_linux_helper(request.prepare)?;
-    if request.write && toolchain == Toolchain::Node {
-        let receipt = safe_path(&ctx.admission.root, ".devkit/state/node-workspace.lock")?;
-        if identity(&receipt)?.is_some() {
-            fs::remove_file(receipt)?;
-            eprintln!(
-                "devkit: note: workspace lock receipt invalidated by --write; run 'make setup' after dependency changes"
-            );
-        }
-    }
     let image = if toolchain == Toolchain::Rust {
         ctx.derived_image("rust", request.prepare)?
     } else {
@@ -2223,6 +2548,29 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         ctx.pnpm(request.prepare)?;
         ctx.admission.pins.node_image.clone()
     };
+    if request.write {
+        let receipt = safe_path(
+            &ctx.admission.root,
+            &format!(".devkit/state/{toolchain}-workspace.lock"),
+        )?;
+        let mut invalidated = false;
+        if identity(&receipt)?.is_some() {
+            remove_file(&receipt)?;
+            invalidated = true;
+        }
+        if toolchain == Toolchain::Rust {
+            let cached = cargo_cache_receipt(&ctx.admission.root, ctx.cache_dir.as_deref())?;
+            if identity(&cached)?.is_some() {
+                remove_file(&cached)?;
+                invalidated = true;
+            }
+        }
+        if invalidated {
+            eprintln!(
+                "devkit: {toolchain} workspace receipt invalidated by --write; run 'make sync' and 'make setup' after dependency changes"
+            );
+        }
+    }
     let task_result = ctx.task(ContainerTask {
         component: target.as_deref(),
         profile: if toolchain == Toolchain::Rust {
@@ -2247,16 +2595,35 @@ pub fn exec(request: ExecRequest, runner: &ProcessRunner) -> Result<()> {
         inputs: None,
     });
     if let Err(err) = task_result {
-        if (!request.write || request.network == "none")
-            && let Some(cf) = err.downcast_ref::<CommandFailure>()
-        {
-            return Err(failure(
-                cf.code,
-                format!(
-                    "{}; add --write to modify checkout files, --network bridge for network access, or --prepare to pull/build missing tool images",
-                    cf.message
-                ),
-            ));
+        if let Some(cf) = err.downcast_ref::<CommandFailure>() {
+            // The Node image's entrypoint treats an unknown executable as a
+            // JavaScript module and returns 1; alternate entrypoints use 127.
+            if matches!(cf.code, 1 | 127)
+                && has_node
+                && has_rust
+                && target.is_none()
+                && request.toolchain.is_none()
+                && request.argv[0]
+                    .to_str()
+                    .is_some_and(|cmd| matches!(cmd, "cargo" | "rustc" | "rustfmt" | "rustup"))
+            {
+                return Err(failure(
+                    cf.code,
+                    format!(
+                        "{}; root exec uses Node here. Select toolchain=rust (--toolchain rust), app=<name>, or package=<name>",
+                        cf.message
+                    ),
+                ));
+            }
+            if !request.write || request.network == "none" {
+                return Err(failure(
+                    cf.code,
+                    format!(
+                        "{}; use write=1 (--write) to modify checkout files, network=bridge (--network bridge) for network access, or prepare=1 (--prepare) for missing tool images",
+                        cf.message
+                    ),
+                ));
+            }
         }
         return Err(err);
     }
@@ -2933,6 +3300,122 @@ pub fn remove_stand(root: &Path, runner: &ProcessRunner) -> Result<()> {
     history.save(&root)
 }
 
+#[derive(Deserialize)]
+struct CargoRunTarget {
+    name: String,
+    kind: Vec<String>,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackageTargets {
+    default_run: Option<String>,
+    targets: Vec<CargoRunTarget>,
+}
+
+/// Cargo resolves explicit targets, default paths and edition-specific auto
+/// discovery. Query it once at launch only when a managed group needs a choice.
+fn workspace_binary_targets(
+    ctx: &PreparedContext<'_>,
+    image: &str,
+) -> Result<BTreeMap<PathBuf, CargoPackageTargets>> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        packages: Vec<Package>,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        manifest_path: PathBuf,
+        #[serde(flatten)]
+        package: CargoPackageTargets,
+    }
+
+    let output = ctx.run_task(
+        ContainerTask {
+            component: None,
+            profile: ToolingProfile::Rust,
+            electron_cache: false,
+            image,
+            argv: &[
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "/workspace/Cargo.toml",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ]
+            .map(OsString::from),
+            network: "none",
+            forward_npm_secrets: false,
+            access: TaskAccess::ExecReadOnly,
+            inputs: None,
+        },
+        OutputMode::Capture(16 * 1024 * 1024),
+    )?;
+    let metadata: Metadata = serde_json::from_slice(&output.stdout)
+        .context("Cannot read workspace targets from cargo metadata")?;
+    Ok(metadata
+        .packages
+        .into_iter()
+        .map(|mut pkg| {
+            pkg.package
+                .targets
+                .retain(|t| t.kind.iter().any(|k| k == "bin"));
+            (pkg.manifest_path, pkg.package)
+        })
+        .collect())
+}
+
+fn group_run_command(
+    service: &str,
+    members: &[CargoMember],
+    targets: &BTreeMap<PathBuf, CargoPackageTargets>,
+) -> Result<Vec<String>> {
+    let mut runnable = Vec::new();
+    for member in members {
+        let manifest = Path::new("/workspace")
+            .join(&member.rel_dir)
+            .join("Cargo.toml");
+        let package = targets
+            .get(&manifest)
+            .with_context(|| format!("cargo metadata did not return {}", manifest.display()))?;
+        if !package.targets.is_empty() {
+            runnable.push((member, package));
+        }
+    }
+    if let [(member, package)] = runnable.as_slice()
+        && (package.targets.len() == 1 || package.default_run.is_some())
+    {
+        return cargo_run_command(Some(member));
+    }
+    ensure!(
+        !runnable.is_empty(),
+        "No binary targets in {service}. Set services.{service}.command in compose.yaml or add a binary"
+    );
+    let mut choices = Vec::new();
+    for (member, package) in runnable {
+        for bin in &package.targets {
+            let mut command = cargo_run_command(Some(member))?;
+            if !bin.required_features.is_empty() {
+                command.extend([
+                    "--features".into(),
+                    bin.required_features.join(",").replace('$', "$$"),
+                ]);
+            }
+            command.push(format!("--bin={}", bin.name.replace('$', "$$")));
+            choices.push(serde_json::to_string(&command)?);
+        }
+    }
+    anyhow::bail!(
+        "Cannot select a Cargo binary to run for {service}. Choose a command for services.{service}.command in compose.yaml.\n{}",
+        choices.join("\n")
+    );
+}
+
 fn run_development(
     request: &RuntimeRequest,
     target: &str,
@@ -2965,11 +3448,39 @@ fn run_development(
     let state_dir = safe_path(&ctx.admission.root, ".devkit/state")?;
     let mut overlays = Vec::new();
     let mut uses_desktop = false;
+    let mut rust_services = serde_json::Map::new();
+    let mut workspace_targets = None;
     for path in reached {
         let c = &full.state.components[&path];
         if c.toolchain == Toolchain::Rust {
-            ctx.derived_image("rust", false)?;
-            ctx.cache_directory("cargo")?;
+            let image = ctx.derived_image("rust", false)?;
+            require_workspace(full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+            let cargo_cache = ctx.cache_directory("cargo")?;
+            assert_clean_cargo_home(&cargo_cache)?;
+            ctx.dirs(["target".into()])?;
+            if c.development
+                .as_ref()
+                .is_some_and(|d| d.owner == DevelopmentOwner::Managed)
+            {
+                let name = service_name(&path, c);
+                let workspace = full
+                    .native
+                    .cargo_workspace
+                    .as_ref()
+                    .context("Missing Cargo workspace")?;
+                let members = workspace.members(&path)?;
+                if members.len() > 1
+                    && model["services"][name].get("command")
+                        == Some(&json!(cargo_run_command(None)?))
+                {
+                    let targets = match &workspace_targets {
+                        Some(targets) => targets,
+                        None => workspace_targets.insert(workspace_binary_targets(ctx, &image)?),
+                    };
+                    let command = group_run_command(name, members, targets)?;
+                    rust_services.insert(name.to_owned(), json!({"command":command}));
+                }
+            }
         } else {
             ctx.node_image(false)?;
             ctx.pnpm(false)?;
@@ -2987,11 +3498,18 @@ fn run_development(
             overlays.push(file);
         }
     }
-    ctx.dirs(full.state.components.iter().flat_map(|(p, c)| {
-        profile_outputs(c.tooling_profile)
-            .iter()
-            .map(move |o| format!("{p}/{o}"))
-    }))?;
+    if !rust_services.is_empty() {
+        let mut file = tempfile::Builder::new()
+            .prefix("cargo-run-")
+            .suffix(".json")
+            .tempfile_in(&state_dir)?;
+        file.write_all(&json_bytes(&json!({"services":rust_services}))?)?;
+        overlays.push(file);
+    }
+    ctx.dirs(workspace_write_directories(
+        &full.state,
+        &full.native.node_inputs,
+    )?)?;
     let mut protected_services = serde_json::Map::new();
     let virtual_store = input_path(&ctx.admission.root, "node_modules/.pnpm")?;
     for (path, component) in &full.state.components {
@@ -3651,7 +4169,7 @@ pub fn enrich_describe(full: &RuntimeAdmission, cache_dir: Option<&Path>) -> Res
         &full.root,
         &full.state,
         &full.pins,
-        Some(&full.native.node_inputs.digest),
+        Some(&full.native),
         None,
         cache_dir,
     )?;
@@ -3667,13 +4185,10 @@ pub fn enrich_describe(full: &RuntimeAdmission, cache_dir: Option<&Path>) -> Res
     }))
 }
 
-pub fn inspect_status(root: &Path, runner: &ProcessRunner) -> Result<(Value, String)> {
-    inspect_status_with_cache(root, runner, None)
-}
-pub fn inspect_status_with_cache(
+pub fn inspect_status(
     root: &Path,
-    runner: &ProcessRunner,
     cache_dir: Option<&Path>,
+    runner: &ProcessRunner,
 ) -> Result<(Value, String)> {
     let root = project_root(root)?;
     ensure_supported_checkout_floor(&root, false, MIN_SUPPORTED_PROJECT_VERSION)?;
@@ -3854,6 +4369,85 @@ pub fn resolve_cargo_build_jobs() -> Result<usize> {
 mod tests {
     use super::resolve_cargo_build_jobs_from;
     use std::ffi::OsStr;
+
+    #[test]
+    fn group_launch_uses_cargo_targets_and_emits_composable_override_commands() {
+        use super::{cargo_run_command, group_run_command};
+        use crate::native::{CargoMember, CargoPackageId};
+        use std::{collections::BTreeMap, path::PathBuf};
+
+        let members = ["service", "model"].map(|name| CargoMember {
+            rel_dir: format!("apps/api/branch$name/{name}"),
+            id: CargoPackageId {
+                name: name.into(),
+                version: "1.0.0".into(),
+                source: None,
+            },
+            dependencies: Vec::new(),
+        });
+        let [service, model] = members.each_ref().map(|m| {
+            PathBuf::from("/workspace")
+                .join(&m.rel_dir)
+                .join("Cargo.toml")
+        });
+        let targets_for = |default_run: Option<&str>, bins: serde_json::Value| {
+            serde_json::from_value(
+                serde_json::json!({ "default_run": default_run, "targets": bins }),
+            )
+            .unwrap()
+        };
+        let server = serde_json::json!({"name":"api","kind":["bin"]});
+        let job = serde_json::json!({"name":"maintenance","kind":["bin"],"required-features":["admin","util/jobs"]});
+        let mut targets = BTreeMap::from([
+            (service.clone(), targets_for(None, serde_json::json!([job]))),
+            (model.clone(), targets_for(None, serde_json::json!([]))),
+        ]);
+        let default = cargo_run_command(Some(&members[0])).unwrap();
+        // Cargo handles a single target or an explicit default-run, including its default features.
+        assert_eq!(
+            group_run_command("api", &members, &targets).unwrap(),
+            default
+        );
+        targets.insert(
+            service.clone(),
+            targets_for(Some("maintenance"), serde_json::json!([server, job])),
+        );
+        assert_eq!(
+            group_run_command("api", &members, &targets).unwrap(),
+            default
+        );
+
+        for (service_bins, model_bins, job_member) in [
+            (
+                serde_json::json!([server, job]),
+                serde_json::json!([]),
+                &members[0],
+            ),
+            (
+                serde_json::json!([server]),
+                serde_json::json!([job]),
+                &members[1],
+            ),
+        ] {
+            targets.insert(service.clone(), targets_for(None, service_bins));
+            targets.insert(model.clone(), targets_for(None, model_bins));
+            let error = group_run_command("api", &members, &targets)
+                .unwrap_err()
+                .to_string();
+            let choices: Vec<Vec<String>> = error
+                .lines()
+                .skip(1)
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let mut expected_server = default.clone();
+            expected_server.push("--bin=api".to_owned());
+            let mut expected_job = cargo_run_command(Some(job_member)).unwrap();
+            expected_job
+                .extend(["--features", "admin,util/jobs", "--bin=maintenance"].map(str::to_owned));
+            assert!(expected_job.iter().any(|arg| arg.contains("branch$$name")));
+            assert_eq!(choices, [expected_server, expected_job]);
+        }
+    }
 
     #[test]
     fn cargo_build_jobs_prioritizes_overrides_caps_defaults_and_rejects_invalid_bounds() {

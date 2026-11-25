@@ -22,40 +22,44 @@ make test
 make build
 ```
 
-Review `git diff` and commit the updated `.devkit/*`, component `devDependencies` (`toolDependencies`), and `pnpm-lock.yaml`.
+Review the diff, including new root workspace files and removed component-local files, and commit the whole change together.
 
-## Supported Upgrade Window
+## Supported upgrade window
 
-Version `0.6.0` accepts checkouts from `0.5.0` onward. On Linux x86-64, update a `0.5.x` checkout with `make update to=0.6.0 preview=1`, then run it again without `preview=1`. On Linux ARM64, use the `0.6.0` npm command above or the versioned installer. The loader checked into a `0.5.x` repository requires x86-64. Create the upgrade branch with `git switch -c` or `wt switch --create --no-hooks` so Worktrunk does not invoke that loader.
+Devkit `0.6.0` supports direct upgrades from `0.5.0` and `0.5.1`. The minimum accepted version is recorded in `release.json` as `minSupportedFromVersion`. Older checkouts are rejected before acquiring locks or changing files.
 
-For a `0.4.x` repository, run the following on Linux x86-64 before following the standard upgrade flow. A `0.2.x` or `0.3.x` repository must first update to `0.4.1` on that host.
+| Accepted checkout  | Next step                                                                                                                        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `0.5.x`            | Preview the update to `0.6.0`, then apply it. On Linux ARM64, invoke `@docouno/devkit@0.6.0` directly rather than `make update`. |
+| `0.4.x`            | On Linux x86-64, run `npx @docouno/devkit@0.5.1 update . --to 0.5.1`, run setup and checks, and commit that migration first.     |
+| `0.2.x` or `0.3.x` | On Linux x86-64, reach `0.4.1` with `npx @docouno/devkit@0.4.1 update . --to 0.4.1`, verify it, then bridge through `0.5.1`.     |
+
+The loader checked into a `0.5.x` repository requires x86-64. On Linux ARM64, create the upgrade branch with `git switch -c` or `wt switch --create --no-hooks` so Worktrunk does not invoke that loader, then run the `0.6.0` npm command above or the versioned installer.
+
+For a schema 1 checkout, first use the published `0.2.1` bootstrap on Linux x86-64 to migrate to schema 2. Run these commands from the checkout on your upgrade branch, verify the result, then follow the `0.2.x` steps above.
 
 ```sh
-npx @docouno/devkit@0.5.1 update . --to 0.5.1
+bootstrap=$(mktemp)
+curl -fsSL https://github.com/docouno/devkit/releases/download/v0.2.1/bootstrap.sh -o "$bootstrap"
+bash "$bootstrap" update "$PWD" --version 0.2.1
 make setup
 make check
 ```
 
-## Files affected by an update
+## Workspace migration and file ownership
 
-Use `make update to=VERSION preview=1` to review changes from a checkout on `0.5.0` or later. Apply with `make update to=VERSION` and run `make recover` if a local transaction is interrupted.
+On `0.5.x` and later on Linux x86-64, the checkout's Makefile can preview and apply the update.
 
-If a `0.4.x` to `0.5.0` update leaves the older loader installed, use the `0.5.0` installer with `recover .` or `npx @docouno/devkit@0.5.0 recover .`. For journals older than `0.5.0` that exceed 4 MiB, run recovery with the pinned release that wrote the journal.
+```sh
+make update to=0.6.0 preview=1
+make update to=0.6.0
+```
 
-- **Updated automatically**:
-  - `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.*.yaml|json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`
-  - On upgrade to `0.6.0`, projects without a registered Electron component drop the managed desktop Dockerfile, seccomp profile, associated notices, desktop recipe pin and tool Compose entries. Adding or registering the first Electron app restores them in the same transaction as registration.
-  - `{rust-component}/rust-toolchain.toml`
-  - Managed `toolDependencies` entries inside `{node-component}/package.json` `devDependencies`
-  - Root `pnpm-workspace.yaml` membership, the release-day age exception for the accepted `@docouno/env` version, and `pnpm-lock.yaml`
-  - Registered internal Node dependencies become `workspace:*` (or `workspace:^` between public libraries); legacy npm linking settings are removed from root `.npmrc` during the 0.5 migration
-- **Preserved untouched**:
-  - Component source (`src/**`, `test/**`, `tests/**`)
-  - Product fields and scripts, external dependencies and peer dependencies, and product-added `devDependencies` in `{component}/package.json`
-  - `{rust-component}/Cargo.toml` and `{rust-component}/Cargo.lock`
-  - Root `Makefile`, `compose.yaml`, and `.env`; registry routing and environment placeholders in `.npmrc`
+Rust projects gain a virtual root Cargo workspace. Existing crate names, dependencies and selected versions carry forward. The migration combines compatible component locks into one root `Cargo.lock`, moves workspace-wide Cargo settings and formatting to the root, and installs the target release's root `rust-toolchain.toml`. Preview and apply both run pinned Cargo in Docker when the combined graph needs verification beyond the known templates or simple local dependencies. If the old components disagree, preview identifies the paths to reconcile on `0.5.x`. The old build directories remain local to the checkout and can be removed once the new build has succeeded. See the [Cargo migration guide](migrations/0.6.0.md#adopt-the-root-cargo-workspace).
 
-If a managed file under `.devkit/` was edited manually, `devkit update` aborts before modifying the repository so local changes are never overwritten silently.
+On upgrade to `0.6.0`, projects without a registered Electron component also drop the managed desktop Dockerfile, seccomp profile, associated notices, desktop recipe pin, and desktop tool Compose service. Adding or registering the first Electron app restores them in the same transaction as registration.
+
+Updates also refresh managed runtime files, Make/Compose projections, and the accepted Node tool dependencies and pnpm workspace lock where applicable. Product source, root `Makefile`, `compose.yaml`, registry settings and project-owned environment files stay under your control. Devkit checks managed file identities before applying changes.
 
 ## Transitive Lockfile Reconciliation (`--reconcile-lock`)
 
@@ -83,9 +87,10 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 
 ## Cross-release dispatch
 
-Daily commands select the checked-in release and verify the engine for the current host. `describe`, `status`, `info`, and stand cleanup operate offline. `info` can report checkout state while the cache is cold or busy. `doctor` inspects the host and checkout without holding the checkout lock.
-
-`init --to VERSION` and `update --to VERSION` resolve the requested release. When that release has no engine for the current host, use a release that provides one. To migrate an x86-64-only `0.5.x` checkout on Linux ARM64, start the update directly with the `0.6.0` CLI.
+- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.5.0+` engine for the current host whenever it differs from the running binary.
+- `devkit stand` (`reserve` / `remove`) selects the cached accepted `0.5.0+` engine locally without network access and refuses before locking on checkouts older than `0.5.0`. If another process is installing the accepted engine, retry the stand command once installation finishes.
+- Read-only `devkit describe` and `devkit status` delegate when the accepted engine is already cached locally and remain strictly offline otherwise; `devkit info` uses a cached accepted `0.5.0+` engine offline and returns a local summary if the engine is unavailable or its cache lock is busy, while `devkit doctor` runs lock-free against the host and checkout directly.
+- `devkit init --to <version>` and `devkit update --to <version>` (for `<version> >= 0.5.0`) resolve and verify the target release first; whenever `<version>` differs from the currently running `devkit` binary, execution delegates symmetrically to the verified `<version>` engine. When a release has no engine for the current host, use a release that provides one — to migrate an x86-64-only `0.5.x` checkout on Linux ARM64, start the update directly with the `0.6.0` CLI.
 
 ### Choosing a CLI for headless projects
 
@@ -93,10 +98,6 @@ Use the checkout's Make targets, `sh .devkit/runtime/devkit.sh cli <command> ...
 
 ## Recovering Interrupted Updates (`devkit recover`)
 
-Updates commit through a crash-safe staging journal (`.devkit/update-pending.json`). If a process crash or power loss interrupts an update mid-commit:
+Updates use a local transaction journal at `.devkit/update-pending.json`. After an interruption, run `make recover` from the affected checkout. Devkit verifies the recorded file identities before restoring the pre-update bytes and modes. A second recovery reports that there is no pending transaction.
 
-```sh
-npx @docouno/devkit@0.6.0 recover .
-```
-
-`devkit recover` verifies backed-up file digests and rolls the repository back to its exact pre-update state without requiring network access or Docker (for an interrupted pre-`0.4.0` update journal, run `npx @docouno/devkit@0.4.1 recover .`).
+If the `0.5.x` loader is still in place, follow the [0.6.0 offline recovery instructions](migrations/0.6.0.md#recover-an-interrupted-update) to locate and run the verified engine in your configured cache. An already installed `0.6.0` CLI can also run `devkit recover .`. For an older interrupted release, use the version that wrote its journal.

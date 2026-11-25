@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86-64 and ARM64 with Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86-64 and ARM64 with Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --template TEMPLATE\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME | --toolchain node|rust] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client, rust-library.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -285,6 +285,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             "ts-library",
             "react-ui",
             "react-client",
+            "rust-library",
         ] {
             let template = crate::catalog::template(name)?;
             entries.push(json!({"id":name,"role":template.role,"toolchain":template.toolchain,"profile":template.profile}));
@@ -292,7 +293,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         globals.emit(
             "catalog",
             json!({"templates":entries,"presets":["fullstack-web","fullstack-desktop","design-system"]}),
-            "Applications: node-api, rust-api, react-web, electron-react\nPackages: ts-library, react-ui, react-client\nPresets: fullstack-web (Rust API and React web), fullstack-desktop (Rust API, shared React web and Electron), design-system (React UI library and playground)",
+            "Applications: node-api, rust-api, react-web, electron-react\nPackages: ts-library, react-ui, react-client, rust-library\nPresets: fullstack-web (Rust API and React web), fullstack-desktop (Rust API, shared React web and Electron), design-system (React UI library and playground)",
         );
         return Ok(());
     }
@@ -344,7 +345,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             return Err(err);
         }
         let (result, human, ok) =
-            crate::doctor::run_doctor_with_cache(&target, runner, globals.cache_dir.as_deref())?;
+            crate::doctor::run_doctor(&target, globals.cache_dir.as_deref(), runner)?;
         if ok {
             globals.emit("doctor", result, &human);
             return Ok(());
@@ -364,7 +365,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         dispatch_accepted(command, &globals, runner)?;
         let root = project_root(&resolve_metadata_target(&globals.args[1..])?)?;
         let (result, human) =
-            crate::runtime::inspect_status_with_cache(&root, runner, globals.cache_dir.as_deref())?;
+            crate::runtime::inspect_status(&root, globals.cache_dir.as_deref(), runner)?;
         globals.emit("status", result, &human);
         return Ok(());
     }
@@ -385,8 +386,8 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         let (result, human) = crate::info::inspect(
             &target,
             options.value("--app")?,
-            runner,
             globals.cache_dir.as_deref(),
+            runner,
         )?;
         globals.emit("info", result, &human);
         return Ok(());

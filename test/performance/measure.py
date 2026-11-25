@@ -31,7 +31,7 @@ def snapshot(root):
     """All source/config/locks, including untracked files, link targets and modes."""
     root = Path(root)
     components = json.loads((root / ".devkit/manifest.json").read_text())["components"]
-    excluded = {".git", ".devkit/state", ".devkit/cache", "node_modules"}
+    excluded = {".git", ".devkit/state", ".devkit/cache", "node_modules", "target"}
     excluded.update(f"{component}/{name}" for component in components
                     for name in ("target", "dist", "release", "node_modules"))
     records = {}

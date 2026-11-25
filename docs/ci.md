@@ -32,7 +32,7 @@ jobs:
           path: |
             ${{ env.DEVKIT_CACHE_DIR }}
             .devkit/cache
-          key: devkit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', '**/Cargo.lock') }}
+          key: devkit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', 'Cargo.lock') }}
           restore-keys: |
             devkit-${{ runner.os }}-${{ runner.arch }}-
 
@@ -75,6 +75,7 @@ cache:
     files:
       - .devkit/manifest.json
       - pnpm-lock.yaml
+      # Add Cargo.lock for repositories with Rust components
   paths:
     - .devkit/cache/
 
@@ -127,7 +128,7 @@ publish_packages:
 
 To run lifecycle commands (`init`, `update`, `sync`) without public internet access:
 
-1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`) and pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` into the runner's Docker daemon (or mirror them carefully by digest).
+1. Pre-stage the verified release directory (`devkit-<version>.tar.gz` extracted to `/opt/devkit/releases/<version>`), pre-load the pinned container images listed in `.devkit/runtime/toolchains.env` (and the digest-pinned Rust base image in `.devkit/runtime/rust.Dockerfile` for Rust projects) into the runner's Docker daemon, and populate the Cargo cache under `DEVKIT_CACHE_DIR/cargo` when offline Cargo resolution is needed.
 2. Prime the local cache once using `--release-root`:
    ```sh
    /opt/devkit/releases/0.6.0/bin/devkit sync . \
@@ -147,7 +148,7 @@ Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI
 
 ## Devkit release verification on Apple Silicon
 
-While Apple Silicon remains behind the publication gate, the host-only `build-darwin-arm64` and `darwin-preview` CI jobs run on `macos-15` in parallel with the required Linux assembly and verification checks without blocking Linux PR checks or Linux-only releases. They exercise the native CLI and the stock shell and Make entry points, and upload the three-target `devkit-darwin-preview` artifact. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
+While Apple Silicon remains behind the publication gate, the `build-darwin-arm64` job (`macos-15`) and the `darwin-preview` workflow (assembling and uploading `devkit-darwin-preview-<attempt>` on `ubuntu-24.04`, then verifying it on `macos-15`) run in parallel with the required Linux assembly and verification checks without blocking Linux PR checks or Linux-only releases. They exercise the native CLI and the stock shell and Make entry points. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
 
 On Linux x86-64, take the run ID, three-target preview artifact name, and preview index SHA-256 from the candidate CI Actions run and its `darwin-preview` assembly summary. Set `run_id`, `preview_artifact`, and `preview_sha256` accordingly. From the candidate checkout, generate a fullstack web project, run its gates, and send the preview, Git bundle, and x86-64 receipt to the ARM64 runner at `linux_arm_host`.
 

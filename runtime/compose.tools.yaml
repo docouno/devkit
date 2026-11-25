@@ -95,6 +95,7 @@ services:
   rust:
     <<: *task
     image: "${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}"
+    working_dir: /workspace
     # rustdoc compiles temporary test executables here. Keep the source read-only.
     tmpfs:
       - /tmp:mode=1777,exec
@@ -102,17 +103,19 @@ services:
       HOME: /tmp/devkit-home
       CI: "true"
       CARGO_HOME: /cache/cargo
-      CARGO_TARGET_DIR: "/workspace/${DEVKIT_CURRENT_COMPONENT:-.}/target"
+      CARGO_TARGET_DIR: "/workspace/target"
       RUSTUP_AUTO_INSTALL: "0"
       DEVKIT_RUST_VERSION: "${DEVKIT_RUST_VERSION:?}"
     volumes:
       - *source
-      - *component
+      - <<: *component
+        target: "/workspace/${DEVKIT_CURRENT_COMPONENT:-.}"
       - type: bind
-        source: "${DEVKIT_COMPONENT_ROOT:-${DEVKIT_PROJECT_ROOT}}/target"
-        target: "/workspace/${DEVKIT_CURRENT_COMPONENT:-.}/target"
+        source: "${DEVKIT_PROJECT_ROOT:?}/target"
+        target: "/workspace/target"
         bind: {create_host_path: false, selinux: z}
       - type: bind
         source: "${DEVKIT_CARGO_CACHE_DIR:-/devkit/unused-cargo}"
         target: /cache/cargo
+        read_only: true
         bind: {create_host_path: false, selinux: z}

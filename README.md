@@ -1,6 +1,6 @@
 # Devkit
 
-A shared development environment for independent TypeScript and Rust repositories. Create applications and npm libraries from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
+A shared development environment for independent TypeScript and Rust repositories. Create applications and libraries from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
 Requires Linux x86-64 or ARM64, GNU Make, and a local Linux Docker Engine with Docker Compose 5.0.0 or newer. Node.js is needed only for the optional npm entry point.
 
@@ -32,7 +32,7 @@ Both entry points verify the native CLI for the host architecture. A checkout re
 
 ## Applications, libraries and presets
 
-Application templates include `node-api`, `rust-api`, `react-web`, and `electron-react`. Package templates include `ts-library`, `react-ui`, and `react-client`. Repositories can host `0..N` applications and `1..M` packages — including standalone library workspaces without applications:
+Application templates include `node-api`, `rust-api`, `react-web`, and `electron-react`. Package templates include `ts-library`, `react-ui`, `react-client`, and `rust-library`. Repositories can host `0..N` applications and `1..M` packages — including standalone library workspaces without applications:
 
 ```sh
 npx @docouno/devkit@0.6.0 init my-sdk --package sdk=ts-library
@@ -52,7 +52,7 @@ fullstack-product/
     └── client/    # UI and logic shared by web and desktop
 ```
 
-Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. Node components share `pnpm-workspace.yaml` and `pnpm-lock.yaml` with isolated package links; Rust components own their Cargo manifests and locks.
+Applications are runnable product entry points. Packages hold shared or publishable code (`ts-library` and `react-ui` start with `"private": true` and opt into publication in `package.json`). The `design-system` preset pairs a `react-ui` package with `apps/playground` using source-level Vite HMR. Node components share `pnpm-workspace.yaml` and `pnpm-lock.yaml` with isolated package links. Rust components share a virtual root `Cargo.toml`, `Cargo.lock`, toolchain pin, formatter settings and checkout-local `target/`.
 
 After initialization, use the checkout's Makefile for daily work and maintenance. Add components as the repository grows:
 
@@ -63,26 +63,39 @@ make add-app name=desktop template=electron-react use=client
 make setup
 ```
 
-Use `make register app=NAME profile=ID` or `make register package=NAME profile=ID` to adopt existing source. Run `make sync` after editing `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
+Use `make register app=NAME profile=ID` or `make register package=NAME profile=ID` to adopt existing source. Run `make sync` after changing Cargo dependencies, `package.json` metadata (`name`, `"private": false`, `exports`, `publishConfig`) or `.npmrc`:
 
 ```sh
 make sync
 ```
 
+Create a Rust workspace with two binaries that depend on the same library.
+
+```sh
+npx @docouno/devkit@0.6.0 init services --package protocol=rust-library
+cd services
+make add-app name=server template=rust-api use=protocol
+make add-app name=worker template=rust-api use=protocol
+make setup
+make test app=server
+```
+
+Setup fetches the workspace's locked dependencies once. Both apps reuse matching Cargo artifacts in `target/`. The selected test gate runs the server's tests. See [Rust workspace workflows](docs/workflows.md#rust-workspaces).
+
 ## Development
 
-| Command            | Purpose                                                                   |
-| ------------------ | ------------------------------------------------------------------------- |
-| `make help`        | List the project commands and registered apps and packages, offline       |
-| `make setup`       | Prepare accepted images and dependencies                                  |
-| `make info`        | Show the branch, checkout readiness, service state and leased addresses   |
-| `make sync`        | Synchronize projections and `pnpm-lock.yaml` after manifest edits         |
-| `make check`       | Check source, types, formatting, lint and applicable native gates         |
-| `make test`        | Run the registered components' native test suites                         |
-| `make build`       | Build the registered components                                           |
-| `make package`     | Package Electron apps or publishable libraries (`ts-library`, `react-ui`) |
-| `make dev app=web` | Start one application's development service                               |
-| `make down`        | Stop services while preserving data volumes                               |
+| Command            | Purpose                                                                    |
+| ------------------ | -------------------------------------------------------------------------- |
+| `make help`        | List the project commands and registered apps and packages, offline        |
+| `make setup`       | Prepare accepted images and dependencies                                   |
+| `make info`        | Show the branch, checkout readiness, service state and leased addresses    |
+| `make sync`        | Synchronize workspace locks and component build order after manifest edits |
+| `make check`       | Check source, types, formatting, lint and applicable native gates          |
+| `make test`        | Run the registered components' native test suites                          |
+| `make build`       | Build the registered components                                            |
+| `make package`     | Package Electron apps or publishable libraries (`ts-library`, `react-ui`)  |
+| `make dev app=web` | Start one application's development service                                |
+| `make down`        | Stop services while preserving data volumes                                |
 
 Use `app=NAME` or `package=NAME` for setup, check, fix, test, build and package. `make down` stops the project stack. The root Makefile belongs to the product, so custom targets and dependencies remain part of the build.
 
@@ -108,13 +121,13 @@ make setup
 make check
 ```
 
-Use `make exec command='pnpm …'` for commands in the root Node workspace (pass `-w` with `pnpm add` or `pnpm remove` at the workspace root). Run `make info json=1` for a machine-readable checkout summary. `make status` remains an alias for `make info`.
+Use `make exec command='pnpm …'` for commands in the root Node workspace (pass `-w` with `pnpm add` or `pnpm remove` at the workspace root). Use `make exec toolchain=rust command='cargo metadata --no-deps'` at the root of a mixed workspace. Run `make info json=1` for a machine-readable checkout summary. `make status` remains an alias for `make info`.
 
 `make package app=desktop` builds a Linux Electron directory and archive; `make package package=ui` builds a verified `.tgz` tarball and receipt (`publint` + `@arethetypeswrong/core`) for publishable libraries.
 
 ## Update an existing project
 
-From a `0.5.1` checkout on Linux x86-64, preview the transition to `0.6.0` on a branch and inspect the migration notes before applying it. For a project without Electron, Make lists the old desktop runtime and its third-party notices for removal. To inspect file hashes and modes before and after the upgrade, run `sh .devkit/runtime/devkit.sh cli update . --to 0.6.0 --preview --json`.
+From a `0.5.x` checkout on Linux x86-64, preview the migration to `0.6.0` and apply it on a branch. For a project without Electron, preview also lists the old desktop runtime and its third-party notices for removal. To inspect file hashes and modes before and after the upgrade, run `sh .devkit/runtime/devkit.sh cli update . --to 0.6.0 --preview --json`.
 
 ```sh
 git switch -c chore/devkit-0.6.0
@@ -124,11 +137,15 @@ make setup
 make check
 ```
 
-Pass `reconcile=1` when transitive lockfile dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Application source, product dependencies and project-owned Make/Compose files retain their ownership. Conflicting edits to managed files stop the update.
+Both preview and apply verify the merged Cargo lock before changing the checkout. Devkit can verify known template and simple local dependency graphs directly. Other Rust graphs need pinned Cargo in Docker, with cached dependencies or network access.
 
-After an interrupted update, `make recover` restores the known transaction state. See [Upgrading](docs/upgrades.md) for recovery while the older loader is still installed.
+Pass `reconcile=1` when transitive pnpm dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Application source, product dependencies and project-owned Make/Compose files retain their ownership. Conflicting edits to managed files stop the update.
 
-On Linux ARM64, use `npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview` for a `0.5.x` checkout, then apply the update without `--preview`. Older checkouts must first adopt `0.5.1` on Linux x86-64. See the [upgrade window](docs/upgrades.md#supported-upgrade-window).
+On Linux ARM64, use `npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview` for a `0.5.x` checkout, then apply the update without `--preview`.
+
+After an interrupted update, `make recover` restores the previous checkout offline from the local journal. See [Upgrading](docs/upgrades.md) for recovery while the older loader is still installed.
+
+Projects on `0.4.x` first run `npx @docouno/devkit@0.5.1 update . --to 0.5.1` on Linux x86-64. Projects on `0.2.x` or `0.3.x` must reach `0.4.1` before that step. For Rust workspace conflicts, headless desktop asset removal, and offline rollback, follow the [0.6.0 migration guide](docs/migrations/0.6.0.md). See also the [upgrade window](docs/upgrades.md#supported-upgrade-window).
 
 ## Documentation
 

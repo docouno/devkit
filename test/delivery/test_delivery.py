@@ -422,6 +422,7 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
         baseline = Path(os.environ["DEVKIT_BASELINE_SET"]) / "payload"
         old_engine = baseline / "devkit"
         upgraded = None
+        removed = []
         for route in ("native", "git"):
             target = self.root / ("legacy " + route)
             token = uuid.uuid4().hex
@@ -448,22 +449,29 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
             def find_actor():
                 return run("docker", "ps", "--quiet", "--no-trunc", "--filter", f"label={label}={token}").stdout.strip()
             try:
+                # A pre-stand Compose checkout already owns this named volume.
+                project = "devkit-" + hashlib.sha256(str(target.resolve()).encode()).hexdigest()[:16]
+                volume = project + "_store"
+                run("docker", "volume", "create", "--label", f"com.docker.compose.project={project}",
+                    "--label", "com.docker.compose.volume=store", "--label", f"{label}={token}", volume)
                 run("make", "setup")
                 run("make", "up")
                 cid = find_actor()
                 observed = json.loads(run("docker", "container", "inspect", cid).stdout)[0]
-                volume = next(m["Name"] for m in observed["Mounts"] if m["Destination"] == "/state")
+                self.assertEqual(next(m["Name"] for m in observed["Mounts"] if m["Destination"] == "/state"), volume)
                 run("docker", "exec", cid, "node", "-e", f"require('node:fs').writeFileSync('/state/value',{json.dumps(token)})")
                 if route == "native":
                     run("make", "down")
                     run(ENGINE, "update", ".", "--to", self.version, "--release-root", RELEASE, "--non-interactive")
-                    updated = json.loads((target / ".devkit/manifest.json").read_text())
+                    # Deliver every tracked or new product change produced by update, including deletions.
+                    changed = run("git", "ls-files", "--modified", "--others", "--exclude-standard", "-z").stdout
+                    changed_paths = set(changed.rstrip("\0").split("\0"))
+                    removed = [name for name in changed_paths if not (target / name).exists()]
                     upgraded = {name: ((target / name).read_bytes(), stat.S_IMODE((target / name).stat().st_mode))
-                                for name in [*updated["managed"], ".devkit/manifest.json"]}
+                                for name in changed_paths if name not in removed}
                 else:
                     run("git", "switch", "-c", "toolchain-update")
-                    old_state = json.loads((target / ".devkit/manifest.json").read_text())
-                    for name in old_state["managed"].keys() - upgraded.keys():
+                    for name in removed:
                         (target / name).unlink()
                     for name, (data, mode) in upgraded.items():
                         path = target / name

@@ -1,5 +1,8 @@
+mod cargo;
+
 use crate::{
     Result,
+    cargo_lock::{CargoLockResolver, DockerCargoLockResolver},
     catalog::*,
     compose::assert_compose_inventory,
     files::*,
@@ -29,7 +32,9 @@ const PROJECT_GITIGNORE:&[u8]=b"**/node_modules/\n/dist/\n/target/\n/release/\n/
 const PROJECT_AGENTS: &[u8] = b"# Development instructions\n\n\
 - Start with `make help` and `make info`. Use `make setup` to prepare pinned tools and dependencies.\n\
 - Run `make check`, `make test`, and `make build` in the checkout. These gates use offline containers.\n\
-- Change dependencies through `make exec` with an explicit component selector and lockfile-only flags, for example `make exec app=<name> write=1 network=bridge command='pnpm add <pkg> --lockfile-only --ignore-scripts'` (or `package=<name>`, `-w` for `pnpm add`/`pnpm remove` in the root Node workspace without a selector, `prepare=1` before the first `make setup`, and `cargo` inside `app=`/`package=` for Rust), then run `make setup` (and `make sync` after manual `package.json` or `.npmrc` edits). Do not edit managed `toolDependencies` manually or invoke host package managers.\n\
+- Edit Node dependencies through `make exec app=<name> write=1 network=bridge command='pnpm add <pkg> --lockfile-only --ignore-scripts'`. Use `package=<name>` for a library and `-w` for root pnpm add/remove. Use `prepare=1` before the first setup. Keep managed `toolDependencies` in sync with the accepted release.\n\
+- Rust crates share a virtual root Cargo.toml, Cargo.lock, formatter settings and a checkout-local target directory. Use `make exec app=<name> write=1 network=bridge command='cargo add <pkg>'` (or `package=<name>` for a library) for a crate, or `toolchain=rust` for root Cargo commands in mixed projects.\n\
+- Run `make sync` after editing native manifests or .npmrc, then `make setup` to refresh dependencies and readiness.\n\
 - Use `make add-app`, `make add-package`, `make register`, `make sync`, `make update`, and `make recover` to manage components and environment updates.\n\
 - Set `DEVKIT_PREVIEW_URL_TEMPLATE` in the checkout's root `.env` for a preview reverse proxy. To share the template from the checkout on branch `next`, run `git config --local devkit.previewSourceBranch next` once in this clone.\n\
 - In non-interactive Worktrunk sessions (including agent PTY runners), pass `--yes` (`wt switch --create --no-cd --yes <branch>`, `wt remove --foreground --yes <branch>`, or approve hooks once with `wt config approvals add --yes`) to avoid interactive hook prompts.\n\
@@ -115,6 +120,8 @@ pub struct InitOptions<'a> {
     pub package_mode: Option<PackageMode>,
     pub name: Option<String>,
     pub registry: Option<&'a str>,
+    pub cargo_resolver: Option<&'a dyn CargoLockResolver>,
+    pub offline: bool,
     pub hooks: Option<&'a dyn MutationHooks>,
     pub no_agents_md: bool,
     pub no_worktrunk: bool,
@@ -124,6 +131,8 @@ pub struct UpdateOptions<'a> {
     pub api: Option<String>,
     pub package_mode: Option<PackageMode>,
     pub registry: Option<&'a str>,
+    pub cargo_resolver: Option<&'a dyn CargoLockResolver>,
+    pub offline: bool,
     pub compose_inventory: Option<&'a ComposeInventory>,
     pub compose_normalizer: Option<&'a dyn crate::compose::ComposeNormalizer>,
     pub runner: Option<&'a crate::processes::ProcessRunner>,
@@ -655,7 +664,7 @@ pub fn render_component(
     spec: &ComponentSpec,
     role: Role,
     mode: PackageMode,
-    components: &BTreeMap<String, ComponentState>,
+    project: &ProjectState,
 ) -> Result<(String, ComponentState, Option<LockSeed>)> {
     let definition = template(&spec.template)?;
     ensure!(
@@ -668,10 +677,17 @@ pub fn render_component(
         !exists(&safe_path(destination, &path)?)?,
         "Component path already exists: {path}"
     );
+    let root_rust = definition.toolchain == Toolchain::Rust
+        && CargoWorkspaceKind::for_state(project)? == CargoWorkspaceKind::Root;
     ensure!(
-        spec.uses.is_empty() || definition.toolchain == Toolchain::Node,
-        "--use is supported for Node.js components"
+        spec.uses.is_empty() || definition.toolchain == Toolchain::Node || root_rust,
+        "Rust --use requires a root Cargo workspace"
     );
+    let cargo_model = if root_rust && !spec.uses.is_empty() && cargo::has_rust(project) {
+        Some(CargoWorkspaceModel::read(destination, project)?)
+    } else {
+        None
+    };
     let mut resolved_uses = Vec::new();
     let mut seen_use_paths = BTreeSet::new();
     for use_slug in &spec.uses {
@@ -680,19 +696,35 @@ pub fn render_component(
         if !seen_use_paths.insert(dep_path.clone()) {
             continue;
         }
-        let dep_comp = components
+        let dep_comp = project
+            .components
             .get(&dep_path)
             .with_context(|| format!("Unknown workspace package for --use: {dep_path}"))?;
         ensure!(
-            dep_comp.role == Role::Library && dep_comp.toolchain == Toolchain::Node,
-            "Target of --use must be a registered Node.js library: {dep_path}"
+            dep_comp.role == Role::Library && dep_comp.toolchain == definition.toolchain,
+            "Target of --use must be a registered {} library: {dep_path}",
+            definition.toolchain
         );
-        let m = native_manifest(destination, &dep_path)?;
-        let dep_pkg_name = text(
-            m.get("name").context("Workspace package name")?,
-            "workspace package name",
-        )?
-        .to_string();
+        let dep_pkg_name = if let Some(model) = &cargo_model {
+            let members = model.members(&dep_path)?;
+            ensure!(
+                members.len() == 1 && members[0].rel_dir == dep_path,
+                "Use an explicit Cargo path dependency for {dep_path}: members are {}",
+                members
+                    .iter()
+                    .map(|member| member.rel_dir.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            members[0].id.name.clone()
+        } else {
+            let m = native_manifest(destination, &dep_path)?;
+            text(
+                m.get("name").context("Workspace package name")?,
+                "workspace package name",
+            )?
+            .to_owned()
+        };
         resolved_uses.push((dep_path, dep_comp.tooling_profile, dep_pkg_name));
     }
     let shared_clients: Vec<&str> = resolved_uses
@@ -704,15 +736,27 @@ pub fn render_component(
         shared_clients.len() <= 1,
         "At most one react-client shared client binding is supported per component"
     );
+    let rust_names = root_rust
+        .then(|| cargo::TemplateNames::read(release, role, spec))
+        .transpose()?;
     let prefix = format!("templates/{}/", definition.id);
     for (name, id) in &release.manifest.files {
         if let Some(suffix) = name.strip_prefix(&prefix) {
-            if suffix.starts_with("variants/") {
+            if suffix.starts_with("variants/")
+                || (root_rust
+                    && ["Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"].contains(&suffix))
+            {
                 continue;
             }
+            let bytes = release.bytes(name)?;
+            let bytes = if let Some(names) = &rust_names {
+                names.render(suffix, bytes)?
+            } else {
+                bytes
+            };
             write_atomic(
                 &safe_path(destination, &format!("{path}/{suffix}"))?,
-                &release.bytes(name)?,
+                &bytes,
                 id.mode,
             )?;
         }
@@ -790,6 +834,9 @@ pub fn render_component(
         extra: BTreeMap::new(),
     };
     if definition.toolchain == Toolchain::Rust {
+        if root_rust {
+            cargo::add_use_dependencies(destination, &path, &resolved_uses)?;
+        }
         return Ok((path, state, None));
     }
     let mut manifest = native_value(destination, &path)?;
@@ -920,19 +967,27 @@ pub fn write_managed(
             identity(&safe_path(destination, &target)?)?.unwrap(),
         );
     }
-    for (path, c) in &state.components {
-        if c.toolchain == Toolchain::Rust {
-            let target = format!("{path}/rust-toolchain.toml");
-            write_atomic(
-                &safe_path(destination, &target)?,
-                &release.bytes("templates/rust-api/rust-toolchain.toml")?,
-                0o644,
-            )?;
-            managed.insert(
-                target.clone(),
-                identity(&safe_path(destination, &target)?)?.unwrap(),
-            );
-        }
+    let rust_pins = if CargoWorkspaceKind::root_with_rust(state)? {
+        vec!["rust-toolchain.toml".to_string()]
+    } else {
+        state
+            .components
+            .iter()
+            .filter(|(_, c)| c.toolchain == Toolchain::Rust)
+            .map(|(path, _)| format!("{path}/rust-toolchain.toml"))
+            .collect()
+    };
+    for name in rust_pins {
+        let pin = safe_path(destination, &name)?;
+        write_atomic(
+            &pin,
+            &release.bytes("templates/rust-api/rust-toolchain.toml")?,
+            0o644,
+        )?;
+        managed.insert(
+            name,
+            identity(&pin)?.context("Missing staged Rust toolchain pin")?,
+        );
     }
     let profiles = state
         .components
@@ -965,6 +1020,11 @@ pub fn write_managed(
             digest: String::new(),
         }
     };
+    let cargo_model = if CargoWorkspaceKind::root_with_rust(state)? {
+        Some(CargoWorkspaceModel::read(destination, state)?)
+    } else {
+        None
+    };
     let outputs = vec![
         (
             ".devkit/tooling-profiles.json",
@@ -976,7 +1036,10 @@ pub fn write_managed(
             ".devkit/project.mk",
             render_project_make(state).into_bytes(),
         ),
-        (".devkit/compose.apps.yaml", render_app_compose(state)?),
+        (
+            ".devkit/compose.apps.yaml",
+            render_app_compose(state, cargo_model.as_ref())?,
+        ),
         (
             ".devkit/compose.workspace.json",
             render_workspace_compose(state, &inputs)?,
@@ -1009,14 +1072,14 @@ fn check_new_managed_files(
     root: &Path,
     old: &ProjectState,
     next: &ProjectState,
-    adopted_toolchain: Option<&str>,
+    allowed_existing: &BTreeSet<String>,
 ) -> Result<()> {
     for (name, id) in &next.managed {
         if !old.managed.contains_key(name)
             && let Some(actual) = identity(&safe_path(root, name)?)?
         {
             ensure!(
-                adopted_toolchain == Some(name.as_str()) && actual.matches_git_tracked(id),
+                allowed_existing.contains(name) && actual.matches_git_tracked(id),
                 "New managed file conflicts with project content: {name}"
             );
         }
@@ -1029,7 +1092,7 @@ fn validate_staged_project(root: &Path, state: &ProjectState) -> Result<()> {
     verify_managed_set(root, state)?;
     ToolPins::admit(root, state)?;
     let native = admit_native_components(root, state)?;
-    assert_projections(root, state, &native.inputs)
+    assert_projections(root, state, &native.inputs, native.cargo_workspace.as_ref())
 }
 
 fn empty_target(target: &Path) -> Result<()> {
@@ -1137,6 +1200,7 @@ pub(crate) fn init_project_with_release(
         package_mode: mode,
         managed: BTreeMap::new(),
         components: BTreeMap::new(),
+        cargo_resolution: None,
         extra: BTreeMap::new(),
     };
     let app = |name: &str, template: &str| ComponentSpec {
@@ -1199,6 +1263,7 @@ pub(crate) fn init_project_with_release(
         let default_slug = match t.id {
             "node-api" => "main",
             "rust-api" => "api",
+            "rust-library" => "core",
             "ts-library" => "lib",
             "react-ui" => "ui",
             "react-client" => "client",
@@ -1211,16 +1276,22 @@ pub(crate) fn init_project_with_release(
         .prefix(".devkit-init-")
         .tempdir_in(parent)?;
     let mut seeds = vec![];
+    let mut cargo_seeds = Vec::new();
+    let mut rust_components = BTreeSet::new();
     for (role, spec) in specs {
-        let (path, c, seed) = render_component(
-            release,
-            stage.path(),
-            &name,
-            &spec,
-            role,
-            mode,
-            &state.components,
-        )?;
+        let (path, c, seed) =
+            render_component(release, stage.path(), &name, &spec, role, mode, &state)?;
+        if c.toolchain == Toolchain::Rust
+            && CargoWorkspaceKind::for_state(&state)? == CargoWorkspaceKind::Root
+        {
+            cargo::add_members(
+                stage.path(),
+                std::slice::from_ref(&path),
+                rust_components.is_empty(),
+            )?;
+            cargo_seeds.push(cargo::template_seed(release, role, &spec)?);
+            rust_components.insert(path.clone());
+        }
         state.components.insert(path, c);
         if let Some(seed) = seed {
             seeds.push(seed);
@@ -1236,6 +1307,21 @@ pub(crate) fn init_project_with_release(
                 d.api = Some("apps/api".to_string());
             }
         }
+    }
+    if !rust_components.is_empty() {
+        cargo::workspace_defaults(stage.path(), release, true, None)?;
+        select_cargo_toolchain(&mut state, release)?;
+        state.cargo_resolution = Some(crate::cargo_lock::reconcile(
+            stage.path(),
+            &state,
+            release,
+            &cargo_seeds,
+            options
+                .cargo_resolver
+                .unwrap_or(&DockerCargoLockResolver::default()),
+            options.offline,
+            &rust_components,
+        )?);
     }
     sync_node_workspace(stage.path(), &state, Some(&name))?;
     state.managed = write_managed(release, stage.path(), &state)?;
@@ -1285,7 +1371,7 @@ pub(crate) fn init_project_with_release(
     }
     let readme = project_readme(&name, &state);
     write_atomic(&stage.path().join("README.md"), readme.as_bytes(), 0o644)?;
-    write_json(&safe_path(stage.path(), MANIFEST_PATH)?, &state)?;
+    write_project_manifest(stage.path(), &state)?;
     validate_staged_project(stage.path(), &state)?;
     release.recheck()?;
     if let Some(h) = options.hooks {
@@ -1325,6 +1411,7 @@ pub struct AdmissionSnapshot {
     pub inputs: InputIdentitySet,
     pub source_signature: String,
     pub manifest_identity: FileIdentity,
+    extra_excluded_dir: Option<String>,
 }
 fn expected_incoming_runtime_files(
     release: &AdmittedRelease,
@@ -1363,16 +1450,30 @@ impl AdmissionSnapshot {
         incoming_runtime: &dyn Fn(&ProjectState) -> Result<BTreeSet<String>>,
     ) -> Result<Self> {
         let root = project_root(root)?;
-        assert_no_pending(&root)?;
-        let manifest_identity =
-            identity(&safe_path(&root, MANIFEST_PATH)?)?.context("Missing project manifest")?;
-        let state = read_project_state(&root)?;
-        assert_managed(&root, &state)?;
+        let (state, identity) = Self::read_accepted(&root)?;
         let incoming = incoming_runtime(&state)?;
-        verify_runtime_inventory_with_incoming(&root, &state, &incoming)?;
+        Self::capture_accepted(root, state, identity, &incoming, None)
+    }
+
+    fn read_accepted(root: &Path) -> Result<(ProjectState, FileIdentity)> {
+        assert_no_pending(root)?;
+        let (bytes, identity, _) = read_manifest_snapshot(&safe_path(root, MANIFEST_PATH)?)?;
+        Ok((parse_project_state(&bytes)?, identity))
+    }
+
+    fn capture_accepted(
+        root: PathBuf,
+        state: ProjectState,
+        manifest_identity: FileIdentity,
+        incoming: &BTreeSet<String>,
+        extra_excluded_dir: Option<String>,
+    ) -> Result<Self> {
+        assert_managed(&root, &state)?;
+        verify_runtime_inventory_with_incoming(&root, &state, incoming)?;
         assert_tool_profiles(&root, &state)?;
         let inputs = collect_native_input_closure(&root, &state)?;
-        let source_signature = source_signature(&root, Some(&state))?;
+        let source_signature =
+            source_signature_with_extra(&root, Some(&state), extra_excluded_dir.as_deref())?;
         ensure!(
             identity(&safe_path(&root, MANIFEST_PATH)?)?.as_ref() == Some(&manifest_identity),
             "Project manifest changed during admission"
@@ -1383,6 +1484,7 @@ impl AdmissionSnapshot {
             inputs,
             source_signature,
             manifest_identity,
+            extra_excluded_dir,
         })
     }
     pub fn recheck(&self) -> Result<()> {
@@ -1393,7 +1495,11 @@ impl AdmissionSnapshot {
             "Project manifest changed while staging"
         );
         ensure!(
-            source_signature(&self.root, Some(&self.state))? == self.source_signature,
+            source_signature_with_extra(
+                &self.root,
+                Some(&self.state),
+                self.extra_excluded_dir.as_deref()
+            )? == self.source_signature,
             "Project changed while staging the update; retry after reviewing concurrent edits"
         );
         ensure!(
@@ -1403,10 +1509,23 @@ impl AdmissionSnapshot {
         Ok(())
     }
 }
-fn verify_old_tools(root: &Path, state: &ProjectState) -> Result<()> {
+fn verify_old_tools(
+    root: &Path,
+    state: &ProjectState,
+    require_root_cargo_lock: bool,
+) -> Result<()> {
     assert_component_manifests(root, state)?;
+    if require_root_cargo_lock && CargoWorkspaceKind::root_with_rust(state)? {
+        ensure!(
+            identity(&safe_path(root, "Cargo.lock")?)?.is_some(),
+            "Missing root Cargo.lock; restore it or run make exec toolchain=rust write=1 network=bridge command='cargo generate-lockfile', then make sync"
+        );
+    }
     for (path, c) in &state.components {
         if c.toolchain == Toolchain::Rust {
+            if CargoWorkspaceKind::for_state(state)? == CargoWorkspaceKind::Root {
+                continue;
+            }
             for name in ["Cargo.toml", "Cargo.lock"] {
                 ensure!(
                     identity(&safe_path(root, &format!("{path}/{name}"))?)?.is_some(),
@@ -1530,8 +1649,13 @@ fn mutate_with_release(
         None => "sync/update",
     };
     let lock = CheckoutLock::acquire_exclusive(target, op_label, options.runner)?;
-    assert_no_pending(&lock.root)?;
-    let candidate_state = read_project_state(&lock.root)?;
+    let (candidate_state, manifest_identity) = AdmissionSnapshot::read_accepted(&lock.root)?;
+    if change.is_some() {
+        ensure!(
+            release.identity == candidate_state.release_identity,
+            "Add/register requires the exact accepted release"
+        );
+    }
     if !node_components(&candidate_state).is_empty()
         && SemVer::parse(&candidate_state.version)? < SemVer::parse("0.5.0")?
         && SemVer::parse(&release.manifest.version)? >= SemVer::parse("0.5.0")?
@@ -1555,11 +1679,42 @@ fn mutate_with_release(
             ..
         })
     );
-    let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, adds_electron)?;
+    let incoming_runtime = expected_incoming_runtime_files(
+        release,
+        &candidate_state,
+        has_electron(&candidate_state) || adds_electron,
+    )?;
+    let migrating_cargo = cargo::has_rust(&candidate_state)
+        && CargoWorkspaceKind::for_state(&candidate_state)? == CargoWorkspaceKind::Component
+        && CargoWorkspaceKind::for_version(&release.manifest.version)? == CargoWorkspaceKind::Root;
+    if migrating_cargo {
+        crate::cargo_migration::check_destinations(&lock.root)?;
+    }
+    let adopting_rust_target = match &change {
+        Some(Change::Register {
+            role,
+            name,
+            profile,
+        }) if profile_toolchain(*profile) == Toolchain::Rust => {
+            Some(format!("{}/target", component_path(*role, name)?))
+        }
+        _ => None,
+    };
+    let snapshot = AdmissionSnapshot::capture_accepted(
+        lock.root.clone(),
+        candidate_state,
+        manifest_identity,
+        &incoming_runtime,
+        adopting_rust_target.clone(),
+    )?;
     let root = &snapshot.root;
     let old = &snapshot.state;
     let mut next = old.clone();
-    verify_old_tools(root, &next)?;
+    verify_old_tools(root, &next, true)?;
+    if migrating_cargo {
+        let native = admit_native_components(root, old)?;
+        assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())?;
+    }
     let intent = change
         .as_ref()
         .map(|change| registration_intent(change, options))
@@ -1568,10 +1723,6 @@ fn mutate_with_release(
         && let Some((path, requested)) = &intent
         && let Some(component) = old.components.get(path)
     {
-        ensure!(
-            release.identity == old.release_identity,
-            "Add/register requires the exact accepted release"
-        );
         let matched = match component.origin.extra.get("registrationIntent") {
             Some(recorded) => recorded == requested,
             None => matches!(&change, Some(Change::Register { profile, .. })
@@ -1583,7 +1734,8 @@ fn mutate_with_release(
         );
         verify_managed_set(root, old)?;
         ToolPins::admit(root, old)?;
-        assert_projections(root, old, &snapshot.inputs)?;
+        let native = admit_native_components(root, old)?;
+        assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())?;
         release.recheck()?;
         snapshot.recheck()?;
         return Ok(MutationOutcome {
@@ -1616,7 +1768,7 @@ fn mutate_with_release(
         Change::Add { spec, .. } => {
             template(&spec.template).is_ok_and(|t| t.toolchain == Toolchain::Node)
         }
-        Change::Register { profile, .. } => *profile != ToolingProfile::Rust,
+        Change::Register { profile, .. } => profile_toolchain(*profile) == Toolchain::Node,
     });
     if !node_components(old).is_empty() || adding_node {
         assert_package_lock_mode(root)?;
@@ -1643,17 +1795,18 @@ fn mutate_with_release(
             "Root npm workspace membership conflicts with accepted registration"
         );
     }
-    if change.is_some() {
-        ensure!(
-            release.identity == old.release_identity,
-            "Add/register requires the exact accepted release"
-        );
-    }
     ensure!(
         old.version != release.manifest.version || old.release_identity == release.identity,
         "A different release has the same version; use a distinctly versioned release"
     );
     let mode = options.package_mode.unwrap_or(old.package_mode);
+    // Adding a Rust component leaves the accepted Node workspace intact. A
+    // separate, explicitly requested lock reconciliation still runs normally.
+    let preserve_node = change.is_some()
+        && !adding_node
+        && !options.reconcile_lock
+        && mode == old.package_mode
+        && CargoWorkspaceKind::for_state(old)? == CargoWorkspaceKind::Root;
     if let Some(Change::Add { role, spec }) = &change {
         assert_legacy_ignore_allows_component(
             root,
@@ -1668,9 +1821,9 @@ fn mutate_with_release(
     {
         verify_managed_set(root, old)?;
         ToolPins::admit(root, old)?;
-        match assert_native_components(root, old)
-            .and_then(|()| assert_projections(root, old, &snapshot.inputs))
-        {
+        match admit_native_components(root, old).and_then(|native| {
+            assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())
+        }) {
             Ok(()) => {
                 release.recheck()?;
                 snapshot.recheck()?;
@@ -1691,10 +1844,20 @@ fn mutate_with_release(
     create_dir_all_durable(&stage)?;
     let staged_root = stage.join("project");
     let result = (|| {
-        copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
+        copy_tree_scratch(
+            root,
+            &staged_root,
+            &|n| {
+                adopting_rust_target
+                    .as_deref()
+                    .is_some_and(|prefix| n == prefix || n.starts_with(&format!("{prefix}/")))
+                    || snapshot_excluded_at(root, old, n)
+            },
+            true,
+        )?;
         let mut seeds = vec![];
         let mut existing_pnpm_lock = None;
-        if !node_components(old).is_empty() {
+        if !preserve_node && !node_components(old).is_empty() {
             let (lock, parsed_pnpm) =
                 read_workspace_lock_with_pnpm(&staged_root, NodeLockKind::for_state(old)?)?;
             existing_pnpm_lock = parsed_pnpm;
@@ -1703,6 +1866,9 @@ fn mutate_with_release(
                 lock,
             });
         }
+        let mut cargo_paths = BTreeSet::new();
+        let mut cargo_seeds = Vec::new();
+        let mut added_rust = BTreeSet::new();
         let mut created = vec![];
         if let Some(Change::Add { role, spec }) = &change {
             let path = component_path(*role, &spec.name)?;
@@ -1724,15 +1890,19 @@ fn mutate_with_release(
             } else {
                 String::new()
             };
-            let (path, mut c, seed) = render_component(
-                release,
-                &staged_root,
-                &name,
-                spec,
-                *role,
-                mode,
-                &next.components,
-            )?;
+            let (path, mut c, seed) =
+                render_component(release, &staged_root, &name, spec, *role, mode, &next)?;
+            if c.toolchain == Toolchain::Rust
+                && CargoWorkspaceKind::for_state(&next)? == CargoWorkspaceKind::Root
+            {
+                cargo::add_members(
+                    &staged_root,
+                    std::slice::from_ref(&path),
+                    !cargo::has_rust(old),
+                )?;
+                cargo_seeds.push(cargo::template_seed(release, *role, spec)?);
+                added_rust.insert(path.clone());
+            }
             if let Some(api) = &options.api {
                 slug(api)?;
                 ensure!(
@@ -1820,7 +1990,18 @@ fn mutate_with_release(
                     extra: BTreeMap::new(),
                 },
             );
-            verify_old_tools(&staged_root, &next)?;
+            if toolchain == Toolchain::Rust
+                && CargoWorkspaceKind::for_state(&next)? == CargoWorkspaceKind::Root
+            {
+                let listed = cargo::listed_members(&staged_root, &path)?;
+                if listed.is_empty() {
+                    let members = cargo::discover_members(&staged_root, &path)?;
+                    cargo::add_members(&staged_root, &members, !cargo::has_rust(old))?;
+                }
+                added_rust.insert(path.clone());
+            } else {
+                verify_old_tools(&staged_root, &next, false)?;
+            }
             if toolchain == Toolchain::Node {
                 let member_lock = safe_path(&staged_root, &format!("{path}/package-lock.json"))?;
                 let pnpm_member_lock = safe_path(&staged_root, &format!("{path}/pnpm-lock.yaml"))?;
@@ -1878,8 +2059,59 @@ fn mutate_with_release(
             migrate_npm_manifests(&staged_root, &next)?;
         }
         next.version = release.manifest.version.clone();
-        sync_node_workspace(&staged_root, &next, None)?;
-        if !node_components(&next).is_empty() {
+        let cargo_toolchain_changed = CargoWorkspaceKind::root_with_rust(&next)?
+            && select_cargo_toolchain(&mut next, release)?;
+        let default_cargo_resolver = DockerCargoLockResolver {
+            runner: options.runner.cloned(),
+            ..Default::default()
+        };
+        if migrating_cargo {
+            let (paths, proof) = crate::cargo_migration::migrate(
+                &staged_root,
+                old,
+                &next,
+                release,
+                options.cargo_resolver.unwrap_or(&default_cargo_resolver),
+                options.offline,
+            )?;
+            cargo_paths = paths;
+            next.cargo_resolution = Some(proof);
+        } else if CargoWorkspaceKind::root_with_rust(&next)?
+            && (!added_rust.is_empty()
+                || cargo_toolchain_changed
+                || (old.version != release.manifest.version
+                    && !cargo_proof_matches(&staged_root, &next)?))
+        {
+            let adopting = if matches!(change, Some(Change::Register { .. })) {
+                added_rust.first().map(String::as_str)
+            } else {
+                None
+            };
+            if let Some(seed) =
+                cargo::workspace_defaults(&staged_root, release, !cargo::has_rust(old), adopting)?
+            {
+                cargo_seeds.push(seed);
+            }
+            next.cargo_resolution = Some(crate::cargo_lock::reconcile(
+                &staged_root,
+                &next,
+                release,
+                &cargo_seeds,
+                options.cargo_resolver.unwrap_or(&default_cargo_resolver),
+                options.offline,
+                &added_rust,
+            )?);
+            cargo_paths.extend(cargo::AUTHORITIES.map(String::from));
+            if let Some(component) = adopting {
+                for name in ["Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"] {
+                    cargo_paths.insert(format!("{component}/{name}"));
+                }
+            }
+        }
+        if !preserve_node {
+            sync_node_workspace(&staged_root, &next, None)?;
+        }
+        if !preserve_node && !node_components(&next).is_empty() {
             seed_workspace_lock_preserving(
                 &staged_root,
                 &next,
@@ -1888,7 +2120,7 @@ fn mutate_with_release(
                 options.reconcile_lock,
             )?;
         }
-        let product = if node_components(&next).is_empty() {
+        let product = if preserve_node || node_components(&next).is_empty() {
             None
         } else {
             Some(match migrating_product {
@@ -1899,7 +2131,7 @@ fn mutate_with_release(
         let old_components = next.components.clone();
         for (path, c) in &mut next.components {
             c.tool_dependencies = profile_tools(release, c.tooling_profile, mode)?;
-            if c.toolchain == Toolchain::Node {
+            if c.toolchain == Toolchain::Node && !preserve_node {
                 update_tools(&staged_root, path, &old_components[path], c)?;
             }
         }
@@ -1907,9 +2139,11 @@ fn mutate_with_release(
         next.version = release.manifest.version.clone();
         next.release_identity = release.identity.clone();
         next.generation = uuid::Uuid::new_v4().to_string();
-        for (path, _) in node_components(&next) {
-            for file in ["package-lock.json", "pnpm-lock.yaml"] {
-                remove_file(&safe_path(&staged_root, &format!("{path}/{file}"))?)?;
+        if !preserve_node {
+            for (path, _) in node_components(&next) {
+                for file in ["package-lock.json", "pnpm-lock.yaml"] {
+                    remove_file(&safe_path(&staged_root, &format!("{path}/{file}"))?)?;
+                }
             }
         }
         next.managed = write_managed(release, &staged_root, &next)?;
@@ -1941,34 +2175,36 @@ fn mutate_with_release(
                 })?;
             }
         }
-        for (path, _) in node_components(&next) {
-            remove_file(&safe_path(
-                &staged_root,
-                &format!("{path}/package-lock.json"),
-            )?)?;
-        }
-        for (path, _) in node_components(&next) {
-            remove_file(&safe_path(&staged_root, &format!("{path}/pnpm-lock.yaml"))?)?;
+        if !preserve_node {
+            for (path, _) in node_components(&next) {
+                for file in ["package-lock.json", "pnpm-lock.yaml"] {
+                    remove_file(&safe_path(&staged_root, &format!("{path}/{file}"))?)?;
+                }
+            }
         }
         let deps = derive_component_dependencies(&staged_root, &next)?;
         for (path, c) in &mut next.components {
             c.dependencies = deps[path].clone();
         }
         next.managed = write_managed(release, &staged_root, &next)?;
-        let adopted_toolchain = match &change {
-            Some(Change::Register {
-                role,
-                name,
-                profile: ToolingProfile::Rust,
-            }) => Some(format!(
+        let mut allowed_existing = BTreeSet::new();
+        if !added_rust.is_empty() {
+            allowed_existing.insert("rust-toolchain.toml".to_string());
+        }
+        if let Some(Change::Register {
+            role,
+            name,
+            profile: ToolingProfile::Rust,
+        }) = &change
+        {
+            allowed_existing.insert(format!(
                 "{}/rust-toolchain.toml",
                 component_path(*role, name)?
-            )),
-            _ => None,
-        };
-        check_new_managed_files(root, old, &next, adopted_toolchain.as_deref())?;
+            ));
+        }
+        check_new_managed_files(root, old, &next, &allowed_existing)?;
         validate_staged_project(&staged_root, &next)?;
-        write_json(&safe_path(&staged_root, MANIFEST_PATH)?, &next)?;
+        write_project_manifest(&staged_root, &next)?;
         let mut paths = old
             .managed
             .keys()
@@ -1988,6 +2224,7 @@ fn mutate_with_release(
             paths.insert(format!("{path}/package-lock.json"));
             paths.insert(format!("{path}/pnpm-lock.yaml"));
         }
+        paths.extend(cargo_paths);
         for dir in &created {
             for (name, _) in file_map(&safe_path(&staged_root, dir)?)? {
                 paths.insert(format!("{dir}/{name}"));
@@ -2007,6 +2244,9 @@ fn mutate_with_release(
         let preflight = || {
             release.recheck()?;
             snapshot.recheck()?;
+            if migrating_cargo {
+                crate::cargo_migration::check_destinations(root)?;
+            }
             if let Some(inventory) = compose_inventory {
                 assert_compose_inventory(root, inventory)?;
             }
@@ -2023,6 +2263,7 @@ fn mutate_with_release(
             })?;
             if old.version != next.version {
                 remove_file(&safe_path(root, ".devkit/state/node-workspace.lock")?)?;
+                remove_file(&safe_path(root, ".devkit/state/rust-workspace.lock")?)?;
             }
         }
         Ok(MutationOutcome {
@@ -2368,7 +2609,7 @@ pub(crate) fn sync_project_with_release(
         .as_deref()
         .unwrap_or(MIN_SUPPORTED_PROJECT_VERSION);
     ensure_supported_checkout_floor(&root_candidate, false, min_from)?;
-    let lock = CheckoutLock::acquire(target)?;
+    let lock = CheckoutLock::acquire_exclusive(target, "sync", options.runner)?;
     let snapshot = AdmissionSnapshot::capture_for_mutation(&lock.root, release, false)?;
     let root = &snapshot.root;
     let old = &snapshot.state;
@@ -2381,7 +2622,7 @@ pub(crate) fn sync_project_with_release(
         options.package_mode.is_none() || options.package_mode == Some(old.package_mode),
         "Sync does not change package mode"
     );
-    verify_old_tools(root, &next)?;
+    verify_old_tools(root, &next, false)?;
     if !node_components(old).is_empty() {
         assert_package_lock_mode(root)?;
         let manifest = native_manifest(root, "")?;
@@ -2398,12 +2639,88 @@ pub(crate) fn sync_project_with_release(
             "Root npm workspace membership conflicts with accepted registration"
         );
     }
+    if !options.reconcile_lock && options.hooks.is_none() {
+        let can_noop = (|| -> Result<bool> {
+            verify_managed_set(root, old)?;
+            ToolPins::admit(root, old)?;
+            let native = admit_native_components(root, old)?;
+            assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())?;
+            if CargoWorkspaceKind::root_with_rust(old)? && old.cargo_resolution.is_none() {
+                return Ok(false);
+            }
+            let nodes = node_components(old);
+            if !nodes.is_empty() {
+                for (path, _) in &nodes {
+                    if exists(&safe_path(root, &format!("{path}/package-lock.json"))?)?
+                        || exists(&safe_path(root, &format!("{path}/pnpm-lock.yaml"))?)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                let lock_kind = NodeLockKind::for_state(old)?;
+                if lock_kind == NodeLockKind::Pnpm {
+                    if native_manifest(root, "")?.contains_key("workspaces") {
+                        return Ok(false);
+                    }
+                    let expected_exclude = format!("@docouno/env@{}", old.version);
+                    if !crate::pnpm::Workspace::read(root)?
+                        .minimum_release_age_exclude
+                        .contains(&expected_exclude)
+                    {
+                        return Ok(false);
+                    }
+                }
+                let drifted = if lock_kind == NodeLockKind::Pnpm {
+                    pnpm_registries_drifted(&native.npmrc_policy, &crate::pnpm::Lock::read(root)?)
+                } else {
+                    npmrc_registries_drifted(&native.npmrc_policy, &package_lock(root)?)
+                };
+                if drifted {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })()
+        .unwrap_or(false);
+        if can_noop {
+            release.recheck()?;
+            snapshot.recheck()?;
+            return Ok(MutationOutcome {
+                state: old.clone(),
+                files: vec![],
+                applied: false,
+                no_op: true,
+                lock_reconciliation: None,
+            });
+        }
+    }
     let stage_name = format!(".devkit/state/update-{}", uuid::Uuid::new_v4());
     let stage = safe_path(root, &stage_name)?;
     create_dir_all_durable(&stage)?;
     let staged_root = stage.join("project");
     let result: Result<MutationOutcome> = (|| {
-        copy_tree(root, &staged_root, &|n| snapshot_excluded(old, n), true)?;
+        copy_tree_scratch(
+            root,
+            &staged_root,
+            &|n| snapshot_excluded_at(root, old, n),
+            true,
+        )?;
+        let default_cargo_resolver = DockerCargoLockResolver {
+            runner: options.runner.cloned(),
+            ..Default::default()
+        };
+        if CargoWorkspaceKind::root_with_rust(&next)? {
+            cargo::reconcile_members(&staged_root, &next)?;
+            next.cargo_resolution = Some(crate::cargo_lock::reconcile(
+                &staged_root,
+                &next,
+                release,
+                &[],
+                options.cargo_resolver.unwrap_or(&default_cargo_resolver),
+                options.offline,
+                &BTreeSet::new(),
+            )?);
+        }
         let staged_closure = collect_native_input_closure(&staged_root, &next)?;
         let npmrc_policy = parse_and_admit_npmrc(
             &staged_root,
@@ -2503,7 +2820,7 @@ pub(crate) fn sync_project_with_release(
                 remove_file_and_empty_runtime_parents(&staged_root, name)?;
             }
         }
-        check_new_managed_files(root, old, &next, None)?;
+        check_new_managed_files(root, old, &next, &BTreeSet::new())?;
         validate_staged_project(&staged_root, &next)?;
         let mut paths = old
             .managed
@@ -2523,6 +2840,9 @@ pub(crate) fn sync_project_with_release(
             paths.insert(format!("{path}/package.json"));
             paths.insert(format!("{path}/package-lock.json"));
             paths.insert(format!("{path}/pnpm-lock.yaml"));
+        }
+        if CargoWorkspaceKind::root_with_rust(&next)? {
+            paths.extend(["Cargo.toml".to_owned(), "Cargo.lock".to_owned()]);
         }
         let mut any_changed = next != *old;
         if !any_changed {
@@ -2554,7 +2874,7 @@ pub(crate) fn sync_project_with_release(
             });
         }
         next.generation = uuid::Uuid::new_v4().to_string();
-        write_json(&safe_path(&staged_root, MANIFEST_PATH)?, &next)?;
+        write_project_manifest(&staged_root, &next)?;
         let tx = PreparedTransaction::prepare(root, &stage_name, &staged_root, &paths, vec![])?;
         let files = tx
             .journal
@@ -2689,3 +3009,23 @@ pub(crate) fn register_project_component_with_release(
     )
 }
 pub use crate::transaction::recover_project;
+
+fn write_project_manifest(root: &Path, state: &ProjectState) -> Result<()> {
+    let path = safe_path(root, MANIFEST_PATH)?;
+    write_json(&path, state)?;
+    check_manifest_regular_bounded(&path)
+}
+
+/// Pin the resolver input before the staged lock is derived. The managed-file
+/// writer installs these same release bytes later in the transaction.
+fn select_cargo_toolchain(state: &mut ProjectState, release: &AdmittedRelease) -> Result<bool> {
+    let pin = release
+        .manifest
+        .files
+        .get("templates/rust-api/rust-toolchain.toml")
+        .context("Missing release Cargo toolchain pin")?;
+    let previous = state
+        .managed
+        .insert("rust-toolchain.toml".into(), pin.clone());
+    Ok(previous.as_ref().map(|id| &id.sha256) != Some(&pin.sha256))
+}

@@ -1613,7 +1613,6 @@ fn cargo_patch_replace_and_config_override_closures_bind_paths_and_transitive_in
         "patch",
         "replace",
         "config-patch",
-        "config-paths",
         "config-include",
         "workspace-patch",
     ] {
@@ -1633,7 +1632,6 @@ fn cargo_patch_replace_and_config_override_closures_bind_paths_and_transitive_in
                 ".cargo/config.toml",
                 "[patch.crates-io]\npatched={path=\"vendor/patched\"}\n",
             ),
-            "config-paths" => put(root, ".cargo/config.toml", "paths=[\"vendor/patched\"]\n"),
             "config-include" => {
                 put(
                     root,
@@ -2491,8 +2489,9 @@ fn cargo_paths_registered_selection_is_actionably_uncertain_and_cycles_are_check
         derive_component_dependencies(root, &first_state)
             .unwrap_err()
             .to_string()
-            .contains("Cannot prove registered Cargo paths override")
+            .contains("Unsupported Cargo config paths override")
     );
+    fs::remove_file(root.join("apps/main/.cargo/config.toml")).unwrap();
     selected_cargo_lock(
         root,
         "apps/main",
@@ -3007,7 +3006,7 @@ fn pinned_cargo_metadata_proves_selected_component_edges_and_paths_uncertainty()
                 derive_component_dependencies(root, &state)
                     .unwrap_err()
                     .to_string()
-                    .contains("Cannot prove registered Cargo paths override")
+                    .contains("Unsupported Cargo config paths override")
             );
         } else {
             let expected = if ["unused-root-patch", "registry-source-control"].contains(&form) {
@@ -3645,4 +3644,934 @@ fn plain_non_component_directories_and_files_in_namespaces_pass_recheck() {
             .to_string()
             .contains("namespace changed")
     );
+}
+
+const ROOT_MEMBERS: &str = "[workspace]\nresolver='3'\nmembers=['apps/server/crates/api one','apps/worker','packages/protocol','packages/storage']\nexclude=['vendor']\n[workspace.package]\nversion='1.1.0'\n[workspace.dependencies]\nwire={package='protocol',path='packages/protocol',version='^1'}\n";
+const SERVER: &str = "[package]\nname='server'\nversion.workspace=true\nworkspace='../../../..'\nedition='2024'\n[dependencies]\nwire.workspace=true\n";
+const PROTOCOL: &str = "[package]\nname='protocol'\nversion='1.1.0'\n[build-dependencies]\nstorage={path='../storage'}\n";
+fn root_cargo_fixture(root: &Path) -> ProjectState {
+    let mut state = state(&[
+        ("apps/server", "rust"),
+        ("apps/worker", "rust"),
+        ("packages/protocol", "rust"),
+        ("packages/storage", "rust"),
+    ]);
+    state.version = "0.6.0".into();
+    state
+        .components
+        .get_mut("apps/server")
+        .unwrap()
+        .dependencies = vec!["packages/protocol".into(), "packages/storage".into()];
+    state
+        .components
+        .get_mut("packages/protocol")
+        .unwrap()
+        .dependencies = vec!["packages/storage".into()];
+    profiles(root, &state);
+    put(root, "Cargo.toml", ROOT_MEMBERS);
+    put(root, "rustfmt.toml", "edition='2024'\n");
+    put(
+        root,
+        "rust-toolchain.toml",
+        "[toolchain]\nchannel='1.99.1'\n",
+    );
+    for (dir, manifest) in [
+        ("apps/server/crates/api one", SERVER),
+        ("apps/worker", "[package]\nname='worker'\nversion='1.0.0'\n"),
+        ("packages/protocol", PROTOCOL),
+        (
+            "packages/storage",
+            "[package]\nname='storage'\nversion='1.0.0'\n",
+        ),
+    ] {
+        rust(root, dir, manifest, false);
+        put(root, &format!("{dir}/src/lib.rs"), "");
+    }
+    selected_cargo_lock(
+        root,
+        ".",
+        json!([
+            {"name":"server","version":"1.1.0","dependencies":["protocol"]},
+            {"name":"worker","version":"1.0.0"},
+            {"name":"protocol","version":"1.1.0","dependencies":["storage"]},
+            {"name":"storage","version":"1.0.0"}
+        ]),
+    );
+    state
+}
+
+#[test]
+fn root_cargo_admits_scoped_selected_edges_and_group_members() {
+    use devkit::native::{CargoWorkspaceModel, assert_component_manifests};
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = root_cargo_fixture(root);
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert_eq!(
+        admitted.dependencies["apps/server"],
+        ["packages/protocol", "packages/storage"]
+    );
+    assert!(admitted.dependencies["apps/worker"].is_empty());
+    let model = admitted.cargo_workspace.as_ref().unwrap();
+    let member = &model.members("apps/server").unwrap()[0];
+    assert_eq!(member.fmt_package(), "server");
+    assert_eq!(
+        member.pkgid().unwrap(),
+        "path+file:///workspace/apps/server/crates/api%20one#server@1.1.0"
+    );
+    assert!(admitted.rust_inputs.directories.is_empty());
+    assert_eq!(admitted.rust_inputs.files["apps/server/Cargo.toml"], None);
+    assert!(admitted.rust_inputs.files["apps/server/crates/api one/Cargo.toml"].is_some());
+    fs::remove_file(root.join("Cargo.lock")).unwrap();
+    CargoWorkspaceModel::read(root, &state).unwrap();
+    assert_component_manifests(root, &state).unwrap();
+    assert!(admitted.recheck(root).is_err());
+    put(
+        root,
+        "Cargo.toml",
+        &ROOT_MEMBERS.replace(",'packages/storage'", ""),
+    );
+    assert_component_manifests(root, &state).unwrap();
+    collect_native_input_closure(root, &state).unwrap();
+    assert!(CargoWorkspaceModel::read(root, &state).is_err());
+}
+
+#[test]
+fn root_cargo_rejects_shadowing_ambiguous_membership_and_drift() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = root_cargo_fixture(root);
+    let original = admit_native_components(root, &state).unwrap();
+    for name in [
+        ".rustfmt.toml",
+        "rust-toolchain",
+        "apps/rust-toolchain.toml",
+        "apps/server/Cargo.lock",
+        "apps/server/crates/.cargo/config.toml",
+        "apps/server/crates/api one/rustfmt.toml",
+        "packages/protocol/.cargo/config",
+        "packages/.rustfmt.toml",
+    ] {
+        put(root, name, "");
+        let err = assert_native_components(root, &state).unwrap_err();
+        assert!(format!("{err:#}").contains(name), "{err:#}");
+        assert!(original.recheck(root).is_err());
+        fs::remove_file(root.join(name)).unwrap();
+    }
+    for (file, contents, expected) in [
+        (
+            "Cargo.toml",
+            ROOT_MEMBERS.replace("vendor", "apps"),
+            "overlaps",
+        ),
+        (
+            "Cargo.toml",
+            ROOT_MEMBERS.replace("packages/storage", "packages/*"),
+            "glob",
+        ),
+        (
+            "Cargo.toml",
+            ROOT_MEMBERS.replace(",'packages/storage'", ""),
+            "Implicit Cargo member",
+        ),
+        (
+            "Cargo.toml",
+            format!("{ROOT_MEMBERS}\n[package]\nname='root'"),
+            "virtual workspace",
+        ),
+        (
+            "apps/server/crates/api one/Cargo.toml",
+            SERVER.replace("../../../..", ".."),
+            "Cargo.toml",
+        ),
+        (
+            "packages/storage/Cargo.toml",
+            "[package]\nname='protocol'\nversion='3.0.0'".into(),
+            "Duplicate workspace package",
+        ),
+        (
+            "packages/storage/Cargo.toml",
+            "[lib]\n".into(),
+            "Missing [package]",
+        ),
+        (
+            "packages/storage/Cargo.toml",
+            "[workspace]\n".into(),
+            "Nested Cargo workspace",
+        ),
+        (
+            "Cargo.toml",
+            ROOT_MEMBERS.replace("version='^1'", "version='^2'"),
+            "Cargo.lock differs",
+        ),
+        (
+            "packages/protocol/Cargo.toml",
+            PROTOCOL.replace("storage={path='../storage'}", ""),
+            "no longer declared",
+        ),
+        (
+            "packages/protocol/Cargo.toml",
+            PROTOCOL.replace("storage={path='../storage'}", "storage='1'"),
+            "Cargo.lock differs",
+        ),
+    ] {
+        let before = fs::read_to_string(root.join(file)).unwrap();
+        put(root, file, &contents);
+        let error = assert_native_components(root, &state).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{file}: expected {expected}, got {error:#}"
+        );
+        put(root, file, &before);
+    }
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    put(
+        root,
+        "Cargo.lock",
+        &format!("{lock}\n[[package]]\nname='removed'\nversion='1.0.0'\n"),
+    );
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("unreachable")
+    );
+}
+
+#[test]
+fn root_cargo_keeps_shadow_candidates_separate_from_selected_packages() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = root_cargo_fixture(root);
+    rust(
+        root,
+        "vendor/unused",
+        "[package]\nname='storage'\nversion='1.0.0'\n",
+        false,
+    );
+    let patched = format!("{ROOT_MEMBERS}[patch.crates-io]\nstorage={{path='vendor/unused'}}\n");
+    put(root, "Cargo.toml", &patched);
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    put(
+        root,
+        "Cargo.lock",
+        &format!("{lock}\n[[patch.unused]]\nname='storage'\nversion='1.0.0'\n"),
+    );
+    let admitted = admit_native_components(root, &state).unwrap();
+    assert!(
+        admitted
+            .rust_inputs
+            .files
+            .contains_key("vendor/unused/Cargo.toml")
+    );
+    put(
+        root,
+        "packages/protocol/Cargo.toml",
+        &PROTOCOL.replace("storage={path='../storage'}", "storage='1'"),
+    );
+    assert!(assert_native_components(root, &state).is_err());
+    put(
+        root,
+        "Cargo.toml",
+        &patched.replace("vendor/unused", "packages/storage"),
+    );
+    put(root, "Cargo.lock", &lock);
+    assert_native_components(root, &state).unwrap();
+
+    // An admitted workspace dependency may cross Node-owned source boundaries
+    // neither as an explicit member nor through an excluded local or patch.
+    let mut mixed = state.clone();
+    mixed
+        .components
+        .insert("apps/web".into(), component("apps/web", "node"));
+    rust(
+        root,
+        "apps/web/nested",
+        "[package]\nname='embedded'\nversion='1.0.0'\n",
+        false,
+    );
+    for manifest in [
+        ROOT_MEMBERS.replace("'apps/worker'", "'apps/worker','apps/web/nested'"),
+        format!("{ROOT_MEMBERS}unused={{path='apps/web/nested'}}\n"),
+        format!("{ROOT_MEMBERS}[patch.crates-io]\nunused={{path='apps/web/nested'}}\n"),
+    ] {
+        put(root, "Cargo.toml", &manifest);
+        let error = devkit::native::CargoWorkspaceModel::read(root, &mixed).unwrap_err();
+        assert!(error.to_string().contains("Node component"), "{error:#}");
+    }
+}
+
+#[test]
+#[ignore = "requires Cargo inside the pinned Rust validation container"]
+fn pinned_cargo_metadata_matches_root_members_excludes_and_self_dev_edges() {
+    let f = TempDir::new().unwrap();
+    let root = f.path();
+    let state = root_cargo_fixture(root);
+    put(
+        root,
+        "apps/server/crates/api one/Cargo.toml",
+        &format!("{SERVER}[dev-dependencies]\nserver={{path='.'}}\n"),
+    );
+    fs::remove_file(root.join("Cargo.lock")).unwrap();
+    let cargo = |args: &[&str]| {
+        let out = std::process::Command::new("cargo")
+            .current_dir(root)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    cargo(&["generate-lockfile", "--offline"]);
+    let metadata: Value = serde_json::from_slice(&cargo(&[
+        "metadata",
+        "--offline",
+        "--locked",
+        "--format-version",
+        "1",
+    ]))
+    .unwrap();
+    let admission = admit_native_components(root, &state).unwrap();
+    let model = admission.cargo_workspace.unwrap();
+    let members: std::collections::BTreeSet<_> = model
+        .components
+        .values()
+        .flatten()
+        .map(|m| root.join(&m.rel_dir).join("Cargo.toml"))
+        .collect();
+    let actual: std::collections::BTreeSet<_> = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| {
+            metadata["workspace_members"]
+                .as_array()
+                .unwrap()
+                .contains(&p["id"])
+        })
+        .map(|p| std::path::PathBuf::from(p["manifest_path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(actual, members);
+    assert_eq!(
+        metadata["target_directory"].as_str().unwrap(),
+        root.join("target").to_str().unwrap()
+    );
+}
+
+#[test]
+fn mixed_workspace_receipts_bind_only_their_ecosystem_inputs() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let mut state = root_cargo_fixture(root);
+    state
+        .components
+        .insert("apps/web".into(), component("apps/web", "node"));
+    node_project(
+        root,
+        &state,
+        &[("apps/web", manifest("web", json!({}), false))],
+        json!({}),
+    );
+    let packages = package_lock(root).unwrap();
+    devkit::project::sync_node_workspace(root, &state, None).unwrap();
+    devkit::pnpm::import_legacy_npm_lock_seed(root, &packages)
+        .unwrap()
+        .write(root)
+        .unwrap();
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    let a = admit_native_components(root, &state).unwrap();
+    put(root, "rustfmt.toml", "edition='2024'\nmax_width=88\n");
+    let b = admit_native_components(root, &state).unwrap();
+    assert_eq!(a.node_inputs.digest, b.node_inputs.digest);
+    assert_ne!(a.rust_inputs.digest, b.rust_inputs.digest);
+    assert_eq!(b.inputs.directories, b.node_inputs.directories);
+    let mut web: Value = read_json(&root.join("apps/web/package.json")).unwrap();
+    web["scripts"]["build"] = json!("node build.mjs");
+    put_json(root, "apps/web/package.json", &web);
+    let c = admit_native_components(root, &state).unwrap();
+    assert_ne!(b.node_inputs.digest, c.node_inputs.digest);
+    assert_eq!(b.rust_inputs.digest, c.rust_inputs.digest);
+}
+
+#[test]
+#[ignore = "requires Cargo and the author cache inside the pinned validation container"]
+fn pinned_cargo_metadata_validates_excluded_edges_aliases_and_patch_sources() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let state = root_cargo_fixture(root);
+    let worker = "[package]\nname='worker'\nversion='1.0.0'\n[dependencies]\n";
+    let helper = "[package]\nname='helper'\nversion='1.0.0'\n[dependencies]\n";
+    let worker_path = "apps/worker/Cargo.toml";
+    let helper_path = "vendor/helper/Cargo.toml";
+    put(root, "vendor/helper/src/lib.rs", "");
+    let cargo = |args: &[&str]| {
+        std::process::Command::new("cargo")
+            .current_dir(root)
+            .args(args)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .output()
+            .unwrap()
+    };
+    let generate = || {
+        let result = cargo(&["generate-lockfile", "--offline"]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let agrees = |accepted| {
+        let result = cargo(&["metadata", "--locked", "--offline", "--format-version", "1"]);
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "Cargo: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let derived = derive_component_dependencies(root, &state);
+        assert_eq!(derived.is_ok(), accepted, "Devkit: {derived:?}");
+    };
+    put(
+        root,
+        worker_path,
+        &format!("{worker}helper={{path='../../vendor/helper'}}\n"),
+    );
+    put(
+        root,
+        helper_path,
+        &format!(
+            "{helper}storage={{path='../../packages/storage',optional=true}}\n[dev-dependencies]\nprotocol={{path='../../packages/protocol'}}\n"
+        ),
+    );
+    generate();
+    agrees(true);
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/worker"].is_empty());
+    put(
+        root,
+        helper_path,
+        &format!("{helper}storage={{path='../../packages/storage'}}\n"),
+    );
+    agrees(false);
+    generate();
+    agrees(true);
+    assert_eq!(
+        derive_component_dependencies(root, &state).unwrap()["apps/worker"],
+        ["packages/storage"]
+    );
+
+    // Cargo owns feature activation. Updating the lock explicitly after a
+    // feature-only edit selects the optional edge from the excluded crate.
+    put(
+        root,
+        helper_path,
+        &format!(
+            "{helper}storage={{path='../../packages/storage',optional=true}}\n[features]\nactivate=['dep:storage']\n"
+        ),
+    );
+    generate();
+    agrees(true);
+    put(
+        root,
+        worker_path,
+        &format!("{worker}helper={{path='../../vendor/helper',features=['activate']}}\n"),
+    );
+    assert!(
+        !cargo(&["metadata", "--locked", "--offline", "--format-version", "1"])
+            .status
+            .success()
+    );
+    assert!(
+        cargo(&["update", "--workspace", "--offline"])
+            .status
+            .success()
+    );
+    agrees(true);
+
+    // Both versions are present in the pinned author's own Cargo.lock/cache.
+    put(
+        root,
+        worker_path,
+        &format!(
+            "{worker}new={{package='base64',version='=0.23.1'}}\nold={{package='base64',version='=0.22.1'}}\n"
+        ),
+    );
+    generate();
+    agrees(true);
+    put(
+        root,
+        worker_path,
+        &format!(
+            "{worker}new={{package='base64',version='*'}}\n[target.'cfg(windows)'.dependencies]\nnew={{package='base64',version='*'}}\n"
+        ),
+    );
+    agrees(false);
+    generate();
+    agrees(true);
+
+    // The extra registry URL is never contacted. Cargo's --locked decision
+    // and Devkit's graph should both notice when the applicable patch moves.
+    put(root, worker_path, &format!("{worker}cfg-if='=1.0.5'\n"));
+    rust(
+        root,
+        "vendor/cfg-if",
+        "[package]\nname='cfg-if'\nversion='1.0.5'\n",
+        false,
+    );
+    put(root, "vendor/cfg-if/src/lib.rs", "");
+    let config = "[patch.crates-io]\ncfg-if={path='vendor/cfg-if'}\n";
+    put(root, ".cargo/config.toml", config);
+    generate();
+    agrees(true);
+    put(
+        root,
+        ".cargo/config.toml",
+        &config.replace("crates-io", "'https://other.example/index'"),
+    );
+    agrees(false);
+}
+
+#[test]
+fn root_cargo_binds_git_refs_and_custom_registry_indexes() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let state = root_cargo_fixture(root);
+    put(
+        root,
+        ".cargo/config.toml",
+        "[registries.internal]\nindex='sparse+https://example.org/index/'\n",
+    );
+    let worker = "[package]\nname='worker'\nversion='1.0.0'\n[dependencies]\n";
+    let manifest = format!(
+        "{worker}remote={{git='https://example.org/repo',branch='feat/one+two'}}\ncustom={{version='1',registry='internal'}}\n"
+    );
+    put(root, "apps/worker/Cargo.toml", &manifest);
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    let mut lock: toml::Table = lock.parse().unwrap();
+    let packages = lock["package"].as_array_mut().unwrap();
+    let worker = packages
+        .iter_mut()
+        .find(|p| p["name"].as_str() == Some("worker"))
+        .unwrap();
+    worker.as_table_mut().unwrap().insert(
+        "dependencies".into(),
+        toml::Value::Array(vec!["remote".into(), "custom".into()]),
+    );
+    for (name, source) in [
+        (
+            "remote",
+            "git+https://example.org/repo?branch=feat%2Fone%2Btwo#abc",
+        ),
+        ("custom", "sparse+https://example.org/index/"),
+    ] {
+        packages.push(
+            toml::Value::try_from(json!({"name":name,"version":"1.0.0","source":source})).unwrap(),
+        );
+    }
+    put(root, "Cargo.lock", &toml::to_string(&lock).unwrap());
+    assert_native_components(root, &state).unwrap();
+    for changed in [
+        manifest.replace("feat/one+two", "feat/main"),
+        manifest.replace("branch=", "tag="),
+        manifest.replace("branch=", "rev="),
+    ] {
+        put(root, "apps/worker/Cargo.toml", &changed);
+        assert!(assert_native_components(root, &state).is_err());
+    }
+    put(root, "apps/worker/Cargo.toml", &manifest);
+    put(
+        root,
+        ".cargo/config.toml",
+        "[registries.internal]\nindex='sparse+https://other.example/index/'\n",
+    );
+    assert!(assert_native_components(root, &state).is_err());
+}
+
+#[test]
+#[ignore = "requires the pinned Cargo version and the author's offline cache"]
+fn pinned_cargo_metadata_distinguishes_patch_precedence_and_replacement_sources() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let mut state = root_cargo_fixture(root);
+    let provider = "packages/provider";
+    state
+        .components
+        .insert(provider.into(), component(provider, "rust"));
+    let root_manifest = ROOT_MEMBERS.replace(
+        "'packages/storage']",
+        "'packages/storage','packages/provider']",
+    );
+    let cargo = |args: &[&str]| {
+        std::process::Command::new("cargo")
+            .current_dir(root)
+            .args(args)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .output()
+            .unwrap()
+    };
+    let fresh = || {
+        for args in [
+            &["generate-lockfile", "--offline"][..],
+            &["metadata", "--locked", "--offline", "--format-version", "1"],
+        ] {
+            let out = cargo(args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    };
+    put(
+        root,
+        "apps/worker/Cargo.toml",
+        "[package]\nname='worker'\nversion='1.0.0'\n[dependencies]\nserde_json='=1.0.154'\n",
+    );
+    rust(
+        root,
+        provider,
+        "[package]\nname='itoa'\nversion='1.0.18'\n",
+        false,
+    );
+    put(root, "packages/provider/src/lib.rs", "");
+    // A registry crate may reach local code through either override mechanism.
+    // Cargo compares canonicalized origins for patches and exact package
+    // specification URLs for replacements.
+    for (table, expected) in [
+        (
+            "[patch.'https://github.com/RUST-LANG/crates.io-index.git/']\nitoa={path='packages/provider'}\n",
+            true,
+        ),
+        (
+            "[replace]\n'itoa:1.0.18'={path='packages/provider'}\n",
+            true,
+        ),
+        (
+            "[replace]\n'registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18'={path='packages/provider'}\n",
+            true,
+        ),
+        (
+            "[replace]\n'https://github.com/rust-lang/crates.io-index.git#itoa@1.0.18'={path='packages/provider'}\n",
+            false,
+        ),
+    ] {
+        put(root, "Cargo.toml", &format!("{root_manifest}{table}"));
+        fresh();
+        assert_eq!(
+            derive_component_dependencies(root, &state).unwrap()["apps/worker"]
+                .contains(&provider.into()),
+            expected,
+            "{table}"
+        );
+        if expected {
+            put(root, "Cargo.toml", &root_manifest);
+            assert!(
+                derive_component_dependencies(root, &state).is_err(),
+                "{table}"
+            );
+            assert!(
+                !cargo(&["metadata", "--locked", "--offline", "--format-version", "1"])
+                    .status
+                    .success()
+            );
+            fresh();
+            assert!(derive_component_dependencies(root, &state).unwrap()["apps/worker"].is_empty());
+        }
+    }
+    // The excluded vendor manifests share one local identity. Config selects
+    // the directory while both manifests remain tracked inputs.
+    rust(
+        root,
+        "vendor/itoa",
+        "[package]\nname='itoa'\nversion='1.0.18'\n",
+        false,
+    );
+    put(root, "vendor/itoa/src/lib.rs", "");
+    // Remove the matching member to exercise a non-pinned local ID.
+    put(
+        root,
+        "packages/provider/Cargo.toml",
+        "[package]\nname='provider'\nversion='1.0.0'\n",
+    );
+    rust(
+        root,
+        "vendor/shadow",
+        "[package]\nname='itoa'\nversion='1.0.18'\n",
+        false,
+    );
+    put(root, "vendor/shadow/src/lib.rs", "");
+    put(
+        root,
+        "Cargo.toml",
+        &format!("{root_manifest}[patch.crates-io]\nitoa={{path='vendor/shadow'}}\n"),
+    );
+    put(root, ".cargo/config.toml", "include=['patch.toml']\n");
+    put(
+        root,
+        ".cargo/patch.toml",
+        "[patch.'https://github.com/rust-lang/crates.io-index.git']\nitoa={path='vendor/itoa'}\n",
+    );
+    fresh();
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/worker"].is_empty());
+    let inputs = collect_native_input_closure(root, &state).unwrap();
+    assert!(inputs.files["vendor/shadow/Cargo.toml"].is_some());
+    assert!(inputs.files["vendor/itoa/Cargo.toml"].is_some());
+
+    // Removing the last direct edge leaves real registry records orphaned.
+    // Cargo drops them from [[package]] and tracks the unused patch separately.
+    put(
+        root,
+        "apps/worker/Cargo.toml",
+        "[package]\nname='worker'\nversion='1.0.0'\n",
+    );
+    let previous = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    let mut stale: toml::Table = previous.parse().unwrap();
+    let worker = stale["package"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["name"].as_str() == Some("worker"))
+        .unwrap();
+    worker.as_table_mut().unwrap().remove("dependencies");
+    put(root, "Cargo.lock", &toml::to_string(&stale).unwrap());
+    assert!(
+        derive_component_dependencies(root, &state)
+            .unwrap_err()
+            .to_string()
+            .contains("unreachable")
+    );
+    assert!(
+        !cargo(&["metadata", "--locked", "--offline", "--format-version", "1"])
+            .status
+            .success()
+    );
+    let repaired = cargo(&["metadata", "--offline", "--format-version", "1"]);
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert!(derive_component_dependencies(root, &state).unwrap()["apps/worker"].is_empty());
+}
+
+#[test]
+fn cargo_config_rejects_executable_hooks_credentials_root_include_diamond_and_local_urls() {
+    for (label, config, extra_file, expected) in [
+        (
+            "paths",
+            "paths = ['vendor/a']\n",
+            None,
+            "Unsupported Cargo config paths override",
+        ),
+        (
+            "env",
+            "[env]\nFOO = 'bar'\n",
+            None,
+            "Unsupported Cargo config section [env]",
+        ),
+        (
+            "alias",
+            "[alias]\nx = 'build'\n",
+            None,
+            "Unsupported Cargo config section [alias]",
+        ),
+        (
+            "http",
+            "[http]\ncainfo = '/tmp/ca.pem'\n",
+            None,
+            "Unsupported Cargo config section [http]",
+        ),
+        (
+            "rustc-wrapper",
+            "[build]\nrustc-wrapper = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config build.rustc-wrapper",
+        ),
+        (
+            "rustc-workspace-wrapper",
+            "[build]\nrustc-workspace-wrapper = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config build.rustc-workspace-wrapper",
+        ),
+        (
+            "rustc",
+            "[build]\nrustc = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config build.rustc",
+        ),
+        (
+            "rustdoc",
+            "[build]\nrustdoc = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config build.rustdoc",
+        ),
+        (
+            "target-dir",
+            "[build]\ntarget-dir = '/tmp/out'\n",
+            None,
+            "Unsupported Cargo config build.target-dir",
+        ),
+        (
+            "build-dir",
+            "[build]\nbuild-dir = '/tmp/out'\n",
+            None,
+            "Unsupported Cargo config build.build-dir",
+        ),
+        (
+            "build-rustflags",
+            "[build]\nrustflags = ['--cap-lints=allow']\n",
+            None,
+            "Unsupported Cargo config build.rustflags",
+        ),
+        (
+            "build-rustdocflags",
+            "[build]\nrustdocflags = ['--cap-lints=allow']\n",
+            None,
+            "Unsupported Cargo config build.rustdocflags",
+        ),
+        (
+            "target-rustflags",
+            "[target.'cfg(all())']\nrustflags = ['-C', 'linker=/bin/sh']\n",
+            None,
+            "Unsupported Cargo config target.rustflags",
+        ),
+        (
+            "target-rustdocflags",
+            "[target.'cfg(all())']\nrustdocflags = ['--cap-lints=allow']\n",
+            None,
+            "Unsupported Cargo config target.rustdocflags",
+        ),
+        (
+            "git-fetch-with-cli",
+            "[net]\ngit-fetch-with-cli = true\n",
+            None,
+            "Unsupported Cargo config net.git-fetch-with-cli",
+        ),
+        (
+            "credential-providers",
+            "[registry]\nglobal-credential-providers = ['cargo:token']\n",
+            None,
+            "Unsupported Cargo config registry.global-credential-providers",
+        ),
+        (
+            "registry-token",
+            "[registry]\ntoken = 'secret'\n",
+            None,
+            "Unsupported Cargo config registry.token",
+        ),
+        (
+            "registries-credential",
+            "[registries.corp]\nindex = 'sparse+https://example.invalid/index/'\ncredential-provider = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config registries.credential-provider",
+        ),
+        (
+            "target-runner",
+            "[target.x86_64-unknown-linux-gnu]\nrunner = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config target.runner",
+        ),
+        (
+            "target-linker",
+            "[target.x86_64-unknown-linux-gnu]\nlinker = '/bin/sh'\n",
+            None,
+            "Unsupported Cargo config target.linker",
+        ),
+        (
+            "absolute-include",
+            "include = ['/etc/config.toml']\n",
+            None,
+            "Cargo config include must be a relative path",
+        ),
+        (
+            "root-level-include",
+            "include = ['../root.toml']\n",
+            Some(("root.toml", "[patch.crates-io]\n")),
+            "must live in a subdirectory below the checkout root",
+        ),
+        (
+            "uppercase-file-registry",
+            "[registries.local]\nindex = 'SPARSE+FILE:///tmp/index'\n",
+            None,
+            "Unsupported local Cargo",
+        ),
+    ] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let state = state(&[("apps/api", "rust")]);
+        rust(
+            root,
+            "apps/api",
+            "[package]\nname='api'\nversion='1.0.0'\n",
+            true,
+        );
+        profiles(root, &state);
+        put(root, ".cargo/config.toml", config);
+        if let Some((path, body)) = extra_file {
+            put(root, path, body);
+        }
+        let err = format!("{:#}", admit_native_components(root, &state).err().unwrap());
+        assert!(err.contains(expected), "{label}: {err}");
+    }
+
+    // Diamond include is rejected fail-closed.
+    {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let state = state(&[("apps/api", "rust")]);
+        rust(
+            root,
+            "apps/api",
+            "[package]\nname='api'\nversion='1.0.0'\n",
+            true,
+        );
+        profiles(root, &state);
+        put(
+            root,
+            ".cargo/config.toml",
+            "include = ['a.toml', 'b.toml']\n",
+        );
+        put(root, ".cargo/a.toml", "include = ['shared.toml']\n");
+        put(root, ".cargo/b.toml", "include = ['shared.toml']\n");
+        put(root, ".cargo/shared.toml", "[patch.crates-io]\n");
+        let err = format!("{:#}", admit_native_components(root, &state).err().unwrap());
+        assert!(err.contains("Duplicate Cargo config include"), "{err}");
+    }
+
+    // Absolute dependency path, absolute package.workspace, and uppercase FILE: git URL are rejected.
+    for (label, manifest) in [
+        (
+            "absolute-dep-path",
+            "[package]\nname='api'\nversion='1.0.0'\n[dependencies]\nhelper={path='/tmp/helper'}\n",
+        ),
+        (
+            "absolute-workspace",
+            "[package]\nname='api'\nversion='1.0.0'\nworkspace='/tmp'\n",
+        ),
+        (
+            "uppercase-git-file",
+            "[package]\nname='api'\nversion='1.0.0'\n[dependencies]\nhelper={git='FILE:///tmp/repo'}\n",
+        ),
+        (
+            "control-char-git",
+            "[package]\nname='api'\nversion='1.0.0'\n[dependencies]\nhelper={git=\"https://example.invalid/repo\\nbar\"}\n",
+        ),
+    ] {
+        let f = TempDir::new().unwrap();
+        let root = f.path();
+        let state = state(&[("apps/api", "rust")]);
+        rust(root, "apps/api", manifest, true);
+        profiles(root, &state);
+        assert!(
+            admit_native_components(root, &state).is_err(),
+            "{label} unexpectedly succeeded"
+        );
+    }
 }

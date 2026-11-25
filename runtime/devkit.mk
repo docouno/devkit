@@ -25,11 +25,12 @@ devkit_cmd_present := $(if $(filter undefined,$(origin cmd)),,1)
 export DEVKIT_EXEC_CONFLICT := $(and $(devkit_command_present),$(devkit_cmd_present))
 export DEVKIT_EXEC_COMMAND := $(if $(devkit_command_present),$(value command),$(value cmd))
 export DEVKIT_EXEC_COMPONENT := $(value component)
+export DEVKIT_EXEC_TOOLCHAIN := $(value toolchain)
 export DEVKIT_EXEC_WRITE := $(or $(value write),0)
 export DEVKIT_EXEC_NETWORK := $(or $(value network),none)
 export DEVKIT_EXEC_PREPARE := $(or $(value prepare),0)
 unexport app package follow tail headless cleanup reconcile preview json
-unexport name template api use profile to command cmd component write network prepare
+unexport name template api use profile to command cmd component write network prepare toolchain
 unexport DEVKIT_MAKE_DAG DEVKIT_MAKE_PLAN DEVKIT_EXPECTED_MANIFEST DEVKIT_EXPECTED_PLAN
 # Clear projection and internal cache variables so ambient environment values
 # can never inject targets, shell text, or cached manifest digests.
@@ -80,10 +81,13 @@ devkit_skip_reason =
 endif
 devkit_skipped_desktop := $(if $(devkit_needs_desktop_probe),$(if $(devkit_skip_gui),$(devkit_desktop_apps)))
 devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(DEVKIT_APP),$(filter $(DEVKIT_APP),$(devkit_apps)),$(filter-out $(devkit_skipped_desktop),$(devkit_apps))),)
-devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(addprefix $(1)-,$(filter $(DEVKIT_APP),$(devkit_apps))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(devkit_packages))),$(addprefix $(1)-,$(devkit_apps)) $(addprefix $(1)/packages/,$(devkit_packages)))),)
-devkit_app_targets := $(foreach command,setup check fix test build dev package,$(addprefix $(command)-,$(devkit_apps)))
+# Keep the public workspace setup targets distinct from apps with the same suffix.
+devkit_workspace_names := node-workspace rust-workspace
+devkit_app_leaves = $(foreach name,$(2),$(if $(and $(filter setup,$(1)),$(filter $(devkit_workspace_names),$(name))),setup/apps/$(name),$(1)-$(name)))
+devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(call devkit_app_leaves,$(1),$(filter $(DEVKIT_APP),$(devkit_apps))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(devkit_packages))),$(call devkit_app_leaves,$(1),$(devkit_apps)) $(addprefix $(1)/packages/,$(devkit_packages)))),)
+devkit_app_targets := $(foreach command,setup check fix test build dev package,$(call devkit_app_leaves,$(command),$(devkit_apps)))
 devkit_package_targets := $(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(devkit_packages)))
-devkit_dag := setup check fix test build dev up package setup-node-workspace $(devkit_app_targets) $(devkit_package_targets)
+devkit_dag := setup check fix test build dev up package setup-node-workspace setup-rust-workspace $(devkit_app_targets) $(devkit_package_targets)
 
 .PHONY: help info status doctor down logs sync add-app add-package register update recover $(devkit_dag)
 # One Make invocation shares dependencies/output paths, even when -j is inherited.
@@ -118,7 +122,9 @@ package: $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),$(call devkit_targets,package),$(ad
 	@$(devkit_task) package-snapshot
 setup-node-workspace:
 	@$(devkit_task) setup-node
-setup-node-workspace: export DEVKIT_TARGET_COMPONENT :=
+setup-rust-workspace:
+	@$(devkit_task) setup-rust
+setup-node-workspace setup-rust-workspace: export DEVKIT_TARGET_COMPONENT :=
 
 ifneq ($(devkit_app_targets),)
 $(devkit_app_targets): export DEVKIT_TARGET_COMPONENT = apps/$*
@@ -128,8 +134,16 @@ $(devkit_package_targets): export DEVKIT_TARGET_COMPONENT = packages/$*
 endif
 
 ifneq ($(devkit_apps),)
-$(addprefix setup-,$(devkit_apps)): setup-%:
+devkit_workspace_setup_apps := $(filter $(devkit_workspace_names),$(devkit_apps))
+devkit_ordinary_setup_apps := $(filter-out $(devkit_workspace_names),$(devkit_apps))
+ifneq ($(devkit_workspace_setup_apps),)
+$(addprefix setup/apps/,$(devkit_workspace_setup_apps)): setup/apps/%:
 	@$(devkit_task) setup
+endif
+ifneq ($(devkit_ordinary_setup_apps),)
+$(addprefix setup-,$(devkit_ordinary_setup_apps)): setup-%:
+	@$(devkit_task) setup
+endif
 $(addprefix check-,$(devkit_apps)): check-%:
 	@$(devkit_task) check
 $(addprefix fix-,$(devkit_apps)): fix-%:
