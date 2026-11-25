@@ -140,6 +140,11 @@ fn project_volume(path: &str) -> Value {
         false,
     )
 }
+fn is_workspace_output_path(path: &str) -> bool {
+    !path.chars().any(|c| ['\r', '\n', '\t', '\0'].contains(&c))
+        && !path.starts_with('/')
+        && !path.split('/').any(|c| ["", ".", ".."].contains(&c))
+}
 pub(crate) fn cargo_run_command(member: Option<&CargoMember>) -> Result<Vec<String>> {
     let mut command = [
         "cargo",
@@ -359,6 +364,23 @@ pub fn render_app_compose(
 ) -> Result<Vec<u8>> {
     json_bytes(&render_app_compose_value(state, cargo)?)
 }
+pub(crate) fn registered_workspace_inputs(state: &ProjectState) -> InputIdentitySet {
+    let nodes = node_components(state);
+    let directories = if nodes.is_empty() {
+        vec![]
+    } else {
+        std::iter::once(String::new())
+            .chain(nodes.into_iter().map(|(path, _)| path.clone()))
+            .collect()
+    };
+    InputIdentitySet {
+        schema_version: 1,
+        files: Default::default(),
+        directories,
+        digest: String::new(),
+    }
+}
+
 pub fn workspace_write_directories(
     state: &ProjectState,
     inputs: &InputIdentitySet,
@@ -381,9 +403,7 @@ pub fn workspace_write_directories(
     }
     for p in &paths {
         ensure!(
-            !p.chars().any(|c| ['\r', '\n', '\t', '\0'].contains(&c))
-                && !p.starts_with('/')
-                && !p.split('/').any(|c| ["", ".", ".."].contains(&c)),
+            is_workspace_output_path(p),
             "Invalid workspace output path: {p}"
         );
     }
@@ -433,6 +453,31 @@ pub(crate) fn assert_workspace_compose(
                 .pointer("/services/node/volumes")
                 .and_then(Value::as_array)
                 .context(STALE)?;
+            let registered = registered_workspace_inputs(state);
+            let mut required: BTreeSet<_> = workspace_write_directories(state, &registered)?
+                .into_iter()
+                .collect();
+            let allow_dependency_mounts = !registered.directories.is_empty();
+            let mut previous: Option<&str> = None;
+            for mount in volumes {
+                let path = mount["target"]
+                    .as_str()
+                    .and_then(|target| target.strip_prefix("/workspace/"))
+                    .context(STALE)?;
+                ensure!(
+                    is_workspace_output_path(path)
+                        && previous.is_none_or(|last| last
+                            .encode_utf16()
+                            .cmp(path.encode_utf16())
+                            .is_lt())
+                        && mount == &project_volume(path)
+                        && (required.remove(path)
+                            || (allow_dependency_mounts && path.ends_with("/node_modules"))),
+                    "{STALE}"
+                );
+                previous = Some(path);
+            }
+            ensure!(required.is_empty(), "{STALE}");
             workspace_compose(volumes)
         }
     };

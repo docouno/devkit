@@ -1025,18 +1025,7 @@ pub fn write_managed(
         {
             collect_native_input_closure(destination, state)?
         } else {
-            InputIdentitySet {
-                schema_version: 1,
-                files: BTreeMap::new(),
-                directories: if node_components(state).is_empty() {
-                    vec![]
-                } else {
-                    std::iter::once(String::new())
-                        .chain(node_components(state).iter().map(|(p, _)| (*p).clone()))
-                        .collect()
-                },
-                digest: String::new(),
-            }
+            registered_workspace_inputs(state)
         };
         outputs.push((
             LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,

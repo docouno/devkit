@@ -423,16 +423,46 @@ fn legacy_status_remains_available_during_native_lock_repair() {
         let admission = ToolAdmission::capture_status_compat(&request).unwrap();
         assert_eq!(admission.state.version, state.version);
 
-        put(&root, RETIRED_FILES[0], b"{\"services\":{}}\n");
-        record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
-        let error = match ToolAdmission::capture_status_compat(&request) {
-            Ok(_) => panic!("admitted a stale workspace projection"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("projection is stale"),
-            "{error:#}"
-        );
+        let mut stale_projections = vec![json!({"services": {}})];
+        if template == "node" {
+            let mut projection: Value = read_json(&root.join(RETIRED_FILES[0])).unwrap();
+            let mut volumes = projection["services"]["node"]["volumes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            volumes.push(json!({
+                "type": "bind",
+                "source": "${DEVKIT_PROJECT_ROOT:?}/vendor/local/node_modules",
+                "target": "/workspace/vendor/local/node_modules",
+                "read_only": false,
+                "bind": {"create_host_path": false, "selinux": "z"}
+            }));
+            projection["services"]["node"]["volumes"] = json!(&volumes);
+            projection["services"]["desktop"]["volumes"] = json!(&volumes);
+            write_json(&root.join(RETIRED_FILES[0]), &projection).unwrap();
+            record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+            assert!(ToolAdmission::capture_status_compat(&request).is_ok());
+
+            let mut missing_root = projection.clone();
+            volumes.retain(|mount| mount["target"] != "/workspace/node_modules");
+            missing_root["services"]["node"]["volumes"] = json!(&volumes);
+            missing_root["services"]["desktop"]["volumes"] = json!(&volumes);
+            stale_projections.push(missing_root);
+            stale_projections
+                .push(json!({"services": {"node": {"volumes": []}, "desktop": {"volumes": []}}}));
+        }
+        for projection in stale_projections {
+            write_json(&root.join(RETIRED_FILES[0]), &projection).unwrap();
+            record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+            let error = match ToolAdmission::capture_status_compat(&request) {
+                Ok(_) => panic!("admitted a stale workspace projection"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("projection is stale"),
+                "{error:#}"
+            );
+        }
     }
 }
 
