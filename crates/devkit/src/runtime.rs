@@ -102,7 +102,13 @@ impl ToolAdmission {
         Self::capture_kind(request, true, false)
     }
     pub fn capture_status_compat(request: &RuntimeRequest) -> Result<Self> {
-        Self::capture_kind(request, true, true)
+        let admission = Self::capture_kind(request, true, true)?;
+        if uses_tool_compose_projections(&admission.state.version)? {
+            let inputs =
+                crate::native::collect_native_input_closure(&admission.root, &admission.state)?;
+            assert_workspace_compose(&admission.root, &admission.state, &inputs)?;
+        }
+        Ok(admission)
     }
     fn capture_kind(
         request: &RuntimeRequest,
@@ -131,6 +137,7 @@ impl ToolAdmission {
             if path.starts_with(".devkit/runtime/")
                 || path == CHECKSUM_PATH
                 || path == ".devkit/compose.apps.yaml"
+                || (allow_older_accepted && path == LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)
             {
                 ensure!(
                     identity(&safe_path(&root, path)?)?

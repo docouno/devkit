@@ -415,6 +415,19 @@ pub fn render_workspace_compose(
     json_bytes(&render_workspace_compose_value(state, inputs)?)
 }
 
+pub(crate) fn assert_workspace_compose(
+    root: &Path,
+    state: &ProjectState,
+    inputs: &InputIdentitySet,
+) -> Result<()> {
+    let workspace: Value = read_json(&safe_path(root, LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)?)?;
+    ensure!(
+        workspace == render_workspace_compose_value(state, inputs)?,
+        "Workspace mount projection is stale; run devkit sync"
+    );
+    Ok(())
+}
+
 pub fn assert_projections(
     root: &Path,
     state: &ProjectState,
@@ -431,11 +444,7 @@ pub fn assert_projections(
         "Development integration projection is stale; run devkit sync"
     );
     if uses_tool_compose_projections(&state.version)? {
-        let workspace: Value = read_json(&safe_path(root, LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)?)?;
-        ensure!(
-            workspace == render_workspace_compose_value(state, inputs)?,
-            "Workspace mount projection is stale; run devkit sync"
-        );
+        assert_workspace_compose(root, state, inputs)?;
     }
     Ok(())
 }
