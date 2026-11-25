@@ -146,6 +146,10 @@ Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI
 - **Explicit resource overrides**: Export `DEVKIT_CPUS` (for example `DEVKIT_CPUS=2`), `DEVKIT_MEMORY_LIMIT` (for example `DEVKIT_MEMORY_LIMIT=4g`), and `DEVKIT_CARGO_BUILD_JOBS` (for example `DEVKIT_CARGO_BUILD_JOBS=2`) when sharing a runner across concurrent jobs.
 - **Nested cgroup v2 delegation**: If a Docker-in-Docker container keeps entrypoint processes in its root cgroup (`/sys/fs/cgroup/cgroup.procs`), Linux cgroup v2 blocks `+cpu +memory` in `cgroup.subtree_control`. Devkit automatically falls back to in-process toolchain bounds without failing the job; to enable hard container cgroup limits in custom DinD images, move entrypoint processes into a child cgroup (such as `/sys/fs/cgroup/init`) before enabling `+cpu +memory +pids` on `cgroup.subtree_control`.
 
+## Devkit release verification on Linux
+
+After Linux x86-64 and ARM64 assembly, the source gates run alongside the consumer checks for the frozen release. The consumer checks use the same assembled bytes and source commit. The required checks cover source, runtime, delivery, packaged consumers, and registry behavior. The release workflow also requires the performance gate before publishing.
+
 ## Devkit release verification on Apple Silicon
 
 While Apple Silicon remains behind the publication gate, the `build-darwin-arm64` job (`macos-15`) and the `darwin-preview` workflow (assembling and uploading `devkit-darwin-preview-<attempt>` on `ubuntu-24.04`, then verifying it on `macos-15`) run in parallel with the required Linux assembly and verification checks without blocking Linux PR checks or Linux-only releases. They exercise the native CLI and the stock shell and Make entry points. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.

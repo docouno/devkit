@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MANIFEST_PATH: &str = ".devkit/manifest.json";
@@ -14,13 +15,19 @@ pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
 pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.5.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const RUNTIME_LICENSES: &str = ".devkit/runtime/licenses";
+pub(crate) const LEGACY_TOOL_COMPOSE_RUNTIME_FILE: &str = "runtime/compose.tools.yaml";
+pub(crate) const LEGACY_TOOL_COMPOSE_RUNTIME_PATH: &str = ".devkit/runtime/compose.tools.yaml";
+pub(crate) const LEGACY_TOOL_COMPOSE_WORKSPACE_FILE: &str = ".devkit/compose.workspace.json";
+const LEGACY_TOOL_COMPOSE_FILES: [&str; 2] = [
+    LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+    LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
+];
 
 // Paths within a release payload. The seccomp notices travel with the profile.
-pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 4] = [
+pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 3] = [
     "runtime/devkit.mk",
     "runtime/devkit.sh",
     "runtime/toolchains.env",
-    "runtime/compose.tools.yaml",
 ];
 pub(crate) const RUNTIME_LICENSE_FILE: &str = "runtime/LICENSE";
 pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
@@ -33,6 +40,10 @@ pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
 pub fn uses_profile_scoped_runtime(version: &str) -> Result<bool> {
     let v = SemVer::parse(version)?;
     Ok((v.major, v.minor, v.patch) >= (0, 6, 0))
+}
+
+pub fn uses_tool_compose_projections(version: &str) -> Result<bool> {
+    Ok(!uses_profile_scoped_runtime(version)?)
 }
 
 pub fn has_electron(state: &ProjectState) -> bool {
@@ -190,7 +201,7 @@ pub fn managed_path(name: &str) -> Result<&str> {
                 "rust-toolchain.toml",
                 ".devkit/project.mk",
                 ".devkit/compose.apps.yaml",
-                ".devkit/compose.workspace.json",
+                LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
                 ".devkit/tooling-profiles.json",
                 CHECKSUM_PATH
             ]
@@ -502,12 +513,30 @@ pub(crate) fn verify_runtime_inventory(root: &Path, state: &ProjectState) -> Res
     verify_runtime_inventory_with_incoming(root, state, &BTreeSet::new())
 }
 
+fn unexpected_legacy_tool_compose(path: &str, is_dir: bool) -> anyhow::Error {
+    let command = if is_dir { "rmdir" } else { "rm" };
+    anyhow::anyhow!("Unexpected legacy {path}; review its contents and run '{command} {path}'")
+}
+
+pub(crate) fn verify_retired_workspace_compose_absent(root: &Path) -> Result<()> {
+    let path = safe_path(root, ".devkit")?.join("compose.workspace.json");
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Err(unexpected_legacy_tool_compose(
+            LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
+            meta.is_dir(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub(crate) fn verify_runtime_inventory_with_incoming(
     root: &Path,
     state: &ProjectState,
     incoming: &BTreeSet<String>,
 ) -> Result<()> {
     let root = project_root(root)?;
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
     let mut files: BTreeSet<&Path> = state
         .managed
         .keys()
@@ -527,6 +556,12 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
             let name = path.strip_prefix(&root)?;
             let typ = entry.file_type()?;
             if typ.is_dir() {
+                if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
+                    return Err(unexpected_legacy_tool_compose(
+                        LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+                        true,
+                    ));
+                }
                 if !directories.contains(name) {
                     if name == Path::new(RUNTIME_LICENSES) {
                         // Sync can restore the notices of a registered Electron
@@ -545,6 +580,12 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
                     let display = name.to_string_lossy();
                     if incoming.contains(display.as_ref()) {
                         anyhow::bail!("New managed file conflicts with project content: {display}");
+                    }
+                    if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
+                        return Err(unexpected_legacy_tool_compose(
+                            LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+                            false,
+                        ));
                     }
                     anyhow::bail!("Unlisted runtime file: {display}");
                 }
@@ -565,13 +606,22 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
     Ok(())
 }
 
+pub(crate) fn verify_retired_tool_compose_unmanaged(state: &ProjectState) -> Result<()> {
+    for path in LEGACY_TOOL_COMPOSE_FILES {
+        ensure!(
+            !state.managed.contains_key(path),
+            "Unexpected legacy tool Compose file: {path}"
+        );
+    }
+    Ok(())
+}
+
 pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
     for required in [
         CHECKSUM_PATH,
         ".devkit/tooling-profiles.json",
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
     ] {
         ensure!(
             state.managed.contains_key(required),
@@ -586,7 +636,17 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         );
     }
     let scoped = uses_profile_scoped_runtime(&state.version)?;
+    if !scoped {
+        for path in LEGACY_TOOL_COMPOSE_FILES {
+            ensure!(
+                state.managed.contains_key(path),
+                "Missing managed runtime identity: {path}"
+            );
+        }
+    }
     if scoped {
+        verify_retired_tool_compose_unmanaged(state)?;
+        verify_retired_workspace_compose_absent(root)?;
         let license = format!(".devkit/{RUNTIME_LICENSE_FILE}");
         ensure!(
             state.managed.contains_key(&license),
@@ -957,6 +1017,18 @@ fn shared_readers_hold_lock(lock_path: &Path) -> bool {
     probe.try_lock_shared().is_ok()
 }
 
+fn ownerless_wait_duration(
+    since: &mut Option<Instant>,
+    now: Instant,
+    owner_present: bool,
+) -> Duration {
+    if owner_present {
+        *since = None;
+        return Duration::ZERO;
+    }
+    now.duration_since(*since.get_or_insert(now))
+}
+
 /// Shared by lifecycle operations and native runtime commands. No inherited
 /// process-wide lock protocol is needed; the open file owns the advisory lock.
 pub struct CheckoutLock {
@@ -1083,6 +1155,7 @@ impl CheckoutLock {
         };
         let timeout_ms = lock_timeout_ms()?;
         let started = std::time::Instant::now();
+        let mut ownerless_since = Some(started);
         let mut printed_wait = false;
         loop {
             ensure!(
@@ -1114,8 +1187,13 @@ impl CheckoutLock {
                     if let Some(r) = runner {
                         r.check_cancelled()?;
                     }
-                    let elapsed = started.elapsed();
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(started);
                     let identity = checkout_owner(&root);
+                    // The owner removes the sidecar while still holding the lock.
+                    // Give any new period without an owner its own short grace window.
+                    let ownerless_elapsed =
+                        ownerless_wait_duration(&mut ownerless_since, now, identity.is_some());
                     if let Some(OwnerIdentity::Verified(owner)) = identity {
                         ensure!(
                             !is_ancestor_or_self(owner.pid),
@@ -1149,7 +1227,9 @@ impl CheckoutLock {
                             } else {
                                 250.min(timeout_ms)
                             };
-                        if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
+                        if elapsed >= Duration::from_millis(timeout_ms)
+                            || ownerless_elapsed >= Duration::from_millis(unowned_limit_ms)
+                        {
                             anyhow::bail!("Another devkit operation owns this checkout");
                         }
                     }
@@ -1164,6 +1244,27 @@ impl CheckoutLock {
 mod owner_tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn ownerless_wait_restarts_when_the_verified_owner_disappears() {
+        let started = Instant::now();
+        let mut since = Some(started);
+        let grace = Duration::from_millis(250);
+        assert_eq!(
+            ownerless_wait_duration(&mut since, started + grace, false),
+            grace
+        );
+        let handoff = started + Duration::from_secs(1);
+        ownerless_wait_duration(&mut since, handoff - grace, true);
+        assert_eq!(
+            ownerless_wait_duration(&mut since, handoff, false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ownerless_wait_duration(&mut since, handoff + grace, false),
+            grace
+        );
+    }
 
     #[test]
     fn lock_identity_rejects_other_clocks_and_stale_start_times() {

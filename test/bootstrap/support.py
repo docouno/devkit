@@ -405,11 +405,26 @@ class Harness:
         worker = baseline / 'apps/worker'
         for path in [worker / 'Cargo.toml', worker / 'Cargo.lock', *worker.rglob('*.rs')]:
             path.write_text(path.read_text().replace('devkit-api', 'worker').replace('devkit_api', 'worker'))
-        self.run('genuine-project-loader-preview', [*bridge, '--preview'], cwd=baseline, env=bridge_env)
+        retired = ('.devkit/compose.workspace.json', '.devkit/runtime/compose.tools.yaml')
+        for path in retired:
+            require((baseline / path).is_file(), 'Missing legacy projection ' + path)
+        preview = self.run('genuine-project-loader-preview', [*bridge, '--preview', '--json'], cwd=baseline, env=bridge_env)
         require(old_loader.read_bytes() == old_bytes, 'Preview changed the checked-in loader')
-        self.run('genuine-project-loader-update', bridge, cwd=baseline, env=bridge_env)
+        planned = {item['path']: item for item in json.loads(preview.stdout)['result']['files']}
+        for path in retired:
+            require((baseline / path).is_file() and planned[path]['before'] and planned[path]['after'] is None,
+                    'Preview must plan removal without deleting ' + path)
+        applied = self.run('genuine-project-loader-update', [*bridge, '--json'], cwd=baseline, env=bridge_env)
+        changes = {item['path']: item for item in json.loads(applied.stdout)['result']['files']}
+        require(changes.keys() == planned.keys(), 'Upgrade paths differ from preview')
         require(all(p.read_bytes() == data for p, data in before.items()), 'Migration changed product inputs')
-        require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
+        state = json.loads((baseline / '.devkit/manifest.json').read_text())
+        require(state['version'] == self.version, 'Migration version differs')
+        checksums = (baseline / '.devkit/runtime.sha256').read_text()
+        for path in retired:
+            require(changes[path] == planned[path] and not (baseline / path).exists()
+                    and not (baseline / path).is_symlink() and path not in state['managed'] and path not in checksums,
+                    'Upgrade retained retired projection ' + path)
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
         self.verify_rust_recovery(target_source)

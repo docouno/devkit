@@ -7,6 +7,11 @@ const DESKTOP_FILES: [&str; 4] = [
     ".devkit/runtime/licenses/moby-profiles.NOTICE",
 ];
 
+const RETIRED_FILES: [&str; 2] = [
+    ".devkit/compose.workspace.json",
+    ".devkit/runtime/compose.tools.yaml",
+];
+
 pub(super) fn add_electron(
     release: &Path,
     root: &Path,
@@ -53,11 +58,13 @@ fn assert_scoped_checkout(root: &Path, desktop: bool) {
             .get(DESKTOP_FILES[0])
             .map(|id| id.sha256.as_str())
     );
-    let tools = fs::read(root.join(".devkit/runtime/compose.tools.yaml")).unwrap();
-    let workspace: Value = read_json(&root.join(".devkit/compose.workspace.json")).unwrap();
-    for projection in [parse_compose(&tools).unwrap(), workspace] {
-        assert_eq!(projection["services"].get("desktop").is_some(), desktop);
-        assert!(projection["services"].get("node").is_some());
+    for path in RETIRED_FILES {
+        assert!(
+            !root.join(path).exists() && !root.join(path).is_symlink(),
+            "{path}"
+        );
+        assert!(!state.managed.contains_key(path), "{path}");
+        assert!(!checksums.contains(path), "{path}");
     }
     read_runtime_project(root, &state.version).unwrap();
 }
@@ -147,20 +154,35 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
     // The 0.5.1 engine predates root Cargo journal paths (docs/migrations/0.6.0.md
     // directs Rust recovery to the cached 0.6.0 engine), while still recovering
     // Node profile transitions cleanly offline.
-    let mut cases = vec![
-        (PathBuf::from(env!("CARGO_BIN_EXE_devkit")), "rust"),
-        (PathBuf::from(env!("CARGO_BIN_EXE_devkit")), "node"),
-    ];
+    let current = PathBuf::from(env!("CARGO_BIN_EXE_devkit"));
     let genuine = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.artifacts/baseline/v0.5.1/payload/devkit");
+    let mut cases = vec![
+        (&current, "rust", false, false),
+        (&current, "node", false, false),
+        (&current, "electron-react", false, true),
+        (&current, "rust", true, true),
+        (&current, "node", true, true),
+    ];
     if devkit::distribution::Target::host().unwrap() == devkit::distribution::Target::LinuxX64
         && genuine.is_file()
     {
-        cases.push((genuine, "node"));
+        cases.extend([
+            (&genuine, "node", false, false),
+            (&genuine, "electron-react", false, true),
+            (&genuine, "node", true, true),
+        ]);
     }
-    for (i, (engine, template)) in cases.iter().enumerate() {
-        for add in [true, false] {
-            let project = temp.path().join(format!("checkout-{i}-{template}-{add}"));
+    for (i, (engine, template, add, desktop_after)) in cases.into_iter().enumerate() {
+        let mut stop_paths = Vec::new();
+        if !add {
+            stop_paths.extend(RETIRED_FILES);
+        }
+        if add || !desktop_after {
+            stop_paths.push(DESKTOP_FILES[3]);
+        }
+        for (j, stop_path) in stop_paths.into_iter().enumerate() {
+            let project = temp.path().join(format!("checkout-{i}-{j}"));
             init(
                 if add { &new } else { &old },
                 &project,
@@ -174,13 +196,23 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
                 .args(["--exact", "interruption_worker", "--ignored"])
                 .env("DEVKIT_TEST_RELEASE", &new)
                 .env("DEVKIT_TEST_TARGET", &project)
-                .env("DEVKIT_TEST_WRITE_PATH", DESKTOP_FILES[3]);
+                .env("DEVKIT_TEST_WRITE_PATH", stop_path);
             if add {
                 child.env("DEVKIT_TEST_ADD_ELECTRON", "1");
             }
             let interruption = child.output().unwrap();
             assert_eq!(interruption.status.code(), Some(86), "{interruption:?}");
-            assert_eq!(project.join(".devkit/runtime/licenses").is_dir(), add);
+            for path in RETIRED_FILES {
+                assert_eq!(
+                    project.join(path).exists(),
+                    !add && path > stop_path,
+                    "{path}"
+                );
+            }
+            assert_eq!(
+                project.join(".devkit/runtime/licenses").is_dir(),
+                add || stop_path < DESKTOP_FILES[3]
+            );
             assert_eq!(read_journal(&project).unwrap().schema_version, 2);
             assert_eq!(
                 identity(&project.join(MANIFEST_PATH)).unwrap(),
@@ -204,7 +236,7 @@ fn interrupted_profile_transition_recovers_offline_and_can_be_retried() {
                 update_project(&new, &project, &UpdateOptions::default(), &FixtureResolver)
                     .unwrap();
             }
-            assert_scoped_checkout(&project, add);
+            assert_scoped_checkout(&project, desktop_after);
         }
     }
 }
@@ -232,6 +264,419 @@ fn record_managed_change(project: &Path, state: &mut ProjectState, path: &str, t
     write_json(&project.join(MANIFEST_PATH), state).unwrap();
 }
 
+fn read_checkout_command(root: &Path, command: &str) -> Value {
+    let out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+        .args(["--offline", "--json", "--cache-dir"])
+        .arg(root.join(".devkit/state/empty-cache"))
+        .arg(command)
+        .arg(root)
+        .env_clear()
+        .env("CI", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{command}: {out:?}");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    if command == "doctor" {
+        report["result"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "checkout_state")
+            .unwrap()
+            .clone()
+    } else {
+        report["error"].clone()
+    }
+}
+
+#[test]
+fn retired_managed_files_are_removed_only_when_their_identities_match() {
+    let temp = TempDir::new().unwrap();
+    let old = fixture_release(temp.path(), "0.5.1");
+    let current = fixture_release(temp.path(), "0.6.0");
+    for template in ["node", "electron-react"] {
+        let legacy = temp.path().join(format!("legacy-{template}"));
+        init(&old, &legacy, template, PackageMode::Registry);
+        for path in RETIRED_FILES {
+            let original = fs::read(legacy.join(path)).unwrap();
+            put(&legacy, path, b"owner changes\n");
+            let before = author_port_payload(&legacy);
+            let error = update_project(&current, &legacy, &UpdateOptions::default(), &NoResolver)
+                .unwrap_err();
+            assert!(error.to_string().contains(path), "{error:#}");
+            assert_eq!(author_port_payload(&legacy), before);
+            put(&legacy, path, &original);
+        }
+        let before = author_port_payload(&legacy);
+        let preview = update_project(
+            &current,
+            &legacy,
+            &UpdateOptions {
+                preview: true,
+                ..Default::default()
+            },
+            &FixtureResolver,
+        )
+        .unwrap();
+        assert_eq!(author_port_payload(&legacy), before);
+        let applied = update_project(
+            &current,
+            &legacy,
+            &UpdateOptions::default(),
+            &FixtureResolver,
+        )
+        .unwrap();
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>(),
+            applied
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>(),
+        );
+        for path in RETIRED_FILES {
+            let file = applied.files.iter().find(|file| file.path == path).unwrap();
+            assert_eq!(file.before.as_ref(), Some(&before[path]));
+            assert!(file.after.is_none(), "{path}");
+        }
+        assert_scoped_checkout(&legacy, template == "electron-react");
+
+        for path in RETIRED_FILES {
+            for modified in [false, true] {
+                let mut state = read_project_state(&legacy).unwrap();
+                put(&legacy, path, b"{}\n");
+                record_managed_change(&legacy, &mut state, path, true);
+                if modified {
+                    put(&legacy, path, b"owner changes\n");
+                }
+                let before = author_port_payload(&legacy);
+                for command in ["describe", "status"] {
+                    let report = read_checkout_command(&legacy, command);
+                    assert!(
+                        report["message"].as_str().unwrap().contains(path),
+                        "{report}"
+                    );
+                }
+                let doctor = read_checkout_command(&legacy, "doctor");
+                assert_eq!(doctor["status"], "fail");
+                if !modified {
+                    assert_eq!(doctor["remediation"], "make sync");
+                }
+                for options in [
+                    UpdateOptions::default(),
+                    UpdateOptions {
+                        reconcile_lock: true,
+                        ..Default::default()
+                    },
+                    UpdateOptions {
+                        package_mode: Some(PackageMode::Local),
+                        ..Default::default()
+                    },
+                ] {
+                    let error =
+                        update_project(&current, &legacy, &options, &NoResolver).unwrap_err();
+                    assert!(error.to_string().contains(path), "{error:#}");
+                    assert_eq!(author_port_payload(&legacy), before);
+                }
+                if modified {
+                    let error =
+                        sync_project(&current, &legacy, &UpdateOptions::default(), &NoResolver)
+                            .unwrap_err();
+                    assert!(error.to_string().contains(path), "{error:#}");
+                    assert_eq!(author_port_payload(&legacy), before);
+                    put(&legacy, path, b"{}\n");
+                }
+                sync_project(
+                    &current,
+                    &legacy,
+                    &UpdateOptions::default(),
+                    &FixtureResolver,
+                )
+                .unwrap();
+                assert_scoped_checkout(&legacy, template == "electron-react");
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_status_remains_available_during_native_lock_repair() {
+    use devkit::runtime::{RuntimeRequest, ToolAdmission};
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.5.1");
+    for template in ["rust", "node"] {
+        let root = temp.path().join(template);
+        let mut state = init(&release, &root, template, PackageMode::Registry);
+        let lock = if template == "rust" {
+            root.join(state.components.keys().next().unwrap())
+                .join("Cargo.lock")
+        } else {
+            root.join("pnpm-lock.yaml")
+        };
+        fs::remove_file(lock).unwrap();
+        let request = RuntimeRequest::new(root.clone(), "status".into());
+        let admission = ToolAdmission::capture_status_compat(&request).unwrap();
+        assert_eq!(admission.state.version, state.version);
+
+        let mut stale_projections = vec![json!({"services": {}})];
+        if template == "node" {
+            let mut projection: Value = read_json(&root.join(RETIRED_FILES[0])).unwrap();
+            let mut volumes = projection["services"]["node"]["volumes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            volumes.push(json!({
+                "type": "bind",
+                "source": "${DEVKIT_PROJECT_ROOT:?}/vendor/local/node_modules",
+                "target": "/workspace/vendor/local/node_modules",
+                "read_only": false,
+                "bind": {"create_host_path": false, "selinux": "z"}
+            }));
+            projection["services"]["node"]["volumes"] = json!(&volumes);
+            projection["services"]["desktop"]["volumes"] = json!(&volumes);
+            write_json(&root.join(RETIRED_FILES[0]), &projection).unwrap();
+            record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+            assert!(ToolAdmission::capture_status_compat(&request).is_ok());
+
+            let mut missing_root = projection.clone();
+            volumes.retain(|mount| mount["target"] != "/workspace/node_modules");
+            missing_root["services"]["node"]["volumes"] = json!(&volumes);
+            missing_root["services"]["desktop"]["volumes"] = json!(&volumes);
+            stale_projections.push(missing_root);
+            stale_projections
+                .push(json!({"services": {"node": {"volumes": []}, "desktop": {"volumes": []}}}));
+        }
+        for projection in stale_projections {
+            write_json(&root.join(RETIRED_FILES[0]), &projection).unwrap();
+            record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+            let error = match ToolAdmission::capture_status_compat(&request) {
+                Ok(_) => panic!("admitted a stale workspace projection"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("projection is stale"),
+                "{error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_status_checks_local_mounts_with_a_large_dependency_archive() {
+    use devkit::runtime::{RuntimeRequest, ToolAdmission};
+    use std::io::Read;
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.5.1");
+    let root = temp.path().join("node");
+    let mut state = init(&release, &root, "node", PackageMode::Registry);
+    put_json(
+        &root,
+        "vendor/local/package.json",
+        &json!({"name": "local", "version": "1.0.0", "private": true}),
+    );
+
+    let archive_path = root.join("vendor/assets.tgz");
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::none(),
+    ));
+    let package = br#"{"name":"assets","version":"1.0.0"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(package.len() as u64);
+    archive
+        .append_data(&mut header, "package/package.json", &package[..])
+        .unwrap();
+    let size = 32 * 1024 * 1024 + 1;
+    header.set_size(size);
+    archive
+        .append_data(
+            &mut header,
+            "package/assets.bin",
+            std::io::repeat(0).take(size),
+        )
+        .unwrap();
+    archive.into_inner().unwrap().finish().unwrap();
+    let integrity = format!(
+        "sha512-{}",
+        STANDARD.encode(Sha512::digest(fs::read(archive_path).unwrap()))
+    );
+
+    let mut manifest: Value = read_json(&root.join("package.json")).unwrap();
+    manifest["dependencies"] =
+        json!({"local": "file:vendor/local", "assets": "file:vendor/assets.tgz"});
+    put_json(&root, "package.json", &manifest);
+    let mut lock = devkit::pnpm::Lock::read(&root).unwrap();
+    for (name, specifier, resolution) in [
+        (
+            "local",
+            "file:vendor/local",
+            json!({"type": "directory", "directory": "vendor/local"}),
+        ),
+        (
+            "assets",
+            "file:vendor/assets.tgz",
+            json!({"tarball": "file:vendor/assets.tgz", "integrity": integrity}),
+        ),
+    ] {
+        lock.importers.get_mut(".").unwrap().dependencies.insert(
+            name.into(),
+            devkit::pnpm::Dependency {
+                specifier: specifier.into(),
+                version: specifier.into(),
+            },
+        );
+        let key = format!("{name}@{specifier}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"version": "1.0.0", "resolution": resolution})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, Default::default());
+    }
+    lock.write(&root).unwrap();
+    let native = devkit::native::admit_native_components(&root, &state).unwrap();
+    assert!(
+        native
+            .inputs
+            .directories
+            .iter()
+            .any(|path| path == "vendor/local")
+    );
+
+    let request = RuntimeRequest::new(root.clone(), "status".into());
+    let error = match ToolAdmission::capture_status_compat(&request) {
+        Ok(_) => panic!("admitted a workspace projection missing the local mount"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("projection is stale"),
+        "{error:#}"
+    );
+    let projection = devkit::projections::render_workspace_compose(&state, &native.inputs).unwrap();
+    put(&root, RETIRED_FILES[0], &projection);
+    record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+    assert!(ToolAdmission::capture_status_compat(&request).is_ok());
+}
+
+#[test]
+fn retired_runtime_directory_is_refused_with_a_managed_child() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("current");
+    let mut state = init(&release, &root, "rust", PackageMode::Registry);
+    let directory = RETIRED_FILES[1];
+    let child = format!("{directory}/README.txt");
+    put(&root, &child, b"local content\n");
+    record_managed_change(&root, &mut state, &child, true);
+    let before = author_port_payload(&root);
+    let doctor = read_checkout_command(&root, "doctor");
+    assert_eq!(doctor["status"], "fail");
+    assert_eq!(doctor["remediation"], format!("rmdir {directory}"));
+    let error = sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap_err();
+    assert!(error.to_string().contains(directory), "{error:#}");
+    assert_eq!(author_port_payload(&root), before);
+}
+
+#[test]
+fn stray_retired_paths_require_explicit_owner_cleanup() {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, symlink},
+    };
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    for template in ["node", "electron-react"] {
+        let root = temp.path().join(template);
+        init(&release, &root, template, PackageMode::Registry);
+        let inventory = capture_compose_inputs(&root).unwrap();
+        let options = UpdateOptions {
+            compose_inventory: Some(&inventory),
+            ..Default::default()
+        };
+        let baseline = source_signature(&root, Some(&read_project_state(&root).unwrap())).unwrap();
+        for path in RETIRED_FILES {
+            let entry = root.join(path);
+            for kind in ["file", "directory", "symlink", "fifo"] {
+                match kind {
+                    "file" => put(&root, path, b"owner file\n"),
+                    "directory" => fs::create_dir(&entry).unwrap(),
+                    "symlink" => symlink("missing-owner-target", &entry).unwrap(),
+                    _ => {
+                        let c_path = std::ffi::CString::new(entry.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+                    }
+                }
+                let state = read_project_state(&root).unwrap();
+                let before = source_signature(&root, Some(&state)).unwrap();
+                let doctor = read_checkout_command(&root, "doctor");
+                let utility = if kind == "directory" { "rmdir" } else { "rm" };
+                assert_eq!(doctor["status"], "fail");
+                assert_eq!(doctor["remediation"], format!("{utility} {path}"));
+                for command in ["describe", "status"] {
+                    let report = read_checkout_command(&root, command);
+                    assert!(
+                        report["message"].as_str().unwrap().contains(path),
+                        "{report}"
+                    );
+                }
+                let error = match admit_runtime_project(&root, "0.6.0") {
+                    Ok(_) => panic!("admitted stray {path} ({kind})"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains(path), "{error:#}");
+                for result in [
+                    update_project(&release, &root, &options, &NoResolver),
+                    sync_project(&release, &root, &options, &NoResolver),
+                    add_project_component(
+                        &release,
+                        &root,
+                        Role::App,
+                        ComponentSpec {
+                            name: "extra".into(),
+                            template: "node-api".into(),
+                            uses: vec![],
+                        },
+                        &options,
+                        &NoResolver,
+                    ),
+                    register_project_component(
+                        &release,
+                        &root,
+                        Role::App,
+                        "extra".into(),
+                        ToolingProfile::Node,
+                        &options,
+                        &NoResolver,
+                    ),
+                ] {
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains(path), "{error:#}");
+                }
+                assert_eq!(source_signature(&root, Some(&state)).unwrap(), before);
+                let typ = fs::symlink_metadata(&entry).unwrap().file_type();
+                assert_eq!(typ.is_fifo(), kind == "fifo");
+                if kind == "directory" {
+                    fs::remove_dir(&entry).unwrap();
+                } else {
+                    fs::remove_file(&entry).unwrap();
+                }
+                assert_eq!(source_signature(&root, Some(&state)).unwrap(), baseline);
+            }
+        }
+    }
+}
+
 #[test]
 fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
     let temp = TempDir::new().unwrap();
@@ -242,17 +687,14 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
         ("missing-file", "electron-react", DESKTOP_FILES[3]),
         ("missing-mit", "rust", ".devkit/runtime/LICENSE"),
         ("wrong-recipe", "electron-react", DESKTOP_FILES[0]),
-        (
-            "stale-compose",
-            "rust",
-            ".devkit/runtime/compose.tools.yaml",
-        ),
+        ("stale-make", "rust", ".devkit/project.mk"),
     ] {
         let root = temp.path().join(case);
         let mut state = init(&release, &root, template, PackageMode::Registry);
         match case {
             "missing-file" | "missing-mit" => fs::remove_file(root.join(path)).unwrap(),
             "wrong-recipe" => put(&root, path, b"FROM another-image\n"),
+            "stale-make" => put(&root, path, b"# stale projection\n"),
             _ => put(
                 &root,
                 path,
@@ -279,11 +721,11 @@ fn describe_rejects_a_consistent_manifest_with_the_wrong_profile_runtime() {
         let error = report["error"]["message"].as_str().unwrap();
         let expected = match case {
             "extra-pin" | "wrong-recipe" => "DEVKIT_DESKTOP_RECIPE_HASH",
-            "stale-compose" => "projection is stale",
+            "stale-make" => "projection is stale",
             _ => path,
         };
         assert!(error.contains(expected), "{case}: {error}");
-        if case == "stale-compose" {
+        if case == "stale-make" {
             let restored =
                 update_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap();
             assert!(restored.applied);
@@ -310,12 +752,16 @@ fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
         ("missing", "runtime/licenses/moby-profiles.NOTICE"),
         ("mismatch", "runtime/desktop.Dockerfile"),
         ("no-pin", "runtime/toolchains.env"),
+        ("retired-compose", "runtime/compose.tools.yaml"),
+        ("retired-compose-dir", "runtime/compose.tools.yaml"),
     ] {
         let temp = TempDir::new().unwrap();
         let release = fixture_release(temp.path(), "0.6.0");
         match case {
             "missing" => fs::remove_file(release.join(path)).unwrap(),
             "mismatch" => put(&release, path, b"FROM different\n"),
+            "retired-compose" => put(&release, path, b"services: {}\n"),
+            "retired-compose-dir" => fs::create_dir(release.join(path)).unwrap(),
             _ => {
                 let pins = fs::read_to_string(release.join(path)).unwrap();
                 let remaining = pins
@@ -327,7 +773,7 @@ fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
             }
         }
         seal(&release, "0.6.0");
-        let expected = if case == "missing" {
+        let expected = if matches!(case, "missing" | "retired-compose" | "retired-compose-dir") {
             path
         } else {
             "DEVKIT_DESKTOP_RECIPE_HASH"
@@ -432,6 +878,10 @@ fn profile_transitions_preserve_runtime_content_created_during_commit() {
             ".devkit/runtime/licenses/.git/owner",
         ),
         (false, DESKTOP_FILES[3], ".devkit/runtime/owner.txt"),
+        (false, RETIRED_FILES[0], RETIRED_FILES[0]),
+        (false, RETIRED_FILES[1], RETIRED_FILES[1]),
+        (true, DESKTOP_FILES[3], RETIRED_FILES[0]),
+        (true, DESKTOP_FILES[3], RETIRED_FILES[1]),
         (
             true,
             DESKTOP_FILES[3],
@@ -468,14 +918,27 @@ fn profile_transitions_preserve_runtime_content_created_during_commit() {
             )
         };
         let error = result.unwrap_err();
-        assert!(
-            format!("{error:#}").contains(".devkit/runtime/"),
-            "{error:#}"
-        );
+        let expected = if RETIRED_FILES.contains(&owner) {
+            owner
+        } else {
+            ".devkit/runtime/"
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert_eq!(fs::read(root.join(owner)).unwrap(), b"owned locally");
-        let mut restored = author_port_payload(&root);
-        restored.remove(owner);
-        assert_eq!(restored, before);
+        if !add && RETIRED_FILES.contains(&owner) {
+            assert!(
+                format!("{error:#}").contains("automatic rollback was blocked"),
+                "{error:#}"
+            );
+            assert!(root.join(PENDING_PATH).is_file());
+            fs::remove_file(root.join(owner)).unwrap();
+            recover_project(&root).unwrap();
+            assert_eq!(author_port_payload(&root), before);
+        } else {
+            let mut restored = author_port_payload(&root);
+            restored.remove(owner);
+            assert_eq!(restored, before);
+        }
         assert!(!root.join(PENDING_PATH).exists());
         assert!(!root.join("apps/shell").exists());
     }
@@ -488,7 +951,9 @@ fn idempotent_add_and_register_admit_the_accepted_runtime() {
     for (case, register) in [
         ("licenses-dir", true),
         ("extra-pin", false),
-        ("stale-compose", false),
+        ("stale-make", false),
+        ("stray-workspace", false),
+        ("forged-workspace", true),
     ] {
         let root = temp.path().join(format!("consumer-{case}"));
         init(&release, &root, "rust", PackageMode::Registry);
@@ -547,12 +1012,21 @@ fn idempotent_add_and_register_admit_the_accepted_runtime() {
                 record_managed_change(&root, &mut state, path, true);
                 "DEVKIT_DESKTOP_RECIPE_HASH"
             }
-            _ => {
-                let path = ".devkit/runtime/compose.tools.yaml";
-                fs::copy(release.join("runtime/compose.tools.yaml"), root.join(path)).unwrap();
+            "stale-make" => {
+                let path = ".devkit/project.mk";
+                put(&root, path, b"# stale projection\n");
                 let mut state = read_project_state(&root).unwrap();
                 record_managed_change(&root, &mut state, path, true);
                 "projection is stale"
+            }
+            _ => {
+                let path = RETIRED_FILES[0];
+                put(&root, path, b"{}\n");
+                if case == "forged-workspace" {
+                    let mut state = read_project_state(&root).unwrap();
+                    record_managed_change(&root, &mut state, path, true);
+                }
+                path
             }
         };
         let before = author_port_payload(&root);
@@ -683,4 +1157,30 @@ fn dirty_runtime_is_rejected_before_node_lock_resolver_runs() {
         format!("{err:#}").contains(".devkit/runtime/licenses"),
         "{err:#}"
     );
+
+    let register = temp.path().join("register-node");
+    init(&new, &register, "node", PackageMode::Registry);
+    copy_tree(
+        &new.join("templates/node-api"),
+        &register.join("apps/extra"),
+        &|_| false,
+        false,
+    )
+    .unwrap();
+    let mut manifest: Value = read_json(&register.join("apps/extra/package.json")).unwrap();
+    manifest["name"] = json!("registered-extra");
+    put_json(&register, "apps/extra/package.json", &manifest);
+    let hook = "apps/extra/.pnpmfile.cjs";
+    put(&register, hook, b"module.exports = {};\n");
+    let err = register_project_component(
+        &new,
+        &register,
+        Role::App,
+        "extra".into(),
+        ToolingProfile::Node,
+        &UpdateOptions::default(),
+        &FailIfCalledResolver,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains(hook), "{err:#}");
 }

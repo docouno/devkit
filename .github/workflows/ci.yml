@@ -14,18 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  source-linux-amd64:
-    uses: ./.github/workflows/source-linux.yml
-    with:
-      platform: amd64
-      source_commit: ${{ github.sha }}
-
-  source-linux-arm64:
-    uses: ./.github/workflows/source-linux.yml
-    with:
-      platform: arm64
-      source_commit: ${{ github.sha }}
-
   build-linux-amd64:
     uses: ./.github/workflows/build-linux.yml
     with:
@@ -50,14 +38,13 @@ jobs:
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
 
   verify:
-    needs: [assemble, build-linux-amd64, build-linux-arm64, source-linux-amd64, source-linux-arm64]
+    needs: [assemble, build-linux-amd64, build-linux-arm64]
     if: '!cancelled()'
     uses: ./.github/workflows/verify.yml
     with:
       state: fresh
       assembly_result: ${{ needs.assemble.result }}
-      source_amd64_result: ${{ needs.source-linux-amd64.result }}
-      source_arm64_result: ${{ needs.source-linux-arm64.result }}
+      source_commit: ${{ github.sha }}
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}

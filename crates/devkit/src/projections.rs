@@ -1,11 +1,10 @@
 use crate::{
     Result,
     catalog::*,
-    compose::{MAX_YAML_BYTES, parse_compose},
     files::*,
     model::*,
     native::{CargoMember, CargoWorkspaceKind, CargoWorkspaceModel},
-    state::{has_electron, uses_profile_scoped_runtime},
+    state::{LEGACY_TOOL_COMPOSE_WORKSPACE_FILE, uses_tool_compose_projections},
 };
 use anyhow::{Context, ensure};
 use serde_json::{Map, Value, json};
@@ -140,6 +139,11 @@ fn project_volume(path: &str) -> Value {
         format!("/workspace/{path}"),
         false,
     )
+}
+fn is_workspace_output_path(path: &str) -> bool {
+    !path.chars().any(|c| ['\r', '\n', '\t', '\0'].contains(&c))
+        && !path.starts_with('/')
+        && !path.split('/').any(|c| ["", ".", ".."].contains(&c))
 }
 pub(crate) fn cargo_run_command(member: Option<&CargoMember>) -> Result<Vec<String>> {
     let mut command = [
@@ -360,15 +364,36 @@ pub fn render_app_compose(
 ) -> Result<Vec<u8>> {
     json_bytes(&render_app_compose_value(state, cargo)?)
 }
+pub(crate) fn registered_workspace_inputs(state: &ProjectState) -> InputIdentitySet {
+    let nodes = node_components(state);
+    let directories = if nodes.is_empty() {
+        vec![]
+    } else {
+        std::iter::once(String::new())
+            .chain(nodes.into_iter().map(|(path, _)| path.clone()))
+            .collect()
+    };
+    InputIdentitySet {
+        schema_version: 1,
+        files: Default::default(),
+        directories,
+        digest: String::new(),
+    }
+}
+
 pub fn workspace_write_directories(
     state: &ProjectState,
     inputs: &InputIdentitySet,
 ) -> Result<Vec<String>> {
+    workspace_output_paths(state, &inputs.directories)
+}
+
+fn workspace_output_paths(state: &ProjectState, directories: &[String]) -> Result<Vec<String>> {
     if node_components(state).is_empty() {
         return Ok(vec![]);
     }
     let mut paths = BTreeSet::new();
-    for d in &inputs.directories {
+    for d in directories {
         paths.insert(if d.is_empty() {
             "node_modules".to_string()
         } else {
@@ -382,9 +407,7 @@ pub fn workspace_write_directories(
     }
     for p in &paths {
         ensure!(
-            !p.chars().any(|c| ['\r', '\n', '\t', '\0'].contains(&c))
-                && !p.starts_with('/')
-                && !p.split('/').any(|c| ["", ".", ".."].contains(&c)),
+            is_workspace_output_path(p),
             "Invalid workspace output path: {p}"
         );
     }
@@ -398,16 +421,28 @@ pub fn render_workspace_compose_value(
     state: &ProjectState,
     inputs: &InputIdentitySet,
 ) -> Result<Value> {
-    let volumes = workspace_write_directories(state, inputs)?
+    render_workspace_compose_for_directories(state, &inputs.directories)
+}
+
+fn render_workspace_compose_for_directories(
+    state: &ProjectState,
+    directories: &[String],
+) -> Result<Value> {
+    ensure!(
+        uses_tool_compose_projections(&state.version)?,
+        "Workspace Compose projection is retired in 0.6.0+"
+    );
+    let volumes = workspace_output_paths(state, directories)?
         .iter()
         .map(|p| project_volume(p))
         .collect::<Vec<_>>();
-    let mut services = json!({"node":{"volumes":volumes}});
-    if !uses_profile_scoped_runtime(&state.version)? || has_electron(state) {
-        services["desktop"] = services["node"].clone();
-    }
-    Ok(json!({"services":services}))
+    Ok(workspace_compose(&volumes))
 }
+
+fn workspace_compose(volumes: &[Value]) -> Value {
+    json!({"services": {"node": {"volumes": volumes}, "desktop": {"volumes": volumes}}})
+}
+
 pub fn render_workspace_compose(
     state: &ProjectState,
     inputs: &InputIdentitySet,
@@ -415,126 +450,49 @@ pub fn render_workspace_compose(
     json_bytes(&render_workspace_compose_value(state, inputs)?)
 }
 
-fn value_mentions_electron_cache(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.contains("ELECTRON_CACHE") || text.contains("/cache/electron"),
-        Value::Array(items) => items.iter().any(value_mentions_electron_cache),
-        Value::Object(map) => map.iter().any(|(key, item)| {
-            key.contains("ELECTRON_CACHE")
-                || key.contains("/cache/electron")
-                || value_mentions_electron_cache(item)
-        }),
-        _ => false,
-    }
-}
-
-fn node_leaks_electron_cache(node: &Map<String, Value>) -> bool {
-    let inherits_desktop_volumes = node.get("volumes_from").is_some_and(|value| match value {
-        Value::Array(items) => items.iter().any(|item| {
-            item.as_str()
-                .is_none_or(|entry| entry == "desktop" || entry.starts_with("desktop:"))
-        }),
-        _ => true,
-    });
-    inherits_desktop_volumes
-        || node.iter().any(|(key, value)| {
-            key.contains("ELECTRON_CACHE")
-                || key.contains("/cache/electron")
-                || value_mentions_electron_cache(value)
-        })
-}
-
-fn checked_tool_compose_profile(bytes: &[u8], electron: bool) -> Result<Value> {
-    let model = parse_compose(bytes)?;
-    let services = object(&model["services"], "Tool Compose services")?;
-    let node = services.get("node").context("Missing node tool service")?;
-    let node_settings = object(node, "Node tool service")?;
-    ensure!(
-        !node_leaks_electron_cache(node_settings),
-        "The node tool service contains an Electron cache"
-    );
-    if electron {
-        ensure!(
-            services.contains_key("desktop"),
-            "Missing desktop tool service"
-        );
-    } else {
-        let source = std::str::from_utf8(bytes)?;
-        ensure!(
-            !services.contains_key("desktop")
-                && !source.contains("desktop-seccomp.json")
-                && !source.contains("ELECTRON_CACHE"),
-            "Headless tool Compose contains desktop runtime references"
-        );
-    }
-    Ok(model)
-}
-
-fn checked_release_tool_compose(bytes: &[u8]) -> Result<Value> {
-    let model = checked_tool_compose_profile(bytes, true)?;
-    let desktop = &model["services"]["desktop"];
-    let security = desktop["security_opt"]
-        .as_array()
-        .context("Missing desktop security options")?;
-    let volumes = desktop["volumes"]
-        .as_array()
-        .context("Missing desktop volumes")?;
-    ensure!(
-        desktop["shm_size"] == "256m"
-            && desktop["cap_drop"] == json!(["ALL"])
-            && security.iter().any(|opt| opt == "no-new-privileges:true")
-            && security.iter().any(|opt| {
-                opt == "seccomp=${DEVKIT_PROJECT_ROOT:?}/.devkit/runtime/desktop-seccomp.json"
-            }),
-        "Invalid desktop tool service security settings"
-    );
-    ensure!(
-        desktop["environment"]["HOME"].is_string()
-            && desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
-            && ["/workspace", "/devkit/bin/pnpm", "/cache/electron"]
-                .iter()
-                .all(|target| volumes.iter().any(|volume| volume["target"] == *target)),
-        "Invalid desktop tool environment or mounts"
-    );
-    Ok(model)
-}
-
-pub fn render_headless_tool_compose(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut expected = checked_release_tool_compose(bytes)?;
-    expected["services"]
-        .as_object_mut()
-        .unwrap()
-        .remove("desktop");
-
-    // Keep the release YAML's comments and anchors. Check the parsed models so
-    // a change in the release layout cannot silently alter another service.
-    let source = std::str::from_utf8(bytes)?;
-    let (prefix, desktop_body) = source
-        .split_once("\n  desktop:\n")
-        .context("Missing desktop service block in release tool Compose")?;
-    let body_len: usize = desktop_body
-        .split_inclusive('\n')
-        .take_while(|line| line.starts_with("   ") || line.trim().is_empty())
-        .map(str::len)
-        .sum();
-    let headless = format!("{prefix}\n{}", &desktop_body[body_len..]).into_bytes();
-    ensure!(
-        checked_tool_compose_profile(&headless, false)? == expected,
-        "Removing desktop changed other tool Compose settings"
-    );
-    Ok(headless)
-}
-
-pub(crate) fn verify_release_tool_compose(bytes: &[u8]) -> Result<()> {
-    render_headless_tool_compose(bytes)?;
-    Ok(())
-}
-
-fn assert_tool_compose(root: &Path, electron: bool) -> Result<()> {
-    let path = safe_path(root, ".devkit/runtime/compose.tools.yaml")?;
-    let (bytes, _) = read_regular_file(&path, MAX_YAML_BYTES as u64, "Tool Compose projection")?
-        .context("Missing tool Compose projection")?;
-    checked_tool_compose_profile(&bytes, electron)?;
+pub(crate) fn assert_workspace_compose(
+    root: &Path,
+    state: &ProjectState,
+    directories: Option<&[String]>,
+) -> Result<()> {
+    const STALE: &str = "Workspace mount projection is stale; run devkit sync";
+    let workspace: Value = read_json(&safe_path(root, LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)?)?;
+    let expected = match directories {
+        Some(directories) => render_workspace_compose_for_directories(state, directories)?,
+        None => {
+            let volumes = workspace
+                .pointer("/services/node/volumes")
+                .and_then(Value::as_array)
+                .context(STALE)?;
+            let registered = registered_workspace_inputs(state);
+            let mut required: BTreeSet<_> = workspace_write_directories(state, &registered)?
+                .into_iter()
+                .collect();
+            let allow_dependency_mounts = !registered.directories.is_empty();
+            let mut previous: Option<&str> = None;
+            for mount in volumes {
+                let path = mount["target"]
+                    .as_str()
+                    .and_then(|target| target.strip_prefix("/workspace/"))
+                    .context(STALE)?;
+                ensure!(
+                    is_workspace_output_path(path)
+                        && previous.is_none_or(|last| last
+                            .encode_utf16()
+                            .cmp(path.encode_utf16())
+                            .is_lt())
+                        && mount == &project_volume(path)
+                        && (required.remove(path)
+                            || (allow_dependency_mounts && path.ends_with("/node_modules"))),
+                    "{STALE}"
+                );
+                previous = Some(path);
+            }
+            ensure!(required.is_empty(), "{STALE}");
+            workspace_compose(volumes)
+        }
+    };
+    ensure!(workspace == expected, "{STALE}");
     Ok(())
 }
 
@@ -553,67 +511,8 @@ pub fn assert_projections(
         apps == render_app_compose_value(state, cargo)?,
         "Development integration projection is stale; run devkit sync"
     );
-    let workspace: Value = read_json(&safe_path(root, ".devkit/compose.workspace.json")?)?;
-    ensure!(
-        workspace == render_workspace_compose_value(state, inputs)?,
-        "Workspace mount projection is stale; run devkit sync"
-    );
-    if uses_profile_scoped_runtime(&state.version)? {
-        assert_tool_compose(root, has_electron(state))
-            .context("Tool Compose projection is stale; run devkit sync")?;
+    if uses_tool_compose_projections(&state.version)? {
+        assert_workspace_compose(root, state, Some(&inputs.directories))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_projection_rejects_stale_desktop_mounts_and_security() {
-        let full = include_bytes!("../../../runtime/compose.tools.yaml");
-        let mut model = checked_release_tool_compose(full).unwrap();
-        assert!(checked_tool_compose_profile(full, false).is_err());
-        model["services"]["desktop"]["volumes"] = model["services"]["node"]["volumes"].clone();
-        assert!(checked_release_tool_compose(&json_bytes(&model).unwrap()).is_err());
-
-        let mut model = parse_compose(full).unwrap();
-        model["services"]["desktop"]["cap_drop"] = json!([]);
-        assert!(checked_release_tool_compose(&json_bytes(&model).unwrap()).is_err());
-        let headless = render_headless_tool_compose(full).unwrap();
-        for mutation in [
-            |node: &mut Value| {
-                node["volumes"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!("cache:/cache/electron"));
-            },
-            |node: &mut Value| {
-                node["volumes"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!({"type": "bind", "source": "/host", "target": "/cache/electron/"}));
-            },
-            |node: &mut Value| {
-                node["volumes"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!("${DEVKIT_ELECTRON_CACHE_DIR}:/tmp/ec"));
-            },
-            |node: &mut Value| {
-                node["environment"]["CUSTOM"] = json!("${DEVKIT_ELECTRON_CACHE_DIR}");
-            },
-            |node: &mut Value| {
-                node["volumes_from"] = json!(["desktop:ro"]);
-            },
-        ] {
-            let mut model = checked_tool_compose_profile(&headless, false).unwrap();
-            mutation(&mut model["services"]["node"]);
-            assert!(checked_tool_compose_profile(&json_bytes(&model).unwrap(), false).is_err());
-
-            let mut full_model = parse_compose(full).unwrap();
-            mutation(&mut full_model["services"]["node"]);
-            assert!(checked_release_tool_compose(&json_bytes(&full_model).unwrap()).is_err());
-        }
-    }
 }

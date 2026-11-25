@@ -1633,6 +1633,88 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
         assert!(!empty_cache.exists());
     }
 
+    let retired = [
+        ".devkit/compose.workspace.json",
+        ".devkit/runtime/compose.tools.yaml",
+    ];
+    for path in retired {
+        assert!(proj_051.join(path).is_file(), "{path}");
+        assert!(!proj_current.join(path).exists(), "{path}");
+    }
+    let checksums = devkit::state::CHECKSUM_PATH;
+    for (case, path, expected) in [
+        (
+            "stale-workspace",
+            retired[0],
+            "Workspace mount projection is stale",
+        ),
+        (
+            "missing-workspace",
+            retired[0],
+            "Missing managed runtime identity",
+        ),
+        (
+            "missing-tools",
+            retired[1],
+            "Missing managed runtime identity",
+        ),
+    ] {
+        let broken = temp.path().join(case);
+        copy_tree(&proj_051, &broken, &|_| false, false).unwrap();
+        let manifest_path = broken.join(MANIFEST_PATH);
+        let mut state = devkit::state::read_project_state(&broken).unwrap();
+        if case == "stale-workspace" {
+            write_json(&broken.join(path), &serde_json::json!({"services":{}})).unwrap();
+            state
+                .managed
+                .insert(path.into(), identity(&broken.join(path)).unwrap().unwrap());
+        } else {
+            fs::remove_file(broken.join(path)).unwrap();
+            state.managed.remove(path);
+        }
+        let contents = state
+            .managed
+            .iter()
+            .filter(|(path, _)| path.as_str() != checksums)
+            .map(|(path, id)| format!("{}  {path}\n", id.sha256))
+            .collect::<String>();
+        write_atomic(&broken.join(checksums), contents.as_bytes(), 0o644).unwrap();
+        state.managed.insert(
+            checksums.into(),
+            identity(&broken.join(checksums)).unwrap().unwrap(),
+        );
+        write_json(&manifest_path, &state).unwrap();
+        for command in ["describe", "status", "doctor"] {
+            let out = Command::new(env!("CARGO_BIN_EXE_devkit"))
+                .args(["--offline", "--json", "--cache-dir"])
+                .arg(&empty_cache)
+                .arg(command)
+                .arg(&broken)
+                .env_clear()
+                .env("PATH", &fake_bin)
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{case}/{command}: {out:?}");
+            let report = decoded(&out);
+            let message = if command == "doctor" {
+                &report["result"]["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == "checkout_state")
+                    .unwrap()["summary"]
+            } else {
+                &report["error"]["message"]
+            };
+            assert!(
+                message.as_str().unwrap().contains(expected),
+                "{case}/{command}: {report}"
+            );
+        }
+        assert!(!empty_cache.exists());
+    }
+
     for meta_cmd in ["describe", "status"] {
         let unprimed = Command::new(env!("CARGO_BIN_EXE_devkit"))
             .args([
@@ -1684,22 +1766,58 @@ fn symmetric_delegation_between_previous_current_and_future_preserves_offline_me
         release.files.remove("release.json");
         write_json(&manifest_path, &release).unwrap();
 
-        let updated = Command::new(&genuine_051)
-            .args(["--json", "--offline", "--cache-dir"])
-            .arg(&genuine_cache)
-            .arg("update")
-            .arg(&proj_051)
-            .args(["--to", current_version, "--release-root"])
-            .arg(&rel_current)
-            .env_clear()
-            .env("CI", "true")
-            .output()
-            .unwrap();
-        assert!(
-            updated.status.success(),
-            "genuine 0.5.1 upgrade: {updated:?}"
-        );
-        assert_eq!(decoded(&updated)["ok"], true);
+        let upgrade = |preview: bool| {
+            let mut command = Command::new(&genuine_051);
+            command
+                .args(["--json", "--offline", "--cache-dir"])
+                .arg(&genuine_cache)
+                .arg("update")
+                .arg(&proj_051)
+                .args(["--to", current_version, "--release-root"])
+                .arg(&rel_current)
+                .env_clear()
+                .env("CI", "true");
+            if preview {
+                command.arg("--preview");
+            }
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "genuine 0.5.1 upgrade (preview={preview}): {out:?}"
+            );
+            decoded(&out)
+        };
+        let preview = upgrade(true);
+        for path in retired {
+            assert!(proj_051.join(path).is_file(), "{path}");
+            let change = preview["result"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["path"] == path)
+                .unwrap();
+            assert!(
+                change["before"].is_object() && change["after"].is_null(),
+                "{change}"
+            );
+        }
+        let updated = upgrade(false);
+        assert_eq!(updated["ok"], true);
+        let paths = |report: &Value| {
+            report["result"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&preview), paths(&updated));
+        for path in retired {
+            assert!(
+                !proj_051.join(path).exists() && !proj_051.join(path).is_symlink(),
+                "{path}"
+            );
+        }
         assert_eq!(
             read_json::<Value>(&proj_051.join(MANIFEST_PATH)).unwrap()["version"],
             current_version

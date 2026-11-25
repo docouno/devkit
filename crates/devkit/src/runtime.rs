@@ -86,8 +86,8 @@ mod pins;
 pub use pins::{EnginePins, PnpmPin, ToolPins};
 pub(crate) use pins::{Records, managed_bytes, render_headless_toolchains};
 
-/// This admission deliberately does not read native dependency graphs/locks.
-/// It permits service operations and explicit repair of stale native inputs.
+/// Base admission for service operations and explicit repair of stale native inputs.
+/// Legacy status also validates the accepted workspace mount projection.
 pub struct ToolAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
@@ -102,7 +102,18 @@ impl ToolAdmission {
         Self::capture_kind(request, true, false)
     }
     pub fn capture_status_compat(request: &RuntimeRequest) -> Result<Self> {
-        Self::capture_kind(request, true, true)
+        let admission = Self::capture_kind(request, true, true)?;
+        if uses_tool_compose_projections(&admission.state.version)? {
+            // Status can report services while Node dependencies are being repaired.
+            // The accepted projection identity was checked in capture_kind.
+            let directories = crate::native::inspect_node_workspace_directories(
+                &admission.root,
+                &admission.state,
+            )
+            .ok();
+            assert_workspace_compose(&admission.root, &admission.state, directories.as_deref())?;
+        }
+        Ok(admission)
     }
     fn capture_kind(
         request: &RuntimeRequest,
@@ -131,6 +142,7 @@ impl ToolAdmission {
             if path.starts_with(".devkit/runtime/")
                 || path == CHECKSUM_PATH
                 || path == ".devkit/compose.apps.yaml"
+                || (allow_older_accepted && path == LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)
             {
                 ensure!(
                     identity(&safe_path(&root, path)?)?

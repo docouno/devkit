@@ -129,20 +129,6 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  source-linux-amd64:
-    needs: admit-and-inspect
-    uses: ./.github/workflows/source-linux.yml
-    with:
-      platform: amd64
-      source_commit: ${{ inputs.source_commit }}
-
-  source-linux-arm64:
-    needs: admit-and-inspect
-    uses: ./.github/workflows/source-linux.yml
-    with:
-      platform: arm64
-      source_commit: ${{ inputs.source_commit }}
-
   build-linux-amd64:
     needs: admit-and-inspect
     uses: ./.github/workflows/build-linux.yml
@@ -174,21 +160,12 @@ jobs:
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
 
   verify:
-    needs:
-      [
-        admit-and-inspect,
-        assemble,
-        build-linux-amd64,
-        build-linux-arm64,
-        source-linux-amd64,
-        source-linux-arm64,
-      ]
+    needs: [admit-and-inspect, assemble, build-linux-amd64, build-linux-arm64]
     uses: ./.github/workflows/verify.yml
     with:
       state: ${{ needs.admit-and-inspect.outputs.state }}
       assembly_result: ${{ needs.assemble.result }}
-      source_amd64_result: ${{ needs.source-linux-amd64.result }}
-      source_arm64_result: ${{ needs.source-linux-arm64.result }}
+      source_commit: ${{ inputs.source_commit }}
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}

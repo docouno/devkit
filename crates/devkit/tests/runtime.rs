@@ -49,12 +49,7 @@ fn fixture_pnpm_pins(pin: &devkit::runtime::PnpmPin) -> String {
 }
 
 fn write_runtime_stub(root: &Path, path: &str) {
-    let contents = if path.ends_with("/compose.tools.yaml") {
-        devkit::projections::render_headless_tool_compose(include_bytes!(
-            "../../../runtime/compose.tools.yaml"
-        ))
-        .unwrap()
-    } else if path.ends_with("/LICENSE") {
+    let contents = if path.ends_with("/LICENSE") {
         include_bytes!("../../../LICENSE").to_vec()
     } else {
         b"{}\n".to_vec()
@@ -524,11 +519,9 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
     for stub in [
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
         ".devkit/tooling-profiles.json",
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
@@ -543,11 +536,9 @@ fn reactive_retry_heals_remote_dind_cgroupv2_failure_by_stripping_limits_and_ena
     for path in [
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
         ".devkit/tooling-profiles.json",
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
@@ -699,7 +690,7 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         delivery::file_digest,
         files::{identity, write_atomic, write_json},
         native::admit_native_components,
-        projections::{render_app_compose_value, render_project_make, render_workspace_compose},
+        projections::{render_app_compose_value, render_project_make},
         state::{CHECKSUM_PATH, MANIFEST_PATH},
     };
     use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, process::Command};
@@ -742,7 +733,6 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
     for stub in [
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
@@ -808,22 +798,14 @@ fn compose_reactive_retry_heals_exit_1_dind_cgroupv2_failure() {
         &render_app_compose_value(&seed_state, native.cargo_workspace.as_ref()).unwrap(),
     )
     .unwrap();
-    write_atomic(
-        &root.join(".devkit/compose.workspace.json"),
-        &render_workspace_compose(&seed_state, &native.inputs).unwrap(),
-        0o644,
-    )
-    .unwrap();
 
     let mut managed = BTreeMap::new();
     for path in [
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
         ".devkit/tooling-profiles.json",
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/pnpm.env",
@@ -1063,7 +1045,7 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         delivery::file_digest,
         files::{digest, identity, write_atomic, write_json},
         native::admit_native_components,
-        projections::{render_app_compose_value, render_project_make, render_workspace_compose},
+        projections::{render_app_compose_value, render_project_make},
         state::{CHECKSUM_PATH, MANIFEST_PATH},
     };
     use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, process::Command};
@@ -1100,7 +1082,6 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
     for stub in [
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
     ] {
         write_runtime_stub(&root, stub);
@@ -1170,22 +1151,14 @@ fn derived_image_tags_existing_state_on_prepare_and_reuses_local_tag_without_bui
         &render_app_compose_value(&seed_state, native.cargo_workspace.as_ref()).unwrap(),
     )
     .unwrap();
-    write_atomic(
-        &root.join(".devkit/compose.workspace.json"),
-        &render_workspace_compose(&seed_state, &native.inputs).unwrap(),
-        0o644,
-    )
-    .unwrap();
 
     let mut managed = BTreeMap::new();
     for path in [
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
         ".devkit/tooling-profiles.json",
         ".devkit/runtime/devkit.mk",
         ".devkit/runtime/devkit.sh",
-        ".devkit/runtime/compose.tools.yaml",
         ".devkit/runtime/LICENSE",
         ".devkit/runtime/toolchains.env",
         ".devkit/runtime/rust.Dockerfile",

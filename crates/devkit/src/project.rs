@@ -918,14 +918,6 @@ fn stage_runtime_files(
                 };
                 (bytes, staged_id)
             }
-            (true, "runtime/compose.tools.yaml") => {
-                let bytes = render_headless_tool_compose(&release.bytes(name)?)?;
-                let staged_id = FileIdentity {
-                    sha256: digest(&bytes),
-                    mode: id.mode,
-                };
-                (bytes, staged_id)
-            }
             _ => (release.bytes(name)?, id.clone()),
         };
         let target = format!(".devkit/{name}");
@@ -939,6 +931,10 @@ fn stage_runtime_files(
             "Missing release {name}"
         );
     }
+    ensure!(
+        scoped || managed.contains_key(LEGACY_TOOL_COMPOSE_RUNTIME_PATH),
+        "Missing release {LEGACY_TOOL_COMPOSE_RUNTIME_FILE}"
+    );
     Ok(managed)
 }
 
@@ -1002,30 +998,12 @@ pub fn write_managed(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let inputs = if exists(&safe_path(destination, "package-lock.json")?)?
-        || exists(&safe_path(destination, "pnpm-lock.yaml")?)?
-    {
-        collect_native_input_closure(destination, state)?
-    } else {
-        InputIdentitySet {
-            schema_version: 1,
-            files: BTreeMap::new(),
-            directories: if node_components(state).is_empty() {
-                vec![]
-            } else {
-                std::iter::once(String::new())
-                    .chain(node_components(state).iter().map(|(p, _)| (*p).clone()))
-                    .collect()
-            },
-            digest: String::new(),
-        }
-    };
     let cargo_model = if CargoWorkspaceKind::root_with_rust(state)? {
         Some(CargoWorkspaceModel::read(destination, state)?)
     } else {
         None
     };
-    let outputs = vec![
+    let mut outputs = vec![
         (
             ".devkit/tooling-profiles.json",
             json_bytes(
@@ -1040,11 +1018,20 @@ pub fn write_managed(
             ".devkit/compose.apps.yaml",
             render_app_compose(state, cargo_model.as_ref())?,
         ),
-        (
-            ".devkit/compose.workspace.json",
-            render_workspace_compose(state, &inputs)?,
-        ),
     ];
+    if uses_tool_compose_projections(&state.version)? {
+        let inputs = if exists(&safe_path(destination, "package-lock.json")?)?
+            || exists(&safe_path(destination, "pnpm-lock.yaml")?)?
+        {
+            collect_native_input_closure(destination, state)?
+        } else {
+            registered_workspace_inputs(state)
+        };
+        outputs.push((
+            LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
+            render_workspace_compose(state, &inputs)?,
+        ));
+    }
     for (name, bytes) in outputs {
         write_atomic(&safe_path(destination, name)?, &bytes, 0o644)?;
         managed.insert(
@@ -1412,6 +1399,7 @@ pub struct AdmissionSnapshot {
     pub source_signature: String,
     pub manifest_identity: FileIdentity,
     extra_excluded_dir: Option<String>,
+    check_retired_workspace_compose: bool,
 }
 fn expected_incoming_runtime_files(
     release: &AdmittedRelease,
@@ -1434,25 +1422,27 @@ fn expected_incoming_runtime_files(
 
 impl AdmissionSnapshot {
     pub fn capture(root: &Path) -> Result<Self> {
-        Self::capture_checked(root, &|_| Ok(BTreeSet::new()))
+        Self::capture_checked(root, false, &|_| Ok(BTreeSet::new()))
     }
     fn capture_for_mutation(
         root: &Path,
         release: &AdmittedRelease,
         adds_electron: bool,
     ) -> Result<Self> {
-        Self::capture_checked(root, &|old| {
+        let target_scoped = uses_profile_scoped_runtime(&release.manifest.version)?;
+        Self::capture_checked(root, target_scoped, &|old| {
             expected_incoming_runtime_files(release, old, has_electron(old) || adds_electron)
         })
     }
     fn capture_checked(
         root: &Path,
+        target_scoped: bool,
         incoming_runtime: &dyn Fn(&ProjectState) -> Result<BTreeSet<String>>,
     ) -> Result<Self> {
         let root = project_root(root)?;
         let (state, identity) = Self::read_accepted(&root)?;
         let incoming = incoming_runtime(&state)?;
-        Self::capture_accepted(root, state, identity, &incoming, None)
+        Self::capture_accepted(root, state, identity, &incoming, None, target_scoped)
     }
 
     fn read_accepted(root: &Path) -> Result<(ProjectState, FileIdentity)> {
@@ -1467,9 +1457,18 @@ impl AdmissionSnapshot {
         manifest_identity: FileIdentity,
         incoming: &BTreeSet<String>,
         extra_excluded_dir: Option<String>,
+        target_scoped: bool,
     ) -> Result<Self> {
         assert_managed(&root, &state)?;
         verify_runtime_inventory_with_incoming(&root, &state, incoming)?;
+        let check_retired_workspace_compose = (uses_profile_scoped_runtime(&state.version)?
+            || target_scoped)
+            && !state
+                .managed
+                .contains_key(LEGACY_TOOL_COMPOSE_WORKSPACE_FILE);
+        if check_retired_workspace_compose {
+            verify_retired_workspace_compose_absent(&root)?;
+        }
         assert_tool_profiles(&root, &state)?;
         let inputs = collect_native_input_closure(&root, &state)?;
         let source_signature =
@@ -1485,10 +1484,14 @@ impl AdmissionSnapshot {
             source_signature,
             manifest_identity,
             extra_excluded_dir,
+            check_retired_workspace_compose,
         })
     }
     pub fn recheck(&self) -> Result<()> {
         verify_runtime_inventory(&self.root, &self.state)?;
+        if self.check_retired_workspace_compose {
+            verify_retired_workspace_compose_absent(&self.root)?;
+        }
         ensure!(
             identity(&safe_path(&self.root, MANIFEST_PATH)?)?.as_ref()
                 == Some(&self.manifest_identity),
@@ -1706,9 +1709,13 @@ fn mutate_with_release(
         manifest_identity,
         &incoming_runtime,
         adopting_rust_target.clone(),
+        uses_profile_scoped_runtime(&release.manifest.version)?,
     )?;
     let root = &snapshot.root;
     let old = &snapshot.state;
+    if uses_profile_scoped_runtime(&old.version)? {
+        verify_retired_tool_compose_unmanaged(old)?;
+    }
     let mut next = old.clone();
     verify_old_tools(root, &next, true)?;
     if migrating_cargo {
@@ -2147,6 +2154,11 @@ fn mutate_with_release(
             }
         }
         next.managed = write_managed(release, &staged_root, &next)?;
+        if !uses_tool_compose_projections(&next.version)? && product.is_some() {
+            // Check new inputs before resolving, while the seeded lock can
+            // still refer to the previous local environment archive.
+            collect_native_input_closure(&staged_root, &next)?;
+        }
         for name in old.managed.keys() {
             if !next.managed.contains_key(name) {
                 remove_file_and_empty_runtime_parents(&staged_root, name)?;
@@ -2259,7 +2271,11 @@ fn mutate_with_release(
             preflight()?;
         } else {
             tx.commit_checked(root, options.hooks, &preflight, &|| {
-                verify_runtime_inventory(root, &next)
+                verify_runtime_inventory(root, &next)?;
+                if uses_profile_scoped_runtime(&next.version)? {
+                    verify_retired_workspace_compose_absent(root)?;
+                }
+                Ok(())
             })?;
             if old.version != next.version {
                 remove_file(&safe_path(root, ".devkit/state/node-workspace.lock")?)?;
@@ -2898,7 +2914,11 @@ pub(crate) fn sync_project_with_release(
             preflight()?;
         } else {
             tx.commit_checked(root, options.hooks, &preflight, &|| {
-                verify_runtime_inventory(root, &next)
+                verify_runtime_inventory(root, &next)?;
+                if uses_profile_scoped_runtime(&next.version)? {
+                    verify_retired_workspace_compose_absent(root)?;
+                }
+                Ok(())
             })?;
         }
         Ok(MutationOutcome {

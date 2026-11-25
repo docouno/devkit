@@ -1,5 +1,5 @@
 //! Test fixture authoring only; not included in release payloads.
-use devkit::{Result, files::*, model::*, native::*, projections::*, state::has_electron};
+use devkit::{Result, files::*, model::*, native::*, projections::*};
 use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
 fn main() -> Result<()> {
@@ -33,22 +33,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut state: ProjectState = read_json(&root.join(".devkit/manifest.json"))?;
-    let tools = include_bytes!("../../../runtime/compose.tools.yaml");
-    let compose = if has_electron(&state) {
-        tools.to_vec()
-    } else {
-        render_headless_tool_compose(tools)?
-    };
-    write_atomic(
-        &root.join(".devkit/runtime/compose.tools.yaml"),
-        &compose,
-        0o644,
-    )?;
     let dependencies = derive_component_dependencies(&root, &state)?;
     for (path, deps) in dependencies {
         state.components.get_mut(&path).unwrap().dependencies = deps;
     }
-    let inputs = collect_native_input_closure(&root, &state)?;
     let cargo = if CargoWorkspaceKind::for_state(&state)? == CargoWorkspaceKind::Root
         && state
             .components
@@ -67,11 +55,6 @@ fn main() -> Result<()> {
     write_atomic(
         &root.join(".devkit/compose.apps.yaml"),
         &render_app_compose(&state, cargo.as_ref())?,
-        0o644,
-    )?;
-    write_atomic(
-        &root.join(".devkit/compose.workspace.json"),
-        &render_workspace_compose(&state, &inputs)?,
         0o644,
     )?;
     let profiles = state

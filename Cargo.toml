@@ -8,6 +8,10 @@ edition = "2024"
 rust-version = "1.99.1"
 license = "MIT"
 
+# Integration tests repeatedly verify the SHA-256 of debug executables.
+[profile.test.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 strip = true

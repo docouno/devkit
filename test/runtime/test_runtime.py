@@ -350,7 +350,7 @@ def seal_runtime(root):
     if token:
         plan = hashlib.sha256(release_identity.encode() + b"\n" + rules).hexdigest().encode()
         projection.write_bytes(rules + token + plan + b"\n")
-    for name in ("project.mk", "compose.apps.yaml", "compose.workspace.json", "tooling-profiles.json"):
+    for name in ("project.mk", "compose.apps.yaml", "tooling-profiles.json"):
         managed[".devkit/" + name] = identity(root / ".devkit" / name)
     if any(info["toolchain"] == "rust" for info in state["components"].values()):
         managed["rust-toolchain.toml"] = identity(root / "rust-toolchain.toml")

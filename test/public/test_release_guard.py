@@ -274,16 +274,17 @@ class RequiredNativeCheckGuard(unittest.TestCase):
         ci, release = self.job("verify", "ci"), self.job("verify", "release")
         for caller in (ci, release):
             self.assertIn("assembly_result: ${{ needs.assemble.result }}", caller)
-            self.assertIn("source_amd64_result: ${{ needs.source-linux-amd64.result }}", caller)
-            self.assertIn("source_arm64_result: ${{ needs.source-linux-arm64.result }}", caller)
             self.assertIn("frozen: ${{ toJSON(needs.assemble.outputs) }}", caller)
+        self.assertIn("source_commit: ${{ github.sha }}", ci)
+        self.assertIn("source_commit: ${{ inputs.source_commit }}", release)
         # Keep the caller job key unadorned so Ruleset 25804809 required checks stay "verify / <gate>".
         self.assertNotIn("name:", ci)
         self.assertIn("if: '!cancelled()'", ci)
         self.assertIn("state: fresh", ci)
         self.assertIn("state: ${{ needs.admit-and-inspect.outputs.state }}", release)
         handoff = self.job("handoff")
-        for env, arg in (("STATE", "state"), ("ASSEMBLY_RESULT", "assembly_result"), ("FROZEN", "frozen")):
+        for env, arg in (("STATE", "state"), ("ASSEMBLY_RESULT", "assembly_result"),
+                         ("SOURCE_COMMIT", "source_commit"), ("FROZEN", "frozen")):
             self.assertIn(env + ": ${{ inputs." + arg + " }}", handoff)
         script = textwrap.dedent(
             handoff.split("        run: |\n", 1)[1].split("      - uses: actions/checkout@", 1)[0]
@@ -298,6 +299,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
             ("success", "fresh", {**frozen, "frozen_set_artifact": "devkit-frozen-set-0"}, False),
             ("success", "fresh", {**frozen, "frozen_set_artifact": "devkit-darwin-preview-2"}, False),
             ("success", "fresh", {**frozen, "index_sha256": "z" * 64}, False),
+            ("success", "fresh", {**frozen, "source_commit": NEWER_EVENT}, False),
             ("success", "restored", {}, False),
             ("success", "unknown", frozen, False),
         ]
@@ -306,7 +308,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
             cases.append((result, "fresh", frozen, False))
         for result, state, outputs, valid in cases:
             env = dict(os.environ, STATE=state, ASSEMBLY_RESULT=result, FROZEN=json.dumps(outputs),
-                       GITHUB_RUN_ATTEMPT="3")
+                       SOURCE_COMMIT=SOURCE, GITHUB_RUN_ATTEMPT="3")
             with self.subTest(result=result, state=state, outputs=outputs):
                 run = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(run.returncode == 0, valid, run.stderr)
@@ -318,7 +320,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
 
         self.assertCountEqual(
             needs_of(ci),
-            ["assemble", "build-linux-amd64", "build-linux-arm64", "source-linux-amd64", "source-linux-arm64"],
+            ["assemble", "build-linux-amd64", "build-linux-arm64"],
         )
         ci_assemble = self.job("assemble", "ci")
         self.assertCountEqual(needs_of(ci_assemble), ["build-linux-amd64", "build-linux-arm64"])
@@ -365,37 +367,28 @@ class RequiredNativeCheckGuard(unittest.TestCase):
             self.assertIn(f"    name: {group}\n", job)
             self.assertIn("    if: '!cancelled()'\n", job)
             dependencies = re.search(r"(?m)^    needs: \[(.+)\]$", job).group(1).split(", ")
-            if group == "source":
-                expected = []
-            elif group == "packaged":
+            if group == "packaged":
                 expected = ["cross-host-checkout", "packaged-linux-amd64", "packaged-linux-arm64"]
             else:
                 expected = [group + "-linux-amd64", group + "-linux-arm64"]
             self.assertCountEqual(dependencies, ["handoff", *expected])
             workers.update(expected)
-            if group == "source":
-                predicate = textwrap.dedent(job.split("        run: |\n", 1)[1])
-                for field in ("handoff", "SOURCE_AMD64", "SOURCE_ARM64"):
-                    for status in ("success", "failure", "cancelled", "skipped"):
-                        results = {name: {"result": "success"} for name in dependencies}
-                        env = {"RESULTS": json.dumps(results), "SOURCE_AMD64": "success", "SOURCE_ARM64": "success"}
-                        if field in results:
-                            results[field]["result"] = status
-                            env["RESULTS"] = json.dumps(results)
-                        else:
-                            env[field] = status
-                        probe = subprocess.run(["bash", "-c", predicate], env=env,
-                                               capture_output=True, text=True, timeout=5)
-                        self.assertEqual(probe.returncode == 0, status == "success", (group, field, status, probe.stderr))
-            else:
-                predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
-                for worker in ("handoff", expected[-1]):
-                    for status in ("success", "failure", "cancelled", "skipped"):
-                        results = {name: {"result": "success"} for name in dependencies}
-                        results[worker]["result"] = status
-                        probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
-                                               capture_output=True, text=True, timeout=5)
-                        self.assertEqual(probe.returncode == 0, status == "success", (group, worker, status, probe.stderr))
+            predicate = re.search(r"(?m)^        run: (.+)$", job).group(1)
+            for worker in dependencies:
+                for status in ("success", "failure", "cancelled", "skipped"):
+                    results = {name: {"result": "success"} for name in dependencies}
+                    results[worker]["result"] = status
+                    probe = subprocess.run(["bash", "-c", predicate], env={"RESULTS": json.dumps(results)},
+                                           capture_output=True, text=True, timeout=5)
+                    self.assertEqual(probe.returncode == 0, status == "success", (group, worker, status, probe.stderr))
+        for platform in ("amd64", "arm64"):
+            name = f"source-linux-{platform}"
+            workers.remove(name)
+            worker = self.job(name)
+            self.assertNotRegex(worker, r"(?m)^    needs:")
+            self.assertIn("uses: ./.github/workflows/source-linux.yml", worker)
+            self.assertIn(f"platform: {platform}\n", worker)
+            self.assertIn("source_commit: ${{ inputs.source_commit }}", worker)
         for name in workers:
             # The cross-host consumers inherit the gate through their export worker.
             worker = self.job(name)
@@ -415,8 +408,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
         verify_needs = [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", verify).group(1).split(",") if item.strip()]
         self.assertCountEqual(
             verify_needs,
-            ["admit-and-inspect", "assemble", "build-linux-amd64", "build-linux-arm64",
-             "source-linux-amd64", "source-linux-arm64"],
+            ["admit-and-inspect", "assemble", "build-linux-amd64", "build-linux-arm64"],
         )
         self.assertIn("run_performance: true", verify)
         publish = self.job("publish", "release")
