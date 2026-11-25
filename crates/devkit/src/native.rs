@@ -770,6 +770,11 @@ impl NativeStructure {
     }
 }
 
+enum NodeDependencyRead {
+    Hash(Option<u64>),
+    Metadata,
+}
+
 /// One admission owns this cache. Derivation and input closure share parsed
 /// manifests and a single physical lock graph.
 struct ReadContext<'a> {
@@ -1624,10 +1629,13 @@ impl<'a> ReadContext<'a> {
         let structure = NativeStructure::capture(self.root, state)?;
         self.closure_with_structure(state, &structure)
     }
-    fn node_closure(&mut self, state: &ProjectState) -> Result<InputIdentitySet> {
+    fn node_closure(
+        &mut self,
+        state: &ProjectState,
+        mut dependency_read: NodeDependencyRead,
+    ) -> Result<InputIdentitySet> {
         let mut files = BTreeMap::new();
         let mut directories = BTreeSet::new();
-        let mut dependency_bytes = self.dependency_byte_limit;
         let mut queue: VecDeque<String> = node_components(state)
             .into_iter()
             .map(|(p, _)| p.clone())
@@ -1640,7 +1648,7 @@ impl<'a> ReadContext<'a> {
                 record(self.root, &mut files, "pnpm-lock.yaml", true)?;
                 let workspace = crate::pnpm::Workspace::read(self.root)?;
                 for path in workspace.patched_dependencies.values() {
-                    record_dependency(self.root, &mut files, path, &mut dependency_bytes)?;
+                    record_dependency(self.root, &mut files, path, &mut dependency_read)?;
                 }
                 for value in workspace.overrides.values() {
                     local_dependency(
@@ -1649,7 +1657,7 @@ impl<'a> ReadContext<'a> {
                         value,
                         &mut queue,
                         &mut files,
-                        &mut dependency_bytes,
+                        &mut dependency_read,
                     )?;
                 }
                 let root = self.root;
@@ -1675,7 +1683,7 @@ impl<'a> ReadContext<'a> {
                                 path,
                                 &mut queue,
                                 &mut files,
-                                &mut dependency_bytes,
+                                &mut dependency_read,
                             )?;
                         }
                     }
@@ -1706,7 +1714,7 @@ impl<'a> ReadContext<'a> {
                             spec,
                             &mut queue,
                             &mut files,
-                            &mut dependency_bytes,
+                            &mut dependency_read,
                         )?;
                     }
                 }
@@ -1768,7 +1776,7 @@ impl<'a> ReadContext<'a> {
                         text(spec, "dependency spec")?,
                         &mut queue,
                         &mut files,
-                        &mut dependency_bytes,
+                        &mut dependency_read,
                     )?;
                 }
             }
@@ -1789,7 +1797,8 @@ impl<'a> ReadContext<'a> {
         state: &ProjectState,
         structure: &NativeStructure,
     ) -> Result<InputIdentitySet> {
-        let node = self.node_closure(state)?;
+        let node =
+            self.node_closure(state, NodeDependencyRead::Hash(self.dependency_byte_limit))?;
         let mut files = structure.manifests.clone();
         files.extend(node.files.clone());
         let directories = node.directories.clone();
@@ -1929,9 +1938,16 @@ fn record_dependency(
     root: &Path,
     files: &mut BTreeMap<String, Option<FileIdentity>>,
     name: &str,
-    budget: &mut Option<u64>,
+    dependency_read: &mut NodeDependencyRead,
 ) -> Result<()> {
     let path = input_path(root, name)?;
+    let NodeDependencyRead::Hash(budget) = dependency_read else {
+        ensure!(
+            fs::symlink_metadata(path)?.is_file(),
+            "Expected regular local dependency input: {name}"
+        );
+        return Ok(());
+    };
     let key = relative_name(&project_root(root)?, &path)?;
     let observed = if let Some(remaining) = budget {
         if files.get(&key).is_some_and(Option::is_some) {
@@ -1953,7 +1969,7 @@ fn local_dependency(
     spec: &str,
     queue: &mut VecDeque<String>,
     files: &mut BTreeMap<String, Option<crate::model::FileIdentity>>,
-    budget: &mut Option<u64>,
+    dependency_read: &mut NodeDependencyRead,
 ) -> Result<()> {
     let Some(spec) = spec.strip_prefix("file:") else {
         return Ok(());
@@ -1964,7 +1980,7 @@ fn local_dependency(
     if fs::symlink_metadata(&target)?.is_dir() {
         queue.push_back(name);
     } else if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
-        record_dependency(root, files, &name, budget)?;
+        record_dependency(root, files, &name, dependency_read)?;
     } else {
         bail!("Unsupported local dependency: {name}");
     }
@@ -2066,13 +2082,15 @@ pub fn derive_component_dependencies(
 pub fn collect_native_input_closure(root: &Path, state: &ProjectState) -> Result<InputIdentitySet> {
     ReadContext::new(root, NodeLockKind::for_state(state)?).closure(state)
 }
-pub(crate) fn inspect_node_input_closure(
+// Mounts depend on paths and bounded Node metadata. Archive and patch bytes
+// matter for runtime input receipts, but their size cannot change the mounts.
+pub(crate) fn inspect_node_workspace_directories(
     root: &Path,
     state: &ProjectState,
-) -> Result<InputIdentitySet> {
-    let mut context = ReadContext::new(root, NodeLockKind::for_state(state)?);
-    context.dependency_byte_limit = Some(NATIVE_METADATA_MAX_BYTES);
-    context.node_closure(state)
+) -> Result<Vec<String>> {
+    Ok(ReadContext::new(root, NodeLockKind::for_state(state)?)
+        .node_closure(state, NodeDependencyRead::Metadata)?
+        .directories)
 }
 pub fn native_input_digest(root: &Path, state: &ProjectState) -> Result<String> {
     Ok(collect_native_input_closure(root, state)?.digest)

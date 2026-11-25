@@ -467,6 +467,108 @@ fn legacy_status_remains_available_during_native_lock_repair() {
 }
 
 #[test]
+fn legacy_status_checks_local_mounts_with_a_large_dependency_archive() {
+    use devkit::runtime::{RuntimeRequest, ToolAdmission};
+    use std::io::Read;
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.5.1");
+    let root = temp.path().join("node");
+    let mut state = init(&release, &root, "node", PackageMode::Registry);
+    put_json(
+        &root,
+        "vendor/local/package.json",
+        &json!({"name": "local", "version": "1.0.0", "private": true}),
+    );
+
+    let archive_path = root.join("vendor/assets.tgz");
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::none(),
+    ));
+    let package = br#"{"name":"assets","version":"1.0.0"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_size(package.len() as u64);
+    archive
+        .append_data(&mut header, "package/package.json", &package[..])
+        .unwrap();
+    let size = 32 * 1024 * 1024 + 1;
+    header.set_size(size);
+    archive
+        .append_data(
+            &mut header,
+            "package/assets.bin",
+            std::io::repeat(0).take(size),
+        )
+        .unwrap();
+    archive.into_inner().unwrap().finish().unwrap();
+    let integrity = format!(
+        "sha512-{}",
+        STANDARD.encode(Sha512::digest(fs::read(archive_path).unwrap()))
+    );
+
+    let mut manifest: Value = read_json(&root.join("package.json")).unwrap();
+    manifest["dependencies"] =
+        json!({"local": "file:vendor/local", "assets": "file:vendor/assets.tgz"});
+    put_json(&root, "package.json", &manifest);
+    let mut lock = devkit::pnpm::Lock::read(&root).unwrap();
+    for (name, specifier, resolution) in [
+        (
+            "local",
+            "file:vendor/local",
+            json!({"type": "directory", "directory": "vendor/local"}),
+        ),
+        (
+            "assets",
+            "file:vendor/assets.tgz",
+            json!({"tarball": "file:vendor/assets.tgz", "integrity": integrity}),
+        ),
+    ] {
+        lock.importers.get_mut(".").unwrap().dependencies.insert(
+            name.into(),
+            devkit::pnpm::Dependency {
+                specifier: specifier.into(),
+                version: specifier.into(),
+            },
+        );
+        let key = format!("{name}@{specifier}");
+        lock.packages.insert(
+            key.clone(),
+            json!({"version": "1.0.0", "resolution": resolution})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        lock.snapshots.insert(key, Default::default());
+    }
+    lock.write(&root).unwrap();
+    let native = devkit::native::admit_native_components(&root, &state).unwrap();
+    assert!(
+        native
+            .inputs
+            .directories
+            .iter()
+            .any(|path| path == "vendor/local")
+    );
+
+    let request = RuntimeRequest::new(root.clone(), "status".into());
+    let error = match ToolAdmission::capture_status_compat(&request) {
+        Ok(_) => panic!("admitted a workspace projection missing the local mount"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("projection is stale"),
+        "{error:#}"
+    );
+    let projection = devkit::projections::render_workspace_compose(&state, &native.inputs).unwrap();
+    put(&root, RETIRED_FILES[0], &projection);
+    record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+    assert!(ToolAdmission::capture_status_compat(&request).is_ok());
+}
+
+#[test]
 fn retired_runtime_directory_is_refused_with_a_managed_child() {
     let temp = TempDir::new().unwrap();
     let release = fixture_release(temp.path(), "0.6.0");

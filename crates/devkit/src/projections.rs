@@ -385,11 +385,15 @@ pub fn workspace_write_directories(
     state: &ProjectState,
     inputs: &InputIdentitySet,
 ) -> Result<Vec<String>> {
+    workspace_output_paths(state, &inputs.directories)
+}
+
+fn workspace_output_paths(state: &ProjectState, directories: &[String]) -> Result<Vec<String>> {
     if node_components(state).is_empty() {
         return Ok(vec![]);
     }
     let mut paths = BTreeSet::new();
-    for d in &inputs.directories {
+    for d in directories {
         paths.insert(if d.is_empty() {
             "node_modules".to_string()
         } else {
@@ -417,11 +421,18 @@ pub fn render_workspace_compose_value(
     state: &ProjectState,
     inputs: &InputIdentitySet,
 ) -> Result<Value> {
+    render_workspace_compose_for_directories(state, &inputs.directories)
+}
+
+fn render_workspace_compose_for_directories(
+    state: &ProjectState,
+    directories: &[String],
+) -> Result<Value> {
     ensure!(
         uses_tool_compose_projections(&state.version)?,
         "Workspace Compose projection is retired in 0.6.0+"
     );
-    let volumes = workspace_write_directories(state, inputs)?
+    let volumes = workspace_output_paths(state, directories)?
         .iter()
         .map(|p| project_volume(p))
         .collect::<Vec<_>>();
@@ -442,12 +453,12 @@ pub fn render_workspace_compose(
 pub(crate) fn assert_workspace_compose(
     root: &Path,
     state: &ProjectState,
-    inputs: Option<&InputIdentitySet>,
+    directories: Option<&[String]>,
 ) -> Result<()> {
     const STALE: &str = "Workspace mount projection is stale; run devkit sync";
     let workspace: Value = read_json(&safe_path(root, LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)?)?;
-    let expected = match inputs {
-        Some(inputs) => render_workspace_compose_value(state, inputs)?,
+    let expected = match directories {
+        Some(directories) => render_workspace_compose_for_directories(state, directories)?,
         None => {
             let volumes = workspace
                 .pointer("/services/node/volumes")
@@ -501,7 +512,7 @@ pub fn assert_projections(
         "Development integration projection is stale; run devkit sync"
     );
     if uses_tool_compose_projections(&state.version)? {
-        assert_workspace_compose(root, state, Some(inputs))?;
+        assert_workspace_compose(root, state, Some(&inputs.directories))?;
     }
     Ok(())
 }

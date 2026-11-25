@@ -106,9 +106,12 @@ impl ToolAdmission {
         if uses_tool_compose_projections(&admission.state.version)? {
             // Status can report services while Node dependencies are being repaired.
             // The accepted projection identity was checked in capture_kind.
-            let inputs =
-                crate::native::inspect_node_input_closure(&admission.root, &admission.state).ok();
-            assert_workspace_compose(&admission.root, &admission.state, inputs.as_ref())?;
+            let directories = crate::native::inspect_node_workspace_directories(
+                &admission.root,
+                &admission.state,
+            )
+            .ok();
+            assert_workspace_compose(&admission.root, &admission.state, directories.as_deref())?;
         }
         Ok(admission)
     }
