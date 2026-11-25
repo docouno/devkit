@@ -2163,6 +2163,8 @@ fn mutate_with_release(
         }
         next.managed = write_managed(release, &staged_root, &next)?;
         if !uses_tool_compose_projections(&next.version)? && product.is_some() {
+            // Check new inputs before resolving, while the seeded lock can
+            // still refer to the previous local environment archive.
             collect_native_input_closure(&staged_root, &next)?;
         }
         for name in old.managed.keys() {

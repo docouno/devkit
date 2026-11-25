@@ -86,8 +86,8 @@ mod pins;
 pub use pins::{EnginePins, PnpmPin, ToolPins};
 pub(crate) use pins::{Records, managed_bytes, render_headless_toolchains};
 
-/// This admission deliberately does not read native dependency graphs/locks.
-/// It permits service operations and explicit repair of stale native inputs.
+/// Base admission for service operations and explicit repair of stale native inputs.
+/// Legacy status also validates the accepted workspace mount projection.
 pub struct ToolAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
