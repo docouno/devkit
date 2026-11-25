@@ -104,9 +104,11 @@ impl ToolAdmission {
     pub fn capture_status_compat(request: &RuntimeRequest) -> Result<Self> {
         let admission = Self::capture_kind(request, true, true)?;
         if uses_tool_compose_projections(&admission.state.version)? {
+            // Status can report services while Node dependencies are being repaired.
+            // The accepted projection identity was checked in capture_kind.
             let inputs =
-                crate::native::collect_native_input_closure(&admission.root, &admission.state)?;
-            assert_workspace_compose(&admission.root, &admission.state, &inputs)?;
+                crate::native::inspect_node_input_closure(&admission.root, &admission.state).ok();
+            assert_workspace_compose(&admission.root, &admission.state, inputs.as_ref())?;
         }
         Ok(admission)
     }

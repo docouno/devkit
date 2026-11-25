@@ -405,7 +405,11 @@ pub fn render_workspace_compose_value(
         .iter()
         .map(|p| project_volume(p))
         .collect::<Vec<_>>();
-    Ok(json!({"services": {"node": {"volumes": &volumes}, "desktop": {"volumes": &volumes}}}))
+    Ok(workspace_compose(&volumes))
+}
+
+fn workspace_compose(volumes: &[Value]) -> Value {
+    json!({"services": {"node": {"volumes": volumes}, "desktop": {"volumes": volumes}}})
 }
 
 pub fn render_workspace_compose(
@@ -418,13 +422,21 @@ pub fn render_workspace_compose(
 pub(crate) fn assert_workspace_compose(
     root: &Path,
     state: &ProjectState,
-    inputs: &InputIdentitySet,
+    inputs: Option<&InputIdentitySet>,
 ) -> Result<()> {
+    const STALE: &str = "Workspace mount projection is stale; run devkit sync";
     let workspace: Value = read_json(&safe_path(root, LEGACY_TOOL_COMPOSE_WORKSPACE_FILE)?)?;
-    ensure!(
-        workspace == render_workspace_compose_value(state, inputs)?,
-        "Workspace mount projection is stale; run devkit sync"
-    );
+    let expected = match inputs {
+        Some(inputs) => render_workspace_compose_value(state, inputs)?,
+        None => {
+            let volumes = workspace
+                .pointer("/services/node/volumes")
+                .and_then(Value::as_array)
+                .context(STALE)?;
+            workspace_compose(volumes)
+        }
+    };
+    ensure!(workspace == expected, "{STALE}");
     Ok(())
 }
 
@@ -444,7 +456,7 @@ pub fn assert_projections(
         "Development integration projection is stale; run devkit sync"
     );
     if uses_tool_compose_projections(&state.version)? {
-        assert_workspace_compose(root, state, inputs)?;
+        assert_workspace_compose(root, state, Some(inputs))?;
     }
     Ok(())
 }

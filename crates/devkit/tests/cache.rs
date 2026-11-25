@@ -272,6 +272,10 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
             Some(b"services: {}\n".as_slice()),
         ),
         (
+            "runtime/compose.tools.yaml/README.txt",
+            Some(b"unexpected runtime directory\n".as_slice()),
+        ),
+        (
             "runtime/desktop.Dockerfile",
             Some(b"FROM changed\n".as_slice()),
         ),

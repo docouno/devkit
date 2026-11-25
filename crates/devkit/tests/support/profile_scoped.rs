@@ -366,10 +366,22 @@ fn retired_managed_files_are_removed_only_when_their_identities_match() {
                 if !modified {
                     assert_eq!(doctor["remediation"], "make sync");
                 }
-                let error =
-                    update_project(&current, &legacy, &UpdateOptions::default(), &NoResolver)
-                        .unwrap_err();
-                assert!(error.to_string().contains(path), "{error:#}");
+                for options in [
+                    UpdateOptions::default(),
+                    UpdateOptions {
+                        reconcile_lock: true,
+                        ..Default::default()
+                    },
+                    UpdateOptions {
+                        package_mode: Some(PackageMode::Local),
+                        ..Default::default()
+                    },
+                ] {
+                    let error =
+                        update_project(&current, &legacy, &options, &NoResolver).unwrap_err();
+                    assert!(error.to_string().contains(path), "{error:#}");
+                    assert_eq!(author_port_payload(&legacy), before);
+                }
                 if modified {
                     let error =
                         sync_project(&current, &legacy, &UpdateOptions::default(), &NoResolver)
@@ -389,6 +401,58 @@ fn retired_managed_files_are_removed_only_when_their_identities_match() {
             }
         }
     }
+}
+
+#[test]
+fn legacy_status_remains_available_during_native_lock_repair() {
+    use devkit::runtime::{RuntimeRequest, ToolAdmission};
+
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.5.1");
+    for template in ["rust", "node"] {
+        let root = temp.path().join(template);
+        let mut state = init(&release, &root, template, PackageMode::Registry);
+        let lock = if template == "rust" {
+            root.join(state.components.keys().next().unwrap())
+                .join("Cargo.lock")
+        } else {
+            root.join("pnpm-lock.yaml")
+        };
+        fs::remove_file(lock).unwrap();
+        let request = RuntimeRequest::new(root.clone(), "status".into());
+        let admission = ToolAdmission::capture_status_compat(&request).unwrap();
+        assert_eq!(admission.state.version, state.version);
+
+        put(&root, RETIRED_FILES[0], b"{\"services\":{}}\n");
+        record_managed_change(&root, &mut state, RETIRED_FILES[0], true);
+        let error = match ToolAdmission::capture_status_compat(&request) {
+            Ok(_) => panic!("admitted a stale workspace projection"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("projection is stale"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn retired_runtime_directory_is_refused_with_a_managed_child() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("current");
+    let mut state = init(&release, &root, "rust", PackageMode::Registry);
+    let directory = RETIRED_FILES[1];
+    let child = format!("{directory}/README.txt");
+    put(&root, &child, b"local content\n");
+    record_managed_change(&root, &mut state, &child, true);
+    let before = author_port_payload(&root);
+    let doctor = read_checkout_command(&root, "doctor");
+    assert_eq!(doctor["status"], "fail");
+    assert_eq!(doctor["remediation"], format!("rmdir {directory}"));
+    let error = sync_project(&release, &root, &UpdateOptions::default(), &NoResolver).unwrap_err();
+    assert!(error.to_string().contains(directory), "{error:#}");
+    assert_eq!(author_port_payload(&root), before);
 }
 
 #[test]
@@ -557,6 +621,7 @@ fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
         ("mismatch", "runtime/desktop.Dockerfile"),
         ("no-pin", "runtime/toolchains.env"),
         ("retired-compose", "runtime/compose.tools.yaml"),
+        ("retired-compose-dir", "runtime/compose.tools.yaml"),
     ] {
         let temp = TempDir::new().unwrap();
         let release = fixture_release(temp.path(), "0.6.0");
@@ -564,6 +629,7 @@ fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
             "missing" => fs::remove_file(release.join(path)).unwrap(),
             "mismatch" => put(&release, path, b"FROM different\n"),
             "retired-compose" => put(&release, path, b"services: {}\n"),
+            "retired-compose-dir" => fs::create_dir(release.join(path)).unwrap(),
             _ => {
                 let pins = fs::read_to_string(release.join(path)).unwrap();
                 let remaining = pins
@@ -575,7 +641,7 @@ fn scoped_checkouts_require_a_complete_release_with_a_matching_recipe() {
             }
         }
         seal(&release, "0.6.0");
-        let expected = if matches!(case, "missing" | "retired-compose") {
+        let expected = if matches!(case, "missing" | "retired-compose" | "retired-compose-dir") {
             path
         } else {
             "DEVKIT_DESKTOP_RECIPE_HASH"

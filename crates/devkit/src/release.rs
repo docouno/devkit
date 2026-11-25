@@ -284,10 +284,10 @@ pub fn read_release(root: &Path) -> Result<Release> {
 impl AdmittedRelease {
     fn check_scoped_runtime(&self) -> Result<()> {
         ensure!(
-            !self
-                .manifest
-                .files
-                .contains_key(crate::state::LEGACY_TOOL_COMPOSE_RUNTIME_FILE),
+            !exists(&safe_path(
+                &self.root,
+                crate::state::LEGACY_TOOL_COMPOSE_RUNTIME_FILE
+            )?)?,
             "Unexpected legacy runtime/compose.tools.yaml in release payload"
         );
         // Every attribution in this directory needs a declared profile. A

@@ -2066,6 +2066,14 @@ pub fn derive_component_dependencies(
 pub fn collect_native_input_closure(root: &Path, state: &ProjectState) -> Result<InputIdentitySet> {
     ReadContext::new(root, NodeLockKind::for_state(state)?).closure(state)
 }
+pub(crate) fn inspect_node_input_closure(
+    root: &Path,
+    state: &ProjectState,
+) -> Result<InputIdentitySet> {
+    let mut context = ReadContext::new(root, NodeLockKind::for_state(state)?);
+    context.dependency_byte_limit = Some(NATIVE_METADATA_MAX_BYTES);
+    context.node_closure(state)
+}
 pub fn native_input_digest(root: &Path, state: &ProjectState) -> Result<String> {
     Ok(collect_native_input_closure(root, state)?.digest)
 }

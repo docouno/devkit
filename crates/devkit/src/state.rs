@@ -555,6 +555,12 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
             let name = path.strip_prefix(&root)?;
             let typ = entry.file_type()?;
             if typ.is_dir() {
+                if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
+                    return Err(unexpected_legacy_tool_compose(
+                        LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+                        true,
+                    ));
+                }
                 if !directories.contains(name) {
                     if name == Path::new(RUNTIME_LICENSES) {
                         // Sync can restore the notices of a registered Electron
@@ -563,11 +569,6 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
                             has_electron(state),
                             "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
                         );
-                    } else if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
-                        return Err(unexpected_legacy_tool_compose(
-                            LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
-                            true,
-                        ));
                     } else {
                         anyhow::bail!("Unlisted runtime directory: {}", name.display());
                     }
@@ -604,6 +605,16 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
     Ok(())
 }
 
+pub(crate) fn verify_retired_tool_compose_unmanaged(state: &ProjectState) -> Result<()> {
+    for path in LEGACY_TOOL_COMPOSE_FILES {
+        ensure!(
+            !state.managed.contains_key(path),
+            "Unexpected legacy tool Compose file: {path}"
+        );
+    }
+    Ok(())
+}
+
 pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
     for required in [
         CHECKSUM_PATH,
@@ -624,13 +635,8 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         );
     }
     let scoped = uses_profile_scoped_runtime(&state.version)?;
-    for path in LEGACY_TOOL_COMPOSE_FILES {
-        if scoped {
-            ensure!(
-                !state.managed.contains_key(path),
-                "Unexpected legacy tool Compose file: {path}"
-            );
-        } else {
+    if !scoped {
+        for path in LEGACY_TOOL_COMPOSE_FILES {
             ensure!(
                 state.managed.contains_key(path),
                 "Missing managed runtime identity: {path}"
@@ -638,6 +644,7 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         }
     }
     if scoped {
+        verify_retired_tool_compose_unmanaged(state)?;
         verify_retired_workspace_compose_absent(root)?;
         let license = format!(".devkit/{RUNTIME_LICENSE_FILE}");
         ensure!(

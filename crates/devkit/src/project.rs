@@ -1724,6 +1724,9 @@ fn mutate_with_release(
     )?;
     let root = &snapshot.root;
     let old = &snapshot.state;
+    if uses_profile_scoped_runtime(&old.version)? {
+        verify_retired_tool_compose_unmanaged(old)?;
+    }
     let mut next = old.clone();
     verify_old_tools(root, &next, true)?;
     if migrating_cargo {
