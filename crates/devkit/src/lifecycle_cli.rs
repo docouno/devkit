@@ -42,10 +42,24 @@ fn ensure_supported_target_version(ver: &str) -> Result<()> {
     Ok(())
 }
 
+/// Execute from the payload to keep its adjacent release available to the
+/// delegated version, including an offline legacy engine.
+fn verified_release_executable(
+    release: &crate::release::AdmittedRelease,
+) -> Result<(PathBuf, String)> {
+    let host = crate::distribution::Target::host()?;
+    let pin = crate::runtime::EnginePins::parse(&release.bytes("runtime/toolchains.env")?)?
+        .for_target(host)?;
+    let path = safe_path(&release.root, host.payload_name())?;
+    crate::delivery::verify_cached_engine(&path, &pin)?;
+    Ok((path, pin.sha256))
+}
+
 pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
     let resolver = DockerPnpmResolver {
         cache_dir: globals.cache_dir.clone(),
         offline: globals.offline,
+        runner: Some(runner.clone()),
     };
     let cargo_resolver = crate::cargo_lock::DockerCargoLockResolver {
         cache_dir: globals.cache_dir.clone(),
@@ -129,20 +143,19 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
                 let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
                 let source = options.path("--release-root");
                 let release = cache.acquire(to_ver, None, source.as_deref(), globals.offline)?;
-                let target_engine = safe_path(&release.root, "devkit")?;
-                let target_sha = crate::delivery::file_digest(&target_engine)?;
+                let (target_engine, target_sha) = verified_release_executable(&release)?;
                 ensure!(
                     std::env::var("DEVKIT_INIT_DELEGATED").ok().as_deref()
                         != Some(target_sha.as_str()),
                     "Init delegation did not converge"
                 );
-                crate::processes::restore_exec_pdeathsig(runner)?;
                 let mut delegated = std::process::Command::new(&target_engine);
                 globals.write_flags(&mut delegated);
                 delegated
                     .args(&globals.args)
                     .env("DEVKIT_INIT_DELEGATED", &target_sha);
                 use std::os::unix::process::CommandExt;
+                crate::processes::restore_self_exec(runner, &mut delegated)?;
                 return Err(delegated.exec()).context("Cannot execute target release engine");
             }
         }
@@ -342,14 +355,12 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
         ensure_supported_target_version(target_version)?;
         let release = cache.acquire(target_version, None, source.as_deref(), globals.offline)?;
         if release.manifest.version != env!("CARGO_PKG_VERSION") {
-            let target_engine = safe_path(&release.root, "devkit")?;
-            let target_sha = crate::delivery::file_digest(&target_engine)?;
+            let (target_engine, target_sha) = verified_release_executable(&release)?;
             ensure!(
                 std::env::var("DEVKIT_UPDATE_DELEGATED").ok().as_deref()
                     != Some(target_sha.as_str()),
                 "Update delegation did not converge"
             );
-            crate::processes::restore_exec_pdeathsig(runner)?;
             let mut delegated = std::process::Command::new(&target_engine);
             globals.write_flags(&mut delegated);
             delegated
@@ -371,6 +382,7 @@ pub fn run(command: &str, globals: &Globals, runner: &ProcessRunner) -> Result<(
             }
             delegated.env("DEVKIT_UPDATE_DELEGATED", &target_sha);
             use std::os::unix::process::CommandExt;
+            crate::processes::restore_self_exec(runner, &mut delegated)?;
             return Err(delegated.exec()).context("Cannot execute target release engine");
         }
         let old = crate::state::read_project_state(&root)?;

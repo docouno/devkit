@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "test") not in sys.path:
     sys.path.insert(0, str(REPO / "test"))
 from docker_flags import author_docker_flags  # noqa: E402
+from release_targets import engine_asset, host_target, payload_name  # noqa: E402
 
 
 def require(condition, message):
@@ -82,8 +83,8 @@ def main():
     index = json.loads(raw_index)
     require(index["publicationEligible"] is True, "Public npx requires the frozen eligible build")
     require(re.fullmatch(r"\d+\.\d+\.\d+", index["version"]), "Exact stable version required")
-    engine = build_set / index["engine"]
-    require(sha256(engine.read_bytes()) == index["files"][index["engine"]]["sha256"], "Engine bytes differ")
+    engine = build_set / engine_asset(index)
+    require(sha256(engine.read_bytes()) == index["files"][engine_asset(index)]["sha256"], "Engine bytes differ")
     engine.chmod(0o755)
     manifest_bytes = (build_set / "release.json").read_bytes()
     require(sha256(manifest_bytes) == index["releaseIdentity"], "Manifest differs")
@@ -156,7 +157,7 @@ def main():
             require(bare["ok"] is False, "Bare non-TTY command must report missing arguments")
             require("devkit init" in (output / "help.txt").read_text(), "Public npm help missing usage")
             cases.append({"umask": mask, "registrySpec": spec, "files": len(delivered),
-                          "engineSha256": delivered["devkit"]["sha256"], "sameVersionRequests": 0,
+                          "engineSha256": delivered[payload_name(host_target())]["sha256"], "sameVersionRequests": 0,
                           "canonicalReleaseIdentity": index["releaseIdentity"], "bareCiDiagnostic": True,
                           "nativeImportNetwork": "none"})
         if args.transport_output:

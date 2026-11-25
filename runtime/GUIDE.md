@@ -2,6 +2,12 @@
 
 This repository uses a pinned Devkit development environment. Daily commands run inside digest-pinned containers so builds, checks, tests, and packages remain identical across workstations and CI runners without host language SDKs.
 
+## Moving a checkout between architectures
+
+The same project commit works on Linux x86-64 and ARM64. Run `make setup` on the destination host to prepare images, the Linux container helper, and any pnpm or Electron downloads for the local Docker daemon. Each host keeps its own ignored build outputs. Electron packaging produces a Linux bundle for the daemon architecture.
+
+`make info json=1` reports the CLI's `hostTarget`, the `preparedPlatform` recorded by setup, and whether the matching helper is available locally (`helperReady`). On a cold checkout, the platform and helper status can be null. Run `make doctor` to inspect the active Docker daemon when diagnosing a platform mismatch.
+
 ## Repository Layout
 
 - `apps/<name>` (`0..N`): Runnable product entry points (`node-api`, `react-web`, `electron-react`, `rust-api`). Libraries-only repositories may have zero applications.
@@ -37,7 +43,7 @@ From Devkit `0.6.0`, adding or registering the first Electron app installs `.dev
 | `make setup` | Pull/build pinned images and install workspace dependencies into container-compatible paths |
 | `make info [app=NAME] [json=1]` | Show checkout identity, readiness, registered components and stand addresses |
 | `make sync [reconcile=1] [preview=1]` | Synchronize workspace lockfiles and build order after native manifest edits |
-| `make doctor` | Fast (`<200ms`) verification of accepted images, receipts, disk space, and project invariants |
+| `make doctor` | Inspect accepted images, local tool readiness, disk space, and Docker resource limits |
 | `make check` | Run typecheck, lint, formatting check, and Rust compile/test-list gates |
 | `make fix` | Format source files explicitly using the pinned formatters |
 | `make test` | Run native unit and integration test suites offline |
@@ -141,7 +147,7 @@ make setup && make check
 
 For the `0.5.x` Rust migration, both preview and apply verify the merged lock in staging. Devkit can verify known template and simple local dependency graphs before setup. Other graphs require Docker to run the target release's pinned Cargo. For offline validation, cache the target release, the base image in its `runtime/rust.Dockerfile` and the required Cargo dependency data.
 
-Pass `reconcile=1` for pnpm transitive re-resolution. After an interrupted update, `make recover` restores the previous checkout offline from the local journal without Docker. If the loader still comes from `0.5.x`, run the cached target engine at `${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/docouno/devkit}/engines/x86_64-unknown-linux-musl/0.6.0/<sha256>/devkit recover .`.
+Pass `reconcile=1` for pnpm transitive re-resolution. After an interrupted update, `make recover` restores the previous checkout offline from the local journal without Docker. If the loader still comes from `0.5.x`, run the cached target engine at `${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/docouno/devkit}/engines/<target>/0.6.0/<sha256>/devkit recover .` (where `<target>` is `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`).
 
 ### Shared caches
 

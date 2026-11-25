@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import time
 from support import Harness, digest, require
+from release_targets import engine_asset, host_target
 
 
 class Safety(Harness):
@@ -24,16 +25,19 @@ class Safety(Harness):
                 archive.addfile(item, io.BytesIO(data))
         return stream.getvalue()
     def index_for_archive(self, *, sha256, size):
-        patched = copy.deepcopy(self.old_index)
-        patched['files'][self.old_index['archive']] = {'sha256': sha256, 'size': size}
+        patched = copy.deepcopy(self.transport_index)
+        patched['files'][self.transport_index['archive']] = {'sha256': sha256, 'size': size}
         return json.dumps(patched).encode()
     def reject_archive(self, name, data):
-        original_archive = self.fixture.routes[self.archive_route]
-        original_index = self.fixture.routes[self.old_index_route]
-        self.fixture.routes[self.archive_route] = data
-        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(data), size=len(data))
+        original_archive = self.fixture.routes[self.transport_archive_route]
+        original_index = self.fixture.routes[self.transport_index_route]
+        self.fixture.routes[self.transport_archive_route] = data
+        self.fixture.routes[self.transport_index_route] = self.index_for_archive(sha256=digest(data), size=len(data))
         try:
-            result = self.cold_old(name, expected='devkit:')
+            before = len(self.fixture.requests)
+            result = self.cold_init(name, self.transport_version, expected='devkit:')
+            require(self.fixture.requests[before:] == [self.transport_index_route, self.transport_archive_route],
+                    f'{name} did not reach the selected archive')
             require(
                 'Downloaded archive checksum mismatch' not in result.stderr
                 and 'Invalid release asset' not in result.stderr
@@ -42,8 +46,8 @@ class Safety(Harness):
                 f'Archive attack stopped outside archive admission: {result.stderr}',
             )
         finally:
-            self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
+            self.fixture.routes[self.transport_archive_route] = original_archive
+            self.fixture.routes[self.transport_index_route] = original_index
     def cancel(self, name, argv, route):
         self.fixture.ready.clear(); self.fixture.resume.clear()
         original = self.fixture.routes.get(route)
@@ -81,7 +85,7 @@ class Safety(Harness):
             require(not list(cache.rglob('devkit')) and not list(cache.rglob('.engine.*')), 'Bad ELF became a cached engine')
         self.fixture.routes[self.engine_route] = real_engine
         self.cancel('cancel-initial-curl', ['sh', self.script, '--version'], self.engine_route)
-        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.old_version, '--app', 'api=rust-api', '--non-interactive'], self.old_index_route)
+        self.cancel('cancel-native-HTTPS-worker', [self.engine, 'init', self.scratch / 'cancel-native-HTTPS-worker', '--to', self.version, '--app', 'api=rust-api', '--non-interactive'], self.index_route)
         # The native HTTP reader has one bounded path for known/unknown lengths.
         def unknown(handler):
             handler.send_response(200); handler.send_header('Connection', 'close'); handler.end_headers()
@@ -102,23 +106,55 @@ class Safety(Harness):
         self.run('native-reader-deadline', [self.engine, 'internal', 'fetch', '--url', 'https://github.com/deadline', '--output', output, '--max-bytes', '128'], expected='devkit:', timeout=16)
         require(time.monotonic() - started < 15 and not output.exists(), 'Stalled reader outlived its bound')
         self.fixture.resume.set()
-        original_archive = self.fixture.routes[self.archive_route]
-        original_index = self.fixture.routes[self.old_index_route]
+        self.verify_archive_transport()
+        # Oversized metadata is refused before any project write, lock, or SDK process.
+        project = self.scratch / 'oversized manifest'
+        (project / '.devkit').mkdir(parents=True)
+        (project / '.devkit/manifest.json').write_bytes(b'{"schemaVersion":2,"pad":"' + b'a' * (4 * 1024 * 1024) + b'"}')
+        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='4 MiB byte budget')
+        require(not (project / '.devkit/state').exists(), 'Oversized manifest created state or lock directory')
+        require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')
+
+    def verify_archive_transport(self):
+        host = host_target()
+        index = self.index
+        if not index['publicationEligible'] and host == self.old_index['target']:
+            index = self.old_index
+        self.transport_version = index['version']
+        base = f'{self.base}/v{self.transport_version}'
+        self.transport_archive_route = f'{base}/{index["archive"]}'
+        self.transport_index_route = f'{base}/release-index.json'
+        original = self.fixture.routes[self.transport_index_route]
+        self.transport_index = index
+        if not index['publicationEligible']:
+            # The historical release has no engine for this host. Only the
+            # private archive test server advertises the host-compatible bytes.
+            require(engine_asset(index, host) in index['files'], f'Missing preview engine for {host}')
+            self.transport_index = dict(index, publicationEligible=True, buildRun='loopback-archive-test')
+            self.fixture.routes[self.transport_index_route] = json.dumps(self.transport_index).encode()
         try:
-            self.fixture.routes[self.archive_route] = None
-            self.cold_old('missing-release-archive', expected='devkit:')
+            self.verify_archives()
+        finally:
+            self.fixture.routes[self.transport_index_route] = original
+
+    def verify_archives(self):
+        original_archive = self.fixture.routes[self.transport_archive_route]
+        original_index = self.fixture.routes[self.transport_index_route]
+        try:
+            self.fixture.routes[self.transport_archive_route] = None
+            self.cold_init('missing-release-archive', self.transport_version, expected='devkit:')
             def partial(handler):
                 handler.send_response(200); handler.send_header('Content-Length', str(len(original_archive))); handler.end_headers()
                 handler.wfile.write(original_archive[:128]); handler.wfile.flush(); handler.close_connection = True
-            self.fixture.routes[self.archive_route] = partial
-            self.cold_old('truncated-HTTP-archive', expected='devkit:')
-            self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256='0' * 64, size=len(original_archive))
-            self.cold_old('archive-checksum-mismatch', expected='Downloaded archive checksum mismatch')
+            self.fixture.routes[self.transport_archive_route] = partial
+            self.cold_init('truncated-HTTP-archive', self.transport_version, expected='devkit:')
+            self.fixture.routes[self.transport_archive_route] = original_archive
+            self.fixture.routes[self.transport_index_route] = self.index_for_archive(sha256='0' * 64, size=len(original_archive))
+            self.cold_init('archive-checksum-mismatch', self.transport_version, expected='Downloaded archive checksum mismatch')
         finally:
-            self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
-        prefix = f'devkit-{self.old_version}/'
+            self.fixture.routes[self.transport_archive_route] = original_archive
+            self.fixture.routes[self.transport_index_route] = original_index
+        prefix = f'devkit-{self.transport_version}/'
         base = [(prefix, tarfile.DIRTYPE, 0o755, b'')]
         for name, path, kind, mode in (
             ('traversal', prefix + '../escape', tarfile.REGTYPE, 0o644),
@@ -157,9 +193,9 @@ class Safety(Harness):
         # and cannot finish or exec into the target binary before SIGTERM arrives.
         env = self.environment('cancel-native-extraction')
         target = self.scratch / 'cancel-native-extraction'
-        self.fixture.routes[self.archive_route] = expanded_bytes
-        self.fixture.routes[self.old_index_route] = self.index_for_archive(sha256=digest(expanded_bytes), size=len(expanded_bytes))
-        process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.old_version,
+        self.fixture.routes[self.transport_archive_route] = expanded_bytes
+        self.fixture.routes[self.transport_index_route] = self.index_for_archive(sha256=digest(expanded_bytes), size=len(expanded_bytes))
+        process = subprocess.Popen([str(self.engine), 'init', str(target), '--to', self.transport_version,
             '--app', 'api=rust-api', '--non-interactive'], cwd=self.scratch, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -176,17 +212,10 @@ class Safety(Harness):
             print('PASS cancel-native-extraction', flush=True)
         finally:
             if process.poll() is None: process.kill(); process.communicate(timeout=5)
-            self.fixture.routes[self.archive_route] = original_archive
-            self.fixture.routes[self.old_index_route] = original_index
-        valid = self.baseline_archive.read_bytes()
+            self.fixture.routes[self.transport_archive_route] = original_archive
+            self.fixture.routes[self.transport_index_route] = original_index
+        valid = original_archive
         # CRC/truncation reach the actual native reader with a matching transport hash.
         changed = bytearray(valid); changed[-8] ^= 1
         self.reject_archive('native-CRC', bytes(changed))
         self.reject_archive('native-truncated-gzip', valid[:-1])
-        # Oversized metadata is refused before any project write, lock, or SDK process.
-        project = self.scratch / 'oversized manifest'
-        (project / '.devkit').mkdir(parents=True)
-        (project / '.devkit/manifest.json').write_bytes(b'{"schemaVersion":2,"pad":"' + b'a' * (4 * 1024 * 1024) + b'"}')
-        self.run('manifest-input-bound', [self.engine, 'register', project, '--app', 'worker', '--profile', 'rust', '--non-interactive'], expected='4 MiB byte budget')
-        require(not (project / '.devkit/state').exists(), 'Oversized manifest created state or lock directory')
-        require(not self.forbidden.exists(), 'Safety gate invoked a host SDK')

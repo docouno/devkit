@@ -102,9 +102,6 @@ fn manifest(root: &Path) -> Result<Option<(File, Witness)>> {
         return Ok(None);
     }
     let state = read_project_state(root)?;
-    if SemVer::parse(&state.version)? < SemVer::parse("0.5.0")? {
-        return Ok(None);
-    }
     let loader = ".devkit/runtime/devkit.sh";
     let Some(id) = state.managed.get(loader) else {
         return Ok(None);

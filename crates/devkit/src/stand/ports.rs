@@ -813,7 +813,7 @@ impl Registry {
         Self::lock_until(root, None)
     }
     fn lock_until(root: &Path, deadline: Option<Instant>) -> Result<File> {
-        create_dir_all_durable(root)?;
+        crate::cache::ensure_cache_root(root)?;
         let path = safe_path(root, "port-leases.lock")?;
         let file = OpenOptions::new()
             .read(true)

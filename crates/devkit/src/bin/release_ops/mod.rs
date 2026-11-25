@@ -1,4 +1,5 @@
 //! A bounded release state machine, with provider operations at one seam.
+mod payload;
 mod provider;
 mod readiness;
 #[cfg(test)]
@@ -8,7 +9,7 @@ use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     Result, archive, assembler,
-    distribution::{NpmArtifact, ReleaseIndex},
+    distribution::{NpmArtifact, REQUIRED_PUBLISHABLE_TARGETS, ReleaseIndex, checksums},
     files::{self, SHA256_RE},
     processes::ProcessRunner,
 };
@@ -161,7 +162,12 @@ impl Contract {
             .split_once("/attempts/")
             .context("Build run must include its attempt")?;
         ensure!(
-            run.bytes().all(|b| b.is_ascii_digit()) && attempt.bytes().all(|b| b.is_ascii_digit()),
+            !run.is_empty()
+                && !run.starts_with('0')
+                && run.bytes().all(|b| b.is_ascii_digit())
+                && !attempt.is_empty()
+                && !attempt.starts_with('0')
+                && attempt.bytes().all(|b| b.is_ascii_digit()),
             "Invalid build run"
         );
         ensure!(attempt.parse::<u64>()? > 0, "Invalid build attempt");
@@ -224,7 +230,7 @@ impl FrozenSet {
         );
         let bytes = read_bounded(&root.join("release-index.json"), 4 * 1024 * 1024)?;
         let index: ReleaseIndex = serde_json::from_slice(&bytes)?;
-        index.validate()?;
+        index.validate_publishable_matrix(REQUIRED_PUBLISHABLE_TARGETS)?;
         ensure!(
             index.publication_eligible
                 && source_hash(&index.source_commit)
@@ -237,13 +243,37 @@ impl FrozenSet {
             index,
             index_sha256: digest(&bytes),
         };
+        let packages_by_archive: BTreeMap<_, _> = set
+            .index
+            .packages
+            .values()
+            .map(|p| (p.archive.as_str(), p))
+            .collect();
+        let expected_checksums = checksums(&set.index.files);
+        let mut saw_checksums = false;
+        let mut verified_packages = 0usize;
         for (name, identity) in &set.index.files {
-            let bytes = read_bounded(&root.join(name), 128 * 1024 * 1024)?;
+            let bytes = read_bounded(&root.join(name), devkit::distribution::MAX_EXECUTABLE_BYTES)?;
             ensure!(
                 bytes.len() as u64 == identity.size && digest(&bytes) == identity.sha256,
                 "Frozen asset differs: {name}"
             );
+            if name == "checksums.txt" {
+                ensure!(
+                    bytes == expected_checksums.as_bytes(),
+                    "Frozen checksums.txt differs from the release index"
+                );
+                saw_checksums = true;
+            }
+            if let Some(package) = packages_by_archive.get(name.as_str()) {
+                verify_npm_bytes(package, &package.integrity, &package.shasum, &bytes)?;
+                verified_packages += 1;
+            }
         }
+        ensure!(
+            saw_checksums && verified_packages == set.index.packages.len(),
+            "Frozen build set is incomplete"
+        );
         let allowed: BTreeSet<_> = set
             .index
             .files
@@ -261,10 +291,6 @@ impl FrozenSet {
                 "Unexpected build-set member"
             );
         }
-        for package in set.index.packages.values() {
-            let bytes = read_bounded(&root.join(&package.archive), 128 * 1024 * 1024)?;
-            verify_npm_bytes(package, &package.integrity, &package.shasum, &bytes)?;
-        }
         Ok(set)
     }
     fn contract(&self, previous: Selectors) -> Result<Contract> {
@@ -280,22 +306,6 @@ impl FrozenSet {
         };
         result.validate()?;
         Ok(result)
-    }
-    fn hydrate(&self) -> Result<()> {
-        let payload = self.root.join("payload");
-        if !payload.exists() {
-            archive::extract_archive(
-                &self.root.join(&self.index.archive),
-                &payload,
-                &format!("devkit-{}", self.index.version),
-            )?;
-        }
-        let admitted = devkit::release::admit_release(&payload)?;
-        ensure!(
-            admitted.identity == self.index.release_identity,
-            "Hydrated payload identity differs"
-        );
-        Ok(())
     }
     fn asset_names(&self) -> BTreeSet<String> {
         self.index
@@ -1469,7 +1479,7 @@ fn run_args(args: Args) -> Result<()> {
                     "Remote index differs from original contract"
                 );
                 let index: ReleaseIndex = files::read_json(&output.join("release-index.json"))?;
-                index.validate()?;
+                index.validate_publishable_matrix(REQUIRED_PUBLISHABLE_TARGETS)?;
                 index.files.keys().all(|name| output.join(name).exists())
             } else {
                 false
@@ -1514,6 +1524,9 @@ fn run_args(args: Args) -> Result<()> {
         );
         set.hydrate()?;
     } else {
+        if matches!(args.command.as_str(), "stage" | "publish") {
+            set.hydrate()?;
+        }
         let c = set.contract(args.previous()?)?;
         args.check_contract(&c)?;
         provider::require_actions(&c.source_commit)?;

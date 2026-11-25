@@ -9,7 +9,7 @@ Run upgrades on a dedicated Git branch:
 ```sh
 git switch -c chore/devkit-0.6.0
 
-# 1. Inspect planned file changes and applicable migration notes without modifying files
+# 1. Inspect planned file changes and applicable migration notes without modifying files (add --json for file hashes and modes)
 npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview
 
 # 2. Apply the environment update
@@ -28,13 +28,15 @@ Review the diff, including new root workspace files and removed component-local 
 
 Devkit `0.6.0` supports direct upgrades from `0.5.0` and `0.5.1`. The minimum accepted version is recorded in `release.json` as `minSupportedFromVersion`. Older checkouts are rejected before acquiring locks or changing files.
 
-| Accepted checkout  | Next step                                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `0.5.x`            | Preview the update to `0.6.0`, then apply it.                                                               |
-| `0.4.x`            | Run `npx @docouno/devkit@0.5.1 update . --to 0.5.1`, run setup and checks, and commit that migration first. |
-| `0.2.x` or `0.3.x` | Reach `0.4.1` with `npx @docouno/devkit@0.4.1 update . --to 0.4.1`, verify it, then bridge through `0.5.1`. |
+| Accepted checkout  | Next step                                                                                                                        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `0.5.x`            | Preview the update to `0.6.0`, then apply it. On Linux ARM64, invoke `@docouno/devkit@0.6.0` directly rather than `make update`. |
+| `0.4.x`            | On Linux x86-64, run `npx @docouno/devkit@0.5.1 update . --to 0.5.1`, run setup and checks, and commit that migration first.     |
+| `0.2.x` or `0.3.x` | On Linux x86-64, reach `0.4.1` with `npx @docouno/devkit@0.4.1 update . --to 0.4.1`, verify it, then bridge through `0.5.1`.     |
 
-For a schema 1 checkout, first use the published `0.2.1` bootstrap to migrate to schema 2. Run these commands from the checkout on your upgrade branch, verify the result, then follow the `0.2.x` steps above.
+The loader checked into a `0.5.x` repository requires x86-64. On Linux ARM64, create the upgrade branch with `git switch -c` or `wt switch --create --no-hooks` so Worktrunk does not invoke that loader, then run the `0.6.0` npm command above or the versioned installer.
+
+For a schema 1 checkout, first use the published `0.2.1` bootstrap on Linux x86-64 to migrate to schema 2. Run these commands from the checkout on your upgrade branch, verify the result, then follow the `0.2.x` steps above.
 
 ```sh
 bootstrap=$(mktemp)
@@ -46,7 +48,7 @@ make check
 
 ## Workspace migration and file ownership
 
-On `0.5.x` and later, the checkout's Makefile can preview and apply the update.
+On `0.5.x` and later on Linux x86-64, the checkout's Makefile can preview and apply the update.
 
 ```sh
 make update to=0.6.0 preview=1
@@ -85,10 +87,10 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 
 ## Cross-release dispatch
 
-- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.5.0+` engine whenever it differs from the running binary.
+- Daily and workspace-scoped commands (`devkit exec`, `devkit task`, `devkit sync`, `devkit add-app`, `devkit add-package`, and `devkit register`) verify and delegate to the project's accepted `0.5.0+` engine for the current host whenever it differs from the running binary.
 - `devkit stand` (`reserve` / `remove`) selects the cached accepted `0.5.0+` engine locally without network access and refuses before locking on checkouts older than `0.5.0`. If another process is installing the accepted engine, retry the stand command once installation finishes.
 - Read-only `devkit describe` and `devkit status` delegate when the accepted engine is already cached locally and remain strictly offline otherwise; `devkit info` uses a cached accepted `0.5.0+` engine offline and returns a local summary if the engine is unavailable or its cache lock is busy, while `devkit doctor` runs lock-free against the host and checkout directly.
-- `devkit init --to <version>` and `devkit update --to <version>` (for `<version> >= 0.5.0`) resolve and verify the target release first; whenever `<version>` differs from the currently running `devkit` binary, execution delegates symmetrically to the verified `<version>` engine.
+- `devkit init --to <version>` and `devkit update --to <version>` (for `<version> >= 0.5.0`) resolve and verify the target release first; whenever `<version>` differs from the currently running `devkit` binary, execution delegates symmetrically to the verified `<version>` engine. When a release has no engine for the current host, use a release that provides one — to migrate an x86-64-only `0.5.x` checkout on Linux ARM64, start the update directly with the `0.6.0` CLI.
 
 ### Choosing a CLI for headless projects
 

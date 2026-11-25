@@ -1,12 +1,11 @@
 //! Bounded checkout metadata for `make info`. All observations are read-only.
 use crate::{
     Result,
-    delivery::EnginePin,
     doctor::ComposeServiceStatus,
     files::*,
-    model::{DevelopmentKind, Role, Toolchain, ToolingProfile},
+    model::{DevelopmentKind, Role},
     processes::ProcessRunner,
-    runtime::CheckoutToolPins,
+    runtime::ToolPins,
     stand::{epoch::Physical, ledger, ports::Ports, preview},
     state,
 };
@@ -248,41 +247,33 @@ fn observe_stand(
 fn local_readiness(
     root: &Path,
     state: &crate::model::ProjectState,
-    pins: &CheckoutToolPins,
+    pins: &ToolPins,
     cache_dir: Option<&Path>,
-) -> (&'static str, Option<Value>) {
+) -> Result<(&'static str, Option<Value>)> {
     let native = match crate::native::inspect_native_components(root, state) {
         Ok(native) => native,
         Err(error) => {
             let exceeds_budget = error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge);
-            return (
+            return Ok((
                 if exceeds_budget {
                     "unknown"
                 } else {
                     "setup-required"
                 },
                 None,
-            );
+            ));
         }
     };
     let receipts =
-        crate::doctor::local_receipts_with_pins(root, state, pins, Some(&native), cache_dir);
-    let ready = state.components.values().all(|c| match c.toolchain {
-        Toolchain::Rust => {
-            receipts["rustImageReady"] == true && receipts["rustWorkspaceReady"] == true
-        }
-        Toolchain::Node => {
-            receipts["nodeWorkspaceReady"] == true
-                && (c.tooling_profile != ToolingProfile::Electron
-                    || receipts["desktopImageReady"] == true)
-        }
-    });
-    (
-        if ready { "ready" } else { "setup-required" },
-        Some(receipts),
-    )
+        crate::doctor::local_receipts_with_pins(root, state, pins, Some(&native), None, cache_dir)?;
+    let readiness = if receipts["ready"] == true {
+        "ready"
+    } else {
+        "setup-required"
+    };
+    Ok((readiness, Some(receipts)))
 }
 
 pub(crate) fn inspect(
@@ -360,8 +351,8 @@ pub(crate) fn inspect(
                     .ok()
                     .flatten()
             })
-            .and_then(|(bytes, _)| EnginePin::from_toolchains(&bytes).ok())
-            .map(|pin| pin.version),
+            .and_then(|(bytes, _)| crate::runtime::EnginePins::parse(&bytes).ok())
+            .map(|pins| pins.version),
     };
     let pending = state::assert_no_pending(&root).is_err();
     if let Some(state) = &accepted {
@@ -391,10 +382,10 @@ pub(crate) fn inspect(
         };
         if !pending
             && state.version == env!("CARGO_PKG_VERSION")
-            && let Ok(pins) = CheckoutToolPins::admit(&root, state)
+            && let Ok(pins) = ToolPins::admit(&root, state)
         {
             if !busy {
-                (readiness, receipts) = local_readiness(&root, state, &pins, cache_dir);
+                (readiness, receipts) = local_readiness(&root, state, &pins, cache_dir)?;
             }
             let ports = Ports::verified_snapshot(&root).ok().flatten();
             let unreadable_claim = ports.is_none() && !matches!(Ports::read(&root), Ok(None));
@@ -468,7 +459,7 @@ pub(crate) fn inspect(
         format!("Stand: {condition}"),
     ];
     if pending {
-        lines.push("Update pending. Run make recover.".into());
+        lines.push("Update pending. Run devkit recover (or make recover).".into());
     }
     for service in &services {
         lines.push(format!("Service {}: {}", service.service, service.state));
@@ -484,8 +475,19 @@ pub(crate) fn inspect(
         }
     }
     lines.extend(preview::reservation_lines(&reservations, &services));
+    let prepared_platform = receipts
+        .as_ref()
+        .and_then(|r| r.get("preparedPlatform"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let helper_ready = receipts
+        .as_ref()
+        .and_then(|r| r.get("helperReady"))
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok((
-        json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,"receipts":receipts,
+        json!({"root":root,"worktreeKind":kind,"branch":branch,"version":version,"readiness":readiness,
+        "hostTarget":crate::distribution::Target::host()?.triple(),"preparedPlatform":prepared_platform,"helperReady":helper_ready,"receipts":receipts,
         "lock":{"state":lock_state,"owner":owner},"apps":apps,"packages":packages,
         "standState":condition,"services":services,"standPorts":reservations}),
         lines.join("\n"),

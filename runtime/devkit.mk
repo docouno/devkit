@@ -31,29 +31,62 @@ export DEVKIT_EXEC_NETWORK := $(or $(value network),none)
 export DEVKIT_EXEC_PREPARE := $(or $(value prepare),0)
 unexport app package follow tail headless cleanup reconcile preview json
 unexport name template api use profile to command cmd component write network prepare toolchain
+unexport DEVKIT_MAKE_DAG DEVKIT_MAKE_PLAN DEVKIT_EXPECTED_MANIFEST DEVKIT_EXPECTED_PLAN
+# Clear projection and internal cache variables so ambient environment values
+# can never inject targets, shell text, or cached manifest digests.
+DEVKIT_REGISTERED_APPS :=
+DEVKIT_REGISTERED_PACKAGES :=
+DEVKIT_DESKTOP_APPS :=
+DEVKIT_PACKAGEABLE_PACKAGES :=
+override devkit_manifest_loaded :=
+override devkit_manifest_saved :=
+unexport DEVKIT_REGISTERED_APPS DEVKIT_REGISTERED_PACKAGES DEVKIT_DESKTOP_APPS DEVKIT_PACKAGEABLE_PACKAGES
+unexport devkit_manifest_loaded devkit_manifest_saved
 
 devkit_loader := .devkit/runtime/devkit.sh
 devkit_projection := $(shell test -d .devkit && test ! -L .devkit && test -f .devkit/project.mk && test ! -L .devkit/project.mk && test -r .devkit/project.mk && printf yes)
 ifeq ($(devkit_projection),yes)
 include .devkit/project.mk
 endif
-devkit_plan := $(value DEVKIT_EXPECTED_PLAN)
+# Only values defined by the checked-in projection file may shape Make targets or recipes.
+devkit_apps := $(if $(filter file,$(origin DEVKIT_REGISTERED_APPS)),$(value DEVKIT_REGISTERED_APPS))
+devkit_packages := $(if $(filter file,$(origin DEVKIT_REGISTERED_PACKAGES)),$(value DEVKIT_REGISTERED_PACKAGES))
+devkit_desktop_apps := $(if $(filter file,$(origin DEVKIT_DESKTOP_APPS)),$(value DEVKIT_DESKTOP_APPS))
+devkit_packageable_packages := $(if $(filter file,$(origin DEVKIT_PACKAGEABLE_PACKAGES)),$(value DEVKIT_PACKAGEABLE_PACKAGES))
+# Only a single hexadecimal word from the checked-in projection may reach a recipe.
+devkit_plan := $(if $(filter file,$(origin DEVKIT_EXPECTED_PLAN)),$(value DEVKIT_EXPECTED_PLAN))
+devkit_plan_remainder := $(subst 0,,$(subst 1,,$(subst 2,,$(subst 3,,$(subst 4,,$(subst 5,,$(subst 6,,$(subst 7,,$(subst 8,,$(subst 9,,$(subst a,,$(subst b,,$(subst c,,$(subst d,,$(subst e,,$(subst f,,$(devkit_plan)))))))))))))))))
+devkit_plan_safe := $(if $(and $(filter 1,$(words $(devkit_plan))),$(if $(devkit_plan_remainder),,1)),$(strip $(devkit_plan)))
 
 # Use the literal inputs throughout the DAG as well as the recipe environment.
-devkit_app_valid := $(if $(DEVKIT_APP),$(if $(findstring %,$(DEVKIT_APP)),,$(if $(filter 1,$(words $(DEVKIT_APP))),$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS)),)),1)
-devkit_package_valid := $(if $(DEVKIT_PACKAGE),$(if $(findstring %,$(DEVKIT_PACKAGE)),,$(if $(filter 1,$(words $(DEVKIT_PACKAGE))),$(filter $(DEVKIT_PACKAGE),$(DEVKIT_REGISTERED_PACKAGES)),)),1)
+devkit_app_valid := $(if $(DEVKIT_APP),$(if $(findstring %,$(DEVKIT_APP)),,$(if $(filter 1,$(words $(DEVKIT_APP))),$(filter $(DEVKIT_APP),$(devkit_apps)),)),1)
+devkit_package_valid := $(if $(DEVKIT_PACKAGE),$(if $(findstring %,$(DEVKIT_PACKAGE)),,$(if $(filter 1,$(words $(DEVKIT_PACKAGE))),$(filter $(DEVKIT_PACKAGE),$(devkit_packages)),)),1)
 devkit_selectors_valid := $(if $(and $(DEVKIT_APP),$(DEVKIT_PACKAGE)),,$(and $(devkit_app_valid),$(devkit_package_valid)))
 devkit_dev_selectors_valid := $(if $(DEVKIT_PACKAGE),,$(devkit_app_valid))
 
-devkit_dev_aggregate := $(if $(DEVKIT_APP),0,$(if $(word 2,$(DEVKIT_REGISTERED_APPS)),1,0))
-devkit_skipped_desktop := $(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(if $(DISPLAY),,$(DEVKIT_DESKTOP_APPS))))
-devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(DEVKIT_APP),$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS)),$(filter-out $(devkit_skipped_desktop),$(DEVKIT_REGISTERED_APPS))),)
+devkit_dev_aggregate := $(if $(DEVKIT_APP),0,$(if $(word 2,$(devkit_apps)),1,0))
+devkit_needs_desktop_probe := $(if $(filter dev up,$(value MAKECMDGOALS)),$(if $(filter 1,$(devkit_dev_aggregate)),$(if $(filter 0,$(DEVKIT_HEADLESS)),$(devkit_desktop_apps))))
+ifneq ($(devkit_needs_desktop_probe),)
+devkit_host_os := $(shell uname -s)
+ifeq ($(devkit_host_os),Darwin)
+devkit_skip_gui := 1
+devkit_skip_reason = on macOS; use headless=1.
+else
+devkit_skip_gui := $(if $(value DISPLAY),,1)
+devkit_skip_reason = without DISPLAY; use headless=1 or app=$(desktop).
+endif
+else
+devkit_skip_gui :=
+devkit_skip_reason =
+endif
+devkit_skipped_desktop := $(if $(devkit_needs_desktop_probe),$(if $(devkit_skip_gui),$(devkit_desktop_apps)))
+devkit_selected_apps := $(if $(devkit_dev_selectors_valid),$(if $(DEVKIT_APP),$(filter $(DEVKIT_APP),$(devkit_apps)),$(filter-out $(devkit_skipped_desktop),$(devkit_apps))),)
 # Keep the public workspace setup targets distinct from apps with the same suffix.
 devkit_workspace_names := node-workspace rust-workspace
 devkit_app_leaves = $(foreach name,$(2),$(if $(and $(filter setup,$(1)),$(filter $(devkit_workspace_names),$(name))),setup/apps/$(name),$(1)-$(name)))
-devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(call devkit_app_leaves,$(1),$(filter $(DEVKIT_APP),$(DEVKIT_REGISTERED_APPS))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(DEVKIT_REGISTERED_PACKAGES))),$(call devkit_app_leaves,$(1),$(DEVKIT_REGISTERED_APPS)) $(addprefix $(1)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))),)
-devkit_app_targets := $(foreach command,setup check fix test build dev package,$(call devkit_app_leaves,$(command),$(DEVKIT_REGISTERED_APPS)))
-devkit_package_targets := $(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(DEVKIT_REGISTERED_PACKAGES)))
+devkit_targets = $(if $(devkit_selectors_valid),$(if $(DEVKIT_APP),$(call devkit_app_leaves,$(1),$(filter $(DEVKIT_APP),$(devkit_apps))),$(if $(DEVKIT_PACKAGE),$(addprefix $(1)/packages/,$(filter $(DEVKIT_PACKAGE),$(devkit_packages))),$(call devkit_app_leaves,$(1),$(devkit_apps)) $(addprefix $(1)/packages/,$(devkit_packages)))),)
+devkit_app_targets := $(foreach command,setup check fix test build dev package,$(call devkit_app_leaves,$(command),$(devkit_apps)))
+devkit_package_targets := $(foreach command,setup check fix test build package,$(addprefix $(command)/packages/,$(devkit_packages)))
 devkit_dag := setup check fix test build dev up package setup-node-workspace setup-rust-workspace $(devkit_app_targets) $(devkit_package_targets)
 
 .PHONY: help info status doctor down logs sync add-app add-package register update recover $(devkit_dag)
@@ -66,10 +99,8 @@ help info status doctor down logs sync add-app add-package register update recov
 
 # Cache the first DAG recipe's manifest digest for this entire Make invocation.
 # The plan token comes from the projection Make parsed, before any prerequisite.
-devkit_manifest_digest = $(if $(filter undefined,$(origin devkit_manifest_saved)),$(eval devkit_manifest_saved := $(shell sh .devkit/runtime/devkit.sh make-manifest | awk 'length($$0) == 64 && $$0 !~ /[^a-f0-9]/ { print; exit }')))$(devkit_manifest_saved)
-$(devkit_dag): private export DEVKIT_MAKE_DAG := 1
-$(devkit_dag): private export DEVKIT_MAKE_PLAN := $(devkit_plan)
-devkit_task = DEVKIT_EXPECTED_MANIFEST=$(devkit_manifest_digest) exec sh $(devkit_loader)
+devkit_manifest_digest = $(if $(devkit_manifest_loaded),,$(eval override devkit_manifest_saved := $(shell sh .devkit/runtime/devkit.sh make-manifest | awk 'NR == 1 && length($$0) == 64 && $$0 !~ /[^a-f0-9]/ { print; exit }'))$(eval override devkit_manifest_loaded := 1))$(devkit_manifest_saved)
+devkit_task = DEVKIT_MAKE_DAG=1 DEVKIT_MAKE_PLAN=$(devkit_plan_safe) DEVKIT_EXPECTED_MANIFEST=$(devkit_manifest_digest) exec sh $(devkit_loader)
 
 setup: $(call devkit_targets,setup)
 check: $(call devkit_targets,check)
@@ -83,11 +114,11 @@ dev up: export DEVKIT_DEV_GROUP := $(devkit_selected_apps)
 dev up: devkit-dev-selection $(addprefix dev-,$(devkit_selected_apps))
 .PHONY: devkit-dev-selection
 devkit-dev-selection:
-	@$(foreach desktop,$(devkit_skipped_desktop),printf '%s\n' 'devkit: warning: skipping Electron app $(desktop) without DISPLAY; use headless=1 or app=$(desktop).' >&2;):
+	@$(foreach desktop,$(devkit_skipped_desktop),printf '%s\n' 'devkit: warning: skipping Electron app $(desktop) $(devkit_skip_reason)' >&2;):
 dev up:
 	@$(devkit_task) dev-snapshot
 package: export DEVKIT_PACKAGE_AGGREGATE := $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),0,1)
-package: $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),$(call devkit_targets,package),$(addprefix package-,$(DEVKIT_DESKTOP_APPS)) $(addprefix package/packages/,$(DEVKIT_PACKAGEABLE_PACKAGES)))
+package: $(if $(DEVKIT_APP)$(DEVKIT_PACKAGE),$(call devkit_targets,package),$(addprefix package-,$(devkit_desktop_apps)) $(addprefix package/packages/,$(devkit_packageable_packages)))
 	@$(devkit_task) package-snapshot
 setup-node-workspace:
 	@$(devkit_task) setup-node
@@ -102,35 +133,45 @@ ifneq ($(devkit_package_targets),)
 $(devkit_package_targets): export DEVKIT_TARGET_COMPONENT = packages/$*
 endif
 
-$(addprefix setup/apps/,$(filter $(devkit_workspace_names),$(DEVKIT_REGISTERED_APPS))): setup/apps/%:
+ifneq ($(devkit_apps),)
+devkit_workspace_setup_apps := $(filter $(devkit_workspace_names),$(devkit_apps))
+devkit_ordinary_setup_apps := $(filter-out $(devkit_workspace_names),$(devkit_apps))
+ifneq ($(devkit_workspace_setup_apps),)
+$(addprefix setup/apps/,$(devkit_workspace_setup_apps)): setup/apps/%:
 	@$(devkit_task) setup
-$(addprefix setup-,$(filter-out $(devkit_workspace_names),$(DEVKIT_REGISTERED_APPS))): setup-%:
+endif
+ifneq ($(devkit_ordinary_setup_apps),)
+$(addprefix setup-,$(devkit_ordinary_setup_apps)): setup-%:
 	@$(devkit_task) setup
-$(addprefix check-,$(DEVKIT_REGISTERED_APPS)): check-%:
+endif
+$(addprefix check-,$(devkit_apps)): check-%:
 	@$(devkit_task) check
-$(addprefix fix-,$(DEVKIT_REGISTERED_APPS)): fix-%:
+$(addprefix fix-,$(devkit_apps)): fix-%:
 	@$(devkit_task) fix
-$(addprefix test-,$(DEVKIT_REGISTERED_APPS)): test-%:
+$(addprefix test-,$(devkit_apps)): test-%:
 	@$(devkit_task) test
-$(addprefix build-,$(DEVKIT_REGISTERED_APPS)): build-%:
+$(addprefix build-,$(devkit_apps)): build-%:
 	@$(devkit_task) build
-$(addprefix dev-,$(DEVKIT_REGISTERED_APPS)): dev-%:
+$(addprefix dev-,$(devkit_apps)): dev-%:
 	@$(devkit_task) dev
-$(addprefix package-,$(DEVKIT_REGISTERED_APPS)): package-%:
+$(addprefix package-,$(devkit_apps)): package-%:
 	@$(devkit_task) package
+endif
 
-$(addprefix setup/packages/,$(DEVKIT_REGISTERED_PACKAGES)): setup/packages/%:
+ifneq ($(devkit_packages),)
+$(addprefix setup/packages/,$(devkit_packages)): setup/packages/%:
 	@$(devkit_task) setup
-$(addprefix check/packages/,$(DEVKIT_REGISTERED_PACKAGES)): check/packages/%:
+$(addprefix check/packages/,$(devkit_packages)): check/packages/%:
 	@$(devkit_task) check
-$(addprefix fix/packages/,$(DEVKIT_REGISTERED_PACKAGES)): fix/packages/%:
+$(addprefix fix/packages/,$(devkit_packages)): fix/packages/%:
 	@$(devkit_task) fix
-$(addprefix test/packages/,$(DEVKIT_REGISTERED_PACKAGES)): test/packages/%:
+$(addprefix test/packages/,$(devkit_packages)): test/packages/%:
 	@$(devkit_task) test
-$(addprefix build/packages/,$(DEVKIT_REGISTERED_PACKAGES)): build/packages/%:
+$(addprefix build/packages/,$(devkit_packages)): build/packages/%:
 	@$(devkit_task) build
-$(addprefix package/packages/,$(DEVKIT_REGISTERED_PACKAGES)): package/packages/%:
+$(addprefix package/packages/,$(devkit_packages)): package/packages/%:
 	@$(devkit_task) package
+endif
 
 .PHONY: exec
 exec:

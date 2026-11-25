@@ -4,19 +4,22 @@ SHELL := /bin/sh
 include toolchains.env
 include tooling/author.mk
 
-.PHONY: verify-engine fix-rust-format pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
-	test-env test-npm-inputs build build-fixtures build-controller pnpm-lock npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
+.PHONY: verify-engine fix-rust-format publish-inputs-guard local-inputs-guard pack-guard verify-author fix-format help setup bootstrap check check-native check-env test test-native test-special \
+	test-env test-npm-inputs build build-target frozen-notices pack-preview local-contribution build-fixtures build-controller pnpm-lock npm-lock npm-inputs notices pack pack-local verify verify-source-gates verify-runtime-gates verify-delivery-gates verify-runtime verify-rust verify-delivery \
 	verify-bootstrap verify-packaged verify-registry verify-public init
 help:
-	@printf '%s\n' 'Devkit author workspace (Linux x86_64 + Docker Compose >=5.0.0 + Python 3)' \
+	@printf '%s\n' 'Devkit author workspace (Linux x86_64 or ARM64 + Docker Compose >=5.0.0 + Python 3)' \
 	  'make setup          Prepare pinned SDK images, native engine and pnpm dependencies' \
 	  'make fix-format     Apply source formatting explicitly' \
 	  'make check          Rust fmt/Clippy and env declarations/lint/format/shell checks' \
 	  'make test           Native units, Cargo/Git/strace gates and Node env/npm tests' \
-	  'make build          Build the attributed static release ELF, offline' \
-	  'make pack output=/absolute/new/build-set  Assemble clean committed source' \
-	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished preview' \
+	  'make build          Build the local static engine, offline' \
+	  'make build-target output=/absolute/new/contribution  Build a verified native contribution from clean HEAD' \
+	  'make pack target_inputs="triple:dir:sha ..." output=/new/set [npm_inputs=/dir]  Assemble native contributions' \
+	  'make pack-preview target_inputs="triple:dir:sha ..." output=/new/set  Verify all three targets for host testing' \
+	  'make pack-local output=/absolute/new/build-set  Assemble an unpublished development build' \
 	  'make verify build_set=/absolute/set release=/absolute/set/payload previous=/absolute/v0.5.1/payload baseline_set=/absolute/v0.5.1' \
+	  '  Both hosts verify the baseline archive. Only x86-64 runs its executable for migration checks.' \
 	  'make verify-bootstrap build_set=/absolute/set baseline_set=/absolute/v0.5.1' \
 	  'make verify-public from_version=0.5.1 version=0.6.0 expected_index_sha256=SHA256' \
 	  'make init release=/absolute/set/payload target=/absolute/new/project' \
@@ -26,7 +29,11 @@ setup: bootstrap
 	$(call author_node_setup,bridge,pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --prefer-offline --trust-lockfile)
 # The only command before a native engine exists: exec Docker, with no host SDK.
 bootstrap:
-	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
+	@set -eu; daemon=$$(docker info --format '{{.OSType}}/{{.Architecture}}'); \
+	case "$$(uname -s):$$(uname -m):$$daemon" in \
+	  Linux:x86_64:linux/x86_64|Linux:x86_64:linux/amd64|Linux:aarch64:linux/aarch64|Linux:aarch64:linux/arm64) ;; \
+	  *) echo "Author builds require Linux x86_64 or ARM64 and a matching native Docker daemon (detected $$daemon)." >&2; exit 1;; \
+	esac
 	@docker image inspect "$$DEVKIT_AUTHOR_RUST_IMAGE" >/dev/null 2>&1 || docker build --tag "$$DEVKIT_AUTHOR_RUST_IMAGE" - < tooling/native.Dockerfile
 	@mkdir -p "$$DEVKIT_AUTHOR_CARGO_HOME" "$$DEVKIT_AUTHOR_TARGET" "$$DEVKIT_AUTHOR_ROOT/.artifacts/author"
 	@set -eu; read -r token < /proc/sys/kernel/random/uuid; \
@@ -81,11 +88,11 @@ bootstrap:
 	  --volume "$$DEVKIT_AUTHOR_CARGO_HOME:/cargo:z" --volume "$$DEVKIT_AUTHOR_TARGET:/target:z" \
 	  --workdir /workspace --env HOME=/tmp/devkit-author-home --env CARGO_HOME=/cargo \
 	  --env CARGO_TARGET_DIR=/target --env "CARGO_BUILD_JOBS=$$jobs" --env RUSTUP_AUTO_INSTALL=0 \
-	  "$$DEVKIT_AUTHOR_RUST_IMAGE" cargo build --locked --target x86_64-unknown-linux-musl --bin devkit
+	  "$$DEVKIT_AUTHOR_RUST_IMAGE" cargo build --locked --target "$$DEVKIT_AUTHOR_TRIPLE" --bin devkit
 check: check-native check-env
 check-native:
 	$(call author_rust,cargo fmt --all -- --check)
-	$(call author_rust,cargo clippy --workspace --all-targets --locked --offline --target x86_64-unknown-linux-musl -- -D warnings)
+	$(call author_rust,cargo clippy --workspace --all-targets --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" -- -D warnings)
 fix-rust-format:
 	$(call author_rust,cargo fmt --all,rw)
 fix-format: fix-rust-format
@@ -94,40 +101,52 @@ check-env:
 	$(call author_node,none,pnpm run check)
 test: test-native test-special test-env test-npm-inputs
 test-native:
-	$(call author_rust,cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl -- --test-threads=1)
+	$(call author_rust,cargo test --workspace --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" -- --test-threads=1)
 test-special:
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --lib pinned_cargo_metadata -- --ignored --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core git_tracks_output_named_component_sources_and_ignores_scoped_outputs -- --ignored --exact --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test native pinned_cargo_metadata -- --ignored --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core pinned_cargo_metadata -- --ignored --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test assembler -- --ignored --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test notices -- --ignored --test-threads=1)
-	$(call author_rust,cargo test --locked --offline --target x86_64-unknown-linux-musl --test core linux_strace_checks_actual_commit_and_recovery_durability_order -- --ignored --exact --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --lib pinned_cargo_metadata -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core git_tracks_output_named_component_sources_and_ignores_scoped_outputs -- --ignored --exact --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test native pinned_cargo_metadata -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core pinned_cargo_metadata -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test assembler -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test notices -- --ignored --test-threads=1)
+	$(call author_rust,cargo test --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --test core linux_strace_checks_actual_commit_and_recovery_durability_order -- --ignored --exact --test-threads=1)
 test-env:
 	$(call author_node,none,pnpm run test:env)
 test-npm-inputs:
 	$(call author_node,bridge,pnpm run test:npm-inputs,--env DEVKIT_TEST_NPM=1)
 build:
-	$(call author_rust,cargo build --release --locked --offline --target x86_64-unknown-linux-musl --bin devkit)
+	$(call author_rust,cargo build --release --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --bin devkit)
 build-fixtures:
-	$(call author_rust,cargo build --locked --offline --target x86_64-unknown-linux-musl --examples)
+	$(call author_rust,cargo build --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --examples)
 build-controller:
-	$(call author_rust,cargo build --locked --offline --target x86_64-unknown-linux-musl --bin devkit-release)
+	$(call author_rust,cargo build --locked --offline --target "$$DEVKIT_AUTHOR_TRIPLE" --bin devkit-release)
 	@mkdir -p "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops"
-	@cp "$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/debug/devkit-release" "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops/devkit-release"
+	@cp "$$DEVKIT_AUTHOR_TARGET/$$DEVKIT_AUTHOR_TRIPLE/debug/devkit-release" "$$DEVKIT_AUTHOR_ROOT/.artifacts/release-ops/devkit-release"
 npm-lock: pnpm-lock
 pnpm-lock:
 	$(call author_node_setup,bridge,pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile)
 npm-inputs:
 	$(call author_node,bridge,node tooling/prepare-npm-inputs.mjs --root /workspace --version "$$DEVKIT_RELEASE_VERSION" --output "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-npm" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-npm-producer.json")
-notices:
-	$(call author_rust,/workspace/.artifacts/author/target/x86_64-unknown-linux-musl/release/devkit internal collect-notices --root /workspace --cargo-home /cargo --rust-docs /usr/local/rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/share/doc/rust --rust-version "$$DEVKIT_RUST_VERSION" --output "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-notices" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notice-producer.json")
-pack: override export DEVKIT_ASSEMBLE_LOCAL :=
-pack: pack-guard build npm-inputs notices
-	$(assemble)
-pack-local: override export DEVKIT_ASSEMBLE_LOCAL := --local
-pack-local: pack-guard build npm-inputs notices
-	$(assemble)
+notices: build
+	$(call author_rust,sh -ec 'exec "$$1" internal collect-notices --root /workspace --cargo-home /cargo --rust-docs "$$(rustc --print sysroot)/share/doc/rust" --rust-version "$$2" --output "$$3"' sh "/target/$$DEVKIT_AUTHOR_TRIPLE/release/devkit" "$$DEVKIT_RUST_VERSION" "/workspace/.artifacts/author/$$DEVKIT_BUILD_ID-notices" > "$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-notice-producer.json")
+# Only the isolated producer invokes this target in its fresh committed checkout.
+frozen-notices: override author_frozen_env := --env DEVKIT_FROZEN_COMMIT --env DEVKIT_FROZEN_TREE
+frozen-notices: notices
+build-target: pack-guard build-controller build-fixtures
+	@python3 tooling/frozen-producer.py "$$DEVKIT_ASSEMBLY_OUTPUT"
+local-contribution: notices
+	$(call contribute,$$DEVKIT_AUTHOR_ROOT/.artifacts/author/$$DEVKIT_BUILD_ID-contribution)
+pack: override export DEVKIT_ASSEMBLY_MODE := publish
+pack-preview: override export DEVKIT_ASSEMBLY_MODE := preview
+pack pack-preview: publish-inputs-guard pack-guard $(if $(filter undefined,$(origin npm_inputs)),npm-inputs)
+	@python3 tooling/assemble.py
+pack-local: override export DEVKIT_ASSEMBLY_MODE := local
+pack-local: local-inputs-guard pack-guard $(if $(strip $(value target_inputs)),,local-contribution) $(if $(filter undefined,$(origin npm_inputs)),npm-inputs)
+	@python3 tooling/assemble.py
+publish-inputs-guard:
+	@test -n "$$DEVKIT_TARGET_INPUTS" || { echo 'Set target_inputs to the native release contributions.' >&2; exit 1; }
+local-inputs-guard:
+	@test -n "$$DEVKIT_TARGET_INPUTS" -o "$$DEVKIT_AUTHOR_TRIPLE" = x86_64-unknown-linux-musl || { echo 'Set target_inputs including the legacy x86-64 contribution.' >&2; exit 1; }
 pack-guard:
 	@test -n "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Set output=/absolute/new/build-set.' >&2; exit 1; }
 	@test ! -e "$$DEVKIT_ASSEMBLY_OUTPUT" -a ! -L "$$DEVKIT_ASSEMBLY_OUTPUT" || { printf '%s\n' 'Assembly output must be new.' >&2; exit 1; }
@@ -148,18 +167,28 @@ verify-delivery:
 	@DEVKIT_TEST_BUILD_SET="$$DEVKIT_BUILD_SET" DEVKIT_TEST_DOCKER=1 python3 test/delivery/test_delivery.py < /dev/null
 verify-bootstrap:
 	@test -n "$$DEVKIT_BASELINE_SET" || { printf '%s\n' 'Set baseline_set=/absolute/v0.5.1.' >&2; exit 1; }
-	@test "$$(uname -s):$$(uname -m)" = Linux:x86_64 || { printf '%s\n' 'Author builds require Linux x86_64.' >&2; exit 1; }
 	@test -n "$$DEVKIT_BUILD_SET" || { printf '%s\n' 'Set build_set=/absolute/build-set.' >&2; exit 1; }
 	@python3 test/bootstrap/verify.py --build-set "$$DEVKIT_BUILD_SET" --baseline-set "$$DEVKIT_BASELINE_SET" < /dev/null
+# The v0.5.1 baseline has an x86-64 executable. ARM64 exercises its genuine
+# archive in verify-bootstrap and uses the current release for native gates.
 verify-packaged:
-	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
-	@DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS" < /dev/null
+	@test -n "$$DEVKIT_VERIFY_RELEASE" || { echo 'Set release= to the immutable payload.' >&2; exit 1; }
+	@if test "$$DEVKIT_AUTHOR_TRIPLE" = aarch64-unknown-linux-musl; then \
+	  unset DEVKIT_VERIFY_NEXT_RELEASE; python3 test/packaged/verify.py "$$DEVKIT_VERIFY_RELEASE"; \
+	elif test -n "$$DEVKIT_VERIFY_PREVIOUS"; then \
+	  DEVKIT_VERIFY_NEXT_RELEASE="$$DEVKIT_VERIFY_RELEASE" python3 test/packaged/verify.py "$$DEVKIT_VERIFY_PREVIOUS"; \
+	else echo 'Set previous= to the baseline payload.' >&2; exit 1; fi < /dev/null
 verify-registry: $(author_blackbox_build) $(author_fixtures_build) verify-engine
-	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_VERIFY_PREVIOUS" || { printf '%s\n' 'Set release= and previous= to two distinct immutable payloads.' >&2; exit 1; }
-	@DEVKIT_AUTHOR_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_REGISTRY_FIXTURE="$$DEVKIT_AUTHOR_FIXTURES/registry_fixture" bash test/verify-registry.sh "$$DEVKIT_VERIFY_PREVIOUS" "$$DEVKIT_VERIFY_RELEASE" < /dev/null
+	@test -n "$$DEVKIT_VERIFY_RELEASE" || { echo 'Set release= to the immutable payload.' >&2; exit 1; }
+	@set -- "$$DEVKIT_VERIFY_RELEASE"; \
+	if test "$$DEVKIT_AUTHOR_TRIPLE" != aarch64-unknown-linux-musl; then \
+	  test -n "$$DEVKIT_VERIFY_PREVIOUS" || { echo 'Set previous= to the baseline payload.' >&2; exit 1; }; \
+	  set -- "$$DEVKIT_VERIFY_PREVIOUS" "$$@"; \
+	fi; \
+	DEVKIT_AUTHOR_ENGINE="$$DEVKIT_VERIFY_ENGINE" DEVKIT_REGISTRY_FIXTURE="$$DEVKIT_AUTHOR_FIXTURES/registry_fixture" bash test/verify-registry.sh "$$@" < /dev/null
 verify-public:
 	@test -n "$$DEVKIT_EXPECTED_INDEX_SHA256" || { printf '%s\n' 'Set expected_index_sha256= to the frozen release-index.json SHA256.' >&2; exit 1; }
 	@python3 test/public/verify.py --version "$$DEVKIT_FROM_VERSION" --next-version "$$DEVKIT_RELEASE_VERSION" --expected-index-sha256 "$$DEVKIT_EXPECTED_INDEX_SHA256" < /dev/null
 init: build
 	@test -n "$$DEVKIT_VERIFY_RELEASE" -a -n "$$DEVKIT_INIT_TARGET" || { printf '%s\n' 'Set release= and target=.' >&2; exit 1; }
-	@"$$DEVKIT_AUTHOR_TARGET/x86_64-unknown-linux-musl/release/devkit" init "$$DEVKIT_INIT_TARGET" --release-root "$$DEVKIT_VERIFY_RELEASE" --template "$$DEVKIT_INIT_TEMPLATE" --package-source local --non-interactive
+	@"$$DEVKIT_AUTHOR_TARGET/$$DEVKIT_AUTHOR_TRIPLE/release/devkit" init "$$DEVKIT_INIT_TARGET" --release-root "$$DEVKIT_VERIFY_RELEASE" --template "$$DEVKIT_INIT_TEMPLATE" --package-source local --non-interactive

@@ -2,7 +2,7 @@
 
 A shared development environment for independent TypeScript and Rust repositories. Create applications and libraries from modular templates, run native tools in pinned containers, and adopt environment updates through a Git diff.
 
-Requires Linux x86_64, a local Docker Engine with Docker Compose 5.0.0 or newer, and GNU Make. Node.js is needed only for the optional npm entry point.
+Requires Linux x86-64 or ARM64, GNU Make, and a local Linux Docker Engine with Docker Compose 5.0.0 or newer. Node.js is needed only for the optional npm entry point.
 
 ## Create a project
 
@@ -28,7 +28,7 @@ Without host Node.js:
 curl -fsSL https://github.com/docouno/devkit/releases/download/v0.6.0/install.sh | sh -s -- init my-product --app web=react-web
 ```
 
-Both entry points use the same native CLI. Projects record an exact release and its integrity; ordinary development commands use the verified local cache.
+Both entry points verify the native CLI for the host architecture. A checkout records the same release identity on both platforms. Run `make setup` in each checkout to prepare the tools and images for its Docker daemon.
 
 ## Applications, libraries and presets
 
@@ -127,7 +127,7 @@ Use `make exec command='pnpm …'` for commands in the root Node workspace (pass
 
 ## Update an existing project
 
-From a `0.5.x` checkout, preview the migration to `0.6.0` and apply it on a branch. For a project without Electron, preview also lists the old desktop runtime and its third-party notices for removal. To inspect file hashes and modes before and after the upgrade, run `sh .devkit/runtime/devkit.sh cli update . --to 0.6.0 --preview --json`.
+From a `0.5.x` checkout on Linux x86-64, preview the migration to `0.6.0` and apply it on a branch. For a project without Electron, preview also lists the old desktop runtime and its third-party notices for removal. To inspect file hashes and modes before and after the upgrade, run `sh .devkit/runtime/devkit.sh cli update . --to 0.6.0 --preview --json`.
 
 ```sh
 git switch -c chore/devkit-0.6.0
@@ -141,9 +141,11 @@ Both preview and apply verify the merged Cargo lock before changing the checkout
 
 Pass `reconcile=1` when transitive pnpm dependencies require re-resolution across toolchain updates. Review and merge the resulting diff. Application source, product dependencies and project-owned Make/Compose files retain their ownership. Conflicting edits to managed files stop the update.
 
+On Linux ARM64, use `npx @docouno/devkit@0.6.0 update . --to 0.6.0 --preview` for a `0.5.x` checkout, then apply the update without `--preview`.
+
 After an interrupted update, `make recover` restores the previous checkout offline from the local journal. See [Upgrading](docs/upgrades.md) for recovery while the older loader is still installed.
 
-Projects on `0.4.x` first run `npx @docouno/devkit@0.5.1 update . --to 0.5.1`. Projects on `0.2.x` or `0.3.x` must reach `0.4.1` before that step. For Rust workspace conflicts, headless desktop asset removal, and offline rollback, follow the [0.6.0 migration guide](docs/migrations/0.6.0.md).
+Projects on `0.4.x` first run `npx @docouno/devkit@0.5.1 update . --to 0.5.1` on Linux x86-64. Projects on `0.2.x` or `0.3.x` must reach `0.4.1` before that step. For Rust workspace conflicts, headless desktop asset removal, and offline rollback, follow the [0.6.0 migration guide](docs/migrations/0.6.0.md). See also the [upgrade window](docs/upgrades.md#supported-upgrade-window).
 
 ## Documentation
 
@@ -170,6 +172,19 @@ Hardlinks require a shared filesystem and mount. If the configured cache cannot 
 Run `make help` for author commands. Releases are built, tested and published through [GitHub Actions](https://github.com/docouno/devkit/actions/workflows/release.yml).
 
 `DEVKIT_AUTHOR_PNPM_STORE` and `DEVKIT_AUTHOR_PNPM_CACHE` configure the author SDK caches for setup and subsequent Node gates, including offline integration tests. They default to `.artifacts/author/pnpm-store` and `.artifacts/author/pnpm-cache` in this checkout; external directories are mounted into the SDK containers.
+
+From a clean committed checkout, run `make build-target output=/absolute/new/contribution` on each native Linux architecture. The producer compiles from a fresh checkout of that commit using an empty Cargo target directory and stamps its executable with the source commit and tree. It verifies the original checkout before emitting the executable, notices and hashed receipt. Assemble the contributions for the same version, source and build run with the following command.
+
+```sh
+make pack output=/absolute/new/build-set \
+  target_inputs="x86_64-unknown-linux-musl:$amd64_dir:$amd64_sha aarch64-unknown-linux-musl:$arm64_dir:$arm64_sha"
+```
+
+The SHA values are the producer-reported SHA-256 digests of `producer.json`. Pass `npm_inputs=/absolute/prepared/directory` to use already prepared npm inputs. Use `make pack-preview` with the same arguments and a third verified Apple Silicon contribution to assemble the unpublished host-test set. In GitHub Actions, both verified assembly modes accept contributions from the same run and an equal or earlier attempt.
+
+For development on x86-64, `make pack-local output=/absolute/new/preview` builds from the current working tree. Local builds carry no verified source attribution and the resulting set has `publicationEligible: false`.
+
+The published engine targets are Linux x86-64 and ARM64. The Darwin ARM64 build is for host testing. Publishing it also requires a full run against a local Linux Docker VM on Apple Silicon.
 
 Template v9 locks record the complete native pnpm selection graph, including peer contexts. Release preparation validates the complete seed with frozen pnpm and changes only the owned environment version and archive identity; the producer and independent assembler reject other selection changes even when the package set and integrity values match. The source environment's dependencies, peers, and metadata must agree with that graph. Regenerate and commit template locks explicitly when changing their dependency graph.
 

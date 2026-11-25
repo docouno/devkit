@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devkit::{
     assembler::{
-        AssemblyOptions, assemble, verify_migration_index, verify_npm_inputs, verify_npm_pack,
-        verify_runtime_notices, verify_rust_template, verify_source_checkout,
+        AssemblyOptions, TargetInput, assemble, verify_migration_index, verify_npm_inputs,
+        verify_npm_pack, verify_runtime_notices, verify_rust_template, verify_source_checkout,
     },
     files::{digest, file_map, read_json, write_atomic, write_json},
     processes::ProcessRunner,
@@ -284,15 +284,13 @@ fn an_existing_output_is_never_replaced_even_when_it_is_empty() {
     fs::create_dir(&output).unwrap();
     let options = AssemblyOptions {
         root: temp.path().to_owned(),
-        engine: temp.path().join("missing-engine"),
+        target_inputs: Vec::new(),
         npm_inputs: temp.path().join("missing-inputs"),
         output: output.clone(),
-        notices: temp.path().join("missing-notices"),
-        notice_set_sha256: "a".repeat(64),
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     assert!(
@@ -407,15 +405,13 @@ fn runtime_notices_refuse_empty_missing_and_symlinked_sources_before_staging() {
     fs::write(&outside, "Outside sentinel\n").unwrap();
     let options = AssemblyOptions {
         root: root.clone(),
-        engine: root.join("missing-engine"),
+        target_inputs: Vec::new(),
         npm_inputs: root.join("missing-prepared-inputs"),
         output: temp.path().join("unpublished-set"),
-        notices: root.join("missing-cargo-notices"),
-        notice_set_sha256: "a".repeat(64),
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     let names = ["Apache-2.0.txt", "moby-profiles.NOTICE"];
@@ -640,7 +636,7 @@ fn source_authority_ignores_ambient_git_controls_binds_membership_and_accepts_re
 }
 
 #[test]
-fn assembler_requires_the_external_notice_digest_before_downstream_inputs_or_staging() {
+fn assembler_requires_the_external_contribution_digest_before_downstream_inputs_or_staging() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     source_checkout_fixture(&root);
@@ -659,35 +655,37 @@ fn assembler_requires_the_external_notice_digest_before_downstream_inputs_or_sta
     .unwrap();
     let notices = temp.path().join("notices");
     fs::create_dir(&notices).unwrap();
-    let receipt_path = notices.join("notice-set.json");
+    let receipt_path = notices.join("producer.json");
     fs::write(&receipt_path, b"{\"producer\":\"original\"}\n").unwrap();
     let producer_digest = digest(fs::read(&receipt_path).unwrap());
     fs::write(&receipt_path, b"changed and no longer valid JSON\n").unwrap();
     let mut options = AssemblyOptions {
         root,
-        engine: temp.path().join("missing-engine"),
+        target_inputs: vec![TargetInput {
+            target: devkit::distribution::Target::LinuxX64,
+            directory: notices,
+            sha256: producer_digest,
+        }],
         npm_inputs: temp.path().join("missing-inputs"),
-        notices,
-        notice_set_sha256: producer_digest,
         output: temp.path().join("unpublished"),
         source_commit: String::new(),
         source_tree: String::new(),
         build_run: String::new(),
-        local: true,
+        mode: devkit::assembler::AssemblyMode::Local,
     };
     let runner = ProcessRunner::new().unwrap();
     assert!(
         assemble(&options, &runner)
             .unwrap_err()
             .to_string()
-            .contains("producer notice-set digest")
+            .contains("producer digest")
     );
-    options.notice_set_sha256.clear();
+    options.target_inputs[0].sha256.clear();
     assert!(
         assemble(&options, &runner)
             .unwrap_err()
             .to_string()
-            .contains("Invalid producer notice-set digest")
+            .contains("Invalid producer contribution digest")
     );
     assert!(!options.output.exists());
     assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
@@ -781,9 +779,52 @@ fn migration_index_validates_unique_ids_semver_bounds_profiles_and_markdown_anch
             "pnpm-workspaces",
             "development-stands",
             "make-targets-and-worktrunk",
+            "portable-linux-checkouts",
             "profile-scoped-desktop-runtime",
-            "root-cargo-workspace"
+            "root-cargo-workspace",
         ]
     );
     assert!(repo_entries[2].profiles.is_empty());
+}
+
+#[test]
+fn npm_launcher_follows_relative_links_and_executes_only_the_pinned_host_file() {
+    use devkit::{delivery::render_npm_launcher, distribution::Target};
+    use std::{
+        os::unix::fs::symlink,
+        process::{Command, Stdio},
+    };
+    let temp = TempDir::new().unwrap();
+    let package = temp.path().join("modules with spaces/@docouno/devkit");
+    let target = Target::host().unwrap();
+    let contents = b"#!/bin/sh\nprintf '%s|%s|%s\\n' \"$$\" \"$1\" \"$2\"\nexit 42\n";
+    let pins = BTreeMap::from([(target.triple().to_string(), digest(contents))]);
+    let launcher = package.join("bin/devkit");
+    write_atomic(
+        &launcher,
+        render_npm_launcher(&pins).unwrap().as_bytes(),
+        0o755,
+    )
+    .unwrap();
+    let engine = package.join(target.payload_name());
+    write_atomic(&engine, contents, 0o700).unwrap();
+    let shim = temp.path().join("modules with spaces/.bin/devkit");
+    fs::create_dir_all(shim.parent().unwrap()).unwrap();
+    symlink("../@docouno/devkit/bin/devkit", &shim).unwrap();
+    let entry = temp.path().join("npm");
+    symlink("modules with spaces/.bin/devkit", &entry).unwrap();
+    let p = Command::new(&entry)
+        .args(["one arg", ""])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = p.id();
+    let result = p.wait_with_output().unwrap();
+    assert_eq!(result.status.code(), Some(42));
+    assert_eq!(result.stdout, format!("{pid}|one arg|\n").as_bytes());
+    write_atomic(&engine, b"#!/bin/sh\nprintf 'changed'\n", 0o700).unwrap();
+    let result = Command::new(entry).output().unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("checksum differs"));
 }

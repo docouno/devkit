@@ -1,14 +1,18 @@
 #!/bin/sh
-# Initial transfer and delegation only; all project operations run in the ELF.
+# Initial transfer and delegation only. Project operations run in the native engine.
 # devkit-stand-protocol-v1
 set -eu
 mode=@@DEVKIT_MODE@@
 version=@@DEVKIT_VERSION@@
-expected=@@DEVKIT_ENGINE_SHA256@@
-target=@@DEVKIT_ENGINE_TARGET@@
-asset=devkit-x86_64-unknown-linux-musl
 fail() { printf 'devkit: %s\n' "$*" >&2; exit 1; }
-[ "$(uname -sm)" = 'Linux x86_64' ] || fail 'this release requires Linux x86_64'
+host_os=$(uname -s)
+host_cpu=$(uname -m)
+case "$host_os:$host_cpu" in
+# @@DEVKIT_ENGINE_PINS@@
+  *) fail "this release does not support $host_os $host_cpu" ;;
+esac
+expected=$sha256
+asset=devkit-$target
 command=${1:-help}
 root=
 loader_directory=${0%/*}
@@ -18,13 +22,13 @@ if [ "$mode" = project ]; then
 fi
 if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
   [ "$#" -eq 2 ] || fail 'worktree-hook requires reserve, start, or remove'
-  unset MAKEFLAGS MFLAGS MAKEOVERRIDES GNUMAKEFLAGS MAKEFILES MAKELEVEL
+  unset MAKEFLAGS MFLAGS MAKEOVERRIDES GNUMAKEFLAGS MAKEFILES MAKELEVEL MAKECMDGOALS
   unset app package component follow tail headless cleanup reconcile preview json
   unset name template api use profile to command cmd write network prepare toolchain
   unset DEVKIT_APP DEVKIT_PACKAGE DEVKIT_TARGET_COMPONENT DEVKIT_FOLLOW DEVKIT_TAIL
   unset DEVKIT_HEADLESS DEVKIT_CLEANUP DEVKIT_PACKAGE_AGGREGATE DEVKIT_DEV_GROUP
   unset DEVKIT_SYNC_RECONCILE DEVKIT_SYNC_PREVIEW DEVKIT_INFO_JSON DEVKIT_EXPECTED_MANIFEST
-  unset DEVKIT_EXPECTED_PLAN DEVKIT_MAKE_PLAN DEVKIT_MAKE_DAG DEVKIT_ENGINE_PATH
+  unset DEVKIT_EXPECTED_PLAN DEVKIT_MAKE_PLAN DEVKIT_MAKE_DAG DEVKIT_ENGINE_PATH DEVKIT_LINUX_HELPER_PATH
   unset DEVKIT_LIFECYCLE_NAME DEVKIT_LIFECYCLE_TEMPLATE DEVKIT_LIFECYCLE_API
   unset DEVKIT_LIFECYCLE_USE DEVKIT_LIFECYCLE_PROFILE DEVKIT_LIFECYCLE_TO
   unset DEVKIT_EXEC_COMMAND DEVKIT_EXEC_COMPONENT DEVKIT_EXEC_CONFLICT
@@ -45,10 +49,45 @@ if [ "$mode" = project ] && [ "$command" = worktree-hook ]; then
 fi
 if [ "$mode" = project ] && [ "$command" = down ]; then
   case "${DEVKIT_CLEANUP:-0}" in 0|1) ;; *) fail 'cleanup must be 0 or 1' ;; esac
+  bounded_git() {
+    if [ "$host_os" = Darwin ]; then
+      # Isolate stdout so a slow descendant cannot keep the loader's pipe open.
+      /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl -MPOSIX=setpgid -MTime::HiRes=alarm -e '
+        my $pid = open(my $output, "-|");
+        defined($pid) or exit 1;
+        if ($pid == 0) {
+          setpgid(0, 0) == 0 or exit 1;
+          exec @ARGV;
+          exit 1;
+        }
+        my ($path, $success);
+        local $SIG{ALRM} = sub { die "deadline" };
+        my $ok = eval {
+          alarm(0.25);
+          local $/;
+          $path = <$output>;
+          $success = close($output);
+          alarm(0);
+          1;
+        };
+        unless ($ok) {
+          alarm(0);
+          kill "KILL", -$pid;
+          kill "KILL", $pid;
+          waitpid($pid, 0);
+          exit 1;
+        }
+        exit 1 unless $success;
+        print $path;
+      ' -- "$@"
+    else
+      timeout --kill-after=0.05s 0.25s "$@"
+    fi
+  }
   git_history_absent() {
     [ -e "$root/.git" ] || [ -L "$root/.git" ] || return 0
     [ ! -L "$root/.git" ] || return 1
-    admin=$(timeout --kill-after=0.05s 0.25s env -i PATH="$PATH" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+    admin=$(bounded_git env -i PATH="$PATH" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
       GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 \
       git -C "$root" -c core.fsmonitor=false rev-parse --absolute-git-dir 2>/dev/null) || return 1
     [ -d "$admin" ] && [ -x "$admin" ] && [ -r "$admin" ] \
@@ -65,13 +104,130 @@ fi
 
 # Bound both the pathname checks and the read. Compare the open file with its
 # pathname before and after, so replacement or an in-progress write fails closed.
+darwin_file() {
+  /usr/bin/env -i /usr/bin/perl -MFcntl=:DEFAULT,:mode -MErrno=ENOENT -MTime::HiRes=stat,lstat,alarm -MDigest::SHA -e '
+    use strict;
+    my ($op, $path, $limit, $expected, $require_755) = @ARGV;
+    alarm($limit <= 4194304 ? 0.25 : 2);
+    sub stamp {
+      return "" unless @_ && S_ISREG($_[2]);
+      # Preserve all time precision exposed by Time::HiRes.
+      return sprintf "%s/%s:%s:%s:%o/%s", @_[3,0,1,7], $_[2] & 07777,
+        unpack("H*", pack("dd", @_[9,10]));
+    }
+    sub resolve_no_symlinks {
+      my ($raw) = @_;
+      my @parts;
+      my $aliased = 0;
+      for my $name (split m{/}, $raw) {
+        next if $name eq "" || $name eq ".";
+        if ($name eq "..") {
+          if ($aliased && @parts == 2) {
+            @parts = ();
+            $aliased = 0;
+          } else {
+            pop @parts;
+          }
+          next;
+        }
+        my $cur = join "/", "", @parts, $name;
+        my @info = lstat($cur);
+        return undef if !@info && !$!{ENOENT};
+        if (@info && S_ISLNK($info[2])) {
+          my $alias = lc $name;
+          return undef if @parts || $alias !~ /\A(?:tmp|var|etc)\z/;
+          my @system = lstat("/$alias");
+          return undef unless @system && $system[0] == $info[0] && $system[1] == $info[1];
+          my $dest = readlink($cur);
+          return undef unless defined($dest) && ($dest eq "private/$alias" || $dest eq "/private/$alias");
+          push @parts, "private";
+          $aliased = 1;
+          $name = $alias;
+          @info = lstat("/private/$name");
+          return undef unless @info && S_ISDIR($info[2]);
+        }
+        push @parts, $name;
+      }
+      return "/" . join("/", @parts);
+    }
+    sub verify_engine_file {
+      my ($engine, $max_bytes, $want_sha, $need_755) = @_;
+      for my $attempt (1..2) {
+        my @initial = lstat($engine);
+        return 2 if !@initial && $!{ENOENT};
+        my $st = stamp(@initial);
+        return 3 unless length($st) && $initial[7] <= $max_bytes && -x $engine;
+        return 3 if $need_755 && (($initial[2] & 07777) != 0755);
+        sysopen(my $fh, $engine, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or return 3;
+        my $sha = Digest::SHA->new(256);
+        my $ok = (stamp(stat($fh)) eq $st);
+        my $count = 0;
+        while ($ok) {
+          my $n = sysread($fh, my $data, 65536);
+          if (!defined($n)) { $ok = 0; last; }
+          last if $n == 0;
+          $count += $n;
+          if ($count > $initial[7]) { $ok = 0; last; }
+          $sha->add($data);
+        }
+        if ($ok && $count == $initial[7]
+          && stamp(stat($fh)) eq $st && stamp(lstat($engine)) eq $st) {
+          return ($sha->hexdigest eq $want_sha) ? 0 : 3;
+        }
+        if ($attempt == 1 && $initial[3] == 2) {
+          my @now = lstat($engine);
+          if (@now && S_ISREG($now[2]) && $now[3] == 1
+            && $now[0] == $initial[0] && $now[1] == $initial[1]
+            && $now[7] == $initial[7] && ($now[2] & 07777) == ($initial[2] & 07777)) {
+            next;
+          }
+        }
+        return 3;
+      }
+      return 3;
+    }
+    if ($op eq "resolve-verify") {
+      my $parent = resolve_no_symlinks($path);
+      exit 1 unless defined($parent);
+      print $parent;
+      exit 4 if $parent =~ m{\A/engines/[^/]+/[^/]+/[^/]+\z};
+      exit verify_engine_file("$parent/devkit", $limit, $expected, $require_755);
+    }
+    if ($op eq "verify") {
+      exit verify_engine_file($path, $limit, $expected, $require_755);
+    }
+    my @initial = lstat($path);
+    my $stamp = stamp(@initial);
+    exit 1 unless length($stamp) && $initial[7] <= $limit;
+    sysopen(my $file, $path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or exit 1;
+    exit 1 unless stamp(stat($file)) eq $stamp;
+    my $sha = Digest::SHA->new(256);
+    my $count = 0;
+    while (1) {
+      my $n = sysread($file, my $data, 65536);
+      defined($n) or exit 1;
+      last if $n == 0;
+      $count += $n;
+      exit 1 if $count > $initial[7];
+      if ($op eq "read") { print $data; } else { $sha->add($data); }
+    }
+    exit 1 unless $count == $initial[7] && stamp(stat($file)) eq $stamp
+      && stamp(lstat($path)) eq $stamp;
+    print $sha->hexdigest if $op eq "hash";
+  ' -- "$@"
+}
 read_small() {
+  if [ "$host_os" = Darwin ]; then
+    darwin_file read "$1" 4194304
+    return
+  fi
   timeout --kill-after=0.05s 0.25s sh -c '
     set -eu
     p=$1
     [ -f "$p" ] && [ ! -L "$p" ] && [ -r "$p" ]
     stamp=$(stat -c "%d:%i:%s:%z" -- "$p")
-    size=$(stat -c %s -- "$p")
+    size=${stamp#*:*:}
+    size=${size%%:*}
     [ "$size" -le 4194304 ]
     exec 3<"$p"
     fd=/proc/$$/fd/3
@@ -84,6 +240,10 @@ read_small() {
 if [ "$mode" = project ] && [ "$command" = make-manifest ]; then
   [ -d "$root/.devkit" ] && [ ! -L "$root/.devkit" ] || exit 1
   [ -f "$root/.devkit/project.mk" ] && [ ! -L "$root/.devkit/project.mk" ] && [ -r "$root/.devkit/project.mk" ] || exit 1
+  if [ "$host_os" = Darwin ]; then
+    darwin_file hash "$root/.devkit/manifest.json" 4194304 && printf '\n'
+    exit $?
+  fi
   # Preserve trailing newlines when capturing the checked bytes in the shell.
   manifest=$(read_small "$root/.devkit/manifest.json" && printf .) || exit 1
   observed=$(printf '%s' "${manifest%.}" | sha256sum)
@@ -233,16 +393,14 @@ if [ "$mode" = project ] && [ "${DEVKIT_MAKE_DAG:-0}" = 1 ]; then
   [ -n "${DEVKIT_MAKE_PLAN:-}" ] && [ -n "${DEVKIT_EXPECTED_MANIFEST:-}" ] \
     || fail 'cannot read accepted Make projection and manifest; run make recover or restore the managed files'
 fi
-if [ -n "${DEVKIT_ENGINE_PATH:-}" ]; then
-  engine=$DEVKIT_ENGINE_PATH
-else
-  cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
-  case "$cache" in /*) ;; *) fail 'the cache directory must be absolute' ;; esac
-  cache=$(realpath -ms -- "$cache")
-  [ "$(realpath -m -- "$cache")" = "$cache" ] || fail 'the cache path contains a symbolic link'
-  engine=$cache/engines/$target/$version/$expected/devkit
-fi
-engine_metadata() { stat -c '%h/%d:%i:%s/%z' -- "$engine"; }
+cache_path() {
+  lexical=$(realpath -ms -- "$1") || return 1
+  [ "$(realpath -m -- "$1")" = "$lexical" ] || return 1
+  printf '%s\n' "$lexical"
+}
+engine_metadata() {
+  stat -c '%h/%d:%i:%s:%a/%z' -- "$engine"
+}
 engine_link_settled() {
   current_stamp=$(engine_metadata 2>/dev/null) || return 1
   before_inode=${engine_stamp#*/}
@@ -251,24 +409,65 @@ engine_link_settled() {
     && [ "${before_inode%%/*}" = "${after_inode%%/*}" ]
 }
 valid_engine_once() {
+  if [ "$host_os" = Darwin ]; then
+    require_755=1
+    [ -z "${DEVKIT_ENGINE_PATH:-}" ] || require_755=0
+    darwin_file verify "$engine" 134217728 "$expected" "$require_755"
+    return
+  fi
   [ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || return 1
   engine_stamp=$(engine_metadata) || return 1
-  size=$(stat -c %s -- "$engine") || return 1
+  if [ -z "${DEVKIT_ENGINE_PATH:-}" ]; then
+    case "$engine_stamp" in *:755/*) ;; *) return 1 ;; esac
+  fi
+  meta=${engine_stamp#*/}
+  meta=${meta#*:}
+  meta=${meta#*:}
+  size=${meta%%:*}
   [ "$size" -le 134217728 ] || return 1
   observed=$(timeout --kill-after=0.05s 2s sh -c '
     set -eu
     exec 3<"$1"
     fd=/proc/$$/fd/3
-    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s:%a/%z" -- "$fd")" = "$2" ]
     head -c 134217729 <&3 | sha256sum
-    [ "$(stat -Lc "%h/%d:%i:%s/%z" -- "$fd")" = "$2" ]
+    [ "$(stat -Lc "%h/%d:%i:%s:%a/%z" -- "$fd")" = "$2" ]
   ' sh "$engine" "$engine_stamp") || return 1
   [ "${observed%% *}" = "$expected" ] && [ "$(engine_metadata)" = "$engine_stamp" ]
 }
 valid_engine() {
+  if [ "$host_os" = Darwin ]; then
+    valid_engine_once
+    return
+  fi
   engine_stamp=
   valid_engine_once || { engine_link_settled && valid_engine_once; }
 }
+engine_ready=0
+if [ -n "${DEVKIT_ENGINE_PATH:-}" ]; then
+  engine=$DEVKIT_ENGINE_PATH
+else
+  cache=${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?HOME or XDG_CACHE_HOME is required}/.cache}/docouno/devkit}
+  case "$cache" in /*) ;; *) fail 'the cache directory must be absolute' ;; esac
+  if [ "$host_os" = Darwin ]; then
+    rc=0
+    parent=$(darwin_file resolve-verify "$cache/engines/$target/$version/$expected" 134217728 "$expected" 1) || rc=$?
+    case "$rc" in
+      0) engine=$parent/devkit; engine_ready=1 ;;
+      1) fail 'the cache path contains a symbolic link' ;;
+      2) engine=$parent/devkit ;;
+      3) fail "cached engine integrity differs: $parent/devkit" ;;
+      4) fail 'the filesystem root cannot be the cache directory' ;;
+      *) fail 'cached engine verification timed out or failed' ;;
+    esac
+  else
+    parent=$(cache_path "$cache/engines/$target/$version/$expected") || fail 'the cache path contains a symbolic link'
+    case "$parent" in
+      "/engines/$target/$version/$expected") fail 'the filesystem root cannot be the cache directory' ;;
+    esac
+    engine=$parent/devkit
+  fi
+fi
 exec_prepare=0
 exec_has_root=0
 cli_offline=0
@@ -288,17 +487,16 @@ elif [ "$command" = cli ]; then
     [ "$arg" != --offline ] || cli_offline=1
   done
 fi
-if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
+if [ "$engine_ready" = 0 ] && ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
   [ ! -e "$engine" ] && [ ! -L "$engine" ] || fail "cached engine integrity differs: $engine"
   [ -z "${DEVKIT_ENGINE_PATH:-}" ] || fail 'DEVKIT_ENGINE_PATH does not select the accepted engine'
   case "$mode:$command" in
     bootstrap:*|project:setup|project:setup-node|project:setup-rust|project:doctor|project:info|project:status|project:down|project:sync|project:add-app|project:add-package|project:register|project:update|project:recover) ;;
     *) { [ "$command" = cli ] && [ "$cli_offline" = 0 ]; } || [ "$exec_prepare" = 1 ] || fail 'the accepted engine is unavailable; run make setup' ;;
   esac
-  parent=${engine%/*}
-  [ "$(realpath -m -- "$parent")" = "$(realpath -ms -- "$parent")" ] || fail 'the engine cache path contains a symbolic link'
+  old_umask=$(umask)
   umask 077
-  mkdir -p -- "$parent"
+  mkdir -p "$parent"
   temporary=$(mktemp "$parent/.engine.XXXXXXXX")
   download_pid=
   cleanup() {
@@ -306,7 +504,7 @@ if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
       kill -TERM "$download_pid" 2>/dev/null || :
       wait "$download_pid" 2>/dev/null || :
     fi
-    rm -f -- "$temporary"
+    rm -f "$temporary"
   }
   trap cleanup 0
   trap 'exit 130' INT
@@ -323,17 +521,20 @@ if ! valid_engine && ! { [ -e "$engine" ] && valid_engine; }; then
     download_pid=
     exit "$status"
   fi
-  observed=$(timeout --kill-after=0.05s 2s sha256sum -- "$temporary")
+  if [ "$host_os" = Darwin ]; then
+    observed=$(darwin_file hash "$temporary" 134217728)
+  else
+    observed=$(timeout --kill-after=0.05s 2s sha256sum -- "$temporary")
+  fi
   [ "${observed%% *}" = "$expected" ] || fail 'downloaded engine checksum differs'
-  chmod 755 -- "$temporary"
+  chmod 755 "$temporary"
   # Creating this link is atomic and cannot replace a concurrent installation.
-  ln -- "$temporary" "$engine" 2>/dev/null || :
+  ln "$temporary" "$engine" 2>/dev/null || :
   cleanup
   trap - 0 INT TERM
+  umask "$old_umask"
   valid_engine || fail 'the accepted engine could not be installed'
 fi
-[ "$(engine_metadata)" = "$engine_stamp" ] || { engine_link_settled && valid_engine_once; } \
-  || fail 'accepted engine changed before dispatch'
 if [ "$mode" = bootstrap ]; then
   DEVKIT_BOOTSTRAP_INTERACTIVE=1
   export DEVKIT_BOOTSTRAP_INTERACTIVE

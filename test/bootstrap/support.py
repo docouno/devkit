@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared native bootstrap fixture: real TLS/proxy, raw ELF, immutable v0.5.1 baseline."""
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.server
 import json
@@ -23,6 +24,8 @@ import uuid
 AUTHOR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHOR / 'test/delivery'))
 from test_delivery import HttpsFixture, worktrunk  # noqa: E402
+sys.path.insert(0, str(AUTHOR / 'test'))
+from release_targets import engine_asset, host_target  # noqa: E402
 
 BASELINE_VERSION = '0.5.1'
 BASELINE_INDEX_SHA256 = 'c55c5b5e0457f5c934079a8bbce272545b1cdbc2b7da25061bd7a95d2780d08a'
@@ -116,7 +119,7 @@ class Harness:
         self.payload = self.build_set / 'payload'
         self.index = json.loads((self.build_set / 'release-index.json').read_text())
         self.version = self.index['version']
-        self.engine = self.build_set / self.index['engine']
+        asset = engine_asset(self.index)
         for name, identity in self.index['files'].items():
             data = (self.build_set / name).read_bytes()
             require(len(data) == identity['size'] and digest(data) == identity['sha256'], f'Build-set identity differs: {name}')
@@ -159,21 +162,28 @@ class Harness:
         }
         self.temp = tempfile.TemporaryDirectory(prefix='devkit bootstrap ')
         self.scratch = Path(self.temp.name)
+        # A raw downloaded engine has no adjacent release.json. Exercise the actual
+        # network acquisition path even when the requested version is the current one.
+        self.engine = self.scratch / asset
+        shutil.copy2(self.build_set / asset, self.engine)
+        self.engine.chmod(0o755)
         self.logs = AUTHOR / '.artifacts/bootstrap' / uuid.uuid4().hex
         self.logs.mkdir(parents=True)
         self.fixture = Fixture(self.scratch / 'tls')
         self.base = '/docouno/devkit/releases/download'
-        self.engine_route = f'{self.base}/v{self.version}/{self.index["engine"]}'
+        self.engine_route = f'{self.base}/v{self.version}/{asset}'
         self.fixture.routes[self.engine_route] = self.engine.read_bytes()
-        self.fixture.routes[f'{self.base}/v{self.version}/release-index.json'] = (self.build_set / 'release-index.json').read_bytes()
-        self.fixture.routes[f'{self.base}/v{self.version}/{self.index["archive"]}'] = (self.build_set / self.index['archive']).read_bytes()
+        self.index_route = f'{self.base}/v{self.version}/release-index.json'
+        self.archive_route = f'{self.base}/v{self.version}/{self.index["archive"]}'
+        self.fixture.routes[self.index_route] = (self.build_set / 'release-index.json').read_bytes()
+        self.fixture.routes[self.archive_route] = (self.build_set / self.index['archive']).read_bytes()
         self.fixture.routes[f'{self.base}/v{self.version}/install.sh'] = (self.build_set / 'install.sh').read_bytes()
         self.old_base = f'{self.base}/v{self.old_version}'
         self.old_index_route = f'{self.old_base}/release-index.json'
-        self.archive_route = f'{self.old_base}/{archive_name}'
+        self.old_archive_route = f'{self.old_base}/{archive_name}'
         self.old_engine_route = f'{self.old_base}/{engine_name}'
         self.fixture.routes[self.old_index_route] = index_bytes
-        self.fixture.routes[self.archive_route] = archive_bytes
+        self.fixture.routes[self.old_archive_route] = archive_bytes
         self.fixture.routes[self.old_engine_route] = engine_bytes
         self.forbidden = self.scratch / 'host-sdk-attempts'
         blockers = self.scratch / 'without host SDK'
@@ -206,14 +216,36 @@ class Harness:
         return result
     def boot(self, name, *args, **kwargs):
         return self.run(name, ['sh', self.script, *args], **kwargs)
-    def cold_old(self, name, *, expected=None):
+    def cold_init(self, name, version, *, expected=None):
         target = self.scratch / name
-        result = self.run(name, [self.engine, 'init', target, '--to', self.old_version, '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], expected=expected, memory_limit=512 * 1024 * 1024 if expected is not None else None)
+        result = self.run(name, [self.engine, 'init', target, '--to', version, '--app', 'api=rust-api', '--package-source', 'local', '--non-interactive'], expected=expected, memory_limit=512 * 1024 * 1024 if expected is not None else None)
         cache = self.scratch / ('cache ' + name)
         require(not list(cache.glob('.acquire-*')), 'Unaccepted acquisition directory leaked')
         if expected is not None:
             require(not target.exists(), 'Rejected archive wrote the project')
         return result
+    def verify_concurrent_bootstrap(self):
+        env = self.environment('simultaneous installs')
+        before = len(self.fixture.requests)
+        def install(_):
+            return subprocess.run(['sh', self.script, '--version'], cwd=self.scratch, env=env,
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  umask=0o077, timeout=25)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for result in pool.map(install, range(3)):
+                require(result.returncode == 0 and self.version in result.stdout, result.stderr)
+        require(set(self.fixture.requests[before:]) == {self.engine_route},
+                'Cold installers requested another target or release asset')
+        fingerprint = self.index['files'][engine_asset(self.index)]['sha256']
+        cache = Path(env['DEVKIT_CACHE_DIR'])
+        binary = cache / 'engines' / host_target() / self.version / fingerprint / 'devkit'
+        require(digest(binary.read_bytes()) == fingerprint and stat.S_IMODE(binary.stat().st_mode) == 0o755,
+                'Concurrent strict-umask installation did not publish the pinned executable')
+        require(not list(cache.rglob('.engine.*')), 'Concurrent engine installation left partial files')
+        before = len(self.fixture.requests)
+        binary.chmod(0o644)
+        self.boot('refuse-unexecutable-cache', '--version', expected='cached engine integrity differs', env=env)
+        require(len(self.fixture.requests) == before, 'An unusable cache entry was silently refetched')
     def verify_cold_worktree(self, target):
         wt = worktrunk(self.scratch)
         worktrees = self.scratch / 'worktree paths'
@@ -243,7 +275,7 @@ class Harness:
         require(worktree['standState'] == 'stopped' and len(worktree['standPorts']) == 1, 'Cold Worktrunk reservation was not available on return')
         run('worktrunk-remove-cold', [wt, 'remove', '--foreground', '--yes', 'approved'])
         require(not approved.exists(), 'Worktrunk did not complete removal')
-    def verify_rust_recovery(self):
+    def verify_rust_recovery(self, target_source):
         target = self.scratch / 'genuine-rust-migration'
         env = self.environment('genuine-rust-migration')
         self.run('genuine-rust-init', [self.engine, 'init', target, '--to', self.old_version,
@@ -252,7 +284,7 @@ class Harness:
         shutil.copytree(target, saved)
         loader = '.devkit/runtime/devkit.sh'
         manifest = '.devkit/manifest.json'
-        self.run('genuine-rust-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive'],
+        self.run('genuine-rust-upgrade', ['sh', loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive', *target_source],
                  cwd=target, env=env, timeout=360)
         old = json.loads((saved / manifest).read_bytes())
         new = json.loads((target / manifest).read_bytes())
@@ -272,7 +304,9 @@ class Harness:
                 and after['Cargo.lock'] and not after['apps/api/Cargo.lock'],
                 'Fixture did not migrate a genuine component lockfile')
         pins = dict(line.split('=', 1) for line in (target / '.devkit/runtime/toolchains.env').read_text().splitlines() if '=' in line)
-        engine = Path(env['DEVKIT_CACHE_DIR']) / 'engines' / pins['DEVKIT_ENGINE_TARGET'] / self.version / pins['DEVKIT_ENGINE_SHA256'] / 'devkit'
+        target_triple = host_target()
+        engine_sha = pins['DEVKIT_ENGINE_SHA256_' + target_triple.upper().replace('-', '_')]
+        engine = Path(env['DEVKIT_CACHE_DIR']) / 'engines' / target_triple / self.version / engine_sha / 'devkit'
         require(engine.is_file(), 'Update did not prime the target engine before commit')
         offline = dict(env, HTTPS_PROXY='http://127.0.0.1:1', DOCKER_HOST='unix:///unavailable.sock')
         def install(root, path, recorded):
@@ -318,6 +352,7 @@ class Harness:
             f'https://github.com{self.base}/v{self.version}/install.sh'])
         require(self.script.read_bytes() == (self.build_set / 'install.sh').read_bytes(), 'Downloaded loader bytes differ')
         self.run('shell-syntax', ['sh', '-n', self.script])
+        self.verify_concurrent_bootstrap()
         target = self.scratch / 'product $(touch injected) with spaces'
         env = self.environment('native-current')
         self.boot('raw-ELF-bootstrap-init', 'init', target, '--app', 'api=rust-api', '--release-root', self.payload,
@@ -327,7 +362,17 @@ class Harness:
         self.boot('cached-bootstrap-offline-metadata', 'describe', '--root', target, env=dict(env, HTTPS_PROXY='http://127.0.0.1:1'))
         self.boot('recover-local-journal-no-cache', 'recover', target, env=self.environment('empty'))
         self.verify_cold_worktree(target)
-        self.cold_old('genuine-baseline-http-init')
+        if host_target() == self.old_index['target']:
+            self.verify_baseline_upgrade()
+        else:
+            before = len(self.fixture.requests)
+            self.cold_init('refuse-unavailable-baseline-target', self.old_version, expected=host_target())
+            require(self.fixture.requests[before:] == [self.old_index_route],
+                    'An incompatible release must be refused from its index before downloading binaries')
+        self.verify_version_floor()
+
+    def verify_baseline_upgrade(self):
+        self.cold_init('genuine-baseline-http-init', self.old_version)
         baseline = self.scratch / 'genuine-baseline-http-init'
         source = baseline / 'apps/api/src/main.rs'
         source.write_text(source.read_text() + '\n// Preserve the product change.\n')
@@ -339,6 +384,18 @@ class Harness:
         old_loader = baseline / '.devkit/runtime/devkit.sh'
         old_bytes = old_loader.read_bytes()
         bridge = ['sh', old_loader, 'cli', 'update', '.', '--to', self.version, '--non-interactive']
+        target_source = []
+        if not self.index['publicationEligible']:
+            previous_requests = len(self.fixture.requests)
+            old_manifest = (baseline / '.devkit/manifest.json').read_bytes()
+            self.run('genuine-project-loader-refuses-unpublished-index', [*bridge, '--preview'],
+                     cwd=baseline, env=bridge_env, expected='Release index version/provenance differs')
+            require(self.fixture.requests[previous_requests:] == [self.index_route],
+                    'The old loader must reject the unpublished index before downloading its archive')
+            require(old_loader.read_bytes() == old_bytes and (baseline / '.devkit/manifest.json').read_bytes() == old_manifest,
+                    'Rejected online preview changed the accepted checkout')
+            target_source = ['--release-root', self.payload]
+            bridge.extend(target_source)
         for mode, args in [('preview', [*bridge, '--preview']), ('apply', bridge)]:
             failed = self.run('duplicate-crate-' + mode, args, cwd=baseline, env=bridge_env, expected='devkit-api')
             for component in ('api', 'worker'):
@@ -355,7 +412,9 @@ class Harness:
         require(json.loads((baseline / '.devkit/manifest.json').read_text())['version'] == self.version, 'Migration version differs')
         info = self.run('upgraded-make-info', ['make', 'info', 'json=1'], cwd=baseline, env=bridge_env)
         require(json.loads(info.stdout)['result']['version'] == self.version, 'Upgraded Make entry point selected another version')
-        self.verify_rust_recovery()
+        self.verify_rust_recovery(target_source)
+
+    def verify_version_floor(self):
         pre_050 = self.scratch / 'pre-050-checkout'
         (pre_050 / '.devkit').mkdir(parents=True)
         (pre_050 / '.devkit/manifest.json').write_text(json.dumps({

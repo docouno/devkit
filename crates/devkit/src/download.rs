@@ -70,8 +70,13 @@ pub(crate) fn additional_ca_bundle(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn additional_ca_file(path: &Path) -> Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::Builder::new().prefix("devkit-ca-").tempfile()?;
+pub(crate) fn additional_ca_file_in(
+    path: &Path,
+    tmp_dir: &Path,
+) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("devkit-ca-")
+        .tempfile_in(tmp_dir)?;
     file.write_all(&additional_ca_bundle(path)?)?;
     file.flush()?;
     file.as_file()

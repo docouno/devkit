@@ -87,6 +87,15 @@ pub fn cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn ensure_cache_root(root: &Path) -> Result<()> {
+    let absent = !exists(root)?;
+    create_dir_all_durable(root)?;
+    if absent {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl<'a> ReleaseCache<'a> {
     pub fn ensure_pnpm(
         &self,
@@ -95,7 +104,9 @@ impl<'a> ReleaseCache<'a> {
         allow_network: bool,
     ) -> Result<PathBuf> {
         // Validate programmatically constructed pins as strictly as file pins.
-        crate::runtime::PnpmPin::parse(pin.encode().as_bytes())?;
+        pin.validate()?;
+        let platform = pin.target()?;
+        let triple = platform.triple();
         self.runner.check_cancelled()?;
         if let Some(path) = std::env::var_os("DEVKIT_PNPM_BIN_OVERRIDE").filter(|p| !p.is_empty()) {
             let path = PathBuf::from(path);
@@ -103,19 +114,19 @@ impl<'a> ReleaseCache<'a> {
                 path.is_absolute(),
                 "DEVKIT_PNPM_BIN_OVERRIDE must be absolute"
             );
-            verify_static_elf_file(&path, &pin.binary_sha256, false)?;
+            verify_executable(&path, &pin.binary_sha256, platform, false)?;
             return Ok(path);
         }
         let directory = safe_path(
             &self.root,
             &format!(
                 "tools/pnpm-{}-{}-{}",
-                pin.version, TARGET, pin.binary_sha256
+                pin.version, triple, pin.binary_sha256
             ),
         )?;
         let target = directory.join("pnpm");
         if exists(&target)? {
-            verify_static_elf_file(&target, &pin.binary_sha256, true)?;
+            verify_executable(&target, &pin.binary_sha256, platform, true)?;
             return Ok(target);
         }
         ensure!(
@@ -124,11 +135,11 @@ impl<'a> ReleaseCache<'a> {
             pin.version
         );
         let _lock = self.lock(&format!(
-            "tool:pnpm:{TARGET}:{}:{}",
+            "tool:pnpm:{triple}:{}:{}",
             pin.version, pin.binary_sha256
         ))?;
         if exists(&target)? {
-            verify_static_elf_file(&target, &pin.binary_sha256, true)?;
+            verify_executable(&target, &pin.binary_sha256, platform, true)?;
             return Ok(target);
         }
         let tools = safe_path(&self.root, "tools")?;
@@ -148,9 +159,14 @@ impl<'a> ReleaseCache<'a> {
             crate::native::valid_registry_or_tarball_url(registry),
             "Invalid pnpm registry URL"
         );
+        let name = pin
+            .package
+            .strip_prefix("@pnpm/")
+            .context("Invalid pinned pnpm package")?;
         let url = format!(
-            "{}/@pnpm/exe.linux-x64-musl/-/exe.linux-x64-musl-{}.tgz",
+            "{}/{}/-/{name}-{}.tgz",
             registry.trim_end_matches('/'),
+            pin.package,
             pin.version
         );
         let archive = stage.path().join("pnpm.tgz");
@@ -194,7 +210,7 @@ impl<'a> ReleaseCache<'a> {
         let payload = stage.path().join("payload");
         fs::create_dir(&payload)?;
         extract_pnpm_binary(&archive, &payload.join("pnpm"), self.runner)?;
-        verify_static_elf_file(&payload.join("pnpm"), &pin.binary_sha256, true)?;
+        verify_executable(&payload.join("pnpm"), &pin.binary_sha256, platform, true)?;
         self.runner.check_cancelled()?;
         publish_new_directory(&payload, &directory)?;
         Ok(target)
@@ -207,12 +223,7 @@ impl<'a> ReleaseCache<'a> {
         })
     }
     fn initialize(&self) -> Result<()> {
-        let absent = !exists(&self.root)?;
-        create_dir_all_durable(&self.root)?;
-        if absent {
-            fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
+        ensure_cache_root(&self.root)
     }
     fn lock_path(&self, key: &str) -> Result<PathBuf> {
         self.initialize()?;
@@ -232,14 +243,7 @@ impl<'a> ReleaseCache<'a> {
         safe_path(&self.root, &format!("releases/{version}/{identity}"))
     }
     pub fn engine_path(&self, pin: &EnginePin) -> Result<PathBuf> {
-        pin.validate()?;
-        safe_path(
-            &self.root,
-            &format!(
-                "engines/{}/{}/{}/devkit",
-                pin.target, pin.version, pin.sha256
-            ),
-        )
+        engine_cache_path(&self.root, pin)
     }
     fn cached(&self, version: &str, identity: &str) -> Result<Option<AdmittedRelease>> {
         let path = self.release_path(version, identity)?;
@@ -288,78 +292,138 @@ impl<'a> ReleaseCache<'a> {
         )
     }
     pub fn prime_engine(&self, release: &AdmittedRelease) -> Result<()> {
-        self.prime_engine_with_timeout(release, CACHE_LOCK_TIMEOUT)
+        let pin = crate::runtime::EnginePins::parse(&release.bytes("runtime/toolchains.env")?)?
+            .for_target(Target::host()?)?;
+        self.prime_release_engine(release, &pin, CACHE_LOCK_TIMEOUT)?;
+        Ok(())
     }
-    fn prime_engine_with_timeout(
+
+    fn prime_release_engine(
         &self,
         release: &AdmittedRelease,
-        lock_timeout: Duration,
-    ) -> Result<()> {
-        let pin = EnginePin {
-            version: release.manifest.version.clone(),
-            target: TARGET.to_owned(),
-            sha256: release
-                .manifest
-                .files
-                .get("devkit")
-                .context("Native release has no engine")?
-                .sha256
-                .clone(),
-        };
-        let recorded = EnginePin::from_toolchains(&release.bytes("runtime/toolchains.env")?)?;
+        pin: &EnginePin,
+        timeout: Duration,
+    ) -> Result<PathBuf> {
+        let platform = Target::parse(&pin.target)?;
+        let file = platform.payload_name();
+        let declared =
+            crate::runtime::EnginePins::parse(&release.bytes("runtime/toolchains.env")?)?
+                .for_target(platform)?;
         ensure!(
-            recorded == pin,
+            declared == *pin
+                && pin.version == release.manifest.version
+                && release
+                    .manifest
+                    .files
+                    .get(file)
+                    .is_some_and(|entry| entry.sha256 == pin.sha256 && entry.mode == 0o755),
             "Release engine pin differs from its actual payload"
         );
+        self.install_engine(pin, timeout, |path| {
+            let source_path = safe_path(&release.root, file)?;
+            let mut input = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&source_path)?;
+            let meta = input.metadata()?;
+            ensure!(
+                meta.is_file() && meta.len() <= MAX_ENGINE_BYTES,
+                "Release engine is not a bounded regular file"
+            );
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .mode(0o600)
+                .open(path)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.set_permissions(fs::Permissions::from_mode(0o755))?;
+            output.sync_all()?;
+            release.recheck()
+        })
+    }
+
+    fn install_engine(
+        &self,
+        pin: &EnginePin,
+        lock_timeout: Duration,
+        prepare: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<PathBuf> {
+        let target = self.engine_path(pin)?;
+        if exists(&target)? {
+            verify_cached_engine(&target, pin)?;
+            return Ok(target);
+        }
         let lock_path = self.lock_path(&format!(
             "engine:{}:{}:{}",
             pin.target, pin.version, pin.sha256
         ))?;
         let _lock = lock_file_with_timeout(&lock_path, self.runner, lock_timeout)?;
-        let target = self.engine_path(&pin)?;
         if exists(&target)? {
-            verify_cached_engine(&target, &pin)?;
-            return Ok(());
+            verify_cached_engine(&target, pin)?;
+            return Ok(target);
         }
-        let parent = target
-            .parent()
-            .context("Engine cache parent")?
-            .parent()
-            .context("Engine cache namespace")?;
-        create_dir_all_durable(parent)?;
+        // The shell loader can create this directory concurrently. Publish the
+        // verified file itself with an exclusive rename on the same volume.
+        let directory = target.parent().context("Engine cache directory")?;
+        create_dir_all_durable(directory)?;
         let stage = tempfile::Builder::new()
             .prefix(".engine-")
-            .tempdir_in(parent)?;
-        let payload = stage.path().join("payload");
-        fs::create_dir(&payload)?;
-        write_atomic(&payload.join("devkit"), &release.bytes("devkit")?, 0o755)?;
-        verify_cached_engine(&payload.join("devkit"), &pin)?;
-        release.recheck()?;
+            .tempdir_in(directory)?;
+        let staged = stage.path().join("devkit");
+        prepare(&staged)?;
+        verify_cached_engine(&staged, pin)?;
         self.runner.check_cancelled()?;
-        let destination = target.parent().unwrap();
-        if exists(destination)? {
-            // The initial loader creates this namespace before downloading.
-            // A cancelled transfer may therefore leave a valid empty directory.
-            // Link complete verified bytes without replacing any concurrent file.
-            match fs::hard_link(payload.join("devkit"), &target) {
-                Ok(()) => sync_directory(destination)?,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_cached_engine(&target, &pin)?;
-                }
-                Err(error) => return Err(error.into()),
+        match archive::rename_noreplace(&staged, &target) {
+            Ok(()) => sync_directory(directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_cached_engine(&target, pin)?;
             }
-        } else {
-            publish_new_directory(&payload, destination)?;
+            Err(error) => return Err(error.into()),
         }
-        Ok(())
+        Ok(target)
     }
     pub(crate) fn local_engine(&self, pin: &EnginePin, release_identity: &str) -> Result<PathBuf> {
         if !exists(&self.engine_path(pin)?)?
             && let Some(release) = self.cached(&pin.version, release_identity)?
         {
-            self.prime_engine_with_timeout(&release, Duration::ZERO)?;
+            return self.prime_release_engine(&release, pin, Duration::ZERO);
         }
         self.accepted_engine(pin)
+    }
+    /// Select a verified static helper for the daemon. Local commands never
+    /// contact the release service. A cached npm payload also works offline.
+    pub fn ensure_linux_helper(
+        &self,
+        pin: &EnginePin,
+        release_identity: &str,
+        allow_network: bool,
+    ) -> Result<PathBuf> {
+        ensure!(
+            Target::parse(&pin.target)?.is_linux(),
+            "Container helper requires a Linux target"
+        );
+        if pin.target == Target::host()?.triple() {
+            return verify_current_engine(pin);
+        }
+        if let Some(path) = local_helper_path(&self.root, pin)? {
+            return Ok(path);
+        }
+        if let Some(release) = self.cached(&pin.version, release_identity)? {
+            return self.prime_release_engine(&release, pin, CACHE_LOCK_TIMEOUT);
+        }
+        ensure!(
+            allow_network,
+            "The accepted Linux helper is unavailable; run make setup (or exec --prepare)"
+        );
+        let platform = Target::parse(&pin.target)?;
+        let url = format!("{RELEASE_BASE}/v{}/{}", pin.version, platform.asset());
+        self.install_engine(pin, CACHE_LOCK_TIMEOUT, |path| {
+            self.fetch(&url, path, MAX_ENGINE_BYTES)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+            File::open(path)?.sync_all()?;
+            Ok(())
+        })
     }
     pub fn accepted_engine(&self, pin: &EnginePin) -> Result<PathBuf> {
         let target = self.engine_path(pin)?;
@@ -430,9 +494,11 @@ impl<'a> ReleaseCache<'a> {
             && let Some(release) = self.cached(version, &identity)?
         {
             let engine_matches = version != env!("CARGO_PKG_VERSION")
-                || release.manifest.files.get("devkit").is_some_and(|id| {
-                    file_digest(&self.executable).is_ok_and(|hash| hash == id.sha256)
-                });
+                || release
+                    .manifest
+                    .files
+                    .get(Target::host()?.payload_name())
+                    .is_some_and(|id| current_engine_digest().is_ok_and(|hash| hash == id.sha256));
             if engine_matches {
                 self.prime_engine(&release)?;
                 return Ok(release);
@@ -461,55 +527,61 @@ impl<'a> ReleaseCache<'a> {
             index.version == version && index.publication_eligible,
             "Release index version/provenance differs"
         );
+        let host_asset = index.engine_asset(Target::host()?)?;
         if version == env!("CARGO_PKG_VERSION") && expected.is_none() {
             ensure!(
-                index.files[&index.engine].sha256 == file_digest(&self.executable)?,
+                index.files[host_asset].sha256 == current_engine_digest()?,
                 "Published engine differs from the running release"
             );
         }
-        let identity = index.release_identity;
-        let archive_hash = index.files[&index.archive].sha256.clone();
+        let identity = index.release_identity.clone();
+        let archive_asset = &index.files[&index.archive];
         ensure!(
             expected.is_none_or(|expected| expected == identity),
             "Downloaded release differs from the accepted project identity"
         );
         let _lock = self.lock(&format!("release:{version}:{identity}"))?;
-        let release = if let Some(release) = self.cached(version, &identity)? {
+        if let Some(release) = self.cached(version, &identity)? {
+            verify_index_engines(&release, &index)?;
+            self.remember(&release)?;
+            drop(_lock);
             self.prime_engine(&release)?;
-            release
-        } else {
-            self.fetch(
-                &format!("{base}/{archive_name}"),
-                &archive,
-                archive::MAX_COMPRESSED,
-            )?;
-            ensure!(
-                file_digest(&archive)? == archive_hash,
-                "Downloaded archive checksum mismatch"
-            );
-            let unpacked = stage.path().join("payload");
-            archive::extract_archive_with(
-                &archive,
-                &unpacked,
-                &format!("devkit-{version}"),
-                Some(self.runner),
-            )?;
-            payload_budget(&unpacked)?;
-            let release = release::admit_release(&unpacked)?;
-            ensure!(
-                release.identity == identity && release.manifest.version == version,
-                "Downloaded payload differs from release metadata"
-            );
-            self.prime_engine(&release)?;
-            let target = self.release_path(version, &identity)?;
-            create_dir_all_durable(target.parent().unwrap())?;
-            self.runner.check_cancelled()?;
-            release.recheck()?;
-            publish_new_directory(&unpacked, &target)?;
-            release::admit_release(&target)?
-        };
+            return Ok(release);
+        }
+        self.fetch(
+            &format!("{base}/{archive_name}"),
+            &archive,
+            archive::MAX_COMPRESSED,
+        )?;
+        ensure!(
+            fs::metadata(&archive)?.len() == archive_asset.size
+                && file_digest(&archive)? == archive_asset.sha256,
+            "Downloaded archive checksum mismatch"
+        );
+        let unpacked = stage.path().join("payload");
+        archive::extract_archive_with(
+            &archive,
+            &unpacked,
+            &format!("devkit-{version}"),
+            Some(self.runner),
+        )?;
+        payload_budget(&unpacked)?;
+        let release = release::admit_release(&unpacked)?;
+        ensure!(
+            release.identity == identity && release.manifest.version == version,
+            "Downloaded payload differs from release metadata"
+        );
+        verify_index_engines(&release, &index)?;
+        verify_payload_host_engine(&release)?;
+        let target = self.release_path(version, &identity)?;
+        create_dir_all_durable(target.parent().unwrap())?;
+        self.runner.check_cancelled()?;
+        release.recheck()?;
+        publish_new_directory(&unpacked, &target)?;
+        let release = release::admit_release(&target)?;
         self.remember(&release)?;
         drop(_lock);
+        self.prime_engine(&release)?;
         Ok(release)
     }
     pub fn import(
@@ -538,6 +610,10 @@ impl<'a> ReleaseCache<'a> {
             expected.is_none_or(|expected| expected == identity),
             "Source release differs from accepted project identity"
         );
+        let host_file = Target::host()?.payload_name();
+        if !manifest.files.contains_key(host_file) {
+            return Err(missing_target(version, Target::host()?));
+        }
         let _lock = self.lock(&format!("release:{version}:{identity}"))?;
         let stage = tempfile::Builder::new()
             .prefix(".import-")
@@ -548,11 +624,10 @@ impl<'a> ReleaseCache<'a> {
             admitted.identity == identity,
             "Source release changed during import"
         );
+        verify_payload_host_engine(&admitted)?;
         let release = if let Some(release) = self.cached(version, &identity)? {
-            self.prime_engine(&release)?;
             release
         } else {
-            self.prime_engine(&admitted)?;
             let target = self.release_path(version, &identity)?;
             create_dir_all_durable(target.parent().unwrap())?;
             self.runner.check_cancelled()?;
@@ -562,8 +637,97 @@ impl<'a> ReleaseCache<'a> {
         };
         self.remember(&release)?;
         drop(_lock);
+        self.prime_engine(&release)?;
         Ok(release)
     }
+}
+
+fn verify_payload_host_engine(release: &AdmittedRelease) -> Result<()> {
+    let host = Target::host()?;
+    let pin = crate::runtime::EnginePins::parse(&release.bytes("runtime/toolchains.env")?)?
+        .for_target(host)?;
+    ensure!(
+        pin.version == release.manifest.version,
+        "Release version differs from toolchain pins"
+    );
+    verify_cached_engine(&safe_path(&release.root, host.payload_name())?, &pin)
+}
+
+fn verify_index_engines(release: &AdmittedRelease, index: &ReleaseIndex) -> Result<()> {
+    // The bytes accepted from the tarball and the standalone bootstrap assets
+    // must identify the same binaries on every host.
+    let check = |target: &str, asset: &str| -> Result<()> {
+        let path = if target == TARGET { "devkit" } else { asset };
+        let file = release
+            .manifest
+            .files
+            .get(path)
+            .context("Release payload is missing an indexed engine")?;
+        let expected = &index.files[asset];
+        ensure!(
+            file.sha256 == expected.sha256
+                && file.mode == 0o755
+                && fs::metadata(safe_path(&release.root, path)?)?.len() == expected.size,
+            "Indexed engine differs from release payload: {target}"
+        );
+        Ok(())
+    };
+    if let Some(engines) = &index.engines {
+        for (target, asset) in engines {
+            check(target, asset)?;
+        }
+        Ok(())
+    } else {
+        check(&index.target, &index.engine)
+    }
+}
+
+fn engine_cache_path(root: &Path, pin: &EnginePin) -> Result<PathBuf> {
+    pin.validate()?;
+    safe_path(
+        root,
+        &format!(
+            "engines/{}/{}/{}/devkit",
+            pin.target, pin.version, pin.sha256
+        ),
+    )
+}
+
+fn local_helper_path(root: &Path, pin: &EnginePin) -> Result<Option<PathBuf>> {
+    let target = Target::parse(&pin.target)?;
+    ensure!(
+        target.is_linux(),
+        "Container helper requires a Linux target"
+    );
+
+    if let Some(value) = std::env::var_os("DEVKIT_LINUX_HELPER_PATH").filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(value);
+        ensure!(
+            path.is_absolute(),
+            "DEVKIT_LINUX_HELPER_PATH must be absolute"
+        );
+        verify_engine(&path, pin)?;
+        return Ok(Some(path));
+    }
+    let path = engine_cache_path(root, pin)?;
+    if exists(&path)? {
+        verify_cached_engine(&path, pin)?;
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+/// Readiness probes must never acquire locks or materialize files.
+pub fn linux_helper_ready(root: &Path, pin: &EnginePin) -> Result<bool> {
+    let target = Target::parse(&pin.target)?;
+    ensure!(
+        target.is_linux(),
+        "Container helper requires a Linux target"
+    );
+    if target == Target::host()? && current_engine_digest()? == pin.sha256 {
+        return Ok(true);
+    }
+    Ok(local_helper_path(root, pin)?.is_some())
 }
 
 pub(crate) fn lock_file(path: &Path, runner: &ProcessRunner) -> Result<CacheLock> {
@@ -640,7 +804,7 @@ fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunne
         compressed.metadata()?.len() <= 64 * 1024 * 1024,
         "pnpm archive exceeds byte budget"
     );
-    let decoded = flate2::read::MultiGzDecoder::new(compressed).take(128 * 1024 * 1024);
+    let decoded = flate2::read::MultiGzDecoder::new(compressed).take(MAX_EXECUTABLE_BYTES);
     let mut archive = tar::Archive::new(decoded);
     let mut found = false;
     for (index, entry) in archive.entries()?.enumerate() {
@@ -664,7 +828,7 @@ fn extract_pnpm_binary(archive: &Path, destination: &Path, runner: &ProcessRunne
             "Unsupported pnpm archive entry"
         );
         ensure!(
-            entry.size() <= 64 * 1024 * 1024,
+            entry.size() <= MAX_EXECUTABLE_BYTES,
             "pnpm archive entry exceeds byte budget"
         );
         if path == Path::new("package/pnpm") {
@@ -715,7 +879,7 @@ fn payload_budget(root: &Path) -> Result<()> {
             }
         } else {
             ensure!(
-                meta.is_file() && meta.len() <= 64 * 1024 * 1024,
+                meta.is_file() && meta.len() <= MAX_ENGINE_BYTES,
                 "Invalid or oversized release source/cache entry"
             );
             bytes = bytes

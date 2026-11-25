@@ -3,7 +3,7 @@ use crate::{Result, files::*, processes::ProcessRunner};
 use anyhow::{Context, ensure};
 use flate2::{Compression, GzBuilder, read::MultiGzDecoder};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -15,17 +15,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_COMPRESSED: u64 = 128 * 1024 * 1024;
+pub const MAX_COMPRESSED: u64 = crate::distribution::MAX_EXECUTABLE_BYTES;
 pub const MAX_EXPANDED: u64 = 256 * 1024 * 1024;
-pub(crate) const MAX_FILE: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = crate::distribution::MAX_ENGINE_BYTES;
 const MAX_ENTRIES: usize = 16_384;
+const ARCHIVE_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     let src = CString::new(source.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
     let dst = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in path"))?;
-    // SAFETY: both C strings live for the call; Linux is the supported host.
+    // SAFETY: both C strings live for the call.
+    #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -36,14 +38,32 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
             libc::RENAME_NOREPLACE,
         )
     };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::ENOTSUP) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This filesystem needs atomic exclusive rename support (use a local APFS volume)",
+            ));
+        }
+        Err(error)
     }
 }
 
-/// Linux publication must not replace a concurrently created destination,
+/// Publication must not replace a concurrently created destination,
 /// including an empty directory. Callers stage on the same filesystem.
 pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
     rename_noreplace(stage, target)
@@ -54,6 +74,30 @@ pub fn publish_new_directory(stage: &Path, target: &Path) -> Result<()> {
 fn prefix(value: &str) -> Result<()> {
     relative_path(value)?;
     ensure!(!value.contains('/'), "Archive requires one root directory");
+    Ok(())
+}
+
+/// Register implicit directories too: a tar need not contain directory headers.
+fn register_spelling(spellings: &mut BTreeMap<String, String>, mut path: &str) -> Result<()> {
+    loop {
+        let folded = path.to_ascii_lowercase();
+        if let Some(previous) = spellings.get(&folded) {
+            ensure!(
+                previous == path,
+                "Case-colliding archive paths: {previous} and {path}"
+            );
+            break;
+        }
+        ensure!(
+            spellings.len() < MAX_ENTRIES,
+            "Archive exceeds its entry budget"
+        );
+        spellings.insert(folded, path.to_owned());
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            break;
+        };
+        path = parent;
+    }
     Ok(())
 }
 
@@ -109,11 +153,16 @@ pub fn extract_archive_with(
 ) -> Result<()> {
     prefix(root_name)?;
     let archive = project_root(archive)?;
-    let source = fs::symlink_metadata(&archive)?;
+    let archive_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&archive)?;
+    let source = archive_file.metadata()?;
     ensure!(
         source.is_file() && source.len() <= MAX_COMPRESSED,
         "Invalid or oversized release archive"
     );
+    let source_stamp = FileStamp::of(&source);
     let destination = project_root(destination)?;
     ensure!(!exists(&destination)?, "Archive destination already exists");
     let parent = destination.parent().context("Archive destination parent")?;
@@ -124,12 +173,13 @@ pub fn extract_archive_with(
     let payload = stage.path().join("payload");
     fs::create_dir(&payload)?;
     let mut stream = BudgetReader {
-        reader: MultiGzDecoder::new(File::open(&archive)?),
+        reader: MultiGzDecoder::new(archive_file),
         remaining: MAX_EXPANDED,
-        deadline: Instant::now() + Duration::from_secs(30),
+        deadline: Instant::now() + ARCHIVE_DEADLINE,
         runner,
     };
     let mut names = BTreeSet::new();
+    let mut spellings = BTreeMap::new();
     let mut directories = BTreeSet::new();
     let mut files = BTreeSet::new();
     let mut total = 0_u64;
@@ -163,6 +213,7 @@ pub fn extract_archive_with(
                 names.insert(encoded.to_owned()),
                 "Duplicate archive entry: {encoded}"
             );
+            register_spelling(&mut spellings, encoded)?;
             let mode = entry.header().mode()?;
             let size = entry.header().size()?;
             if kind.is_dir() {
@@ -202,6 +253,9 @@ pub fn extract_archive_with(
                 "Truncated archive entry: {encoded}"
             );
             output.set_permissions(fs::Permissions::from_mode(mode))?;
+            #[cfg(target_os = "macos")]
+            flush_file_pages(&output)?;
+            #[cfg(not(target_os = "macos"))]
             output.sync_all()?;
             files.insert(relative.to_owned());
         }
@@ -228,15 +282,36 @@ pub fn extract_archive_with(
             "Unnecessary empty archive directory: {directory}"
         );
     }
-    let now = fs::symlink_metadata(&archive)?;
     ensure!(
-        now.is_file() && now.len() == source.len(),
+        source_stamp.matches(&archive)?
+            && FileStamp::of(&stream.reader.into_inner().metadata()?) == source_stamp,
         "Archive changed during extraction"
     );
-    for name in &files {
-        sync_directory(safe_path(&payload, name)?.parent().unwrap())?;
+    #[cfg(target_os = "macos")]
+    {
+        // One APFS F_FULLFSYNC barrier flushes the staged tree before atomic rename.
+        sync_directory(&payload)?;
     }
-    sync_directory(&payload)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Include implicit ancestors; synchronize every directory once, deepest first.
+        let mut parents = BTreeSet::new();
+        for name in &files {
+            let path = safe_path(&payload, name)?;
+            for ancestor in path
+                .ancestors()
+                .skip(1)
+                .take_while(|p| p.starts_with(&payload))
+            {
+                if !parents.insert(ancestor.to_path_buf()) {
+                    break;
+                }
+            }
+        }
+        for parent in parents.iter().rev() {
+            sync_directory(parent)?;
+        }
+    }
     if let Some(runner) = runner {
         runner.check_cancelled()?;
     }
@@ -265,7 +340,9 @@ pub fn create_archive(source: &Path, root_name: &str, target: &Path) -> Result<(
             .write(&mut output, Compression::default());
         let mut tar = tar::Builder::new(gzip);
         let mut directories = BTreeSet::from([root_name.to_owned()]);
+        let mut spellings = BTreeMap::new();
         for name in before.keys() {
+            register_spelling(&mut spellings, name)?;
             let mut parent = Path::new(name).parent();
             while let Some(path) = parent {
                 if path.as_os_str().is_empty() {
@@ -289,7 +366,7 @@ pub fn create_archive(source: &Path, root_name: &str, target: &Path) -> Result<(
             header.set_cksum();
             tar.append_data(&mut header, &name, io::empty())?;
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + ARCHIVE_DEADLINE;
         let mut total = 0_u64;
         for (name, id) in &before {
             ensure!(

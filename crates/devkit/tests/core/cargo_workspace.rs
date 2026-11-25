@@ -1559,20 +1559,28 @@ fn docker_cargo_resolver_enforces_ro_cache_masks_ca_and_cgroup_retry() {
     let script = format!(
         r#"#!/bin/sh
 set -eu
+if [ -n "${{DOCKER_DEFAULT_PLATFORM:-}}" ]; then
+  printf 'leaked DOCKER_DEFAULT_PLATFORM=%s\n' "$DOCKER_DEFAULT_PLATFORM" >&2
+  exit 91
+fi
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "info" ]; then
-  printf '{{"OSType":"linux","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
+  printf '{{"OSType":"linux","Architecture":"{arch}","NCPU":4,"MemTotal":4294967296,"MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"CPUShares":true,"PidsLimit":true}}\n'
   exit 0
 fi
 if [ "$1" = "context" ]; then
   case "$2" in
     show) printf 'default\n' ;;
-    inspect) printf 'tcp://127.0.0.1:2375\n' ;;
+    inspect) printf 'default\ntcp://127.0.0.1:2375\n' ;;
     *) exit 90 ;;
   esac
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf '{platform}\n'
+  exit 0
+fi
+if [ "$1" = "container" ] && [ "$2" = "ls" ]; then
   exit 0
 fi
 if [ "$1" = "run" ]; then
@@ -1589,10 +1597,17 @@ if [ "$1" = "run" ]; then
   esac
   exit 0
 fi
-exit 0
+printf 'unexpected docker args: %s\n' "$*" >&2
+exit 90
 "#,
         log = docker_log.display(),
         fail_once = fail_once.display(),
+        arch = std::env::consts::ARCH,
+        platform = if cfg!(target_arch = "aarch64") {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        },
     );
     fs::write(&docker_script, script).unwrap();
     fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1609,6 +1624,7 @@ exit 0
         ])
         .env("PATH", &path_env)
         .env("DEVKIT_CACHE_DIR", &cache)
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/riscv64")
         .env("DEVKIT_CA_CERT", &ca)
         .env("DEVKIT_TEST_RELEASE", &release)
         .env("DEVKIT_TEST_TARGET", &root)
@@ -1626,18 +1642,61 @@ exit 0
     // 2. Validate offline mounted /cache/cargo RO without CA cert.
     // 3. Paths offline mounted /cache/cargo RO without CA cert.
     // 4. Paths online mounted /cache/cargo RW with CA cert.
+    let expected_platform = if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    };
+    let canonical_cache = project_root(&cache).unwrap();
+    let mask_source = canonical_cache.join("empty-file-mask");
+    let tmp_ca_prefix = format!(
+        "type=bind,\"source={}/devkit-ca-",
+        canonical_cache.join(".tmp").display()
+    );
+    assert!(
+        log.lines().any(|l| l.starts_with("image inspect ")),
+        "expected ensure_image inspect call:\n{log}"
+    );
+    assert!(
+        !log.lines().any(|l| l.starts_with("pull ")),
+        "unexpected docker pull when image is present:\n{log}"
+    );
+    assert!(
+        !log.contains("/dev/null"),
+        "unexpected /dev/null mount:\n{log}"
+    );
     assert_eq!(runs.len(), 5, "expected 5 docker run lines:\n{log}");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(cache.join(".tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     assert!(runs[0].contains("--cpus") || runs[0].contains("--memory"));
     assert!(!runs[1].contains("--cpus") && !runs[1].contains("--memory"));
+    assert!(runs[1].contains(&format!("--platform {expected_platform} --pull never")));
     assert!(runs[1].contains("--tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size="));
     assert!(!runs[1].contains("exec,mode=1777"));
-    assert!(runs[1].contains("type=bind,\"source=/dev/null\",\"target=/workspace/.env\",readonly"));
-    assert!(runs[1].contains(
-        "type=bind,\"source=/dev/null\",\"target=/workspace/packages/core/.env\",readonly"
-    ));
-    assert!(
-        runs[1].contains("type=bind,\"source=/dev/null\",\"target=/workspace/.npmrc\",readonly")
-    );
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/.env\",readonly",
+        mask_source.display()
+    )));
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/packages/core/.env\",readonly",
+        mask_source.display()
+    )));
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/.npmrc\",readonly",
+        mask_source.display()
+    )));
+    assert!(runs[1].contains(&tmp_ca_prefix));
+    assert!(runs[1].contains(",\"target=/devkit/ca.pem\",readonly"));
     assert!(runs[1].contains("RUSTC=/usr/local/cargo/bin/rustc"));
     assert!(runs[1].contains("CARGO_NET_GIT_FETCH_WITH_CLI=false"));
     assert!(runs[1].contains("RUSTFLAGS="));
@@ -1646,8 +1705,15 @@ exit 0
     assert!(!runs[1].contains("\"target=/cache/cargo\",readonly"));
     assert!(runs[2].contains("\"target=/cache/cargo\",readonly"));
     assert!(!runs[2].contains("CARGO_HTTP_CAINFO"));
+    assert!(!runs[2].contains(&tmp_ca_prefix));
+    assert!(!runs[2].contains("target=/devkit/ca.pem"));
     assert!(runs[3].contains("\"target=/cache/cargo\",readonly"));
     assert!(!runs[3].contains("CARGO_HTTP_CAINFO"));
+    assert!(!runs[3].contains(&tmp_ca_prefix));
+    assert!(!runs[3].contains("target=/devkit/ca.pem"));
+    assert!(runs[4].contains(&format!("--platform {expected_platform} --pull never")));
+    assert!(runs[4].contains(&tmp_ca_prefix));
+    assert!(runs[4].contains(",\"target=/devkit/ca.pem\",readonly"));
     assert!(runs[4].contains("\"target=/cache/cargo\" "));
     assert!(!runs[4].contains("\"target=/cache/cargo\",readonly"));
     assert!(runs[4].contains("CARGO_HTTP_CAINFO=/devkit/ca.pem"));
@@ -1703,6 +1769,37 @@ fn docker_cargo_resolver_worker() {
         "{err}"
     );
     fs::remove_file(&poison).unwrap();
+}
+
+#[test]
+fn corrupt_or_symlinked_rust_workspace_receipt_fails_closed_in_doctor() {
+    let temp = TempDir::new().unwrap();
+    let release = fixture_release(temp.path(), "0.6.0");
+    let root = temp.path().join("consumer");
+    let state = init(&release, &root, "rust-library", PackageMode::Local);
+    let cache = temp.path().join("cache");
+    let receipts = devkit::doctor::local_receipts(&root, &state, None, None, Some(&cache)).unwrap();
+    assert_eq!(receipts["rustWorkspaceReady"], false);
+
+    let receipt = root.join(".devkit/state/rust-workspace.lock");
+    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    fs::write(&receipt, b"\xff\xfeinvalid").unwrap();
+    let receipts = devkit::doctor::local_receipts(&root, &state, None, None, Some(&cache)).unwrap();
+    assert_eq!(receipts["rustWorkspaceReady"], false);
+
+    fs::remove_file(&receipt).unwrap();
+    std::os::unix::fs::symlink(root.join("Cargo.toml"), &receipt).unwrap();
+    assert!(
+        devkit::doctor::local_receipts(&root, &state, None, None, Some(&cache)).is_err(),
+        "symlinked rust-workspace.lock must fail closed in doctor::local_receipts"
+    );
+
+    fs::remove_file(&receipt).unwrap();
+    fs::write(&receipt, vec![b'x'; 5000]).unwrap();
+    assert!(
+        devkit::doctor::local_receipts(&root, &state, None, None, Some(&cache)).is_err(),
+        "oversized rust-workspace.lock must fail closed in doctor::local_receipts"
+    );
 }
 
 #[path = "cargo_reconcile.rs"]

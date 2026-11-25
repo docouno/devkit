@@ -3,7 +3,7 @@
 use crate::{
     Result, cache::ReleaseCache, delivery, distribution, files::*, processes::ProcessRunner, state,
 };
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Devkit — pinned development tools for Linux x86_64 and Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --template TEMPLATE\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME | --toolchain node|rust] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client, rust-library.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
+const HELP: &str = "Devkit — pinned development tools for Linux x86-64 and ARM64 with Docker Compose\n\nUsage:\n  devkit init TARGET --app NAME=TEMPLATE [--app NAME=TEMPLATE ...]\n  devkit init TARGET --package NAME=TEMPLATE [--package NAME=TEMPLATE ...]\n  devkit init TARGET --template TEMPLATE\n  devkit init TARGET --preset fullstack-web|fullstack-desktop|design-system\n  devkit add-app [TARGET] --name NAME --template TEMPLATE [--api APP] [--use PKG ...] [--reconcile-lock]\n  devkit add-package [TARGET] --name NAME --template TEMPLATE [--use PKG ...] [--reconcile-lock]\n  devkit register [TARGET] (--app NAME | --package NAME) --profile PROFILE [--reconcile-lock]\n  devkit sync [TARGET] [--preview] [--reconcile-lock]\n  devkit update [TARGET] --to VERSION [--preview] [--reconcile-lock]\n  devkit recover [TARGET]\n  devkit run COMMAND [--root PATH] [--app NAME | --package NAME]\n  devkit exec [--component apps/NAME|packages/NAME | --toolchain node|rust] [--root PATH] [--write] [--network none|bridge] [--prepare] -- ARGV\n  devkit info [TARGET] [--app NAME] [--json]\n  devkit stand reserve [TARGET]\n  devkit stand remove [TARGET]\n  devkit status [TARGET] [--root PATH] [--json]\n  devkit doctor [TARGET] [--root PATH] [--json]\n  devkit describe [TARGET] [--root PATH] [--json]\n  devkit catalog\n  devkit --version\n\nTemplates: node-api, rust-api, react-web, electron-react; packages: ts-library, react-ui, react-client, rust-library.\nProfiles: node, web, electron, ts-library, react-ui, react-library, rust.\nCommands: help, info, setup, doctor, check, fix, test, build, dev, up, down, logs, status, package.\n\nInit pins the selected release. Add/register/sync use the accepted project release;\nupdate requires --to. Recover uses the local journal without a release cache.\n\nOptions:\n  --to VERSION                 Exact release for init/update\n  --package-source registry|local\n  --reconcile-lock             Reconcile transitive lockfile resolutions when needed\n  --name NAME                  Explicit project name for init\n  --no-agents-md               Omit the project-owned AGENTS.md on init\n  --no-worktrunk               Omit the project-owned Worktrunk configuration on init\n  --release-root PATH          Verified local release (author/preview use)\n  --cache-dir PATH             Absolute cache directory; also DEVKIT_CACHE_DIR\n  --offline                    Refuse network acquisition\n  --interactive                Permit terminal prompts for missing input\n  --non-interactive            Require complete arguments\n  --json                       One JSON result for lifecycle/metadata commands\n\nComplete arguments never prompt. Without arguments a terminal opens the create\nwizard. CI and non-terminal input require complete arguments. JSON implies\nnon-interactive; streaming run/exec/task/internal reject --json before execution.\nRun preserves the real root Make DAG. Exec ARGV after -- is passed unchanged.\nMake exec command= uses shellwords quoting without variable/command expansion.\n";
 
 #[derive(Debug)]
 pub struct SilentExit(pub u8);
@@ -374,13 +374,13 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
         let options = Options::parse(&globals.args[1..], &["--app"], &[], &[])?;
         let target = options.target.clone().unwrap_or(std::env::current_dir()?);
         if let Some((engine, sha256)) = try_dispatch_info(&target, &globals, runner)? {
-            crate::processes::restore_exec_pdeathsig(runner)?;
             let mut command = std::process::Command::new(&engine);
             globals.write_flags(&mut command);
             command
                 .args(&globals.args)
                 .env("DEVKIT_DISPATCHED_ENGINE", &sha256);
             use std::os::unix::process::CommandExt;
+            crate::processes::restore_self_exec(runner, &mut command)?;
             return Err(command.exec()).context("Cannot execute the accepted native engine");
         }
         let (result, human) = crate::info::inspect(
@@ -405,6 +405,7 @@ pub fn main(args: Vec<OsString>, runner: &ProcessRunner) -> Result<()> {
             "Expected stand reserve or stand remove [TARGET]"
         );
         let root = project_root(&resolve_metadata_target(&globals.args[2..])?)?;
+        state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
         dispatch_accepted("stand", &globals, runner)?;
         match action {
             "reserve" => {
@@ -548,31 +549,12 @@ fn try_dispatch_info(
         }
         return Ok(None);
     }
-    if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some() {
-        return Ok(None);
-    }
     let candidate = (|| -> Result<Option<(PathBuf, String)>> {
         let header = state::parse_accepted_header(&bytes)?;
-        let pins_name = ".devkit/runtime/toolchains.env";
-        let Some(expected_pins) = header.managed.get(pins_name) else {
-            return Ok(None);
-        };
-        let Some((pins_bytes, pins_id)) = read_regular_file(
-            &safe_path(&root, pins_name)?,
-            TOOLCHAIN_PINS_MAX_BYTES as u64,
-            "toolchain pins",
-        )?
-        else {
-            return Ok(None);
-        };
-        if !pins_id.matches_git_tracked(expected_pins) {
-            return Ok(None);
-        }
-        let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
-        if pin.version != header.version {
-            return Ok(None);
-        }
-        if delivery::current_engine_digest()? == pin.sha256 {
+        let pin = accepted_host_pin(&root, &header)?;
+        if std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_some()
+            || delivery::current_engine_digest()? == pin.sha256
+        {
             return Ok(None);
         }
         let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
@@ -583,7 +565,10 @@ fn try_dispatch_info(
         }
         Ok(Some((engine, pin.sha256)))
     })();
-    Ok(candidate.ok().flatten())
+    match candidate {
+        Err(err) if error_code(&err) == "UNSUPPORTED_HOST_TARGET" => Err(err),
+        other => Ok(other.ok().flatten()),
+    }
 }
 
 fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunner) -> Result<()> {
@@ -646,27 +631,7 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
     };
     state::ensure_supported_checkout_floor(&root, false, state::MIN_SUPPORTED_PROJECT_VERSION)?;
     let header = state::read_accepted_header(&root)?;
-    let name = ".devkit/runtime/toolchains.env";
-    let path = safe_path(&root, name)?;
-    let conflict_msg = || {
-        format!(
-            "Managed file conflict: {name}; restore with 'git checkout -- {name}' before running 'make sync' (or 'devkit sync')"
-        )
-    };
-    let expected_pins = header.managed.get(name).with_context(conflict_msg)?;
-    let (pins_bytes, pins_id) =
-        read_regular_file(&path, TOOLCHAIN_PINS_MAX_BYTES as u64, "toolchain pins")?
-            .with_context(conflict_msg)?;
-    ensure!(
-        pins_id.matches_git_tracked(expected_pins),
-        "{}",
-        conflict_msg()
-    );
-    let pin = crate::delivery::EnginePin::from_toolchains(&pins_bytes)?;
-    ensure!(
-        pin.version == header.version,
-        "Accepted version differs from toolchain pins"
-    );
+    let pin = accepted_host_pin(&root, &header)?;
     let current = fs::canonicalize(std::env::current_exe()?)?;
     if delivery::current_engine_digest()? == pin.sha256 {
         ensure!(
@@ -699,14 +664,28 @@ fn dispatch_accepted(command_name: &str, globals: &Globals, runner: &ProcessRunn
         engine != current && std::env::var_os("DEVKIT_DISPATCHED_ENGINE").is_none(),
         "Accepted engine dispatch did not converge"
     );
-    crate::processes::restore_exec_pdeathsig(runner)?;
     let mut command = std::process::Command::new(&engine);
     globals.write_flags(&mut command);
     command
         .args(&globals.args)
         .env("DEVKIT_DISPATCHED_ENGINE", &pin.sha256);
     use std::os::unix::process::CommandExt;
+    crate::processes::restore_self_exec(runner, &mut command)?;
     Err(command.exec()).context("Cannot execute the accepted native engine")
+}
+
+pub(crate) fn accepted_host_pin(
+    root: &std::path::Path,
+    header: &state::AcceptedManifestHeader,
+) -> Result<delivery::EnginePin> {
+    let bytes =
+        crate::runtime::managed_bytes(root, ".devkit/runtime/toolchains.env", &header.managed)?;
+    let pins = crate::runtime::EnginePins::parse(&bytes)?;
+    ensure!(
+        pins.version == header.version,
+        "Accepted version differs from toolchain pins"
+    );
+    pins.for_target(distribution::Target::host()?)
 }
 
 fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Result<bool> {
@@ -728,7 +707,9 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                 .value("--pin-file")?
                 .map(PathBuf::from)
                 .unwrap_or(std::env::current_dir()?.join(".devkit/runtime/pnpm.env"));
-            let pin = crate::runtime::PnpmPin::from_pin_file(&pin_file)?;
+            let daemon =
+                crate::resources::query_docker_info(runner, &mut crate::runtime::docker_command())?;
+            let pin = crate::runtime::PnpmPin::from_pin_file_for_target(&pin_file, daemon.target)?;
             let cache = ReleaseCache::new(globals.cache_dir.as_deref(), runner)?;
             println!(
                 "{}",
@@ -738,6 +719,17 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
         "build-info" => {
             ensure!(args.len() == 1, "Build-info takes no arguments");
             println!("{}", serde_json::to_string(&distribution::build_info())?);
+        }
+        "probe-hardlinks" => {
+            ensure!(
+                args.len() == 4,
+                "probe-hardlinks requires SOURCE DEST TOKEN"
+            );
+            crate::shared_cache::check_guest_hardlink(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                string(&args[3])?,
+            )?;
         }
         "docker-flags" => {
             let options = Options::parse(
@@ -762,6 +754,10 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                         .context("Invalid --pids-limit integer")
                 })
                 .transpose()?;
+            ensure!(
+                cfg!(target_os = "linux"),
+                "The author docker-flags command requires Linux"
+            );
             let budget = crate::resources::HostResourceBudget::probe_local()?;
             let flags =
                 budget.author_flags(cpus_milli, mem_bytes, pids, options.flag("--node-fallback"));
@@ -783,23 +779,57 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                 options.flag("--allow-loopback-http"),
             )?;
         }
-        "assemble" => {
+        "contribute" => {
             let options = Options::parse(
                 &args[1..],
                 &[
                     "--root",
                     "--engine",
+                    "--notices",
+                    "--notice-set-sha256",
+                    "--build-run",
+                    "--output",
+                    "--host-env",
+                    "--verified",
+                ],
+                &[],
+                &["--verified"],
+            )?;
+            ensure!(
+                options.target.is_none(),
+                "Contribute takes named options only"
+            );
+            let receipt = crate::assembler::contribute(
+                &crate::assembler::ProduceOptions {
+                    root: options.required_path("--root")?,
+                    engine: options.required_path("--engine")?,
+                    notices: options.required_path("--notices")?,
+                    notice_set_sha256: options.required("--notice-set-sha256")?.to_owned(),
+                    build_run: options.required("--build-run")?.to_owned(),
+                    output: options.required_path("--output")?,
+                    host_env: options.path("--host-env"),
+                    verified: options.flag("--verified"),
+                },
+                runner,
+            )?;
+            println!("{receipt}");
+        }
+        "assemble" => {
+            let options = Options::parse(
+                &args[1..],
+                &[
+                    "--root",
+                    "--target-input",
                     "--npm-inputs",
                     "--output",
                     "--source-commit",
                     "--source-tree",
                     "--build-run",
-                    "--notices",
-                    "--notice-set-sha256",
                     "--local",
+                    "--verified-preview",
                 ],
-                &[],
-                &["--local"],
+                &["--target-input"],
+                &["--local", "--verified-preview"],
             )?;
             ensure!(
                 options.target.is_none(),
@@ -808,15 +838,22 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
             let index = crate::assembler::assemble(
                 &crate::assembler::AssemblyOptions {
                     root: options.required_path("--root")?,
-                    engine: options.required_path("--engine")?,
+                    target_inputs: options
+                        .all("--target-input")?
+                        .iter()
+                        .map(|value| value.parse())
+                        .collect::<Result<_>>()?,
                     npm_inputs: options.required_path("--npm-inputs")?,
                     output: options.required_path("--output")?,
-                    notices: options.required_path("--notices")?,
-                    notice_set_sha256: options.required("--notice-set-sha256")?.to_owned(),
                     source_commit: options.required("--source-commit")?.to_owned(),
                     source_tree: options.required("--source-tree")?.to_owned(),
                     build_run: options.required("--build-run")?.to_owned(),
-                    local: options.flag("--local"),
+                    mode: match (options.flag("--local"), options.flag("--verified-preview")) {
+                        (false, false) => crate::assembler::AssemblyMode::Published,
+                        (true, false) => crate::assembler::AssemblyMode::Local,
+                        (false, true) => crate::assembler::AssemblyMode::VerifiedPreview,
+                        (true, true) => bail!("Choose one assembly mode"),
+                    },
                 },
                 runner,
             )?;
@@ -848,7 +885,7 @@ fn internal(args: &[OsString], globals: &Globals, runner: &ProcessRunner) -> Res
                     output: options.required_path("--output")?,
                     target: options
                         .value("--target")?
-                        .unwrap_or(distribution::TARGET)
+                        .unwrap_or(distribution::Target::host()?.triple())
                         .to_owned(),
                     rust_version: options.required("--rust-version")?.to_owned(),
                 },

@@ -16,6 +16,7 @@ import signal
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import tarfile
 import threading
@@ -26,13 +27,16 @@ import urllib.request
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "test"))
+from release_targets import LINUX_ARM64, LINUX_X64, host_target, linux_arch, payload_name  # noqa: E402
+
 PINS = dict(line.split("=", 1) for line in (REPO / "toolchains.env").read_text().splitlines()
             if line and not line.startswith("#"))
 IMAGE = PINS["DEVKIT_NODE_IMAGE"]
 NODE_VERSION = PINS["DEVKIT_NODE_VERSION"]
 LABEL = "io.docouno.devkit.invocation"
 RUNTIME_SOURCE = REPO / "runtime"
-ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/native/target/x86_64-unknown-linux-musl/debug/devkit")).resolve()
+ENGINE = Path(os.environ.get("DEVKIT_TEST_ENGINE", REPO / ".artifacts/author/target" / host_target() / "debug/devkit")).resolve()
 PNPM_BIN = None
 CACHE_OVERRIDE = None
 FIXTURE = Path(os.environ.get("DEVKIT_TEST_FIXTURE", ENGINE.parent / "examples/runtime_fixture")).resolve()
@@ -247,6 +251,11 @@ def fixture_tool(root, script):
                "node", "--input-type=module", "-e", script, timeout=35)
 
 
+def write_fixture_pnpm(runtime):
+    pins = {key: value for key, value in PINS.items() if key.startswith("DEVKIT_PNPM_")}
+    (runtime / "pnpm.env").write_text("".join(f"{key}={value}\n" for key, value in pins.items()))
+
+
 def write_fixture_runtime(root):
     runtime = root / ".devkit/runtime"
     shutil.copytree(RUNTIME_SOURCE, runtime)
@@ -255,7 +264,7 @@ def write_fixture_runtime(root):
         f"DEVKIT_VERSION={VERSION}\nDEVKIT_NODE_IMAGE={IMAGE}\nDEVKIT_NODE_VERSION={NODE_VERSION}\n"
         f"DEVKIT_RUST_VERSION={PINS['DEVKIT_RUST_VERSION']}\n"
         f"DEVKIT_RUST_RECIPE_HASH={hashlib.sha256((runtime / 'rust.Dockerfile').read_bytes()).hexdigest()}\n")
-    (runtime / "pnpm.env").write_text("DEVKIT_PNPM_PACKAGE=@pnpm/exe.linux-x64-musl\n" + "".join(f"{key}={PINS[key]}\n" for key in ("DEVKIT_PNPM_SHA256", "DEVKIT_PNPM_TARBALL_SHA256", "DEVKIT_PNPM_VERSION")))
+    write_fixture_pnpm(runtime)
     (root / "Makefile").write_text("include .devkit/runtime/devkit.mk\n")
 
 
@@ -304,20 +313,31 @@ if (fs.existsSync('SLOW')) {
 def seal_runtime(root):
     """Accept known fixture bytes; the same native engine verifies admission."""
     runtime = root / ".devkit/runtime"
-    engine_sha = hashlib.sha256(ENGINE.read_bytes()).hexdigest()
+    # The other target is present in frozen sets. A source-only fixture owns
+    # just its native binary and never pretends that binary works on both CPUs.
+    engine_pins = {}
+    arms = []
+    for triple, selector in ((LINUX_X64, "Linux:x86_64"), (LINUX_ARM64, "Linux:aarch64|Linux:arm64")):
+        path = ENGINE if triple == host_target() else ENGINE.parent / payload_name(triple)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "0" * 64
+        engine_pins[triple] = digest
+        arms.append(f"{selector}) target={triple}; sha256={digest}; payload={payload_name(triple)} ;;")
     loader = runtime / "devkit.sh"
     source = loader.read_text()
     if "@@DEVKIT_MODE@@" in source:
         for key, value in {"@@DEVKIT_MODE@@": "project", "@@DEVKIT_VERSION@@": VERSION,
-                           "@@DEVKIT_ENGINE_SHA256@@": engine_sha,
-                           "@@DEVKIT_ENGINE_TARGET@@": "x86_64-unknown-linux-musl"}.items():
+                           "# @@DEVKIT_ENGINE_PINS@@": "\n".join(arms)}.items():
             assert source.count(key) == 1
             source = source.replace(key, value)
         loader.write_text(source)
     pins = runtime / "toolchains.env"
     source = pins.read_text()
     if "DEVKIT_ENGINE_SHA256=" not in source:
-        pins.write_text(source + f"DEVKIT_ENGINE_SHA256={engine_sha}\nDEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n")
+        selected = {"DEVKIT_ENGINE_SHA256": engine_pins[LINUX_X64], "DEVKIT_ENGINE_TARGET": LINUX_X64,
+                    "DEVKIT_ENGINE_TARGETS": ",".join(engine_pins)}
+        for triple, digest in engine_pins.items():
+            selected["DEVKIT_ENGINE_SHA256_" + triple.upper().replace("-", "_")] = digest
+        pins.write_text(source + "".join(f"{name}={value}\n" for name, value in selected.items()))
     def identity(path):
         return {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "mode": path.stat().st_mode & 0o777}
     managed = {str(path.relative_to(root)): identity(path)
@@ -909,8 +929,10 @@ with pathlib.Path(os.environ['COMPAT_DOCKER_LOG']).open('a') as log:
     log.write(json.dumps(argv)+'\\n')
 if argv == ['compose', 'version', '--short']:
     print(os.environ['COMPAT_COMPOSE_VERSION'])
-elif argv == ['info', '--format', '{{.OSType}}']:
-    print('linux')
+elif argv == ['info', '--format', '{{json .}}']:
+    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine, 'ClientInfo': {'Context': 'default'}}))
+elif argv == ['context', 'inspect', '--format', '{{.Name}}\\n{{.Endpoints.docker.Host}}']:
+    print('default\\nunix:///var/run/docker.sock')
 elif argv[0] == 'compose' and 'config' in argv:
     print(json.dumps({'services': {'api': {}}}))
 elif argv[0] == 'compose' and 'ps' in argv:
@@ -938,6 +960,8 @@ else:
                                              "unsupported Compose reached configuration or daemon queries")
                         else:
                             self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertFalse(any(call[:1] == ["context"] for call in calls),
+                                             f"native default Linux context ran extra docker context calls: {calls}")
                             if surface == "runtime":
                                 self.assertIn("COMPAT_STATUS_READY", result.stdout)
                             else:
@@ -954,18 +978,24 @@ class DoctorSnapshotTests(unittest.TestCase):
             root = base / "checkout with space"
             recipe = write_rust_fixture(root)
             (root / ".devkit/state").mkdir(exist_ok=True)
-            (root / ".devkit/state/rust-image").write_text("sha256:" + "a"*64 + "\n")
+            image_id = "sha256:" + "a" * 64
+            (root / ".devkit/state/rust-image.json").write_text(json.dumps({
+                "schemaVersion": 1, "platform": "linux/" + linux_arch(),
+                "imageId": image_id, "recipeSha256": recipe,
+            }))
             fake = base / "bin"
             fake.mkdir()
             docker = fake / "docker"
             docker.write_text('''#!/usr/bin/python3
-import os, pathlib, sys, time
+import json, os, pathlib, sys, time
 argv = sys.argv[1:]
 base = pathlib.Path(os.environ['DOCTOR_SNAPSHOT_BASE'])
 if argv[:2] == ['compose', 'version']:
     print('v5.0.0')
-elif argv[:2] == ['info', '--format']:
-    print('linux')
+elif argv == ['info', '--format', '{{json .}}']:
+    print(json.dumps({'OSType': 'linux', 'Architecture': os.uname().machine, 'ClientInfo': {'Context': 'default'}}))
+elif argv == ['context', 'inspect', '--format', '{{.Name}}\\n{{.Endpoints.docker.Host}}']:
+    print('default\\nunix:///var/run/docker.sock')
 elif argv[:2] == ['image', 'inspect']:
     if (base/'armed').exists():
         (base/'ready').write_text('admission finished before image query')
@@ -974,7 +1004,11 @@ elif argv[:2] == ['image', 'inspect']:
             if time.monotonic() > deadline:
                 sys.exit(89)
             time.sleep(.01)
-    print(os.environ['DOCTOR_SNAPSHOT_RECIPE'])
+    platform = os.environ['DOCTOR_SNAPSHOT_PLATFORM']
+    if argv[3] == '{{.Os}}/{{.Architecture}}':
+        print(platform)
+    else:
+        print('sha256:' + 'a'*64, platform, os.environ['DOCTOR_SNAPSHOT_RECIPE'], platform, sep='\\n')
 elif argv[:2] in (["image", "tag"], ["container", "ls"]) or argv[0] == "run":
     pass
 else:
@@ -984,7 +1018,8 @@ else:
             docker.chmod(0o755)
             environment = dict(env(), PATH=str(fake)+os.pathsep+os.environ["PATH"],
                                DEVKIT_CACHE_DIR=str(base / "cache"),
-                               DOCTOR_SNAPSHOT_BASE=str(base), DOCTOR_SNAPSHOT_RECIPE=recipe)
+                               DOCTOR_SNAPSHOT_BASE=str(base), DOCTOR_SNAPSHOT_RECIPE=recipe,
+                               DOCTOR_SNAPSHOT_PLATFORM='linux/' + linux_arch())
             run(str(ENGINE), "task", "setup-rust", "--root", str(root), env=environment, timeout=12)
             argv = [str(ENGINE), "task", "doctor", "--root", str(root)]
             baseline = run(*argv, env=environment, timeout=12)
@@ -1205,11 +1240,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("skipping Electron app desktop", aggregate.stderr)
         self.assertIn("apps/web:dev", aggregate.stdout)
         self.assertNotIn("packages/desktop-only", aggregate.stdout)
-        for args in [("up", "app=desktop"), ("dev-desktop",), ("up", "headless=1"), ("up", "DEVKIT_REGISTERED_APPS=desktop")]:
+        for args in [("up", "app=desktop"), ("dev-desktop",), ("up", "headless=1")]:
             selected = self.make(*args, override, env=environment, check=False)
             self.assertNotEqual(selected.returncode, 0)
             self.assertIn("42", selected.stderr)
             self.assertIn("packages/desktop-only:build", selected.stdout)
+        # CLI override of DEVKIT_REGISTERED_APPS cannot spoof file-origin projection.
+        spoofed = self.make("up", "DEVKIT_REGISTERED_APPS=desktop", override, env=environment, check=False)
+        self.assertNotIn("packages/desktop-only:build", spoofed.stdout)
+        # A real single-app desktop projection runs desktop without DISPLAY.
+        projection = self.root / ".devkit/project.mk"
+        original_projection = projection.read_text()
+        try:
+            projection.write_text(original_projection.replace(
+                "DEVKIT_REGISTERED_APPS := desktop web", "DEVKIT_REGISTERED_APPS := desktop"
+            ).replace(
+                "DEVKIT_REGISTERED_APPS := web desktop", "DEVKIT_REGISTERED_APPS := desktop"
+            ))
+            single = self.make("up", override, env=environment, check=False)
+            self.assertNotEqual(single.returncode, 0)
+            self.assertIn("42", single.stderr)
+            self.assertIn("packages/desktop-only:build", single.stdout)
+        finally:
+            projection.write_text(original_projection)
 
     def preview_fixture(self):
         write_fixture(self.root)
@@ -1784,7 +1837,7 @@ class RuntimeTests(unittest.TestCase):
         self.images.append(project + "-helper")
         spec["services"].update({"main": frontend, "helper": {
             "build": {"context": ".", "dockerfile_inline": f"FROM {IMAGE}\nLABEL {LABEL}={self.token}\n"},
-            "platform": "linux/x86_64", "labels": {LABEL: self.token},
+            "platform": "linux/" + linux_arch(), "labels": {LABEL: self.token},
             "command": ["node", "-e", "require('node:http').createServer((q,s)=>s.end('helper')).listen(3001,'0.0.0.0')"],
             "ports": ["127.0.0.1::3001"], "environment": {"DEVKIT_SERVICE": "helper"},
         }})
@@ -2401,7 +2454,7 @@ build: simulate-update
         accept_runtime(self.root)
         result = self.make("check", check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("accepted Node image is absent; run make setup", result.stderr)
+        self.assertIn(f"is absent for linux/{linux_arch()}; run make setup", result.stderr)
 
     def test_rust_derived_image_state_and_native_gates(self):
         write_fixture(self.root)
@@ -2416,7 +2469,9 @@ build: simulate-update
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rust image is absent/stale; run make setup", result.stderr)
         self.make("setup", timeout=180)
-        image_id = (self.root / ".devkit/state/rust-image").read_text().strip()
+        receipt = json.loads((self.root / ".devkit/state/rust-image.json").read_text())
+        image_id = receipt["imageId"]
+        self.assertFalse((self.root / ".devkit/state/rust-image").exists())
         self.assertRegex(image_id, r"^sha256:[a-f0-9]{64}$")
         image = json.loads(run("docker", "image", "inspect", image_id).stdout)[0]
         self.assertEqual(image["Config"]["Labels"]["io.docouno.devkit.rust-recipe"], recipe)
@@ -2425,7 +2480,7 @@ build: simulate-update
         for command in ("check", "test", "build"):
             self.make(command, timeout=180)
         self.assertEqual(hashes, {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
-        self.assertEqual((self.root / ".devkit/state/rust-image").read_text().strip(), image_id)
+        self.assertEqual(json.loads((self.root / ".devkit/state/rust-image.json").read_text())["imageId"], image_id)
 
         cold = self.base / "unused-cache"
         cold_env = dict(env(), DEVKIT_CACHE_DIR=str(cold))
@@ -2612,7 +2667,9 @@ build: simulate-update
         directories = [".devkit", ".devkit/state", ".devkit/cache", ".devkit/cache/pnpm-store",
                        "node_modules", "apps/main/node_modules", "apps/main/dist"]
         directories += [str(self.base / "cache" / name) for name in ("pnpm-store", "pnpm-cache", "cargo", "electron", "tools", "empty-mask")]
-        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock", ".devkit/state/rust-workspace.lock", ".devkit/state/rust-image", ".devkit/state/desktop-image"]
+        files = [".devkit/state/task.lock", ".devkit/state/node-workspace.lock",
+                 ".devkit/state/rust-workspace.lock", ".devkit/state/rust-image.json",
+                 ".devkit/state/desktop-image.json"]
         dist_occurrence = 0
         for relative in directories + files + ["apps/main/dist"]:
             with self.subTest(path=relative):
@@ -3535,6 +3592,10 @@ if (priv.value !== 'from-private-gitlab-registry') {
             "rustImageReady": False,
             "rustWorkspaceReady": False,
             "desktopImageReady": False,
+            "preparedPlatform": "linux/" + linux_arch(),
+            "helperReady": True,
+            "helperError": None,
+            "ready": True,
         })
 
         # Concurrent LOCK_SH readers succeed in parallel while an external LOCK_SH is also held.
@@ -3744,13 +3805,23 @@ if (priv.value !== 'from-private-gitlab-registry') {
             "files": node_files,
             "directories": desc["inputs"]["directories"],
         }, separators=(",", ":")).encode()).hexdigest()
-        node_receipt = hashlib.sha256(f"{desc['releaseIdentity']}\n{node_inputs}".encode()).hexdigest()
-        (self.root / ".devkit/state/node-workspace.lock").write_text(node_receipt + "\n")
+        platform = f"linux/{linux_arch()}"
+        node_receipt = hashlib.sha256(f"{desc['releaseIdentity']}\n{platform}\n{node_inputs}".encode()).hexdigest()
+        (self.root / ".devkit/state/node-workspace.lock").write_text(json.dumps({
+            "schemaVersion": 1,
+            "platform": platform,
+            "digest": node_receipt,
+        }) + "\n")
         desktop_pin = hashlib.sha256(
             (self.root / ".devkit/runtime/desktop.Dockerfile").read_bytes()
         ).hexdigest()
         desktop_id = "sha256:" + "e" * 64
-        (self.root / ".devkit/state/desktop-image").write_text(desktop_id + "\n")
+        (self.root / ".devkit/state/desktop-image.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "platform": platform,
+            "imageId": desktop_id,
+            "recipeSha256": desktop_pin,
+        }) + "\n")
         fake_bin = self.base / "tamper-seccomp-bin"
         fake_bin.mkdir()
         docker_run_log = self.base / "tamper-docker-run.log"
@@ -3764,7 +3835,7 @@ if (priv.value !== 'from-private-gitlab-registry') {
             "    for arg in \"$@\"; do\n"
             f"      if [ \"$arg\" = \"{desktop_id}\" ]; then\n"
             f"        printf '{{\"defaultAction\":\"SCMP_ACT_ALLOW\"}}\\n' > \"{seccomp_path}\"\n"
-            f"        printf '{desktop_pin}\\n'\n"
+            f"        printf '{desktop_id}\\n{platform}\\n{desktop_pin}\\n{platform}\\n'\n"
             "        exit 0\n"
             "      fi\n"
             "    done\n"

@@ -159,7 +159,8 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             bytes.as_bytes(),
         );
     }
-    if SemVer::parse(version).unwrap() >= SemVer::parse("0.6.0").unwrap() {
+    let parsed = SemVer::parse(version).unwrap();
+    if parsed >= SemVer::parse("0.6.0").unwrap() {
         for name in ["Cargo.toml", "Cargo.lock"] {
             let source = fs::read_to_string(root.join("templates/rust-api").join(name)).unwrap();
             put(
@@ -174,16 +175,18 @@ fn fixture_release(parent: &Path, version: &str) -> PathBuf {
             b"pub fn answer() -> u32 { 42 }\n",
         );
     }
-    if SemVer::parse(version).unwrap() >= SemVer::parse("0.5.0").unwrap() {
-        let pin = devkit::runtime::PnpmPin::from_source_pins(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap(),
-        )
-        .unwrap();
-        put(&root, "runtime/pnpm.env", pin.encode().as_bytes());
+    if parsed >= SemVer::parse("0.5.0").unwrap() {
+        use devkit::runtime::PnpmPin;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        let pins = if parsed >= SemVer::parse("0.6.0").unwrap() {
+            PnpmPin::release_env_from_source(source).unwrap()
+        } else {
+            PnpmPin::from_source_pins(source).unwrap().encode()
+        };
+        put(&root, "runtime/pnpm.env", pins.as_bytes());
     }
     seal(&root, version);
     root
@@ -2024,10 +2027,24 @@ fn successful_sync(line: &str, path: &str) -> bool {
         && line.contains(&format!("<{path}>)"))
         && line.trim_end().ends_with("= 0")
 }
+fn successful_unlink(line: &str, path: &str) -> bool {
+    (line.contains("unlink(") || line.contains("unlinkat("))
+        && line.contains(&format!("\"{path}\""))
+        && line.trim_end().ends_with("= 0")
+}
+fn successful_rmdir(line: &str, path: &str) -> bool {
+    (line.contains(&format!("rmdir(\"{path}\")"))
+        || (line.contains("unlinkat(")
+            && line.contains(&format!("\"{path}\""))
+            && line.contains("AT_REMOVEDIR")))
+        && line.trim_end().ends_with("= 0")
+}
 fn assert_durable_transaction_trace(trace: &str) {
     let lines = trace.lines().collect::<Vec<_>>();
-    let rename = regex::Regex::new(r#"rename\("([^"]+)", "([^"]+)"\)\s+= 0"#).unwrap();
-    let mkdir = regex::Regex::new(r#"mkdir\("([^"]+)", [0-7]+\)\s+= 0"#).unwrap();
+    let rename = regex::Regex::new(r#"rename(?:at2?)?\((?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)", (?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)"(?:, [^)]*)?\)\s+= 0"#).unwrap();
+    let mkdir =
+        regex::Regex::new(r#"mkdir(?:at)?\((?:AT_FDCWD(?:<[^>]+>)?, )?"([^"]+)", [0-7]+\)\s+= 0"#)
+            .unwrap();
     let publications = lines
         .iter()
         .enumerate()
@@ -2092,9 +2109,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             .iter()
             .enumerate()
             .skip(published + 1)
-            .find(|(_, line)| {
-                line.contains(&format!("unlink(\"{pending}\")")) && line.trim_end().ends_with("= 0")
-            })
+            .find(|(_, line)| successful_unlink(line, &pending))
             .map(|(i, _)| i)
             .expect("Pending marker was not removed");
         let discarded = lines
@@ -2130,10 +2145,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             let deleted = format!("{devkit}/runtime/obsolete-helper.sh");
             let deletion = lines[published + 1..manifest]
                 .iter()
-                .position(|line| {
-                    line.contains(&format!("unlink(\"{deleted}\")"))
-                        && line.trim_end().ends_with("= 0")
-                })
+                .position(|line| successful_unlink(line, &deleted))
                 .map(|i| i + published + 1)
                 .expect("Expected managed deletion before manifest");
             assert!(
@@ -2145,10 +2157,7 @@ fn assert_durable_transaction_trace(trace: &str) {
             let licenses = format!("{devkit}/runtime/licenses");
             let removed = lines[published + 1..manifest]
                 .iter()
-                .position(|line| {
-                    line.contains(&format!("rmdir(\"{licenses}\")"))
-                        && line.trim_end().ends_with("= 0")
-                })
+                .position(|line| successful_rmdir(line, &licenses))
                 .map(|i| i + published + 1)
                 .expect("Expected empty licenses directory removal before manifest");
             assert!(
@@ -2182,16 +2191,14 @@ fn assert_durable_transaction_trace(trace: &str) {
 fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
     let f = TempDir::new().unwrap();
     let trace = f.path().join("durability.trace");
+    // AArch64 implements the *at syscall family and has no mkdir/rename/unlink opcodes.
+    let calls = if cfg!(target_arch = "aarch64") {
+        "trace=mkdirat,renameat,renameat2,fsync,fdatasync,unlinkat"
+    } else {
+        "trace=mkdir,mkdirat,rename,renameat,renameat2,fsync,fdatasync,unlink,unlinkat,rmdir"
+    };
     let status = Command::new("strace")
-        .args([
-            "-f",
-            "-yy",
-            "-s",
-            "4096",
-            "-e",
-            "trace=mkdir,mkdirat,rename,renameat,renameat2,fsync,fdatasync,unlink,unlinkat,rmdir",
-            "-o",
-        ])
+        .args(["-f", "-yy", "-s", "4096", "-e", calls, "-o"])
         .arg(&trace)
         .arg(std::env::current_exe().unwrap())
         .args([
@@ -2209,6 +2216,32 @@ fn linux_strace_checks_actual_commit_and_recovery_durability_order() {
         fs::write(output, &bytes).unwrap();
     }
     assert_durable_transaction_trace(std::str::from_utf8(&bytes).unwrap());
+}
+
+#[test]
+fn durability_trace_recognizes_both_x86_rmdir_and_aarch64_unlinkat_removedir() {
+    let dir = "/tmp/checkout/.devkit/runtime/licenses";
+    assert!(successful_rmdir(&format!("15 rmdir(\"{dir}\") = 0"), dir));
+    assert!(successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD</tmp>, \"{dir}\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", 0) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}/file\", AT_REMOVEDIR) = 0"),
+        dir
+    ));
+    assert!(!successful_rmdir(
+        &format!("15 unlinkat(AT_FDCWD, \"{dir}\", AT_REMOVEDIR) = -1 ENOTEMPTY"),
+        dir
+    ));
 }
 
 // Ports of the source scenarios retained when the former TS factory was removed.
@@ -3403,6 +3436,7 @@ fn umask_worktree_modes_and_transient_sockets_pass_admission_and_sync_without_ch
     .unwrap();
     assert!(!preview.no_op);
     assert!(!preview.applied);
+    assert!(preview.files.iter().any(|f| f.path == "pnpm-lock.yaml"));
     assert!(
         !preview
             .files
@@ -3428,8 +3462,8 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
     for (label, manifest_val) in [
         ("schema1", json!({"schemaVersion": 1, "version": "0.1.0"})),
         ("v021", json!({"schemaVersion": 2, "version": "0.2.1"})),
-        ("v041", json!({"schemaVersion": 2, "version": "0.4.1"})),
         ("v032", json!({"schemaVersion": 2, "version": "0.3.2"})),
+        ("v041", json!({"schemaVersion": 2, "version": "0.4.1"})),
     ] {
         let proj = temp.path().join(label);
         fs::create_dir_all(proj.join(".devkit")).unwrap();

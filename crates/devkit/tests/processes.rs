@@ -14,6 +14,41 @@ use std::{
 use tempfile::TempDir;
 
 const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+fn process_exists(pid: i32) -> bool {
+    assert!(pid > 1);
+    // A zombie also counts: the runner must reap children before returning.
+    unsafe {
+        libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+fn descendant_stopped(pid: i32) -> bool {
+    if !process_exists(pid) {
+        return true;
+    }
+    // launchd may still be collecting an orphan. Its zombie is terminal.
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = size_of::<libc::proc_bsdinfo>() as i32;
+        if unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        } == size
+        {
+            return unsafe { info.assume_init() }.pbi_status == libc::SZOMB;
+        }
+        !process_exists(pid)
+    }
+    #[cfg(target_os = "linux")]
+    false
+}
+
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -152,8 +187,81 @@ fn native_process_probe() {
     let Ok(scenario) = std::env::var("DEVKIT_PROCESS_PROBE") else {
         return;
     };
+    #[cfg(target_os = "macos")]
+    if scenario == "no-waitable-children" {
+        assert_ne!(
+            unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) },
+            libc::SIG_ERR
+        );
+        let runner = ProcessRunner::new().unwrap();
+        let error = runner.capture(&mut Command::new("true")).err().unwrap();
+        assert!(format!("{error:#}").contains("waitable children"));
+        return;
+    }
     let runner = ProcessRunner::new().unwrap();
     let owned = OwnedContainer::new("devkit-process-test".into(), "accepted-token".into());
+    if scenario.starts_with("metadata-") {
+        if scenario == "metadata-results" {
+            use devkit::processes::CpMetadata;
+            let budget = Duration::from_secs(2);
+            let CpMetadata::Header(bytes) = runner.cp_metadata(ID, "/file", budget).unwrap() else {
+                panic!("Expected the first tar header");
+            };
+            assert_eq!(*bytes, [0; 512]);
+            assert!(matches!(
+                runner.cp_metadata(ID, "/missing", budget).unwrap(),
+                CpMetadata::Missing
+            ));
+            assert!(runner.cp_metadata(ID, "/oversize", budget).is_err());
+            return;
+        }
+        if scenario == "metadata-cancelled" {
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            assert!(runner.check_cancelled().is_err());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            assert!(
+                runner
+                    .capture_before(&mut Command::new("true"), deadline)
+                    .is_err()
+            );
+            assert!(
+                runner
+                    .cp_metadata(ID, "/file", Duration::from_secs(2))
+                    .is_err()
+            );
+            runner
+                .capture_recovery_before(&mut Command::new("true"), deadline)
+                .unwrap();
+            assert!(
+                runner
+                    .inspection_snapshot(&owned, &Default::default(), deadline)
+                    .unwrap()
+                    .is_none()
+            );
+            return;
+        }
+        for operation in ["capture", "recovery", "snapshot", "cp"] {
+            let timeout = Duration::from_millis(300);
+            let start = Instant::now();
+            let deadline = start + timeout;
+            let mut command = Command::new("docker");
+            let error = match operation {
+                "capture" => runner.capture_before(&mut command, deadline).err(),
+                "recovery" => runner.capture_recovery_before(&mut command, deadline).err(),
+                "snapshot" => runner
+                    .inspection_snapshot(&owned, &Default::default(), deadline)
+                    .err(),
+                _ => runner.cp_metadata(ID, "/file", timeout).err(),
+            }
+            .expect("Stalled metadata query succeeded");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{operation} took {:?}: {error:#}",
+                start.elapsed()
+            );
+        }
+        return;
+    }
     let mut command = Command::new("sh");
     let source = match scenario.as_str() {
         "exit42" => "exit 42",
@@ -162,6 +270,7 @@ fn native_process_probe() {
         "foreign-cleanup" => "printf foreign-token > \"$DEVKIT_PROCESS_FIXTURE/container\"",
         "cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"",
         "primary-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 42",
+        "probe-cleanup-failed" => "touch \"$DEVKIT_PROCESS_FIXTURE/daemon-failed\"; exit 125",
         "wait-cancel" => {
             "sleep 25 & printf '%s' \"$!\" > \"$DEVKIT_PROCESS_FIXTURE/child-pid\"; touch \"$DEVKIT_PROCESS_FIXTURE/ready\"; wait"
         }
@@ -187,6 +296,8 @@ fn native_process_probe() {
             &owned,
             Duration::from_millis(300),
         )
+    } else if scenario == "probe-cleanup-failed" {
+        runner.run_owned_unchecked(&mut command, OutputMode::Inherit, &owned, None)
     } else {
         runner.run_owned(&mut command, OutputMode::Inherit, &owned)
     };
@@ -251,8 +362,8 @@ fn normal_creator_exit_reaps_children_holding_output_pipe() {
     assert!(before.elapsed() < Duration::from_secs(5));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "Creator child was not reaped"
+        descendant_stopped(pid.trim().parse().unwrap()),
+        "Creator descendant was still running"
     );
 }
 #[test]
@@ -261,6 +372,11 @@ fn native_failure_and_cleanup_failure_preserve_primary_exit() {
         ("exit42", 42, "exit 42"),
         ("cleanup-failed", 1, "Cannot verify cleanup"),
         ("primary-failed", 42, "daemon verification unavailable"),
+        (
+            "probe-cleanup-failed",
+            125,
+            "daemon verification unavailable",
+        ),
     ] {
         let fixture = Fixture::new();
         let output = wait(fixture.start(scenario));
@@ -326,7 +442,7 @@ fn cancellation_reaps_before_cleanup_and_never_reports_success() {
             }
             if let Ok(pid) = fs::read_to_string(fixture.root().join("child-pid")) {
                 assert!(
-                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    descendant_stopped(pid.trim().parse().unwrap()),
                     "Creator child survived {scenario}"
                 );
             }
@@ -345,7 +461,7 @@ fn deadlines_reap_the_creator_group_before_exact_owned_cleanup() {
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
         assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
+            descendant_stopped(pid.trim().parse().unwrap()),
             "Timed-out creator descendant survived"
         );
         if scenario == "timed-owned" {
@@ -396,22 +512,37 @@ fn bounded_plain_commands_preserve_native_exit_and_stop_ignored_term_children() 
     assert!(error.to_string().contains("exceeded its deadline"));
     assert!(started.elapsed() < Duration::from_secs(4));
     let pid = fs::read_to_string(fixture.root().join("child-pid")).unwrap();
-    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    assert!(descendant_stopped(pid.trim().parse().unwrap()));
 }
 
 #[test]
 fn stopped_creator_group_wakes_and_terminates_without_sigkill_delay() {
     let runner = ProcessRunner::new().unwrap();
+    let temp = TempDir::new().unwrap();
+    let continued = temp.path().join("continued");
     let started = Instant::now();
     let error = runner
         .checked_with_timeout(
-            Command::new("sh").args(["-c", "kill -STOP $$"]),
+            Command::new("sh")
+                .args([
+                    "-c",
+                    r#"trap '' TERM; trap 'echo continued > "$1"' CONT; kill -STOP "$$"; test -s "$1""#,
+                    "sh",
+                ])
+                .arg(&continued),
             OutputMode::Capture(4096),
             Duration::from_millis(100),
         )
         .err()
         .unwrap();
-    assert!(error.to_string().contains("exceeded its deadline"));
+    assert!(
+        error.to_string().contains("exceeded its deadline"),
+        "{error:#}"
+    );
+    assert!(
+        continued.is_file(),
+        "Stopped creator did not receive SIGCONT"
+    );
     assert!(
         started.elapsed() < Duration::from_millis(1500),
         "Stopped creator waited for SIGKILL instead of waking on SIGCONT: {:?}",
@@ -555,7 +686,7 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
             .parse()
             .unwrap();
         assert!(
-            Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            process_exists(devkit_pid),
             "devkit died prematurely on worker thread exit"
         );
         // SAFETY: parent is the live helper process spawned above.
@@ -563,8 +694,7 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
         let _ = parent.wait();
         let mut reaped_code = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (Path::new(&format!("/proc/{devkit_pid}")).exists()
-            || Path::new(&format!("/proc/{grandchild_pid}")).exists())
+        while (process_exists(devkit_pid) || process_exists(grandchild_pid))
             && Instant::now() < deadline
         {
             let mut status = 0;
@@ -584,11 +714,11 @@ fn worker_thread_exit_preserves_devkit_while_real_parent_death_cancels_and_clean
             );
         }
         assert!(
-            !Path::new(&format!("/proc/{devkit_pid}")).exists(),
+            !process_exists(devkit_pid),
             "devkit survived real parent SIGKILL: {devkit_err}"
         );
         assert!(
-            !Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+            !process_exists(grandchild_pid),
             "grandchild survived real parent SIGKILL: {devkit_err}"
         );
         assert!(
@@ -638,5 +768,77 @@ fn tracked_stdin_is_exact_bounded_and_has_a_terminal_receipt() {
                 &vec![0; 8 * 1024 * 1024 + 1]
             )
             .is_err()
+    );
+}
+
+#[test]
+fn metadata_reads_share_the_reap_deadline_and_stop_term_ignoring_descendants() {
+    let fixture = Fixture::new();
+    script(
+        &fixture.root().join("docker"),
+        r#"#!/bin/sh
+trap '' TERM
+sleep 25 &
+printf '%s\n%s\n' "$$" "$!" >> "$DEVKIT_PROCESS_FIXTURE/pids"
+wait
+"#,
+    );
+    let output = wait(fixture.start("metadata-stalled"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pids = fs::read_to_string(fixture.root().join("pids")).unwrap();
+    assert_eq!(pids.lines().count(), 8);
+    for pid in pids.lines() {
+        assert!(
+            descendant_stopped(pid.parse().unwrap()),
+            "Metadata process {pid} survived"
+        );
+    }
+}
+
+#[test]
+fn image_metadata_stops_at_the_first_header_and_bounds_diagnostics() {
+    let fixture = Fixture::new();
+    script(
+        &fixture.root().join("docker"),
+        r#"#!/bin/sh
+set -eu
+case "${2#*:}" in
+    /file) trap '' TERM; dd if=/dev/zero bs=512 count=1 2>/dev/null; exec sleep 25 ;;
+    /missing) printf 'Error response from daemon: Could not find the file /missing in container %s\n' "${2%%:*}" >&2; exit 1 ;;
+    /oversize) dd if=/dev/zero bs=8193 count=1 >&2 2>/dev/null; dd if=/dev/zero bs=512 count=1 2>/dev/null ;;
+esac
+"#,
+    );
+    let output = wait(fixture.start("metadata-results"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn recovery_observations_can_finish_after_cancellation() {
+    let output = wait(Fixture::new().start("metadata-cancelled"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn auto_reaping_controller_is_detected_before_group_creation() {
+    let fixture = Fixture::new();
+    let output = wait(fixture.start("no-waitable-children"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

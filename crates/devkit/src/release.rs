@@ -309,13 +309,18 @@ impl AdmittedRelease {
                 .with_context(|| format!("Missing release {name}"))?;
             ensure!(file.sha256 != empty, "Empty release {name}");
         }
-        let pins = crate::runtime::ReleaseToolPins::parse(&self.bytes("runtime/toolchains.env")?)?;
+        let pins = crate::runtime::ToolPins::parse_release(&self.bytes("runtime/toolchains.env")?)?;
         ensure!(
-            pins.engine.version == self.manifest.version,
+            pins.version == self.manifest.version,
             "Release toolchain version differs from manifest"
         );
         ensure!(
-            pins.desktop_recipe == self.manifest.files["runtime/desktop.Dockerfile"].sha256,
+            pins.desktop_recipe.as_deref()
+                == Some(
+                    self.manifest.files["runtime/desktop.Dockerfile"]
+                        .sha256
+                        .as_str()
+                ),
             "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
         );
         crate::projections::verify_release_tool_compose(&self.bytes("runtime/compose.tools.yaml")?)
@@ -386,19 +391,63 @@ pub fn import_npm_payload(source: &Path, target: &Path) -> Result<AdmittedReleas
         "Npm import destination must be empty"
     );
     fs::create_dir_all(target)?;
-    for (name, expected) in &manifest.files {
-        let bytes = fs::read(safe_path(&source, name)?)?;
+    #[cfg(target_os = "macos")]
+    {
+        for (name, expected) in &manifest.files {
+            let bytes = fs::read(safe_path(&source, name)?)?;
+            ensure!(
+                digest(&bytes) == expected.sha256,
+                "Npm payload changed during import: {name}"
+            );
+            write_staged_file(&safe_path(target, name)?, &bytes, expected.mode)?;
+        }
+        let bytes = fs::read(safe_path(&source, "release.json")?)?;
         ensure!(
-            digest(&bytes) == expected.sha256,
-            "Npm payload changed during import: {name}"
+            digest(&bytes) == identity,
+            "Npm manifest changed during import"
         );
-        write_atomic(&safe_path(target, name)?, &bytes, expected.mode)?;
+        write_staged_file(&safe_path(target, "release.json")?, &bytes, 0o644)?;
+        // One APFS F_FULLFSYNC barrier flushes the staged tree before callers
+        // publish it atomically.
+        sync_directory(target)?;
     }
-    let bytes = fs::read(safe_path(&source, "release.json")?)?;
-    ensure!(
-        digest(&bytes) == identity,
-        "Npm manifest changed during import"
-    );
-    write_atomic(&safe_path(target, "release.json")?, &bytes, 0o644)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        for (name, expected) in &manifest.files {
+            let bytes = fs::read(safe_path(&source, name)?)?;
+            ensure!(
+                digest(&bytes) == expected.sha256,
+                "Npm payload changed during import: {name}"
+            );
+            write_atomic(&safe_path(target, name)?, &bytes, expected.mode)?;
+        }
+        let bytes = fs::read(safe_path(&source, "release.json")?)?;
+        ensure!(
+            digest(&bytes) == identity,
+            "Npm manifest changed during import"
+        );
+        write_atomic(&safe_path(target, "release.json")?, &bytes, 0o644)?;
+    }
     admit_release(target)
+}
+
+#[cfg(target_os = "macos")]
+fn write_staged_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::{
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600)
+        .open(path)?;
+    output.write_all(bytes)?;
+    output.set_permissions(fs::Permissions::from_mode(mode))?;
+    flush_file_pages(&output)?;
+    Ok(())
 }

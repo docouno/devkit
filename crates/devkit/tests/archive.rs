@@ -120,6 +120,26 @@ fn traversal_extra_roots_duplicates_links_devices_and_noncanonical_modes_never_p
 }
 
 #[test]
+fn entries_and_implicit_directories_have_one_portable_spelling() {
+    let temp = TempDir::new().unwrap();
+    for (i, second) in ["pkg/readme", "pkg/src/b"].into_iter().enumerate() {
+        let first = ["pkg/Readme", "pkg/Src/a"][i];
+        let archive = temp.path().join(format!("{i}.tgz"));
+        write_archive(
+            &archive,
+            &[
+                (first, tar::EntryType::Regular, 0o644, b"a"),
+                (second, tar::EntryType::Regular, 0o644, b"b"),
+            ],
+        );
+        let out = temp.path().join("out");
+        let error = extract_archive(&archive, &out, "pkg").unwrap_err();
+        assert!(error.to_string().contains("Case-colliding"), "{error:#}");
+        assert!(!out.exists());
+    }
+}
+
+#[test]
 fn truncated_crc_and_trailing_tar_data_do_not_leave_partial_installations() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

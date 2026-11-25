@@ -13,74 +13,54 @@ inputs:
   index_sha256:
     required: true
     description: SHA256 of the original raw release index
-  artifact_suffix:
+  platform:
     required: true
-    description: Successful prepare attempt, retained on failed-only reruns
+    description: Native Linux daemon architecture (amd64 or arm64)
+  need_baseline:
+    required: true
+    description: Restore the genuine x86-64 baseline
+  frozen_set_artifact:
+    required: true
+    description: Exact successful assembly artifact name
+  controller_artifact:
+    required: true
+    description: Exact native producer controller artifact name
+  controller_sha256:
+    required: true
+    description: Expected native controller identity before execution
 runs:
   using: composite
   steps:
     - uses: ./.github/actions/setup-compose
     - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
       with:
-        name: devkit-frozen-set-${{ inputs.artifact_suffix }}
+        name: ${{ inputs.frozen_set_artifact }}
         path: .artifacts/frozen
     - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
       with:
-        name: devkit-release-controller-${{ inputs.artifact_suffix }}
+        name: ${{ inputs.controller_artifact }}
         path: .artifacts/release-ops
     - name: Verify identities and hydrate the original archive
       shell: bash
       env:
+        PLATFORM: ${{ inputs.platform }}
+        CONTROLLER_SHA256: ${{ inputs.controller_sha256 }}
         VERSION: ${{ inputs.version }}
         SOURCE_COMMIT: ${{ inputs.source_commit }}
         SOURCE_TREE: ${{ inputs.source_tree }}
         INDEX_SHA256: ${{ inputs.index_sha256 }}
       run: |
         set -euo pipefail
+        case "$PLATFORM:$(uname -m)" in amd64:x86_64|arm64:aarch64) ;; *) exit 1;; esac
+        test "$(sha256sum .artifacts/release-ops/devkit-release | cut -d ' ' -f 1)" = "$CONTROLLER_SHA256"
         test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
         test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
         test "$(sha256sum .artifacts/frozen/release-index.json | cut -d ' ' -f 1)" = "$INDEX_SHA256"
-        chmod 755 .artifacts/release-ops/devkit-release .artifacts/frozen/devkit-x86_64-unknown-linux-musl
+        chmod 755 .artifacts/release-ops/devkit-release
+        jq -er '.engines[]' .artifacts/frozen/release-index.json | while IFS= read -r engine; do
+          chmod 755 ".artifacts/frozen/$engine"
+        done
         .artifacts/release-ops/devkit-release hydrate --root "$PWD" --version "$VERSION" \
           --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" --build-set "$PWD/.artifacts/frozen"
-    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-      with:
-        path: .artifacts/baseline/v0.5.1/downloads
-        key: devkit-baseline-v0.5.1-c55c5b5e0457f5c9
-    - name: Preserve the genuine public baseline
-      shell: bash
-      run: |
-        set -euo pipefail
-        umask 022
-        mkdir -p .artifacts/baseline/v0.5.1/downloads
-        for asset in release-index.json devkit-0.5.1.tar.gz devkit-x86_64-unknown-linux-musl; do
-          if ! test -f ".artifacts/baseline/v0.5.1/downloads/$asset"; then
-            curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-              --max-time 180 --max-filesize 134217728 \
-              --output ".artifacts/baseline/v0.5.1/downloads/$asset" \
-              "https://github.com/docouno/devkit/releases/download/v0.5.1/$asset"
-          fi
-        done
-        (
-          cd .artifacts/baseline/v0.5.1/downloads
-          sha256sum --check <<'EOF'
-        c55c5b5e0457f5c934079a8bbce272545b1cdbc2b7da25061bd7a95d2780d08a  release-index.json
-        f8b8a3bf4aea83c932d667d1c8e08779c610ab6999b1144ad6d5fbc8b7cf8f1b  devkit-0.5.1.tar.gz
-        8388c1c2105b7f4b952277922ecb82747ab81d506a66d6d439258ae8196ef479  devkit-x86_64-unknown-linux-musl
-        EOF
-        )
-        cp -f .artifacts/baseline/v0.5.1/downloads/release-index.json .artifacts/baseline/v0.5.1/release-index.json
-        cp -f .artifacts/baseline/v0.5.1/downloads/devkit-0.5.1.tar.gz .artifacts/baseline/v0.5.1/devkit-0.5.1.tar.gz
-        cp -f .artifacts/baseline/v0.5.1/downloads/devkit-x86_64-unknown-linux-musl .artifacts/baseline/v0.5.1/devkit-x86_64-unknown-linux-musl
-        chmod 755 .artifacts/baseline/v0.5.1/devkit-x86_64-unknown-linux-musl
-        rm -rf .artifacts/baseline/v0.5.1/payload
-        mkdir -p .artifacts/baseline/v0.5.1/payload
-        tar --extract --gzip --strip-components=1 --file .artifacts/baseline/v0.5.1/devkit-0.5.1.tar.gz --directory .artifacts/baseline/v0.5.1/payload
-        chmod 755 .artifacts/baseline/v0.5.1/payload/devkit
-        (
-          cd .artifacts/baseline/v0.5.1/payload
-          sha256sum --check <<'EOF'
-        870146c4055749dd0e4555e49605c3dcd697444f481ef197ff043796c33df74c  release.json
-        8388c1c2105b7f4b952277922ecb82747ab81d506a66d6d439258ae8196ef479  devkit
-        EOF
-        )
+    - uses: ./.github/actions/restore-baseline
+      if: inputs.need_baseline == 'true'

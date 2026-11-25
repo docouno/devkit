@@ -364,12 +364,18 @@ class Gate:
         expected_version = BASELINE_VERSION if side == "baseline" else self.receipt["version"]
         require(state["version"] == expected_version and len(state["components"]) == count,
                 "Factory did not create the intended accepted component matrix")
+        rust_receipt = root / ".devkit/state/rust-image.json"
+        rust_image_id = (
+            json.loads(rust_receipt.read_text())["imageId"]
+            if rust_receipt.is_file()
+            else (root / ".devkit/state/rust-image").read_text().strip()
+        )
         item = {"shape": shape, "side": side, "root": str(root), "componentCount": count,
                 "localTransitiveCrates": closure, "version": state["version"],
                 "releaseIdentity": state["releaseIdentity"], "inputSnapshotSha256": digest(before),
                 "inputFiles": sum(value[0] == "file" for value in before.values()),
                 "inputBytes": sum(value[3] for value in before.values() if value[0] == "file"),
-                "rustImageId": (root / ".devkit/state/rust-image").read_text().strip(),
+                "rustImageId": rust_image_id,
                 "productInputSha256": digest(self.product_inputs(root)),
                 "sourceUnchanged": True}
         atomic_json(self.logs / f"inputs-{shape}-{side}.json", before)

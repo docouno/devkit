@@ -29,6 +29,7 @@ fn release_notes_select_only_the_requested_version() {
 fn release_body_uses_changelog_and_collapses_only_verification() {
     let f = Fixture::native_update();
     let body = f.contract.body().unwrap();
+    assert!(body.contains("Run the same checkout on Linux x86-64 and Linux ARM64"));
     assert!(body.contains("Move registered Rust components into one virtual root Cargo workspace"));
     assert!(!body.contains("Compare Git-tracked managed files"));
     assert_eq!(Contract::from_body(&body).unwrap(), f.contract);
@@ -47,6 +48,12 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
     assert!(
         details
             > saved
+                .find("Run the same checkout on Linux x86-64 and Linux ARM64")
+                .unwrap()
+    );
+    assert!(
+        details
+            > saved
                 .find("Move registered Rust components into one virtual root Cargo workspace")
                 .unwrap()
     );
@@ -59,6 +66,36 @@ fn release_body_uses_changelog_and_collapses_only_verification() {
         );
     }
     assert_eq!(read_proof(&remote).index_sha256, proof.index_sha256);
+}
+
+fn seal_checksums(root: &Path, files: &mut BTreeMap<String, devkit::distribution::AssetIdentity>) {
+    let bytes = checksums(files);
+    fs::write(root.join("checksums.txt"), &bytes).unwrap();
+    files.insert(
+        "checksums.txt".into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(bytes.as_bytes()),
+            size: bytes.len() as u64,
+        },
+    );
+}
+
+fn elf_fixture(machine: u16) -> Vec<u8> {
+    // A format fixture with one executable PT_LOAD segment. It is never run.
+    let mut b = vec![0; 120];
+    b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    b[16..18].copy_from_slice(&2u16.to_le_bytes());
+    b[18..20].copy_from_slice(&machine.to_le_bytes());
+    b[20] = 1;
+    b[32] = 64;
+    b[52] = 64;
+    b[54] = 56;
+    b[56] = 1;
+    b[64] = 1;
+    b[68] = 5;
+    b[96] = 120;
+    b[104] = 120;
+    b
 }
 
 struct Fixture {
@@ -80,27 +117,148 @@ impl Fixture {
     }
     fn with_version(version: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let mut files = BTreeMap::new();
-        for name in [
-            "devkit-x86_64-unknown-linux-musl".to_owned(),
-            format!("devkit-{version}.tar.gz"),
-            "release.json".into(),
-            "install.sh".into(),
-            "bootstrap.sh".into(),
-            "checksums.txt".into(),
-            format!("docouno-env-{version}.tgz"),
-            format!("docouno-devkit-{version}.tgz"),
+        let root = directory.path();
+        let stage = tempfile::tempdir().unwrap();
+        let payload = stage.path().join("payload");
+        let targets = REQUIRED_PUBLISHABLE_TARGETS;
+        let mut hashes = BTreeMap::new();
+        for (target, machine) in [
+            (devkit::distribution::Target::LinuxX64, 62),
+            (devkit::distribution::Target::LinuxArm64, 183),
         ] {
-            let bytes = format!("frozen {name}");
-            fs::write(directory.path().join(&name), &bytes).unwrap();
+            let bytes = elf_fixture(machine);
+            files::write_atomic(&root.join(target.asset()), &bytes, 0o755).unwrap();
+            files::write_atomic(&payload.join(target.payload_name()), &bytes, 0o755).unwrap();
+            hashes.insert(target.triple().to_string(), digest(&bytes));
+        }
+        let legacy = devkit::distribution::TARGET;
+        let triples = targets
+            .iter()
+            .map(|t| t.triple())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut pins = format!(
+            "DEVKIT_VERSION={version}\nDEVKIT_NODE_IMAGE=node:24@sha256:{}\nDEVKIT_NODE_VERSION=24.13.1\nDEVKIT_RUST_VERSION=1.99.1\nDEVKIT_RUST_RECIPE_HASH={}\nDEVKIT_DESKTOP_RECIPE_HASH={}\nDEVKIT_ENGINE_TARGET={legacy}\nDEVKIT_ENGINE_SHA256={}\nDEVKIT_ENGINE_TARGETS={triples}\n",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            hashes[legacy]
+        );
+        for target in targets {
+            pins.push_str(&format!(
+                "DEVKIT_ENGINE_SHA256_{}={}\n",
+                target.key_suffix(),
+                hashes[target.triple()]
+            ));
+        }
+        files::write_atomic(
+            &payload.join("runtime/toolchains.env"),
+            pins.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        let pnpm_x64 = devkit::runtime::PnpmPin {
+            package: devkit::distribution::Target::LinuxX64
+                .pnpm_package()
+                .unwrap()
+                .into(),
+            version: "10.30.3".into(),
+            tarball_sha256: "4".repeat(64),
+            binary_sha256: "5".repeat(64),
+        };
+        let mut pnpm_env = pnpm_x64.encode();
+        pnpm_env.push_str(&format!(
+            "DEVKIT_PNPM_TARGETS={},{}\n",
+            devkit::distribution::Target::LinuxX64.triple(),
+            devkit::distribution::Target::LinuxArm64.triple(),
+        ));
+        for target in devkit::distribution::Target::LINUX {
+            let suffix = target.key_suffix();
+            let pkg = target.pnpm_package().unwrap();
+            pnpm_env.push_str(&format!(
+                "DEVKIT_PNPM_PACKAGE_{suffix}={pkg}\nDEVKIT_PNPM_TARBALL_SHA256_{suffix}={}\nDEVKIT_PNPM_SHA256_{suffix}={}\n",
+                "4".repeat(64),
+                "5".repeat(64),
+            ));
+        }
+        files::write_atomic(
+            &payload.join("runtime/pnpm.env"),
+            pnpm_env.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        for (file, rendered) in [
+            (
+                "bin/devkit",
+                devkit::delivery::render_npm_launcher(&hashes).unwrap(),
+            ),
+            (
+                "runtime/devkit.sh",
+                devkit::delivery::render_project_loader_pins(version, &hashes).unwrap(),
+            ),
+        ] {
+            files::write_atomic(&payload.join(file), rendered.as_bytes(), 0o755).unwrap();
+        }
+        let bootstrap = devkit::delivery::render_bootstrap_pins(version, &hashes).unwrap();
+        for file in ["install.sh", "bootstrap.sh"] {
+            fs::write(root.join(file), &bootstrap).unwrap();
+        }
+        let package = json!({"name":CLI,"version":version,"bin":{"devkit":"bin/devkit"},"os":["linux"],"cpu":["x64","arm64"]});
+        files::write_json(&payload.join("package.json"), &package).unwrap();
+        let environment_source = stage.path().join("environment");
+        files::write_json(
+            &environment_source.join("package.json"),
+            &json!({"name": ENVIRONMENT, "version": version}),
+        )
+        .unwrap();
+        let env_archive = format!("docouno-env-{version}.tgz");
+        archive::create_archive(&environment_source, "package", &root.join(&env_archive)).unwrap();
+        let environment = fs::read(root.join(&env_archive)).unwrap();
+        files::write_atomic(&payload.join("npm/env.tgz"), &environment, 0o644).unwrap();
+        files::write_json(
+            &payload.join("release.json"),
+            &devkit::model::Release {
+                schema_version: 1,
+                version: version.into(),
+                min_supported_from_version: None,
+                rust_version: "1.99.1".into(),
+                environment: devkit::model::Environment {
+                    name: ENVIRONMENT.into(),
+                    version: version.into(),
+                    archive: "npm/env.tgz".into(),
+                    integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(&environment))),
+                },
+                files: files::file_map(&payload).unwrap(),
+                migrations: Vec::new(),
+            },
+        )
+        .unwrap();
+        fs::copy(payload.join("release.json"), root.join("release.json")).unwrap();
+        archive::create_archive(
+            &payload,
+            &format!("devkit-{version}"),
+            &root.join(format!("devkit-{version}.tar.gz")),
+        )
+        .unwrap();
+        archive::create_archive(
+            &payload,
+            "package",
+            &root.join(format!("docouno-devkit-{version}.tgz")),
+        )
+        .unwrap();
+        let mut files = BTreeMap::new();
+        for item in fs::read_dir(root).unwrap() {
+            let item = item.unwrap();
+            let bytes = fs::read(item.path()).unwrap();
             files.insert(
-                name,
+                item.file_name().into_string().unwrap(),
                 devkit::distribution::AssetIdentity {
-                    sha256: digest(bytes.as_bytes()),
+                    sha256: digest(&bytes),
                     size: bytes.len() as u64,
                 },
             );
         }
+        seal_checksums(directory.path(), &mut files);
         let mut packages = BTreeMap::new();
         for (kind, name, archive) in [
             (
@@ -132,6 +290,12 @@ impl Fixture {
             publication_eligible: true,
             release_identity: files["release.json"].sha256.clone(),
             engine: "devkit-x86_64-unknown-linux-musl".into(),
+            engines: Some(
+                REQUIRED_PUBLISHABLE_TARGETS
+                    .iter()
+                    .map(|t| (t.triple().into(), t.asset().into()))
+                    .collect(),
+            ),
             archive: format!("devkit-{version}.tar.gz"),
             packages,
             files,
@@ -169,6 +333,147 @@ impl Fixture {
             selector_reads: std::collections::VecDeque::new(),
             latest_read_elapsed: BTreeMap::new(),
         }
+    }
+}
+
+#[test]
+fn release_controller_requires_the_complete_engine_matrix_and_its_checksum_listing() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.path();
+    let index = fixture.set().index;
+    let mut incomplete = index.clone();
+    incomplete
+        .engines
+        .as_mut()
+        .unwrap()
+        .remove(devkit::distribution::Target::LinuxArm64.triple());
+    files::write_json(&root.join("release-index.json"), &incomplete).unwrap();
+    assert!(FrozenSet::load(root).is_err());
+    let mut inconsistent = index;
+    let old = fs::read_to_string(root.join("checksums.txt")).unwrap();
+    let partial = old
+        .lines()
+        .filter(|line| !line.ends_with(devkit::distribution::Target::LinuxArm64.asset()))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(root.join("checksums.txt"), &partial).unwrap();
+    inconsistent.files.insert(
+        "checksums.txt".into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(partial.as_bytes()),
+            size: partial.len() as u64,
+        },
+    );
+    files::write_json(&root.join("release-index.json"), &inconsistent).unwrap();
+    let err = FrozenSet::load(root)
+        .err()
+        .expect("missing checksum must fail admission");
+    assert!(err.to_string().contains("checksums.txt differs"));
+}
+
+#[test]
+fn frozen_archives_must_agree_even_with_an_existing_valid_payload() {
+    let other_fixture = Fixture::native_update();
+    let other = other_fixture.set();
+    for name in ["archive", "cli", "environment"] {
+        let fixture = Fixture::new();
+        let root = fixture.directory.path();
+        fixture.set().hydrate().unwrap();
+        let mut index = fixture.set().index;
+        let (asset, bytes) = if name == "archive" {
+            (
+                index.archive.clone(),
+                other.asset_bytes(&other.index.archive).unwrap(),
+            )
+        } else {
+            let package = index.packages.get_mut(name).unwrap();
+            let replacement = &other.index.packages[name];
+            package.integrity = replacement.integrity.clone();
+            package.shasum = replacement.shasum.clone();
+            (
+                package.archive.clone(),
+                other.asset_bytes(&replacement.archive).unwrap(),
+            )
+        };
+        fs::write(root.join(&asset), &bytes).unwrap();
+        index.files.insert(
+            asset.clone(),
+            devkit::distribution::AssetIdentity {
+                size: bytes.len() as u64,
+                sha256: digest(&bytes),
+            },
+        );
+        seal_checksums(root, &mut index.files);
+        files::write_json(&root.join("release-index.json"), &index).unwrap();
+        assert!(
+            FrozenSet::load(root).unwrap().hydrate().is_err(),
+            "accepted inconsistent {asset}"
+        );
+    }
+}
+
+#[test]
+fn frozen_payload_and_npm_cannot_enable_an_unpublished_target() {
+    for change in ["engine", "pin", "os", "cpu", "bin", "launcher"] {
+        let fixture = Fixture::new();
+        let set = fixture.set();
+        let work = tempfile::tempdir().unwrap();
+        let payload = work.path().join("payload");
+        archive::extract_archive(&set.root.join(&set.index.archive), &payload, "devkit-0.3.0")
+            .unwrap();
+        let extra_triple = "riscv64gc-unknown-linux-musl";
+        let extra_asset = "devkit-riscv64gc-unknown-linux-musl";
+        let extra_suffix = "RISCV64GC_UNKNOWN_LINUX_MUSL";
+        match change {
+            "engine" => files::write_atomic(&payload.join(extra_asset), b"preview", 0o755).unwrap(),
+            "pin" => {
+                let path = payload.join("runtime/toolchains.env");
+                let pins = fs::read_to_string(&path).unwrap().replace(
+                    "musl\nDEVKIT_ENGINE_SHA256_X86",
+                    &format!("musl,{extra_triple}\nDEVKIT_ENGINE_SHA256_X86"),
+                );
+                fs::write(
+                    path,
+                    format!(
+                        "{pins}DEVKIT_ENGINE_SHA256_{extra_suffix}={}\n",
+                        "a".repeat(64)
+                    ),
+                )
+                .unwrap();
+            }
+            "os" | "cpu" | "bin" => {
+                let path = payload.join("package.json");
+                let mut package: Value = files::read_json(&path).unwrap();
+                package[change] = match change {
+                    "os" => json!(["linux", "freebsd"]),
+                    "cpu" => json!(["x64"]),
+                    _ => json!({"devkit": "devkit"}),
+                };
+                files::write_json(&path, &package).unwrap();
+            }
+            "launcher" => fs::write(payload.join("bin/devkit"), b"other launcher").unwrap(),
+            _ => unreachable!(),
+        }
+        let manifest_path = payload.join("release.json");
+        let mut manifest: devkit::model::Release = files::read_json(&manifest_path).unwrap();
+        manifest.files = files::file_map(&payload).unwrap();
+        manifest.files.remove("release.json");
+        files::write_json(&manifest_path, &manifest).unwrap();
+        let admitted = devkit::release::admit_release(&payload).unwrap();
+        let err = set
+            .verify_payload_matrix(&admitted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(match change {
+                "engine" => "engine target matrix",
+                "pin" => "engine pins differ",
+                "launcher" => "bin/devkit differs",
+                _ => "npm platforms or bin",
+            }),
+            "{change}: {err}"
+        );
     }
 }
 
@@ -216,60 +521,12 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
     ]);
     let commit = git(&["rev-parse", "HEAD"]);
     let tree = git(&["rev-parse", "HEAD^{tree}"]);
-    let payload_source = tempfile::tempdir().unwrap();
-    let environment = b"fixture environment archive";
-    files::write_atomic(
-        &payload_source.path().join("npm/env.tgz"),
-        environment,
-        0o644,
-    )
-    .unwrap();
-    files::write_json(
-        &payload_source.path().join("release.json"),
-        &devkit::model::Release {
-            schema_version: 1,
-            version: "0.3.0".into(),
-            min_supported_from_version: None,
-            rust_version: "1.99.1".into(),
-            environment: devkit::model::Environment {
-                name: ENVIRONMENT.into(),
-                version: "0.3.0".into(),
-                archive: "npm/env.tgz".into(),
-                integrity: format!("sha512-{}", STANDARD.encode(Sha512::digest(environment))),
-            },
-            files: files::file_map(payload_source.path()).unwrap(),
-            migrations: Vec::new(),
-        },
-    )
-    .unwrap();
     let set_root = fixture.directory.path();
-    fs::copy(
-        payload_source.path().join("release.json"),
-        set_root.join("release.json"),
-    )
-    .unwrap();
-    fs::remove_file(set_root.join("devkit-0.3.0.tar.gz")).unwrap();
-    archive::create_archive(
-        payload_source.path(),
-        "devkit-0.3.0",
-        &set_root.join("devkit-0.3.0.tar.gz"),
-    )
-    .unwrap();
+    let environment = fs::read(set_root.join("docouno-env-0.3.0.tgz")).unwrap();
     let mut index: ReleaseIndex = files::read_json(&set_root.join("release-index.json")).unwrap();
     index.source_commit = commit.clone();
     index.source_tree = tree.clone();
     index.build_run = "https://github.com/example/fork/actions/runs/456/attempts/2".into();
-    for name in ["release.json", "devkit-0.3.0.tar.gz"] {
-        let bytes = fs::read(set_root.join(name)).unwrap();
-        index.files.insert(
-            name.into(),
-            devkit::distribution::AssetIdentity {
-                sha256: digest(&bytes),
-                size: bytes.len() as u64,
-            },
-        );
-    }
-    index.release_identity = index.files["release.json"].sha256.clone();
     files::write_json(&set_root.join("release-index.json"), &index).unwrap();
     let mut args = Args {
         command: "hydrate".into(),
@@ -296,6 +553,33 @@ fn fork_run_hydrates_exact_bytes_without_acquiring_publication_authority() {
             .identity,
         index.release_identity
     );
+    // A self-consistent raw asset set must still match the bytes in the accepted payload.
+    let arm = devkit::distribution::Target::LinuxArm64.asset();
+    let original = fs::read(set_root.join(arm)).unwrap();
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"other build");
+    fs::write(set_root.join(arm), &changed).unwrap();
+    let mut mismatched = index.clone();
+    mismatched.files.insert(
+        arm.into(),
+        devkit::distribution::AssetIdentity {
+            sha256: digest(&changed),
+            size: changed.len() as u64,
+        },
+    );
+    seal_checksums(set_root, &mut mismatched.files);
+    files::write_json(&set_root.join("release-index.json"), &mismatched).unwrap();
+    assert!(
+        FrozenSet::load(set_root)
+            .unwrap()
+            .hydrate()
+            .unwrap_err()
+            .to_string()
+            .contains("Hydrated engine differs")
+    );
+    fs::write(set_root.join(arm), original).unwrap();
+    seal_checksums(set_root, &mut index.files);
+    files::write_json(&set_root.join("release-index.json"), &index).unwrap();
     for (field, wrong) in [
         ("--version", "0.4.0"),
         ("--source-commit", &"c".repeat(40)),
@@ -519,7 +803,11 @@ impl Remote for Fake {
     }
     fn publish_npm(&mut self, path: &Path, tag: &str) -> Result<()> {
         ensure!(
-            self.assets.len() == 9 && self.assets.contains_key("release-index.json"),
+            self.assets.len() == 8 + REQUIRED_PUBLISHABLE_TARGETS.len()
+                && self.assets.contains_key("release-index.json")
+                && REQUIRED_PUBLISHABLE_TARGETS
+                    .iter()
+                    .all(|t| self.assets.contains_key(t.asset())),
             "Registry write before complete durable GitHub staging"
         );
         ensure!(
@@ -640,11 +928,12 @@ impl Remote for Fake {
 #[test]
 fn lost_upload_response_resumes_without_overwriting_any_original_bytes() {
     let f = Fixture::new();
+    let set = f.set();
     let mut remote = f.remote();
     remote.fault = Some("upload:checksums.txt".into());
-    assert!(stage(&mut remote, &f.set(), &f.contract).is_err());
+    assert!(stage(&mut remote, &set, &f.contract).is_err());
     let first = remote.assets["checksums.txt"].clone();
-    stage(&mut remote, &f.set(), &f.contract).unwrap();
+    stage(&mut remote, &set, &f.contract).unwrap();
     assert_eq!(remote.assets["checksums.txt"], first);
     assert_eq!(
         remote
@@ -654,7 +943,7 @@ fn lost_upload_response_resumes_without_overwriting_any_original_bytes() {
             .count(),
         1
     );
-    assert_eq!(remote.assets.len(), 9);
+    assert_eq!(remote.assets.len(), set.asset_names().len());
 }
 
 #[test]

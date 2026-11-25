@@ -238,23 +238,38 @@ fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
         );
         return;
     }
-    let pages = fs::read_to_string("/proc/self/statm")
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
-    // SAFETY: the isolated worker lowers only its own address-space limit;
-    // sparse rejected inputs must never allocate their declared GiB size.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    let maximum = pages * page_size + 96 * 1024 * 1024;
-    let limit = libc::rlimit {
-        rlim_cur: maximum,
-        rlim_max: maximum,
+    #[cfg(target_os = "linux")]
+    {
+        let pages = fs::read_to_string("/proc/self/statm")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        // SAFETY: the isolated worker lowers only its own address-space limit;
+        // sparse rejected inputs must never allocate their declared GiB size.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let maximum = pages * page_size + 96 * 1024 * 1024;
+        let limit = libc::rlimit {
+            rlim_cur: maximum,
+            rlim_max: maximum,
+        };
+        // SAFETY: a live rlimit pointer and this disposable worker process only.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+    }
+    #[cfg(target_os = "macos")]
+    let peak = || {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0
+        );
+        // Darwin reports the resident high-water mark in bytes.
+        unsafe { usage.assume_init().ru_maxrss }
     };
-    // SAFETY: a live rlimit pointer and this disposable worker process only.
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+    #[cfg(target_os = "macos")]
+    let initial_peak = peak();
     let temporary = TempDir::new().unwrap();
     let root = temporary.path();
     let mut state = state(&[("apps/main", "node")]);
@@ -418,6 +433,11 @@ fn pnpm_yaml_budget_precedes_native_admission_and_identity_rechecks() {
     write_json(&project.join(devkit::state::PENDING_PATH), &tx.journal).unwrap();
     assert!(devkit::transaction::recover_project(&project).unwrap());
     devkit::project::AdmissionSnapshot::capture(&project).unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(
+        peak() - initial_peak < 96 * 1024 * 1024,
+        "Sparse input exceeded resident memory budget"
+    );
 }
 
 #[test]

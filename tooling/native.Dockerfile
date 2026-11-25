@@ -6,8 +6,10 @@ RUN apt-get update \
         binutils ca-certificates file git musl-tools strace \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add --toolchain 1.99.1 x86_64-unknown-linux-musl \
-    && rustup component add --toolchain 1.99.1 rustfmt clippy
+RUN rustup target add --toolchain 1.99.1 "$(uname -m)-unknown-linux-musl" \
+    && rustup component add --toolchain 1.99.1 rustfmt clippy \
+    && test -s "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+    && test -d "$(rustc --print sysroot)/share/doc/rust/licenses"
 
 ENV CARGO_BUILD_JOBS=1 \
     RUSTUP_AUTO_INSTALL=0

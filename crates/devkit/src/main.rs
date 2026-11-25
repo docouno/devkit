@@ -1,9 +1,19 @@
 fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    let handoff = {
+        let value = std::env::var_os(devkit::processes::PARENT_HANDOFF);
+        // SAFETY: process entry, before signals, threads or native libraries are initialized.
+        unsafe { std::env::remove_var(devkit::processes::PARENT_HANDOFF) };
+        value
+    };
     let json = devkit::cli::wants_json(&args);
     let command = devkit::cli::command_label(&args);
     let result = (|| -> devkit::Result<()> {
         let runner = devkit::processes::ProcessRunner::new()?;
+        #[cfg(target_os = "macos")]
+        devkit::processes::watch_cli_parent(&runner, handoff.as_deref())?;
+        #[cfg(target_os = "linux")]
         devkit::processes::watch_parent(&runner)?;
         let result = devkit::cli::main(args, &runner);
         if result.as_ref().err().is_some_and(|e| {

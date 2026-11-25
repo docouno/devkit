@@ -12,14 +12,16 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "test"))
+from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, payload_name  # noqa: E402
 BASE = "https://github.com/docouno/devkit/releases/download"
-TARGET = "x86_64-unknown-linux-musl"
 VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-z0-9][a-z0-9.-]*)?")
 STABLE_VERSION = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 HEX256 = re.compile(r"[a-f0-9]{64}")
@@ -195,7 +197,7 @@ def main():
                     "Genuine v0.5.1 baseline release-index.json SHA256 changed")
         old_index = json.loads(raw_old_index)
         require(old_index["schemaVersion"] == 1 and old_index["version"] == old
-                and old_index["target"] == TARGET and old_index["publicationEligible"] is True,
+                and old_index["target"] == LINUX_X64 and old_index["publicationEligible"] is True,
                 "Public baseline is not a publication-eligible native build-set")
         if old == "0.5.1":
             require(old_index["releaseIdentity"] == BASELINE_051_RELEASE_IDENTITY,
@@ -232,7 +234,7 @@ def main():
         require(sha256(raw_index) == args.expected_index_sha256, "Public index differs from frozen build-set")
         index = json.loads(raw_index)
         require(index["schemaVersion"] == 1 and index["version"] == target
-                and index["target"] == TARGET and index["publicationEligible"] is True,
+                and index["target"] == LINUX_X64 and index["publicationEligible"] is True,
                 "Public target is not a publication-eligible native build-set")
         require(re.fullmatch(r"[a-f0-9]{40}", index["sourceCommit"])
                 and re.fullmatch(r"[a-f0-9]{40}", index["sourceTree"])
@@ -250,7 +252,7 @@ def main():
                     f"Public asset differs from frozen index: {name}")
             assets[name] = data
         archive_name = f"devkit-{target}.tar.gz"
-        require(index["archive"] == archive_name and index["engine"] == f"devkit-{TARGET}",
+        require(index["archive"] == archive_name and index["engine"] == f"devkit-{LINUX_X64}",
                 "Unexpected public native asset names")
         for name in (archive_name, index["engine"], "release.json", "install.sh", "bootstrap.sh", "checksums.txt"):
             require(name in assets, f"Missing required public asset: {name}")
@@ -265,8 +267,15 @@ def main():
         expected["release.json"] = {"mode": 0o644, "sha256": index["releaseIdentity"]}
         require(archive_files(archive, f"devkit-{target}") == expected,
                 "Public tar payload differs from canonical manifest")
-        require(manifest["files"]["devkit"]["sha256"] == sha256(assets[index["engine"]])
-                and assets[index["engine"]][:4] == b"\x7fELF", "Raw engine/payload identity differs")
+        engines = index["engines"]
+        require({LINUX_X64, LINUX_ARM64} <= set(engines) <= {LINUX_X64, LINUX_ARM64, DARWIN_ARM64},
+                "Unexpected public host targets")
+        require(engines[LINUX_X64] == index["engine"], "Legacy engine alias differs")
+        for triple, name in engines.items():
+            require(name == "devkit-" + triple, f"Unexpected asset for {triple}")
+            require(manifest["files"][payload_name(triple)] == {"mode": 0o755, "sha256": sha256(assets[name])}
+                    and executable_header_matches(assets[name][:64], triple),
+                    f"Wrong executable identity or format for {triple}")
         require(set(index["packages"]) == {"cli", "environment"}, "Unexpected npm artifact set")
         npm_proofs = {}
         for kind, name in (("environment", "@docouno/env"), ("cli", "@docouno/devkit")):
@@ -299,7 +308,7 @@ def main():
                        "sourceCommit": index["sourceCommit"], "sourceTree": index["sourceTree"],
                        "buildRun": index["buildRun"], "indexSha256": sha256(raw_index),
                        "gitSource": git_source, "tarAndNpmCanonicalPayloadEqual": True,
-                       "packages": npm_proofs})
+                       "engines": engines, "packages": npm_proofs})
 
         spec = importlib.util.spec_from_file_location("devkit_packaged_verification", REPO / "test/packaged/verify.py")
         require(spec is not None and spec.loader is not None, "Packaged verifier unavailable")

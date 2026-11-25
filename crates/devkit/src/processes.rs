@@ -14,13 +14,25 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
-static INITIAL_PPID: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "linux")]
+pub use linux::{restore_exec_pdeathsig, watch_parent};
+
+#[cfg(target_os = "macos")]
+mod darwin;
+#[cfg(target_os = "macos")]
+use darwin as platform;
+#[cfg(target_os = "macos")]
+pub use darwin::{PARENT_HANDOFF, restore_exec_pdeathsig, watch_cli_parent};
 
 #[derive(Debug)]
 pub struct CommandFailure {
@@ -67,6 +79,30 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+const MAX_METADATA_TIME: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct MetadataDeadline {
+    read_until: Instant,
+    finish_by: Instant,
+}
+
+impl MetadataDeadline {
+    fn before(deadline: Instant) -> Result<Self> {
+        let now = Instant::now();
+        let finish_by = deadline.min(now + MAX_METADATA_TIME);
+        // Leave time to stop the read-only group and drain its bounded pipes.
+        let read_until = finish_by
+            .checked_sub(Duration::from_millis(60))
+            .filter(|at| *at > now)
+            .context("Metadata query deadline exceeded")?;
+        Ok(Self {
+            read_until,
+            finish_by,
+        })
+    }
+}
+
 type MetadataRead = (Option<Box<[u8; 512]>>, Option<ExitStatus>);
 pub enum CpMetadata {
     Header(Box<[u8; 512]>),
@@ -186,36 +222,23 @@ impl ProcessRunner {
             }?;
             signals.registrations.push(id);
         }
-        {
-            let cancelled = cancelled.clone();
-            // SAFETY: getppid() and lock-free atomic operations are async-signal-safe.
-            // Linux PR_SET_PDEATHSIG fires when the spawning OS thread exits even while
-            // the parent process (TGID) remains alive; only cancel when getppid() changes.
-            let id = unsafe {
-                signal_hook::low_level::register(libc::SIGURG, move || {
-                    let initial = INITIAL_PPID.load(Ordering::Relaxed);
-                    if initial > 0 && libc::getppid() != initial {
-                        let _ = cancelled.compare_exchange(
-                            0,
-                            libc::SIGTERM as usize,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        );
-                    }
-                })
-            }?;
-            signals.registrations.push(id);
-        }
-        // Orphaned ordinary creator descendants remain our responsibility.
-        // SAFETY: prctl accepts these scalar arguments, with no borrowed pointers.
-        ensure!(
-            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0,
-            "Cannot enable child reaping"
-        );
+        platform::register_platform_signals(&cancelled, &mut signals.registrations)?;
         Ok(Self {
             signals: Arc::new(signals),
         })
     }
+
+    fn spawn_creator(&self, command: &mut Command, deadline: Option<Instant>) -> Result<Creator> {
+        if std::path::Path::new(command.get_program())
+            .file_name()
+            .is_some_and(|p| p == "docker")
+        {
+            command.env_remove("DOCKER_DEFAULT_PLATFORM");
+        }
+        command.process_group(0);
+        platform::spawn(command, deadline)
+    }
+
     pub(crate) fn cancel(&self, sig: i32) {
         let _ = self.signals.cancelled.compare_exchange(
             0,
@@ -268,27 +291,8 @@ impl ProcessRunner {
         command: &mut Command,
         deadline: Instant,
     ) -> Result<ProcessOutput> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .context("Metadata query deadline exceeded")?;
-        let deadline = Instant::now() + remaining.min(Duration::from_secs(3));
-        let run_until = deadline
-            .checked_sub(Duration::from_millis(60))
-            .context("Metadata query deadline exceeded")?;
-        let timeout = run_until
-            .checked_duration_since(Instant::now())
-            .context("Metadata query deadline exceeded")?;
-        self.run_input_inner(
-            command,
-            OutputMode::Capture(16 * 1024 * 1024),
-            false,
-            Some(timeout),
-            None,
-            None,
-            Some(deadline),
-        )?
-        .success(&command.get_program().to_string_lossy())
+        self.read_before(command, deadline, 16 * 1024 * 1024, false)?
+            .success(&command.get_program().to_string_lossy())
     }
     /// Reconcile already accepted writes after cancellation, within one deadline.
     pub fn capture_recovery_before(
@@ -296,16 +300,25 @@ impl ProcessRunner {
         command: &mut Command,
         deadline: Instant,
     ) -> Result<ProcessOutput> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("Creator recovery deadline exceeded")?;
-        self.run_inner(
+        self.read_before(command, deadline, 16 * 1024 * 1024, true)?
+            .success("Creator recovery query")
+    }
+    fn read_before(
+        &self,
+        command: &mut Command,
+        deadline: Instant,
+        max_bytes: usize,
+        ignore_cancellation: bool,
+    ) -> Result<ProcessOutput> {
+        self.run_input_inner(
             command,
-            OutputMode::Capture(16 * 1024 * 1024),
-            true,
-            Some(remaining.min(Duration::from_secs(3))),
-        )?
-        .success("Creator recovery query")
+            OutputMode::Capture(max_bytes),
+            ignore_cancellation,
+            None,
+            None,
+            None,
+            Some(MetadataDeadline::before(deadline)?),
+        )
     }
     fn run_inner(
         &self,
@@ -351,7 +364,7 @@ impl ProcessRunner {
         timeout: Option<Duration>,
         input: Option<&[u8]>,
         mut reaped: Option<&mut bool>,
-        metadata_deadline: Option<Instant>,
+        metadata_deadline: Option<MetadataDeadline>,
     ) -> Result<ProcessOutput> {
         if !cleanup && let Err(error) = self.check_cancelled() {
             if let Some(flag) = reaped.as_deref_mut() {
@@ -359,7 +372,7 @@ impl ProcessRunner {
             }
             return Err(error);
         }
-        command.process_group(0).stdin(if input.is_some() {
+        command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -378,18 +391,18 @@ impl ProcessRunner {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                if let Some(flag) = reaped.as_deref_mut() {
-                    *flag = true;
+        let mut creator =
+            match self.spawn_creator(command, metadata_deadline.map(|at| at.read_until)) {
+                Ok(creator) => creator,
+                Err(error) => {
+                    if let Some(flag) = reaped.as_deref_mut() {
+                        *flag = true;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("Cannot start {}", command.get_program().to_string_lossy())
+                    });
                 }
-                return Err(error).with_context(|| {
-                    format!("Cannot start {}", command.get_program().to_string_lossy())
-                });
-            }
-        };
-        let mut creator = Creator::new(child);
+            };
         let readers_done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_failed = Arc::new(AtomicBool::new(false));
@@ -409,6 +422,7 @@ impl ProcessRunner {
                 readers_done.clone(),
                 overflow.clone(),
                 reader_failed.clone(),
+                metadata_deadline.map(|at| at.finish_by),
             )
         });
         let stderr = creator.child.stderr.take().map(|stream| {
@@ -418,6 +432,7 @@ impl ProcessRunner {
                 readers_done.clone(),
                 overflow.clone(),
                 reader_failed.clone(),
+                metadata_deadline.map(|at| at.finish_by),
             )
         });
         let started = Instant::now();
@@ -425,7 +440,9 @@ impl ProcessRunner {
             if !cleanup && let Err(error) = self.check_cancelled() {
                 break Err(error);
             }
-            if timeout.is_some_and(|t| started.elapsed() >= t) {
+            if timeout.is_some_and(|t| started.elapsed() >= t)
+                || metadata_deadline.is_some_and(|at| Instant::now() >= at.read_until)
+            {
                 break Err(anyhow::anyhow!("Process exceeded its deadline"));
             }
             if overflow.load(Ordering::SeqCst) {
@@ -434,7 +451,7 @@ impl ProcessRunner {
             if reader_failed.load(Ordering::SeqCst) {
                 break Err(anyhow::anyhow!("Cannot read native command output"));
             }
-            match creator.child.try_wait() {
+            match creator.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
                     if input_failed.load(Ordering::SeqCst) {
@@ -448,7 +465,7 @@ impl ProcessRunner {
         // This happens on every path, including wait/read errors. Do not let an
         // early ? bypass termination and reaping of the exact creator PGID.
         let stopped = match metadata_deadline {
-            Some(deadline) => creator.finish_metadata(deadline),
+            Some(deadline) => creator.finish_metadata(deadline.finish_by),
             None => creator.finish(),
         };
         if stopped.is_ok()
@@ -509,16 +526,8 @@ impl ProcessRunner {
         Ok(output)
     }
     fn query(&self, command: &mut Command, deadline: Instant) -> Result<ProcessOutput> {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .context("Container cleanup deadline exceeded")?;
-        self.run_inner(
-            command,
-            OutputMode::Capture(1024 * 1024),
-            true,
-            Some(timeout.min(Duration::from_secs(3))),
-        )?
-        .success("Docker ownership query")
+        self.read_before(command, deadline, 1024 * 1024, true)?
+            .success("Docker ownership query")
     }
     fn named_ids(&self, owned: &OwnedContainer, deadline: Instant) -> Result<Vec<String>> {
         let output = self
@@ -562,23 +571,16 @@ impl ProcessRunner {
             "Invalid image metadata query"
         );
         self.check_cancelled()?;
+        let deadline = MetadataDeadline::before(Instant::now() + timeout.min(MAX_METADATA_TIME))?;
         let mut command = Command::new("docker");
         command
             .args(["cp", &format!("{id}:{path}"), "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut creator = Creator::new(
-            command
-                .spawn()
-                .context("Cannot start image metadata query")?,
-        );
-        let mut stdout = creator
-            .child
-            .stdout
-            .take()
-            .context("Missing metadata stream")?;
+            .stderr(Stdio::piped());
+        let mut creator = self
+            .spawn_creator(&mut command, Some(deadline.read_until))
+            .context("Cannot start image metadata query")?;
         let done = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
@@ -589,9 +591,15 @@ impl ProcessRunner {
                 done.clone(),
                 overflow.clone(),
                 failed.clone(),
+                Some(deadline.finish_by),
             )
         });
         let result = (|| -> Result<MetadataRead> {
+            let mut stdout = creator
+                .child
+                .stdout
+                .take()
+                .context("Missing metadata stream")?;
             let fd = stdout.as_raw_fd();
             // SAFETY: this is the live, owned pipe descriptor.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -600,13 +608,12 @@ impl ProcessRunner {
                     && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
                 "Cannot configure metadata pipe"
             );
-            let deadline = Instant::now() + timeout.min(Duration::from_secs(3));
             let mut header = Box::new([0; 512]);
             let mut count = 0;
             loop {
                 self.check_cancelled()?;
                 ensure!(
-                    Instant::now() < deadline,
+                    Instant::now() < deadline.read_until,
                     "Image metadata query exceeded deadline"
                 );
                 ensure!(
@@ -615,7 +622,7 @@ impl ProcessRunner {
                 );
                 match stdout.read(&mut header[count..]) {
                     Ok(0) => {
-                        if let Some(status) = creator.child.try_wait()? {
+                        if let Some(status) = creator.try_wait()? {
                             ensure!(count == 0, "Truncated image metadata header");
                             return Ok((None, Some(status)));
                         }
@@ -632,8 +639,7 @@ impl ProcessRunner {
                 thread::sleep(Duration::from_millis(2));
             }
         })();
-        drop(stdout);
-        let stopped = creator.finish();
+        let stopped = creator.finish_metadata(deadline.finish_by);
         done.store(true, Ordering::SeqCst);
         let stderr = join_reader(stderr);
         stopped?;
@@ -857,7 +863,8 @@ impl ProcessRunner {
             (Err(primary), _) => Err(primary),
             (Ok(output), Err(cleanup)) if output.code != 0 => {
                 eprintln!("devkit: {cleanup:#}");
-                Ok(output)
+                // A failed ownership check must stop callers that retry selected exit codes.
+                output.success("Container task")
             }
             (Ok(_), Err(error)) => Err(failure(1, format!("{error:#}"))),
             (Ok(output), Ok(())) => {
@@ -996,6 +1003,7 @@ fn reader(
     done: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Reader {
     thread::spawn(move || {
         let result = (|| {
@@ -1010,6 +1018,12 @@ fn reader(
             let mut block = [0; 8192];
             let mut finished_at = None;
             loop {
+                if deadline.is_some_and(|at| Instant::now() >= at) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Metadata output exceeded its deadline",
+                    ));
+                }
                 if done.load(Ordering::SeqCst) {
                     let at = finished_at.get_or_insert_with(Instant::now);
                     if at.elapsed() >= Duration::from_millis(100) {
@@ -1081,85 +1095,8 @@ impl Creator {
             finished: false,
         }
     }
-    fn finish_metadata(&mut self, deadline: Instant) -> Result<()> {
-        // This process has no daemon-side mutation to reconcile. Stop it
-        // immediately and never enter the mutation grace period on drop.
-        self.finished = true;
-        signal_group(self.pid, libc::SIGKILL);
-        loop {
-            if self.child.try_wait()?.is_some() {
-                reap_available(self.pid)?;
-                if !group_exists(self.pid) {
-                    return Ok(());
-                }
-            }
-            ensure!(
-                Instant::now() < deadline,
-                "Metadata query process group was not reaped"
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-    fn finish(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        signal_group(self.pid, libc::SIGTERM);
-        signal_group(self.pid, libc::SIGCONT);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut first_error = None;
-        let mut reaped = false;
-        // Reap the direct creator via Child before waitpid handles adopted
-        // descendants, and still kill the group if waiting itself fails.
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    reaped = true;
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(error) => {
-                    first_error = Some(anyhow::Error::from(error));
-                    break;
-                }
-            }
-        }
-        if !reaped {
-            signal_group(self.pid, libc::SIGKILL);
-        }
-        if let Err(error) = self.child.wait() {
-            first_error.get_or_insert(error.into());
-        }
-        while group_exists(self.pid) && Instant::now() < deadline {
-            if let Err(error) = reap_available(self.pid) {
-                first_error.get_or_insert(error);
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        if group_exists(self.pid) {
-            signal_group(self.pid, libc::SIGKILL);
-        }
-        let reap_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Err(error) = reap_available(self.pid) {
-                first_error.get_or_insert(error);
-            }
-            if !group_exists(self.pid) {
-                self.finished = true;
-                break;
-            }
-            if Instant::now() >= reap_deadline {
-                first_error
-                    .get_or_insert_with(|| anyhow::anyhow!("Creator process group was not reaped"));
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        platform::poll_creator(&mut self.child)
     }
 }
 impl Drop for Creator {
@@ -1177,64 +1114,13 @@ fn signal_group(pid: i32, signal: i32) {
         libc::kill(-pid, signal);
     }
 }
-fn group_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only probes the creator's PGID.
-    let result = unsafe { libc::kill(-pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-fn reap_available(pid: i32) -> Result<()> {
-    loop {
-        let mut status = 0;
-        // SAFETY: waitpid is restricted to adopted children in our owned PGID.
-        let waited = unsafe { libc::waitpid(-pid, &mut status, libc::WNOHANG) };
-        if waited > 0 {
-            continue;
-        }
-        if waited == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        if error.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(());
-        }
-        return Err(error.into());
-    }
-}
-/// The CLI dies with its invoking Make/shell; its installed handlers still get
-/// to clean up. Install ProcessRunner before calling this, before any spawn.
-pub fn watch_parent(runner: &ProcessRunner) -> Result<()> {
-    // SAFETY: getppid and scalar prctl arguments contain no borrowed pointers.
-    let parent = unsafe { libc::getppid() };
-    INITIAL_PPID.store(parent, Ordering::SeqCst);
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGURG, 0, 0, 0) } == 0,
-        "Cannot watch parent lifetime"
-    );
-    let current = unsafe { libc::getppid() };
-    if current != parent || (parent != 1 && current == 1) {
-        runner.cancel(libc::SIGTERM);
-        runner.check_cancelled()?;
-    }
-    Ok(())
-}
 
-/// Restore SIGTERM parent-death notification before replacing this image via execve,
-/// while guarding against a parent exit in the transition window.
-pub fn restore_exec_pdeathsig(runner: &ProcessRunner) -> Result<()> {
-    runner.check_cancelled()?;
-    let initial = INITIAL_PPID.load(Ordering::SeqCst);
-    // SAFETY: scalar prctl arguments contain no borrowed pointers.
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } == 0,
-        "Cannot restore parent death signal before exec"
-    );
-    let current = unsafe { libc::getppid() };
-    if initial > 0 && (current != initial || (initial != 1 && current == 1)) {
-        runner.cancel(libc::SIGTERM);
-        runner.check_cancelled()?;
-    }
+/// Prepare a CLI-to-CLI exec, preserving the original parent across image replacement.
+pub fn restore_self_exec(runner: &ProcessRunner, command: &mut Command) -> Result<()> {
+    restore_exec_pdeathsig(runner)?;
+    #[cfg(target_os = "macos")]
+    darwin::set_handoff(runner, command)?;
+    #[cfg(target_os = "linux")]
+    let _ = command;
     Ok(())
 }

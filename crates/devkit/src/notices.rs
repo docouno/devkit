@@ -4,7 +4,7 @@
 use crate::{
     Result,
     archive::publish_new_directory,
-    distribution::{BuildInfo, TARGET, build_info},
+    distribution::{BuildInfo, Target, build_info},
     files::*,
     model::FileIdentity,
     processes::{OutputMode, ProcessRunner},
@@ -346,18 +346,23 @@ pub fn read_crate_notices(
     ))
 }
 
-fn std_sources(root: &Path) -> Result<BTreeMap<String, FileIdentity>> {
+fn std_sources(root: &Path, target: Target) -> Result<BTreeMap<String, FileIdentity>> {
     let mut result = BTreeMap::new();
     let copyright = safe_path(root, "COPYRIGHT-library.html")?;
     let copyright_id = identity(&copyright)?.context("Rust COPYRIGHT-library.html missing")?;
     let bytes = fs::read(copyright)?;
     ensure!(
-        bytes.len() > 1024
-            && String::from_utf8_lossy(&bytes)
+        bytes.len() > 1024,
+        "Incomplete Rust library copyright bundle"
+    );
+    if target.is_musl() {
+        ensure!(
+            String::from_utf8_lossy(&bytes)
                 .to_ascii_lowercase()
                 .contains("musl"),
-        "Rust library copyright bundle lacks the musl notices"
-    );
+            "Rust library copyright bundle lacks the musl notices"
+        );
+    }
     result.insert("COPYRIGHT-library.html".to_owned(), copyright_id);
     let licenses = safe_path(root, "licenses")?;
     let entries = file_map(&licenses)?;
@@ -376,7 +381,11 @@ fn std_sources(root: &Path) -> Result<BTreeMap<String, FileIdentity>> {
 }
 
 pub fn collect_notices(options: &NoticeOptions, runner: &ProcessRunner) -> Result<Value> {
-    ensure!(options.target == TARGET, "Unsupported notice target");
+    let target = Target::parse(&options.target)?;
+    ensure!(
+        target == Target::host()?,
+        "Collect notices on the native target"
+    );
     version(&options.rust_version)?;
     let root = project_root(&options.root)?;
     let cargo_home = project_root(&options.cargo_home)?;
@@ -401,7 +410,7 @@ pub fn collect_notices(options: &NoticeOptions, runner: &ProcessRunner) -> Resul
     );
     let source_lock = identity(&safe_path(&root, "Cargo.lock")?)?.context("Missing Cargo.lock")?;
     let checksums = lock_checksums(&root)?;
-    let standard_sources = std_sources(&rust_docs)?;
+    let standard_sources = std_sources(&rust_docs, target)?;
     let raw = runner.checked_with_timeout(
         Command::new("cargo")
             .args([
@@ -589,7 +598,7 @@ pub fn collect_notices(options: &NoticeOptions, runner: &ProcessRunner) -> Resul
         "Cargo.lock changed during notice collection"
     );
     ensure!(
-        std_sources(&rust_docs)? == standard_sources,
+        std_sources(&rust_docs, target)? == standard_sources,
         "Rust standard-library notices changed during collection"
     );
     runner.check_cancelled()?;
@@ -605,7 +614,7 @@ pub fn verify_notice_set(
     target: &str,
     rust_version: &str,
     expected_sha256: &str,
-) -> Result<()> {
+) -> Result<NoticeSet> {
     let directory = project_root(directory)?;
     ensure!(
         SHA256_RE.is_match(expected_sha256),
@@ -635,7 +644,8 @@ pub fn verify_notice_set(
     ensure!(
         receipt.schema_version == 1
             && receipt.target == target
-            && target == TARGET
+            && Target::parse(target).is_ok()
+            && receipt.generator.target == target
             && receipt.rust_version == rust_version,
         "Notice bundle target/toolchain differs"
     );
@@ -730,5 +740,5 @@ pub fn verify_notice_set(
         named == receipt.files.keys().cloned().collect(),
         "Notice bundle has unexplained files"
     );
-    Ok(())
+    Ok(receipt)
 }

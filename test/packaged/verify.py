@@ -22,6 +22,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import tarfile
 import threading
@@ -33,7 +34,11 @@ import uuid
 
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "test"))
+from release_targets import DARWIN_ARM64, LINUX_ARM64, LINUX_X64, executable_header_matches, host_target, linux_arch, payload_engine, payload_name  # noqa: E402
+
 OWNERSHIP = "io.docouno.devkit.packaged-test"
+COMMAND_TIMEOUT_SECONDS = 600
 
 
 def require(condition, message):
@@ -46,8 +51,8 @@ def sha256(data):
 
 
 def native_release(release):
-    with (release / "devkit").open("rb") as stream:
-        return stream.read(4) == b"\x7fELF"
+    with payload_engine(release).open("rb") as stream:
+        return executable_header_matches(stream.read(64), host_target())
 
 
 def semver_tuple(value):
@@ -87,14 +92,14 @@ def verify_creation_hint(output):
             "Successful init did not provide a make setup hint")
 
 
-def pnpm_project(root):
-    state = json.loads((root / '.devkit/manifest.json').read_text())
-    return semver_tuple(state['version']) >= (0, 5, 0)
+def read_image_id(root, kind):
+    receipt = root / ".devkit/state" / f"{kind}-image.json"
+    if receipt.is_file():
+        return json.loads(receipt.read_text())["imageId"]
+    return (root / ".devkit/state" / f"{kind}-image").read_text().strip()
 
 
 def node_workspace(root):
-    if not pnpm_project(root):
-        return set(json.loads((root / 'package.json').read_text())['workspaces'])
     # Generated membership is an explicit sequence of canonical component paths.
     text = (root / 'pnpm-workspace.yaml').read_text()
     return set(re.findall(r'^\s*-\s*[\'"]?((?:apps|packages)/[a-z][a-z0-9-]*)[\'"]?\s*$', text, re.M))
@@ -102,11 +107,8 @@ def node_workspace(root):
 
 def assert_node_workspace(root, paths):
     require(node_workspace(root) == set(paths), 'Root workspace registration mismatch')
-    if pnpm_project(root):
-        require('workspaces' not in json.loads((root / 'package.json').read_text()), 'npm workspaces survived pnpm migration')
-        require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
-    else:
-        require((root / 'package-lock.json').is_file(), 'Missing legacy npm lock')
+    require('workspaces' not in json.loads((root / 'package.json').read_text()), 'npm workspaces survived pnpm migration')
+    require((root / 'pnpm-lock.yaml').is_file() and not (root / 'package-lock.json').exists(), 'Wrong pnpm lockfile set')
 
 
 def assert_desktop_runtime(root, state):
@@ -206,12 +208,15 @@ def local_cargo_registry(directory):
 
 class Verification:
     def __init__(self, release, next_release=None, *, package_source="local",
-                 public_bootstrap=None):
+                 public_bootstrap=None, daemon_arch=None, scratch_parent=None, preview_index_sha256=None):
         self.token = uuid.uuid4().hex
         self.receipt = REPO / ".artifacts/packaged" / self.token
         self.receipt.mkdir(parents=True)
-        self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-"))
-        self.release = self.copy_release(release, "release")
+        self.scratch = Path(tempfile.mkdtemp(prefix="devkit-packaged-", dir=scratch_parent))
+        self.daemon_arch = daemon_arch or linux_arch()
+        self.linux_target = {"amd64": LINUX_X64, "arm64": LINUX_ARM64}[self.daemon_arch]
+        self.release = (self.copy_preview(release, preview_index_sha256) if preview_index_sha256 is not None
+                        else self.copy_release(release, "release"))
         self.next_release = self.copy_release(next_release, "next-release") if next_release else None
         self.version = json.loads((self.release / "release.json").read_text())["version"]
         self.release_identity = sha256((self.release / "release.json").read_bytes())
@@ -258,8 +263,8 @@ class Verification:
         self.environment["DEVKIT_FORBIDDEN_HOST_SDK_LOG"] = str(self.forbidden_log)
         self.environment["DEVKIT_CACHE_DIR"] = str(self.scratch / "native cache")
         self.environment["CI"] = "true"
-        if (self.manager / "runtime/pnpm.env").is_file():
-            selected = subprocess.check_output([str(self.manager / 'devkit'), 'internal', 'ensure-pnpm', '--pin-file', str(self.manager / 'runtime/pnpm.env')], text=True).strip()
+        if host_target() != DARWIN_ARM64 and (self.manager / "runtime/pnpm.env").is_file():
+            selected = subprocess.check_output([str(payload_engine(self.manager)), 'internal', 'ensure-pnpm', '--pin-file', str(self.manager / 'runtime/pnpm.env')], text=True).strip()
             self.environment['DEVKIT_PNPM_BIN_OVERRIDE'] = selected
         print(f"Receipt directory: {self.receipt}", flush=True)
         print(f"Consumer scratch: {self.scratch}", flush=True)
@@ -270,10 +275,10 @@ class Verification:
         # directly by its actual released native binary; public_bootstrap exercises
         # cross-version init delegation through the target bootstrap script.
         if operation == "init" and release == self.release and not self.public_bootstrap:
-            return [release / "devkit", "--non-interactive", "init", root,
+            return [payload_engine(release), "--non-interactive", "init", root,
                     "--to", version, "--release-root", release, *arguments]
         command = (["sh", self.public_bootstrap] if self.public_bootstrap
-                   else [self.manager / "devkit"])
+                   else [payload_engine(self.manager)])
         command += ["--non-interactive", operation, root]
         if operation in ("init", "update"):
             command += ["--to", version]
@@ -283,11 +288,48 @@ class Verification:
 
     def exec_cli(self, root, component, *argv, write=False):
         command = (["sh", self.public_bootstrap] if self.public_bootstrap
-                   else [self.manager / "devkit"])
+                   else [payload_engine(self.manager)])
         command += ["exec", "--root", root, "--component", component]
         if write:
             command.append("--write")
         return command + ["--", *argv]
+
+    def copy_preview(self, build_set, expected_sha256):
+        raw = (build_set / "release-index.json").read_bytes()
+        require(sha256(raw) == expected_sha256, "Frozen preview index SHA-256 differs")
+        index = json.loads(raw)
+        targets = (LINUX_X64, LINUX_ARM64, DARWIN_ARM64)
+        require(index["publicationEligible"] is False and
+                index["engines"] == {target: "devkit-" + target for target in targets},
+                "Expected an unpublished three-target preview")
+        archive_name = index["archive"]
+        require(archive_name == f'devkit-{index["version"]}.tar.gz' and Path(archive_name).name == archive_name,
+                "Invalid preview archive name")
+        # Artifact downloads do not retain executable modes or the payload directory.
+        # Extract the same private archive copy that was verified against the frozen index.
+        archive = self.scratch / archive_name
+        shutil.copyfile(build_set / archive_name, archive)
+        require(archive_name in index["files"], "Preview archive missing from the index")
+        for name, identity in index["files"].items():
+            require(Path(name).name == name and name not in ("", ".", ".."), "Invalid preview asset name")
+            path = archive if name == archive_name else build_set / name
+            with path.open("rb") as stream:
+                require(os.fstat(stream.fileno()).st_size == identity["size"] and
+                        hashlib.file_digest(stream, "sha256").hexdigest() == identity["sha256"],
+                        f"Frozen preview asset differs: {name}")
+        release = self.copy_release(archive, "release")
+        manifest = (release / "release.json").read_bytes()
+        require(sha256(manifest) == index["releaseIdentity"] == index["files"]["release.json"]["sha256"],
+                "Preview payload differs from its frozen release identity")
+        accepted = json.loads(manifest)
+        require(accepted["version"] == index["version"], "Preview manifest version differs")
+        for target, asset in index["engines"].items():
+            member = payload_name(target)
+            with (release / member).open("rb") as stream:
+                require(executable_header_matches(stream.read(64), target) and
+                        accepted["files"][member]["sha256"] == index["files"][asset]["sha256"],
+                        f"Preview payload engine differs from {asset}")
+        return release
 
     def copy_release(self, source, name):
         source = Path(source).resolve()
@@ -323,7 +365,7 @@ class Verification:
                 check_payload_path(entry.name)
         return destination
 
-    def run(self, label, argv, *, expected=None, timeout=600, cwd=None, environment=None):
+    def run(self, label, argv, *, expected=None, timeout=COMMAND_TIMEOUT_SECONDS, cwd=None, environment=None):
         sequence = len(self.results) + 1
         logfile = self.receipt / f"{sequence:03d}-{label}.log"
         started = time.monotonic()
@@ -512,12 +554,10 @@ class Verification:
                     "import { closeSync, openSync } from 'node:fs';\n"
                     "import test from 'node:test';\n\n"
                     "test('source and native lock mounts reject writable opens', () => {\n"
-                    "  for (const file of [new URL(import.meta.url), new URL('../../../package-lock.json', import.meta.url)]) {\n"
+                    "  for (const file of [new URL(import.meta.url), new URL('../../../pnpm-lock.yaml', import.meta.url), new URL('../../../pnpm-workspace.yaml', import.meta.url)]) {\n"
                     "    assert.throws(() => { const fd = openSync(file, 'r+'); closeSync(fd); }, { code: 'EROFS' });\n"
                     "  }\n"
                     "});\n")
-            if pnpm_project(root):
-                code = code.replace("new URL('../../../package-lock.json', import.meta.url)", "new URL('../../../pnpm-lock.yaml', import.meta.url), new URL('../../../pnpm-workspace.yaml', import.meta.url)")
         else:
             probe = root / "apps/api/tests/readonly_mount.rs"
             lockfile = "../../Cargo.lock" if root_cargo_project(root) else "Cargo.lock"
@@ -678,7 +718,7 @@ class Verification:
         settings = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if line and not line.startswith("#"))
         name = f"devkit-packaged-{self.token}-{kind}"
         self.containers.append(name)
-        image = settings["DEVKIT_NODE_IMAGE"] if kind == "node" else (root / ".devkit/state/rust-image").read_text().strip()
+        image = settings["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
         command = api_binary(root, kind)
         self.run(f"{kind}-emitted-start", ["docker", "run", "--detach", "--pull", "never", "--name", name,
                  "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -705,7 +745,7 @@ class Verification:
 
     def electron_runtime(self, root):
         """Resolve the installed binary from the consuming workspace, never infer hoisting."""
-        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(root, "desktop")
         name = f"devkit-packaged-{self.token}-electron-resolve"
         self.containers.append(name)
         output = self.run("consumer-electron-runtime", ["docker", "run", "--rm", "--pull", "never", "--name", name,
@@ -724,7 +764,7 @@ class Verification:
         name = f"devkit-packaged-{self.token}-{label}"
         self.containers.append(name)
         runtime_root = electron_root or root
-        image = (runtime_root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(runtime_root, "desktop")
         argv = ["docker", "run", "--detach", "--pull", "never", "--name", name,
                 "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--network", f"container:{network_container}", "--read-only", "--tmpfs", "/tmp:mode=1777",
@@ -787,7 +827,7 @@ class Verification:
 
     def starter_bind_options(self, root, kind):
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
-        image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else (root / ".devkit/state/rust-image").read_text().strip()
+        image = pins["DEVKIT_NODE_IMAGE"] if kind == "node" else read_image_id(root, "rust")
         command = api_binary(root, kind)
         common = ["--pull", "never", "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                   "--network", "none", "--read-only", "--volume", f"{root}:/workspace:ro,z"]
@@ -818,6 +858,8 @@ class Verification:
         self.make(root, "setup", label="fullstack-web-setup")
         self.make(root, "up", "app=web", label="fullstack-web-selected-start")
         api, web = self.service(root, "api"), self.service(root, "web")
+        # The first cargo run compiles the API before its HTTP listener opens.
+        self.http(self.port(api, 8080), "/health", {"status": "ok"}, timeout=COMMAND_TIMEOUT_SECONDS)
         self.http(self.port(web, 5173), "/api/greeting?name=Connected", {"message": "Hello, Connected!"})
         self.preview_host_wire(root)
         self.make(root, "down", label="fullstack-web-stop")
@@ -875,14 +917,14 @@ class Verification:
         browser = f"devkit-packaged-{self.token}-preview-browser"
         self.containers.extend([server, browser])
         pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
-        image = (root / ".devkit/state/desktop-image").read_text().strip()
+        image = read_image_id(root, "desktop")
         certificate = f"devkit-packaged-{self.token}-preview-certificate"
         self.containers.append(certificate)
         self.run("preview-test-certificate", ["docker", "run", "--rm", "--pull", "never", "--name", certificate,
                  "--label", f"{OWNERSHIP}={self.token}", "--user", f"{os.getuid()}:{os.getgid()}",
                  "--network", "none", "--read-only", "--cpus", "1", "--memory", "128m", "--pids-limit", "64",
                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--volume", f"{output}:/evidence:z",
-                 (root / ".devkit/state/rust-image").read_text().strip(), "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                 read_image_id(root, "rust"), "openssl", "req", "-x509", "-newkey", "rsa:2048",
                  "-nodes", "-days", "1", "-subj", "/CN=preview.test", "-keyout", "/evidence/preview-key.pem", "-out", "/evidence/preview-cert.pem"])
         common = ["--detach", "--pull", "never", "--label", f"{OWNERSHIP}={self.token}",
                   "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:rw,exec,mode=1777,size=512m",
@@ -921,28 +963,27 @@ class Verification:
         (root / "compose.yaml").write_text('services:\n  desktop:\n    environment:\n      REMOTE_DEBUGGING_PORT: "9222"\n')
         self.make(node, "dev", label="node-development-start")
         preview_template = "https://{port}-{service}.preview.example.test"
-        args = ["dev", "headless=1"] + (["DEVKIT_PREVIEW_URL_TEMPLATE=" + preview_template] if pnpm_project(root) else [])
+        args = ["dev", "headless=1", "DEVKIT_PREVIEW_URL_TEMPLATE=" + preview_template]
         self.make(root, *args, label="fullstack-development-start")
         web, api, desktop = (self.service(root, name) for name in ("web", "api", "desktop"))
         main = self.service(node, "main")
         self.http(self.port(api, 8080), "/health", {"status": "ok"})
         self.http(self.port(web, 5173), "/api/greeting?name=shared", {"message": "Hello, shared!"})
-        if pnpm_project(root):
-            actual = self.inspect("container", web)
-            env = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
-            require(env.get("DEVKIT_PREVIEW_HOSTS_FILE") in ("/run/devkit/preview-hosts.json", "/devkit/preview-hosts.json"), "Managed Vite did not receive FILE carrier")
-            require(env.get("DEVKIT_PREVIEW_HOSTS", "") == "", "Managed Vite retained CSV carrier")
-            host = f"{self.port(web, 5173)}-web.preview.example.test"
-            for authority, expected_status in [(host, 200), ("unrelated.preview.example.test", 403)]:
-                connection = http.client.HTTPConnection("127.0.0.1", self.port(web, 5173), timeout=3)
-                try:
-                    connection.request("GET", "/", headers={"Host": authority})
-                    response = connection.getresponse()
-                    response.read()
-                    require(response.status == expected_status, "Managed FILE-to-Vite host policy mismatch")
-                finally:
-                    connection.close()
-            self.results.append({"label": "managed-file-to-vite-host-policy", "passed": True, "file": env["DEVKIT_PREVIEW_HOSTS_FILE"]})
+        actual = self.inspect("container", web)
+        env = dict(item.split("=", 1) for item in actual["Config"]["Env"] if "=" in item)
+        require(env.get("DEVKIT_PREVIEW_HOSTS_FILE") in ("/run/devkit/preview-hosts.json", "/devkit/preview-hosts.json"), "Managed Vite did not receive FILE carrier")
+        require(env.get("DEVKIT_PREVIEW_HOSTS", "") == "", "Managed Vite retained CSV carrier")
+        host = f"{self.port(web, 5173)}-web.preview.example.test"
+        for authority, expected_status in [(host, 200), ("unrelated.preview.example.test", 403)]:
+            connection = http.client.HTTPConnection("127.0.0.1", self.port(web, 5173), timeout=3)
+            try:
+                connection.request("GET", "/", headers={"Host": authority})
+                response = connection.getresponse()
+                response.read()
+                require(response.status == expected_status, "Managed FILE-to-Vite host policy mismatch")
+            finally:
+                connection.close()
+        self.results.append({"label": "managed-file-to-vite-host-policy", "passed": True, "file": env["DEVKIT_PREVIEW_HOSTS_FILE"]})
         self.http(self.port(main, 8080), "/health", {"status": "ok"})
         initial = "A small app, ready to change."
         marker = "Packaged harness shared UI"
@@ -972,7 +1013,9 @@ class Verification:
                 for entry in tar.getmembers():
                     require(not entry.name.startswith("/") and ".." not in Path(entry.name).parts, "Unsafe archive member")
                 tar.extractall(extracted, filter="data")
-            require((extracted / "app").read_bytes()[:4] == b"\x7fELF", "Packaged app is not an ELF executable")
+            with (extracted / "app").open("rb") as executable:
+                require(executable_header_matches(executable.read(64), self.linux_target),
+                        "Packaged Electron executable has the wrong Linux architecture")
             asar = extracted / "resources/app.asar"
             require(asar.is_file(), "Packaged app has no ASAR payload")
             require(not (extracted / "src").exists(), "Raw application source leaked outside ASAR")
@@ -981,8 +1024,7 @@ class Verification:
             for mode, label in (("production-web", "production-web"), ("packaged-desktop", "packaged-desktop")):
                 helper = self.helper(root, mode, api, marker, label, packaged=extracted)
                 self.helper_finish(helper, label)
-        if pnpm_project(root):
-            self.preview_transport(root)
+        self.preview_transport(root)
         self.make(root, "status", label="fullstack-status")
         self.make(root, "logs", "tail=10", label="fullstack-finite-logs", timeout=30)
         self.make(node, "down", label="node-development-down")
@@ -1030,14 +1072,12 @@ class Verification:
 
     def electron_cache_corruption(self, root):
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        if state["version"].startswith("0.4."):
-            return
         component = next(path for path, value in state["components"].items()
                          if value["toolingProfile"] == "electron")
         package = root / component / "node_modules/electron"
         version = json.loads((package / "package.json").read_text())["version"]
         cached = (Path(self.environment["DEVKIT_CACHE_DIR"]) / "pnpm-store/electron-dist"
-                  / (version + "-linux-x64") / "dist/icudtl.dat")
+                  / (version + "-linux-" + {"amd64": "x64", "arm64": "arm64"}[self.daemon_arch]) / "dist/icudtl.dat")
         local = package / "dist/icudtl.dat"
         require(cached.is_file() and local.is_file(), "Electron ICU resource is absent before corruption proof")
         require((cached.stat().st_dev, cached.stat().st_ino) ==
@@ -1316,7 +1356,7 @@ class Verification:
         root_package = root / "package.json"
         if root_package.is_file() and any(c["toolchain"] == "node" for c in state["components"].values()):
             package = json.loads(root_package.read_text())
-            manager_metadata = "npm@11.21.1" if semver_tuple(state["version"]) < (0, 5, 0) else "pnpm@0.0.0"
+            manager_metadata = "pnpm@0.0.0"
             package["packageManager"] = manager_metadata
             pins = dict(line.split("=", 1) for line in (root / ".devkit/runtime/toolchains.env").read_text().splitlines() if "=" in line)
             engine_metadata = {"runtime": {"name": "node", "version": pins["DEVKIT_NODE_VERSION"], "onFail": "download"}}
@@ -1390,14 +1430,6 @@ class Verification:
         node_paths = [path for path,c in after['components'].items() if c['toolchain'] == 'node']
         if node_paths: assert_node_workspace(root,node_paths)
         for path, fields in native_packages.items():
-            if semver_tuple(state['version']) < (0,5,0) <= semver_tuple(version):
-                fields = json.loads(json.dumps(fields))
-                for field in ('dependencies','optionalDependencies','peerDependencies'):
-                    for name,spec in fields.get(field,{}).items():
-                        target = next((p for p in native_packages if json.loads((root/p/'package.json').read_text())['name'] == name),None)
-                        if target is not None:
-                            public = fields.get('private') is False and json.loads((root/target/'package.json').read_text()).get('private') is False
-                            fields[field][name] = 'workspace:^' if public else 'workspace:*'
             current = json.loads((root / path / "package.json").read_text())
             require({key: value for key, value in current.items() if key != "devDependencies"} == fields,
                     f"{kind} update changed product manifest fields: {path}")
@@ -1421,18 +1453,13 @@ class Verification:
                              "preservedFiles": len(preserve), "unknownMetadataPreserved": True})
 
     def verify_v04_libraries_and_design_system(self, fullstack):
-        manager_version = json.loads((self.manager / "release.json").read_text())["version"]
-        core_parts = tuple(int(part) for part in manager_version.split("-", 1)[0].split("+")[0].split("."))
-        if core_parts < (0, 4, 0):
-            return
-
         # 1. Zero-app ts-library lifecycle: init -> setup -> dev refusal -> check/test/build ->
         #    private package refusal -> "private": false + devkit sync -> npm version 0.2.0 ->
         #    setup -> make package -> verified tarball + package-receipt.json.
         tslib = self.create("tslib", "e-tslib", release=self.manager)
         state = json.loads((tslib / ".devkit/manifest.json").read_text())
         require(set(state["components"]) == {"packages/lib"}, "ts-library init registered wrong components")
-        if core_parts >= (0, 6, 0):
+        if semver_tuple(state["version"]) >= (0, 6, 0):
             self.verify_headless_tasks(tslib, "tslib")
         else:
             self.healthy(tslib, "tslib")
@@ -1450,7 +1477,7 @@ class Verification:
         self.run("tslib-sync", self.cli(self.manager, "sync", tslib))
         self.make(tslib, "setup", label="tslib-setup-after-sync")
         self.run("tslib-npm-version", self.exec_cli(
-            tslib, "packages/lib", "pnpm" if pnpm_project(tslib) else "npm", "version", "0.2.0", "--no-git-tag-version", write=True))
+            tslib, "packages/lib", "pnpm", "version", "0.2.0", "--no-git-tag-version", write=True))
         self.make(tslib, "setup", label="tslib-setup-after-version")
         self.make(tslib, "package", label="tslib-package")
 
@@ -1553,6 +1580,44 @@ class Verification:
                         errors.append(f"Could not remove owned container {name}: {result.stderr}")
         require(not errors, "\n".join(errors))
 
+    def cross_host_checkout(self, *, export=None, imported=None):
+        if not (export or imported):
+            return
+        require(not (export and imported), "Select one cross-host checkout operation")
+        if export:
+            root = self.create("fullstack-web", "cross-host-export", release=self.manager)
+            self.run("cross-host-init", ["git", "init", "-b", "main"], cwd=root)
+            self.run("cross-host-add", ["git", "add", "."], cwd=root)
+            self.run("cross-host-commit", ["git", "-c", "user.name=Fixture", "-c",
+                     "user.email=fixture@example.invalid", "commit", "-m", "Create cross-host project"], cwd=root)
+        else:
+            root = self.scratch / "cross-host-import"
+            self.run("cross-host-clone", ["git", "clone", "--branch", "main", imported, root])
+            self.projects.append(root)
+        state = json.loads((root / ".devkit/manifest.json").read_text())
+        require(state["releaseIdentity"] == sha256((self.manager / "release.json").read_bytes()),
+                "Cross-host checkout belongs to another frozen release")
+        revision = self.run("cross-host-revision", ["git", "rev-parse", "HEAD"], cwd=root).strip()
+        # A caller's default build platform cannot select the task's executable.
+        opposite = "linux/amd64" if self.daemon_arch == "arm64" else "linux/arm64"
+        environment = dict(self.environment, DOCKER_DEFAULT_PLATFORM=opposite)
+        helper = self.make(root, "exec", "app=web", "prepare=1", "command=/devkit/devkit internal build-info",
+                           label="cross-host-linux-helper", environment=environment)
+        info = next(json.loads(line) for line in helper.splitlines() if line.startswith("{"))
+        require(info["target"] == self.linux_target and info["version"] == state["version"],
+                "Wrong release helper executed in the native Linux container")
+        self.healthy(root, "cross-host")
+        require(not self.run("cross-host-status", ["git", "status", "--porcelain"], cwd=root).strip(),
+                "Platform-specific preparation changed the shared checkout")
+        if export:
+            destination = Path(export).resolve()
+            require(not destination.exists(), "Cross-host bundle already exists")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.run("cross-host-bundle", ["git", "bundle", "create", destination, "refs/heads/main"], cwd=root)
+        self.results.append({"label": "cross-host-checkout", "commit": revision, "target": host_target(),
+                             "helper": info, "releaseIdentity": state["releaseIdentity"], "passed": True})
+        return root
+
     def verify(self):
         failure = None
         try:
@@ -1597,6 +1662,8 @@ class Verification:
                 self.first_electron("node", adopt=False)
                 self.rust_workspace()
             self.electron_cache_corruption(fullstack)
+            self.cross_host_checkout(export=os.environ.get("DEVKIT_VERIFY_EXPORT_CHECKOUT"),
+                                     imported=os.environ.get("DEVKIT_VERIFY_IMPORT_CHECKOUT"))
             require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
         except BaseException as error:
             failure = error
@@ -1613,7 +1680,7 @@ class Verification:
                        "createdVersions": self.created_versions,
                        "publicBootstrapSha256": sha256(self.public_bootstrap.read_bytes()) if self.public_bootstrap else None,
                        "nativeManagerVersion": json.loads((self.manager / "release.json").read_text())["version"],
-                       "nativeManagerSha256": sha256((self.manager / "devkit").read_bytes()),
+                       "nativeManagerSha256": sha256((payload_engine(self.manager)).read_bytes()),
                        "nativeCacheIsolated": True,
                        "harnessIdentity": self.harness_identity,
                        "passed": failure is None, "error": str(failure) if failure else None,
@@ -1636,6 +1703,26 @@ class Verification:
             raise failure
 
 
+    def export_cross_host_only(self, destination):
+        failure = None
+        try:
+            self.cross_host_checkout(export=destination)
+            require(not self.forbidden_log.exists(), "A command tried to use a host language SDK")
+        except BaseException as error:
+            failure = error
+        finally:
+            try:
+                self.cleanup()
+            except BaseException as error:
+                failure = RuntimeError(f"{failure or ''}\nCleanup: {error}")
+            if failure is None and os.environ.get("DEVKIT_VERIFY_KEEP") != "1":
+                shutil.rmtree(self.scratch)
+            else:
+                print(f"Preserved scratch: {self.scratch}", flush=True)
+        if failure:
+            raise failure
+
+
 def main():
     def interrupted(signum, _frame):
         # selectors retries InterruptedError as EINTR; cancellation must unwind.
@@ -1649,9 +1736,15 @@ def main():
     parser.add_argument("--package-source", choices=("local", "registry"), default="local")
     parser.add_argument("--public-bootstrap", type=Path,
                         help="Run lifecycle operations through this downloaded public bootstrap")
+    parser.add_argument("--export-cross-host-only", type=Path,
+                        help="Only create, verify, and export the cross-host checkout bundle")
     args = parser.parse_args()
-    Verification(args.release, args.next_release, package_source=args.package_source,
-                 public_bootstrap=args.public_bootstrap).verify()
+    verifier = Verification(args.release, args.next_release, package_source=args.package_source,
+                            public_bootstrap=args.public_bootstrap)
+    if args.export_cross_host_only:
+        verifier.export_cross_host_only(args.export_cross_host_only)
+    else:
+        verifier.verify()
 
 
 if __name__ == "__main__":

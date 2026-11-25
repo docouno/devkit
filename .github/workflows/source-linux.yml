@@ -1,0 +1,43 @@
+name: Verify native Linux source gates
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ${{ inputs.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/author-sdk
+        with:
+          mode: full
+      - name: Verify portable loader and Make entry points
+        run: python3 test/bootstrap/portable.py
+      - name: Verify canonical source gates
+        run: make verify-source-gates
+      - name: Preserve source diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: verify-source-${{ inputs.platform }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/**/receipt.json
+            .artifacts/**/*.log
+          retention-days: 90
+          if-no-files-found: warn

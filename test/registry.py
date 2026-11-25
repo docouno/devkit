@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'test') not in sys.path:
     sys.path.insert(0, str(ROOT / 'test'))
 from docker_flags import author_docker_flags  # noqa: E402
+from release_targets import host_target  # noqa: E402
 PINS = dict(line.split('=', 1) for line in (ROOT / 'toolchains.env').read_text().splitlines())
 
 
@@ -30,13 +31,14 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('previous', type=Path)
+    parser.add_argument('previous', type=Path, nargs='?')
     parser.add_argument('release', type=Path)
     args = parser.parse_args()
-    releases = [args.previous.resolve(), args.release.resolve()]
+    releases = [path.resolve() for path in (args.previous, args.release) if path is not None]
     manifests = [json.loads((p / 'release.json').read_text()) for p in releases]
-    assert manifests[0]['version'] != manifests[1]['version'], 'Provide two genuinely distinct releases'
-    target_dir = ROOT / '.artifacts/author/target/x86_64-unknown-linux-musl/debug'
+    if args.previous:
+        assert manifests[0]['version'] != manifests[-1]['version'], 'Provide two genuinely distinct releases'
+    target_dir = ROOT / '.artifacts/author/target' / host_target() / 'debug'
     engine = Path(os.environ.get('DEVKIT_AUTHOR_ENGINE', target_dir / 'devkit')).resolve()
     fixture = Path(os.environ.get('DEVKIT_REGISTRY_FIXTURE', target_dir / 'examples/registry_fixture')).resolve()
     assert engine.is_file() and fixture.is_file(), 'Run make setup build-fixtures'
@@ -73,7 +75,8 @@ def main():
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:mode=1777,size=256m',
                     '--volume', f'{pnpm_bin}:/devkit/bin/pnpm:ro,z', '--env', 'PATH=/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                     '--volume', f'{ROOT}:/source:ro,z', '--volume', f'{engine}:/devkit/devkit:ro,z',
-                    '--volume', f'{releases[0]}:/release-v1:ro,z', '--volume', f'{releases[1]}:/release-v2:ro,z',
+                    *(['--volume', f'{releases[0]}:/release-old:ro,z'] if args.previous else []),
+                    '--volume', f'{releases[-1]}:/release-current:ro,z',
                     '--volume', f'{scratch}:/proof:z', '--volume', f'{project}:/consumer:z',
                     '--workdir', '/source', '--env', 'HOME=/tmp/home', '--env', 'CI=true',
                     PINS['DEVKIT_NODE_IMAGE'], '/devkit/devkit', 'internal', 'node', PINS['DEVKIT_NODE_VERSION'],
@@ -93,20 +96,21 @@ def main():
                 assert (scratch / 'registry-url').exists(), (proof / 'server.log').read_text()
                 registry = (scratch / 'registry-url').read_text()
                 run('native-init', [str(fixture), 'init', str(releases[0]), str(consumer), registry])
-                run('first-npm', node('first'))
-                source = consumer / 'apps/main/src/greeting.ts'
-                source.write_text(source.read_text() + '\n// Preserve the product edit.\n')
-                (consumer / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
-                preserved = {p: p.read_bytes() for p in (source, consumer / '.env', consumer / 'Makefile', consumer / 'compose.yaml')}
-                run('native-update', [str(fixture), 'update', str(releases[1]), str(consumer), registry])
-                assert all(p.read_bytes() == data for p, data in preserved.items())
-                assert json.loads((consumer / '.devkit/manifest.json').read_text())['version'] == manifests[1]['version']
-                run('second-npm', node('second'))
+                if args.previous:
+                    run('baseline-pnpm', node('first'))
+                    source = consumer / 'apps/main/src/greeting.ts'
+                    source.write_text(source.read_text() + '\n// Preserve the product edit.\n')
+                    (consumer / '.env').write_text('PRODUCT_SENTINEL=preserve\n')
+                    preserved = {p: p.read_bytes() for p in (source, consumer / '.env', consumer / 'Makefile', consumer / 'compose.yaml')}
+                    run('native-update', [str(fixture), 'update', str(releases[-1]), str(consumer), registry])
+                    assert all(p.read_bytes() == data for p, data in preserved.items())
+                assert json.loads((consumer / '.devkit/manifest.json').read_text())['version'] == manifests[-1]['version']
+                run('current-pnpm', node('second'))
                 run('integrity-missing-version-negatives', node('negative'))
                 # Legacy npm can select newly published transitive dependencies.
                 # Exercise a release-day edit with the target template's frozen graph.
                 fresh = scratch / 'release-day'
-                run('release-day-init', [str(fixture), 'init', str(releases[1]), str(fresh), registry])
+                run('release-day-init', [str(fixture), 'init', str(releases[-1]), str(fresh), registry])
                 run('release-day-dependency-edit', node('release-day', fresh))
                 (proof / 'requests.json').write_bytes((scratch / 'requests.json').read_bytes())
                 assert not forbidden.exists(), 'Host SDK attempted'
@@ -128,7 +132,7 @@ def main():
                 releases=[dict(version=m['version'], releaseIdentity=digest(p / 'release.json')) for p, m in zip(releases, manifests)],
                 engineSha256=digest(engine), fixtureSha256=digest(fixture), hostSdkAttempts=0, containersAbsent=owned,
                 limits=['Local unpublished registry uses the author-only native library fixture; public CLI registry proof is separate.']), indent=2) + '\n')
-    print(f'PASS native registry init/update + npm exports/gates/integrity; {proof}')
+    print(f'PASS native registry lifecycle + pnpm exports/gates/integrity; {proof}')
 
 
 if __name__ == '__main__':

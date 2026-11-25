@@ -1,0 +1,162 @@
+name: Assemble and verify unpublished Apple Silicon preview
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+      amd64:
+        required: true
+        type: string
+      arm64:
+        required: true
+        type: string
+      darwin:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      preview_artifact: ${{ steps.preview.outputs.preview_artifact }}
+      preview_index_sha256: ${{ steps.preview.outputs.preview_index_sha256 }}
+      legacy_checkout_artifact: ${{ steps.legacy.outputs.artifact }}
+      legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}
+    env:
+      BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ fromJSON(inputs.amd64).contribution_artifact }}
+          path: .artifacts/amd64
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ fromJSON(inputs.arm64).contribution_artifact }}
+          path: .artifacts/arm64
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ fromJSON(inputs.amd64).npm_inputs_artifact }}
+          path: .artifacts/npm-inputs
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ fromJSON(inputs.darwin).contribution_artifact }}
+          path: .artifacts/darwin
+      - name: Verify downloaded producer identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AMD64: ${{ inputs.amd64 }}
+          ARM64: ${{ inputs.arm64 }}
+          DARWIN: ${{ inputs.darwin }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check-contributions.py amd64 arm64 darwin
+      - name: Assemble a separate unpublished host-only Darwin preview
+        id: preview
+        env:
+          AMD64: ${{ fromJSON(inputs.amd64).contribution_sha256 }}
+          ARM64: ${{ fromJSON(inputs.arm64).contribution_sha256 }}
+          DARWIN: ${{ fromJSON(inputs.darwin).contribution_sha256 }}
+        run: |
+          set -euo pipefail
+          img=$(sed -n 's/^DEVKIT_NODE_IMAGE=//p' toolchains.env)
+          test -n "$img"
+          docker pull "$img"
+          export DEVKIT_AUTHOR_ENGINE="$PWD/.artifacts/amd64/devkit-x86_64-unknown-linux-musl"
+          make pack-preview output="$PWD/.artifacts/preview" npm_inputs="$PWD/.artifacts/npm-inputs" \
+            target_inputs="x86_64-unknown-linux-musl:.artifacts/amd64:$AMD64 aarch64-unknown-linux-musl:.artifacts/arm64:$ARM64 aarch64-apple-darwin:.artifacts/darwin:$DARWIN" build_run="$BUILD_RUN"
+          version=$(cat VERSION)
+          jq -e --arg version "$version" --arg commit "$(git rev-parse HEAD)" --arg tree "$(git rev-parse 'HEAD^{tree}')" \
+            '.publicationEligible == false and (.engines | length) == 3 and .version == $version and .sourceCommit == $commit and .sourceTree == $tree' \
+            .artifacts/preview/release-index.json
+          preview_artifact="devkit-darwin-preview-$GITHUB_RUN_ATTEMPT"
+          preview_sha256=$(sha256sum .artifacts/preview/release-index.json | cut -d ' ' -f 1)
+          echo "preview_artifact=$preview_artifact" >> "$GITHUB_OUTPUT"
+          echo "preview_index_sha256=$preview_sha256" >> "$GITHUB_OUTPUT"
+          printf 'Darwin preview artifact %s has index SHA-256 %s.\n' "$preview_artifact" "$preview_sha256" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: devkit-darwin-preview-${{ github.run_attempt }}
+          path: |
+            .artifacts/preview/*.json
+            .artifacts/preview/*.tgz
+            .artifacts/preview/*.tar.gz
+            .artifacts/preview/*.sh
+            .artifacts/preview/*.txt
+            .artifacts/preview/devkit-*
+          if-no-files-found: error
+          retention-days: 90
+      - uses: ./.github/actions/restore-baseline
+      - name: Create a transferable checkout using the released v0.5.1 engine
+        id: legacy
+        run: |
+          set -euo pipefail
+          python3 test/bootstrap/legacy_checkout.py export --release .artifacts/baseline/v0.5.1/payload --bundle .artifacts/legacy.bundle
+          {
+            echo "artifact=devkit-darwin-legacy-checkout-$GITHUB_RUN_ATTEMPT"
+            echo "sha256=$(sha256sum .artifacts/legacy.bundle | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          include-hidden-files: true
+          name: ${{ steps.legacy.outputs.artifact }}
+          path: .artifacts/legacy.bundle
+          if-no-files-found: error
+          retention-days: 90
+
+  host:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PREVIEW_ARTIFACT: ${{ needs.assemble.outputs.preview_artifact }}
+      PREVIEW_SHA256: ${{ needs.assemble.outputs.preview_index_sha256 }}
+      LEGACY_SHA256: ${{ needs.assemble.outputs.legacy_checkout_sha256 }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ env.PREVIEW_ARTIFACT }}
+          path: .artifacts/preview
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ${{ needs.assemble.outputs.legacy_checkout_artifact }}
+          path: .artifacts/legacy-handoff
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Verify the unpublished native package, bootstrap and checkout
+        run: |
+          set -euo pipefail
+          dir="$PWD/.artifacts/preview"
+          test "$(shasum -a 256 "$dir/release-index.json" | cut -d ' ' -f 1)" = "$PREVIEW_SHA256"
+          test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d ' ' -f 1)" = "$LEGACY_SHA256"
+          archive=$(jq -er '.archive' "$dir/release-index.json")
+          test "$(shasum -a 256 "$dir/$archive" | cut -d ' ' -f 1)" = "$(jq -er --arg name "$archive" '.files[$name].sha256' "$dir/release-index.json")"
+          jq -er '.engines[]' "$dir/release-index.json" | while IFS= read -r engine; do
+            chmod 755 "$dir/$engine"
+          done
+          chmod 755 "$dir"/{install,bootstrap}.sh
+          mkdir "$dir/payload"
+          tar -xzf "$dir/$archive" --strip-components=1 -C "$dir/payload"
+          python3 test/darwin/verify.py --build-set "$dir"
+          python3 test/bootstrap/legacy_checkout.py verify --release "$dir/payload" --bundle .artifacts/legacy-handoff/legacy.bundle

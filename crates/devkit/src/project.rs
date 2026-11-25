@@ -12,7 +12,7 @@ use crate::{
     processes::{OutputMode, OwnedContainer, ProcessRunner},
     projections::*,
     release::*,
-    runtime::{CheckoutToolPins, ReleaseToolPins},
+    runtime::ToolPins,
     state::*,
     transaction::*,
 };
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -294,6 +294,7 @@ pub trait LockResolver {
 }
 #[derive(Default)]
 pub struct DockerPnpmResolver {
+    pub runner: Option<ProcessRunner>,
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
 }
@@ -304,37 +305,56 @@ impl LockResolver for DockerPnpmResolver {
         release: &AdmittedRelease,
         registry: Option<&str>,
     ) -> Result<()> {
-        let image = ReleaseToolPins::parse(&release.bytes("runtime/toolchains.env")?)?.node_image;
+        let image = ToolPins::parse_release(&release.bytes("runtime/toolchains.env")?)?.node_image;
         let root = project_root(root)?;
         let npmrc_policy = parse_manifest_npmrc_policy(
             &root,
             NodeLockKind::for_version(&release.manifest.version)?,
         )?;
         if !self.offline {
+            crate::native::validate_vm_registries(&npmrc_policy, registry)?;
             verify_required_npm_env_vars(&npmrc_policy)?;
         }
+        let fallback_runner;
+        let runner = if let Some(runner) = self.runner.as_ref() {
+            runner
+        } else {
+            fallback_runner = ProcessRunner::new()?;
+            &fallback_runner
+        };
+        let mut budget = crate::resources::HostResourceBudget::probe_with_docker(
+            runner,
+            &mut crate::runtime::docker_command(),
+        )?;
+        let daemon = budget
+            .daemon_info
+            .as_ref()
+            .context("Missing Linux Docker daemon information")?;
+        let platform = daemon.platform;
+        let pin = crate::runtime::PnpmPin::from_release_for_target(release, daemon.target)?;
+        let cache = crate::cache::ReleaseCache::new(self.cache_dir.as_deref(), runner)?;
+        let pnpm = cache.ensure_pnpm(&pin, Some(&npmrc_policy), !self.offline)?;
+        crate::shared_cache::prepare_mount_masks(&cache.root)?;
+        let mask = cache.root.join("empty-file-mask");
+        let tmp_dir = cache.root.join(".tmp");
         let ca_cert = if self.offline {
             None
         } else {
             resolve_ca_cert_path()?
-                .map(|p| crate::download::additional_ca_file(&p))
+                .map(|p| crate::download::additional_ca_file_in(&p, &tmp_dir))
                 .transpose()?
         };
-        let meta = fs::metadata(&root)?;
-        let runner = ProcessRunner::new()?;
-        let pin = crate::runtime::PnpmPin::from_release(release)?;
-        let cache = crate::cache::ReleaseCache::new(self.cache_dir.as_deref(), &runner)?;
-        let pnpm = cache.ensure_pnpm(&pin, Some(&npmrc_policy), !self.offline)?;
         let mut userconfig = tempfile::Builder::new()
             .prefix("devkit-npmrc-")
-            .tempfile()?;
+            .tempfile_in(&tmp_dir)?;
         use std::io::Write;
         userconfig.write_all(npmrc_policy.sanitized_lines.join("\n").as_bytes())?;
         userconfig.flush()?;
-        let mut budget = crate::resources::HostResourceBudget::probe_with_docker(
-            &runner,
-            &mut Command::new("docker"),
-        )?;
+        userconfig
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+        let meta = fs::metadata(&root)?;
+        crate::runtime::ensure_image(runner, &image, platform, !self.offline)?;
         // Docker's --mount value is CSV; quoting keeps spaces and commas in the
         // source path inside one field. No shell interprets any argument.
         let mount = format!(
@@ -347,13 +367,23 @@ impl LockResolver for DockerPnpmResolver {
             |budget: &crate::resources::HostResourceBudget, token: &str| -> Result<Command> {
                 let spec = budget.for_npm_resolver();
                 let env_plan = budget.toolchain_env_for_resolver(&spec);
-                let mut command = Command::new("docker");
+                let mut command = crate::runtime::docker_command();
                 command.args([
                     "run",
+                    "--platform",
+                    platform,
+                    "--pull",
+                    "never",
                     "--rm",
                     "--init",
                     "--network",
-                    if self.offline { "none" } else { "host" },
+                    if self.offline {
+                        "none"
+                    } else if cfg!(target_os = "macos") {
+                        "bridge"
+                    } else {
+                        "host"
+                    },
                     "--cap-drop",
                     "ALL",
                     "--security-opt",
@@ -380,10 +410,10 @@ impl LockResolver for DockerPnpmResolver {
                         true,
                     )?);
                 }
-                if fs::symlink_metadata(root.join(".npmrc")).is_ok_and(|m| m.is_file()) {
+                for name in crate::shared_cache::npmrc_targets(&root)? {
                     command.arg("--mount").arg(crate::runtime::bind_mount(
-                        Path::new("/dev/null"),
-                        Path::new("/workspace/.npmrc"),
+                        &mask,
+                        &Path::new("/workspace").join(name),
                         true,
                     )?);
                 }
@@ -1060,7 +1090,7 @@ fn check_new_managed_files(
 fn validate_staged_project(root: &Path, state: &ProjectState) -> Result<()> {
     validate_project_state(state)?;
     verify_managed_set(root, state)?;
-    CheckoutToolPins::admit(root, state)?;
+    ToolPins::admit(root, state)?;
     let native = admit_native_components(root, state)?;
     assert_projections(root, state, &native.inputs, native.cargo_workspace.as_ref())
 }
@@ -1703,7 +1733,7 @@ fn mutate_with_release(
             "Component {path} already exists with different or unverified registration options; use make sync reconcile=1 to reconcile its lock"
         );
         verify_managed_set(root, old)?;
-        CheckoutToolPins::admit(root, old)?;
+        ToolPins::admit(root, old)?;
         let native = admit_native_components(root, old)?;
         assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())?;
         release.recheck()?;
@@ -1790,7 +1820,7 @@ fn mutate_with_release(
         && mode == old.package_mode
     {
         verify_managed_set(root, old)?;
-        CheckoutToolPins::admit(root, old)?;
+        ToolPins::admit(root, old)?;
         match admit_native_components(root, old).and_then(|native| {
             assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())
         }) {
@@ -2612,7 +2642,7 @@ pub(crate) fn sync_project_with_release(
     if !options.reconcile_lock && options.hooks.is_none() {
         let can_noop = (|| -> Result<bool> {
             verify_managed_set(root, old)?;
-            CheckoutToolPins::admit(root, old)?;
+            ToolPins::admit(root, old)?;
             let native = admit_native_components(root, old)?;
             assert_projections(root, old, &native.inputs, native.cargo_workspace.as_ref())?;
             if CargoWorkspaceKind::root_with_rust(old)? && old.cargo_resolution.is_none() {

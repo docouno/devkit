@@ -7,167 +7,71 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: source-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    outputs:
-      version: ${{ steps.freeze.outputs.version }}
-      source_commit: ${{ steps.freeze.outputs.source_commit }}
-      source_tree: ${{ steps.freeze.outputs.source_tree }}
-      index_sha256: ${{ steps.freeze.outputs.index_sha256 }}
-      fixtures_sha256: ${{ steps.freeze.outputs.fixtures_sha256 }}
-      artifact_suffix: ${{ steps.freeze.outputs.artifact_suffix }}
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Verify source admission and performance failure guards
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/public -p test_release_guard.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/performance -p 'test_*.py'
-      - uses: ./.github/actions/setup-compose
-      - name: Cache verified pnpm executable
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/docouno/devkit/tools
-          key: pnpm-tools-${{ runner.os }}-${{ hashFiles('toolchains.env') }}
-      - name: Cache author pnpm store
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .artifacts/author/pnpm-store
-          key: author-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'toolchains.env') }}
-      - name: Cache author Cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            .artifacts/author/cargo-home/registry/index
-            .artifacts/author/cargo-home/registry/cache
-            .artifacts/author/cargo-home/git/db
-          key: author-cargo-${{ hashFiles('Cargo.lock', 'toolchains.env') }}
-      - name: Cache author Rust SDK image
-        id: author_rust_cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .artifacts/cache/author-rust-image.tar
-          key: author-rust-img-${{ hashFiles('tooling/native.Dockerfile') }}
-      - name: Load cached author Rust SDK image
-        if: steps.author_rust_cache.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          docker load --input .artifacts/cache/author-rust-image.tar
-          docker image inspect "devkit-author-rust:$recipe_sha" >/dev/null
-      - name: Prepare pinned author SDKs
-        run: make setup
-      - name: Stage author Rust SDK image for cache
-        if: steps.author_rust_cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          umask 022
-          recipe_sha=$(sha256sum tooling/native.Dockerfile | cut -d ' ' -f 1)
-          mkdir -p .artifacts/cache
-          docker save --output .artifacts/cache/author-rust-image.tar "devkit-author-rust:$recipe_sha"
-      - name: Build the author-only controller
-        run: make build-controller
-      - name: Build static black-box verification fixtures
-        run: |
-          set -euo pipefail
-          umask 022
-          make build-fixtures
-          rm -rf .artifacts/author-fixtures
-          mkdir -p .artifacts/author-fixtures
-          cp .artifacts/author/target/x86_64-unknown-linux-musl/debug/examples/runtime_fixture .artifacts/author-fixtures/runtime_fixture
-          cp .artifacts/author/target/x86_64-unknown-linux-musl/debug/examples/registry_fixture .artifacts/author-fixtures/registry_fixture
-          chmod 755 .artifacts/author-fixtures/runtime_fixture .artifacts/author-fixtures/registry_fixture
-          (
-            cd .artifacts/author-fixtures
-            sha256sum runtime_fixture registry_fixture > checksums.txt
-          )
-      - name: Assemble one frozen test set from clean source
-        env:
-          BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-        run: make pack output="$PWD/.artifacts/frozen" build_id=ci build_run="$BUILD_RUN"
-      - name: Freeze handoff identities
-        id: freeze
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          raw = Path('.artifacts/frozen/release-index.json').read_bytes()
-          fixtures_raw = Path('.artifacts/author-fixtures/checksums.txt').read_bytes()
-          index = json.loads(raw)
-          assert index['publicationEligible'] is True
-          assert index['sourceCommit'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          assert index['sourceTree'] == subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in (
-                  ('version', index['version']),
-                  ('source_commit', index['sourceCommit']),
-                  ('source_tree', index['sourceTree']),
-                  ('index_sha256', hashlib.sha256(raw).hexdigest()),
-                  ('fixtures_sha256', hashlib.sha256(fixtures_raw).hexdigest()),
-                  ('artifact_suffix', os.environ['GITHUB_RUN_ATTEMPT']),
-              ):
-                  output.write(key + '=' + value + '\n')
-          PY
-      - name: Preserve every frozen distribution file
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          include-hidden-files: true
-          name: devkit-frozen-set-${{ github.run_attempt }}
-          path: |
-            .artifacts/frozen/*.json
-            .artifacts/frozen/*.tgz
-            .artifacts/frozen/*.tar.gz
-            .artifacts/frozen/*.sh
-            .artifacts/frozen/*.txt
-            .artifacts/frozen/devkit-x86_64-unknown-linux-musl
-          if-no-files-found: error
-          retention-days: 14
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          include-hidden-files: true
-          name: devkit-release-controller-${{ github.run_attempt }}
-          path: .artifacts/release-ops/devkit-release
-          if-no-files-found: error
-          retention-days: 14
-      - name: Preserve static black-box verification fixtures
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          include-hidden-files: true
-          name: devkit-author-fixtures-${{ github.run_attempt }}
-          path: |
-            .artifacts/author-fixtures/runtime_fixture
-            .artifacts/author-fixtures/registry_fixture
-            .artifacts/author-fixtures/checksums.txt
-          if-no-files-found: error
-          retention-days: 14
-      - name: Preserve build diagnostics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          include-hidden-files: true
-          name: source-build-diagnostics-${{ github.run_attempt }}
-          path: |
-            .artifacts/**/*.log
-            .artifacts/author/*notice-producer.json
-          retention-days: 14
-          if-no-files-found: warn
+  source-linux-amd64:
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: amd64
+      source_commit: ${{ github.sha }}
+
+  source-linux-arm64:
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: arm64
+      source_commit: ${{ github.sha }}
+
+  build-linux-amd64:
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      platform: amd64
+      source_commit: ${{ github.sha }}
+      fresh: true
+
+  build-linux-arm64:
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      platform: arm64
+      source_commit: ${{ github.sha }}
+      fresh: true
+
+  assemble:
+    needs: [build-linux-amd64, build-linux-arm64]
+    uses: ./.github/workflows/assemble.yml
+    with:
+      source_commit: ${{ github.sha }}
+      state: fresh
+      amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
+      arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
 
   verify:
-    needs: prepare
+    needs: [assemble, build-linux-amd64, build-linux-arm64, source-linux-amd64, source-linux-arm64]
+    if: '!cancelled()'
     uses: ./.github/workflows/verify.yml
     with:
-      version: ${{ needs.prepare.outputs.version }}
-      source_commit: ${{ needs.prepare.outputs.source_commit }}
-      source_tree: ${{ needs.prepare.outputs.source_tree }}
-      index_sha256: ${{ needs.prepare.outputs.index_sha256 }}
-      fixtures_sha256: ${{ needs.prepare.outputs.fixtures_sha256 }}
-      artifact_suffix: ${{ needs.prepare.outputs.artifact_suffix }}
+      state: fresh
+      assembly_result: ${{ needs.assemble.result }}
+      source_amd64_result: ${{ needs.source-linux-amd64.result }}
+      source_arm64_result: ${{ needs.source-linux-arm64.result }}
+      frozen: ${{ toJSON(needs.assemble.outputs) }}
+      amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
+      arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
+
+  build-darwin-arm64:
+    uses: ./.github/workflows/build-darwin.yml
+    with:
+      source_commit: ${{ github.sha }}
+
+  darwin-preview:
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    uses: ./.github/workflows/darwin-preview.yml
+    with:
+      source_commit: ${{ github.sha }}
+      amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
+      arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
+      darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}

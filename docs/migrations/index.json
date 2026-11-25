@@ -32,6 +32,16 @@
       "anchor": "make-targets-and-worktrunk"
     },
     {
+      "id": "portable-linux-checkouts",
+      "version": "0.6.0",
+      "severity": "recommended",
+      "title": "Prepare checkouts for each Linux architecture",
+      "summary": "Run setup on each host and include the runner architecture in CI cache keys.",
+      "profiles": [],
+      "docPath": "docs/migrations/0.6.0.md",
+      "anchor": "prepare-checkouts-for-each-linux-architecture"
+    },
+    {
       "id": "profile-scoped-desktop-runtime",
       "version": "0.6.0",
       "severity": "info",

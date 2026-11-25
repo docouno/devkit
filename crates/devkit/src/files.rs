@@ -214,6 +214,9 @@ pub fn lexical(path: &Path) -> Result<PathBuf> {
     }
     Ok(result)
 }
+#[cfg(target_os = "macos")]
+mod darwin;
+
 pub fn project_root(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -221,7 +224,11 @@ pub fn project_root(path: &Path) -> Result<PathBuf> {
         std::env::current_dir()?.join(path)
     };
     let result = lexical(&absolute)?;
+    #[cfg(target_os = "macos")]
+    let result = darwin::system_alias(result)?;
     check_ancestors(&result)?;
+    #[cfg(target_os = "macos")]
+    let result = darwin::spelling(&result)?;
     Ok(result)
 }
 fn check_ancestors(path: &Path) -> Result<()> {
@@ -453,6 +460,24 @@ pub fn sync_directory(path: &Path) -> Result<()> {
         .sync_all()
         .with_context(|| format!("Cannot synchronize directory: {}", path.display()))
 }
+
+/// Flush dirty file data pages from kernel UBC to the storage controller on
+/// macOS without issuing a per-file F_FULLFSYNC hardware cache flush. Pair
+/// with a single `sync_directory` (`F_FULLFSYNC`) barrier at the end of a batch.
+#[cfg(target_os = "macos")]
+pub(crate) fn flush_file_pages(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: `file` owns a live open descriptor for the duration of the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
 /// Install each new directory entry durably, not only the final file's parent.
 /// A journal may be published from a different directory than its saved data.
 pub fn create_dir_all_durable(path: &Path) -> Result<()> {
@@ -462,6 +487,10 @@ pub fn create_dir_all_durable(path: &Path) -> Result<()> {
     } else {
         path.to_path_buf()
     };
+    #[cfg(target_os = "macos")]
+    {
+        current = darwin::system_alias(current)?;
+    }
     loop {
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {

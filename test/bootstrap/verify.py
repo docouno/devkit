@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
+from portable import verify as verify_portable_loader
 from safety import Safety
 from support import Harness
 
@@ -15,6 +16,7 @@ def main():
     mode.add_argument('--safety-only', action='store_true')
     mode.add_argument('--skip-safety', action='store_true')
     args = parser.parse_args()
+    verify_portable_loader()
     for cls in ([Safety] if args.safety_only else [Harness] if args.skip_safety else [Harness, Safety]):
         harness = cls(args.build_set, args.baseline_set)
         passed = False

@@ -649,7 +649,7 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
 pub struct RuntimeAdmission {
     pub root: PathBuf,
     pub state: ProjectState,
-    pub pins: crate::runtime::CheckoutToolPins,
+    pub pins: crate::runtime::ToolPins,
     pub native: crate::native::NativeAdmission,
     pub manifest_identity: FileIdentity,
 }
@@ -691,13 +691,13 @@ pub(crate) fn admit_runtime_snapshot_with_pins(
     root: &Path,
     s: ProjectState,
     manifest_identity: FileIdentity,
-    admitted_pins: Option<crate::runtime::CheckoutToolPins>,
+    admitted_pins: Option<crate::runtime::ToolPins>,
 ) -> Result<RuntimeAdmission> {
     assert_managed(root, &s)?;
     verify_managed_set(root, &s)?;
     let pins = match admitted_pins {
         Some(pins) => pins,
-        None => crate::runtime::CheckoutToolPins::admit(root, &s)?,
+        None => crate::runtime::ToolPins::admit(root, &s)?,
     };
     let native = crate::native::admit_native_components(root, &s)?;
     crate::projections::assert_projections(
@@ -730,6 +730,8 @@ pub enum CheckoutLockMode {
 pub struct LockOwner {
     pub pid: u32,
     pub start_time_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time_scale: Option<String>,
     pub operation: String,
     pub started_at_ms: u64,
 }
@@ -741,7 +743,13 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+#[cfg(target_os = "linux")]
+const START_TIME_SCALE: &str = "linux-ticks";
+#[cfg(target_os = "macos")]
+const START_TIME_SCALE: &str = "darwin-usec";
+
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
     let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = raw.get(raw.rfind(')')? + 1..)?;
     let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
@@ -751,6 +759,56 @@ fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
     let ppid: u32 = fields[1].parse().ok()?;
     let start_ticks: u64 = fields[19].parse().ok()?;
     Some((ppid, start_ticks))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_bsd_info(
+    pid: i32,
+    include_zombies: bool,
+) -> std::io::Result<libc::proc_bsdinfo> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let length = size_of::<libc::proc_bsdinfo>() as i32;
+    let count = unsafe {
+        *libc::__error() = 0;
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            u64::from(include_zombies),
+            info.as_mut_ptr().cast(),
+            length,
+        )
+    };
+    if count != length {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(0) {
+            std::io::Error::from_raw_os_error(libc::ESRCH)
+        } else {
+            error
+        });
+    }
+    Ok(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_stat_ppid_and_start(pid: u32) -> Option<(u32, u64)> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    match darwin_bsd_info(pid, false) {
+        Ok(info) => {
+            return (info.pbi_pid == pid as u32 && info.pbi_status != libc::SZOMB).then_some((
+                info.pbi_ppid,
+                info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(_) => return None,
+    }
+    // KERN_PROC_PID exposes BSD identity for a live parent/lock holder under another UID.
+    unsafe extern "C" {
+        fn devkit_sysctl_process(pid: i32, parent: *mut u32, start: *mut u64) -> i32;
+    }
+    let mut parent = 0;
+    let mut start = 0;
+    (unsafe { devkit_sysctl_process(pid, &mut parent, &mut start) } == 0).then_some((parent, start))
 }
 
 fn is_ancestor_or_self(target_pid: u32) -> bool {
@@ -770,15 +828,39 @@ fn is_ancestor_or_self(target_pid: u32) -> bool {
     false
 }
 
-pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
+enum OwnerIdentity {
+    Verified(LockOwner),
+    Inaccessible,
+}
+
+fn checkout_owner(root: &Path) -> Option<OwnerIdentity> {
     let path = safe_path(root, ".devkit/state/task.owner.json").ok()?;
     let (bytes, _) = read_regular_file(&path, 65536, "checkout lock owner").ok()??;
     let owner: LockOwner = serde_json::from_slice(&bytes).ok()?;
-    if owner.pid == 0 {
+    if owner.pid == 0
+        || owner.start_time_scale.as_deref().unwrap_or("linux-ticks") != START_TIME_SCALE
+    {
         return None;
     }
-    let (_, ticks) = proc_stat_ppid_and_start(owner.pid)?;
-    (ticks == owner.start_time_ticks).then_some(owner)
+    if let Some((_, ticks)) = proc_stat_ppid_and_start(owner.pid) {
+        return (ticks == owner.start_time_ticks).then_some(OwnerIdentity::Verified(owner));
+    }
+    if let Ok(pid) = i32::try_from(owner.pid)
+        && unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    {
+        // A protected process exists but its birth time could not be verified.
+        // Honor the normal wait deadline without trusting its identity.
+        return Some(OwnerIdentity::Inaccessible);
+    }
+    None
+}
+
+pub fn read_live_owner(root: &Path) -> Option<LockOwner> {
+    match checkout_owner(root)? {
+        OwnerIdentity::Verified(owner) => Some(owner),
+        OwnerIdentity::Inaccessible => None,
+    }
 }
 
 pub(crate) fn probe_checkout_lock(root: &Path) -> Result<bool> {
@@ -817,10 +899,12 @@ fn write_owner_sidecar(root: &Path, operation: &str) -> Result<PathBuf> {
         );
     }
     let pid = std::process::id();
-    let start_time_ticks = proc_stat_ppid_and_start(pid).map(|(_, t)| t).unwrap_or(0);
+    let (_, start_time_ticks) =
+        proc_stat_ppid_and_start(pid).context("Cannot establish checkout lock owner identity")?;
     let payload = serde_json::to_vec(&LockOwner {
         pid,
         start_time_ticks,
+        start_time_scale: Some(START_TIME_SCALE.to_owned()),
         operation: operation.to_owned(),
         started_at_ms: now_epoch_ms(),
     })?;
@@ -1031,7 +1115,8 @@ impl CheckoutLock {
                         r.check_cancelled()?;
                     }
                     let elapsed = started.elapsed();
-                    if let Some(owner) = read_live_owner(&root) {
+                    let identity = checkout_owner(&root);
+                    if let Some(OwnerIdentity::Verified(owner)) = identity {
                         ensure!(
                             !is_ancestor_or_self(owner.pid),
                             "Recursive devkit invocation detected inside active operation (pid {})",
@@ -1054,13 +1139,16 @@ impl CheckoutLock {
                             );
                         }
                     } else {
-                        let unowned_limit_ms = if mode == CheckoutLockMode::Exclusive
-                            && shared_readers_hold_lock(&p)
-                        {
-                            5_000.min(timeout_ms)
-                        } else {
-                            250.min(timeout_ms)
-                        };
+                        let unowned_limit_ms =
+                            if matches!(identity, Some(OwnerIdentity::Inaccessible)) {
+                                timeout_ms
+                            } else if mode == CheckoutLockMode::Exclusive
+                                && shared_readers_hold_lock(&p)
+                            {
+                                5_000.min(timeout_ms)
+                            } else {
+                                250.min(timeout_ms)
+                            };
                         if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
                             anyhow::bail!("Another devkit operation owns this checkout");
                         }
@@ -1069,5 +1157,56 @@ impl CheckoutLock {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn lock_identity_rejects_other_clocks_and_stale_start_times() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = CheckoutLock::acquire(root.path()).unwrap();
+        let owner = read_live_owner(root.path()).unwrap();
+        assert_eq!(owner.start_time_scale.as_deref(), Some(START_TIME_SCALE));
+        let file = root.path().join(".devkit/state/task.owner.json");
+        let mut json = serde_json::to_value(owner).unwrap();
+        json["startTimeScale"] = "unknown".into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(read_live_owner(root.path()).is_none());
+        json.as_object_mut().unwrap().remove("startTimeScale");
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(
+            read_live_owner(root.path()).is_some(),
+            cfg!(target_os = "linux")
+        );
+        json["startTimeScale"] = START_TIME_SCALE.into();
+        json["startTimeTicks"] = 0.into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(read_live_owner(root.path()).is_none());
+        assert!(probe_checkout_lock(root.path()).unwrap());
+        drop(lock);
+    }
+
+    #[test]
+    fn process_birth_time_and_ancestry_exclude_zombies() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read x"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (parent, start) = proc_stat_ppid_and_start(pid).unwrap();
+        assert_eq!(parent, std::process::id());
+        assert!(start > 0);
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while proc_stat_ppid_and_start(pid).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.wait().unwrap();
     }
 }
