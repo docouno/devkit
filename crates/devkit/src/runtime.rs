@@ -1686,7 +1686,7 @@ pub(crate) fn mount_sensitive_workspace_masks(
     let file_mask = cache_root.join("empty-file-mask");
     let fold_case = cfg!(target_os = "macos");
     let mut rel_paths = BTreeSet::new();
-    let mut scan_dirs: Vec<(String, PathBuf)> = vec![(String::new(), root.to_path_buf())];
+    let mut scan_dirs: Vec<(PathBuf, PathBuf)> = vec![(PathBuf::new(), root.to_path_buf())];
     for group in ["apps", "packages"] {
         let group_dir = root.join(group);
         if fs::symlink_metadata(&group_dir)
@@ -1694,24 +1694,22 @@ pub(crate) fn mount_sensitive_workspace_masks(
         {
             for entry in sorted_entries(&group_dir)? {
                 let path = entry.path();
-                if let Some(child) = entry.file_name().to_str()
-                    && fs::symlink_metadata(&path)
-                        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                if fs::symlink_metadata(&path)
+                    .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
                 {
-                    scan_dirs.push((format!("{group}/{child}"), path));
+                    scan_dirs.push((Path::new(group).join(entry.file_name()), path));
                 }
             }
         }
     }
     for (prefix, dir) in scan_dirs {
         for entry in sorted_entries(&dir)? {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
             let canonical: std::borrow::Cow<'_, str> = if fold_case {
-                name.to_ascii_lowercase().into()
+                text.to_ascii_lowercase().into()
             } else {
-                name.as_str().into()
+                text.as_ref().into()
             };
             let sensitive = canonical == ".npmrc"
                 || canonical == ".env"
@@ -1723,25 +1721,26 @@ pub(crate) fn mount_sensitive_workspace_masks(
             if !sensitive {
                 continue;
             }
-            let rel_for = |leaf: &str| {
-                if prefix.is_empty() {
-                    leaf.to_owned()
+            let rel_for = |leaf: &std::ffi::OsStr| {
+                if prefix.as_os_str().is_empty() {
+                    PathBuf::from(leaf)
                 } else {
-                    format!("{prefix}/{leaf}")
+                    prefix.join(leaf)
                 }
             };
             let rel = rel_for(&name);
             let meta = fs::symlink_metadata(entry.path())?;
             ensure!(
                 !meta.file_type().is_symlink(),
-                "Refusing symlinked sensitive file inside Rust workspace: {rel}"
+                "Refusing symlinked sensitive file inside Rust workspace: {}",
+                rel.display()
             );
             if meta.is_file() {
                 rel_paths.insert(rel);
-                if canonical.as_ref() != name.as_str() {
+                if fold_case && canonical.as_ref() != text.as_ref() {
                     match fs::symlink_metadata(dir.join(canonical.as_ref())) {
                         Ok(alias_meta) if alias_meta.is_file() => {
-                            rel_paths.insert(rel_for(canonical.as_ref()));
+                            rel_paths.insert(rel_for(std::ffi::OsStr::new(canonical.as_ref())));
                         }
                         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
                             return Err(err.into());
@@ -1760,6 +1759,7 @@ pub(crate) fn mount_sensitive_workspace_masks(
             true,
         )?;
     }
+    crate::shared_cache::mask_embedded_cache(command, root, cache_root, Path::new("/workspace"))?;
     Ok(())
 }
 

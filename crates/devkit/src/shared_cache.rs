@@ -403,18 +403,15 @@ impl UnifiedStorePlan {
     }
 }
 
-pub fn mask_checkout_secrets(
+pub(crate) fn mask_embedded_cache(
     command: &mut Command,
     checkout: &Path,
     cache: &Path,
     target_root: &Path,
 ) -> Result<()> {
-    let file_mask = cache.join("empty-file-mask");
-    for target in mask_targets(checkout, true, cfg!(target_os = "macos"))? {
-        mount(command, &file_mask, &target_root.join(target), true)?;
-    }
     if let Ok(relative) = cache.strip_prefix(checkout) {
         let dir_mask = cache.join("empty-mask");
+        let file_mask = cache.join("empty-file-mask");
         for name in MASKED_CACHE_DIRS {
             mount(
                 command,
@@ -435,6 +432,19 @@ pub fn mask_checkout_secrets(
         }
     }
     Ok(())
+}
+
+pub fn mask_checkout_secrets(
+    command: &mut Command,
+    checkout: &Path,
+    cache: &Path,
+    target_root: &Path,
+) -> Result<()> {
+    let file_mask = cache.join("empty-file-mask");
+    for target in mask_targets(checkout, true, cfg!(target_os = "macos"))? {
+        mount(command, &file_mask, &target_root.join(target), true)?;
+    }
+    mask_embedded_cache(command, checkout, cache, target_root)
 }
 
 fn canonical_secret_name(name: &str, fold_case: bool) -> std::borrow::Cow<'_, str> {
