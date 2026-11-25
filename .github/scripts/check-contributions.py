@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 def sha256(path):
@@ -15,16 +16,20 @@ def sha256(path):
     return hasher.hexdigest()
 
 
-targets = {
+TARGETS = {
     "amd64": "x86_64-unknown-linux-musl",
     "arm64": "aarch64-unknown-linux-musl",
     "darwin": "aarch64-apple-darwin",
 }
+requested = sys.argv[1:]
+if not requested or len(set(requested)) != len(requested) or any(p not in TARGETS for p in requested):
+    raise SystemExit("Usage: check-contributions.py <amd64|arm64|darwin>...")
 commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
 version = Path("VERSION").read_text().strip()
 run_prefix = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/"
-for platform, target in targets.items():
+for platform in requested:
+    target = TARGETS[platform]
     handoff = json.loads(os.environ[platform.upper()])
     path = f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts/{int(handoff['artifact_id'])}"
     artifact = json.loads(subprocess.check_output(["gh", "api", path], timeout=60))

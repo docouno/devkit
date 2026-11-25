@@ -290,25 +290,20 @@ class RequiredNativeCheckGuard(unittest.TestCase):
         )
         frozen = dict(version="0.6.0", source_commit="a" * 40, source_tree="b" * 40,
                       index_sha256="c" * 64, frozen_set_artifact="devkit-frozen-set-2")
-        preview = dict(preview_artifact="devkit-darwin-preview-2", preview_index_sha256="d" * 64)
-        complete = {**frozen, **preview}
         cases = [
-            ("success", "fresh", complete, True),
+            ("success", "fresh", frozen, True),
             ("success", "restored", frozen, True),
             ("success", "incomplete", frozen, True),
-            ("success", "fresh", frozen, False),
-            ("success", "fresh", {**complete, "preview_artifact": ""}, False),
-            ("success", "fresh", {**complete, "preview_artifact": "devkit-darwin-preview-3"}, False),
-            ("success", "fresh", {**complete, "preview_index_sha256": ""}, False),
-            ("success", "fresh", {**complete, "preview_index_sha256": "z" * 64}, False),
+            ("success", "fresh", {}, False),
+            ("success", "fresh", {**frozen, "frozen_set_artifact": "devkit-frozen-set-0"}, False),
+            ("success", "fresh", {**frozen, "frozen_set_artifact": "devkit-darwin-preview-2"}, False),
+            ("success", "fresh", {**frozen, "index_sha256": "z" * 64}, False),
             ("success", "restored", {}, False),
-            ("success", "unknown", complete, False),
-            # Failure during preview assembly leaves only the Linux outputs.
-            ("failure", "fresh", frozen, False),
+            ("success", "unknown", frozen, False),
         ]
-        # An upload may fail after both sets of step outputs have been written.
+        # An upload may fail after step outputs have been written.
         for result in ("failure", "skipped", "cancelled"):
-            cases.append((result, "fresh", complete, False))
+            cases.append((result, "fresh", frozen, False))
         for result, state, outputs, valid in cases:
             env = dict(os.environ, STATE=state, ASSEMBLY_RESULT=result, FROZEN=json.dumps(outputs),
                        GITHUB_RUN_ATTEMPT="3")
@@ -317,13 +312,41 @@ class RequiredNativeCheckGuard(unittest.TestCase):
                 self.assertEqual(run.returncode == 0, valid, run.stderr)
 
         self.assertIn("legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}", handoff)
-        darwin = self.job("darwin-host")
-        self.assertNotIn("if: env.PREVIEW_ARTIFACT", darwin)
-        self.assertIn("LEGACY_SHA256: ${{ needs.handoff.outputs.legacy_checkout_sha256 }}", darwin)
-        self.assertIn('test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d \' \' -f 1)" = "$LEGACY_SHA256"', darwin)
-        self.assertIn("if: inputs.state == 'fresh'\n        run: |", darwin)
-        self.assertIn("if: inputs.state == 'restored' || inputs.state == 'incomplete'\n"
-                      "        run: python3 test/bootstrap/portable.py", darwin)
+        # Publishable Linux assembly must not wait on the unpublished Darwin preview runner.
+        ci_assemble = self.job("assemble", "ci")
+        self.assertEqual(
+            re.search(r"(?m)^    needs: \[(.+)\]$", ci_assemble).group(1).split(", "),
+            ["build-linux-amd64", "build-linux-arm64"],
+        )
+        self.assertNotIn("darwin:", ci_assemble)
+        assemble_wf = (REPO / ".github/workflows/assemble.yml").read_text()
+        self.assertIn("python3 .github/scripts/check-contributions.py amd64 arm64", assemble_wf)
+        self.assertNotIn("build-darwin", assemble_wf)
+        self.assertNotIn("darwin:", assemble_wf)
+
+        # Darwin preview stays a parallel non-blocking CI pipeline with full digest verification.
+        ci_preview = self.job("darwin-preview", "ci")
+        self.assertEqual(
+            re.search(r"(?m)^    needs: \[(.+)\]$", ci_preview).group(1).split(", "),
+            ["build-linux-amd64", "build-linux-arm64", "build-darwin-arm64"],
+        )
+        preview_assemble = self.job("assemble", "darwin-preview")
+        self.assertIn("python3 .github/scripts/check-contributions.py amd64 arm64 darwin", preview_assemble)
+        self.assertIn("make pack-preview", preview_assemble)
+        self.assertIn("legacy_checkout_sha256: ${{ steps.legacy.outputs.sha256 }}", preview_assemble)
+        preview_host = self.job("host", "darwin-preview")
+        self.assertIn("PREVIEW_SHA256: ${{ needs.assemble.outputs.preview_index_sha256 }}", preview_host)
+        self.assertIn("LEGACY_SHA256: ${{ needs.assemble.outputs.legacy_checkout_sha256 }}", preview_host)
+        self.assertIn('test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d \' \' -f 1)" = "$LEGACY_SHA256"', preview_host)
+        self.assertIn('python3 test/darwin/verify.py --build-set "$dir"', preview_host)
+        self.assertIn('python3 test/bootstrap/legacy_checkout.py verify --release "$dir/payload" --bundle .artifacts/legacy-handoff/legacy.bundle', preview_host)
+
+        for bad_args in ([], ["unknown"], ["amd64", "amd64"]):
+            check = subprocess.run(
+                [sys.executable, str(REPO / ".github/scripts/check-contributions.py"), *bad_args],
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertNotEqual(check.returncode, 0, bad_args)
 
     def test_each_required_check_rejects_an_unsuccessful_or_skipped_worker(self):
         workers = {"performance", "cross-host-checkout"}
@@ -333,7 +356,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
             self.assertIn("    if: '!cancelled()'\n", job)
             dependencies = re.search(r"(?m)^    needs: \[(.+)\]$", job).group(1).split(", ")
             if group == "source":
-                expected = ["darwin-host"]
+                expected = []
             elif group == "packaged":
                 expected = ["cross-host-checkout", "packaged-linux-amd64", "packaged-linux-arm64"]
             else:
@@ -342,7 +365,7 @@ class RequiredNativeCheckGuard(unittest.TestCase):
             workers.update(expected)
             if group == "source":
                 predicate = textwrap.dedent(job.split("        run: |\n", 1)[1])
-                for field in ("handoff", "darwin-host", "SOURCE_AMD64", "SOURCE_ARM64"):
+                for field in ("handoff", "SOURCE_AMD64", "SOURCE_ARM64"):
                     for status in ("success", "failure", "cancelled", "skipped"):
                         results = {name: {"result": "success"} for name in dependencies}
                         env = {"RESULTS": json.dumps(results), "SOURCE_AMD64": "success", "SOURCE_ARM64": "success"}
@@ -374,6 +397,10 @@ class RequiredNativeCheckGuard(unittest.TestCase):
     def test_release_workflow_admission_needs_and_sha256_handoffs(self):
         admit = self.job("admit-and-inspect", "release")
         self.assertIn("if: github.repository == 'docouno/devkit' && github.ref == 'refs/heads/main'", admit)
+        assemble = self.job("assemble", "release")
+        assemble_needs = [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", assemble).group(1).split(",") if item.strip()]
+        self.assertCountEqual(assemble_needs, ["admit-and-inspect", "build-linux-amd64", "build-linux-arm64"])
+        self.assertNotIn("build-darwin-arm64", (REPO / ".github/workflows/release.yml").read_text())
         verify = self.job("verify", "release")
         verify_needs = [item.strip() for item in re.search(r"(?ms)^    needs:\s*\[([^\]]+)\]", verify).group(1).split(",") if item.strip()]
         self.assertCountEqual(

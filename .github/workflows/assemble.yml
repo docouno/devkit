@@ -9,9 +9,6 @@ on:
       state:
         required: true
         type: string
-      darwin:
-        required: true
-        type: string
       amd64:
         required: true
         type: string
@@ -34,12 +31,6 @@ on:
         required: false
         type: string
     outputs:
-      preview_artifact:
-        description: Preview artifact
-        value: ${{ jobs.assemble.outputs.preview_artifact }}
-      preview_index_sha256:
-        description: Preview index sha256
-        value: ${{ jobs.assemble.outputs.preview_index_sha256 }}
       version:
         description: Version
         value: ${{ jobs.assemble.outputs.version }}
@@ -70,8 +61,6 @@ jobs:
       source_tree: ${{ steps.freeze.outputs.source_tree }}
       index_sha256: ${{ steps.freeze.outputs.index_sha256 }}
       frozen_set_artifact: ${{ steps.freeze.outputs.frozen_set_artifact }}
-      preview_artifact: ${{ steps.preview.outputs.preview_artifact }}
-      preview_index_sha256: ${{ steps.preview.outputs.preview_index_sha256 }}
     env:
       EXPECTED_INDEX: ${{ inputs.expected_index_sha256 }}
       VERSION: ${{ inputs.version }}
@@ -97,21 +86,15 @@ jobs:
         with:
           name: ${{ fromJSON(inputs.amd64).npm_inputs_artifact }}
           path: .artifacts/npm-inputs
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: inputs.state == 'fresh'
-        with:
-          name: ${{ fromJSON(inputs.darwin).contribution_artifact }}
-          path: .artifacts/darwin
       - name: Verify downloaded producer identities
         if: inputs.state == 'fresh'
         env:
           GH_TOKEN: ${{ github.token }}
           AMD64: ${{ inputs.amd64 }}
-          DARWIN: ${{ inputs.darwin }}
           ARM64: ${{ inputs.arm64 }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/check-contributions.py
+          python3 .github/scripts/check-contributions.py amd64 arm64
       - name: Assemble verified Linux contributions
         if: inputs.state == 'fresh'
         env:
@@ -182,37 +165,5 @@ jobs:
             .artifacts/frozen/*.sh
             .artifacts/frozen/*.txt
             .artifacts/frozen/devkit-*
-          if-no-files-found: error
-          retention-days: 90
-      - name: Assemble a separate unpublished host-only Darwin preview
-        if: inputs.state == 'fresh'
-        id: preview
-        env:
-          AMD64: ${{ fromJSON(inputs.amd64).contribution_sha256 }}
-          ARM64: ${{ fromJSON(inputs.arm64).contribution_sha256 }}
-          DARWIN: ${{ fromJSON(inputs.darwin).contribution_sha256 }}
-        run: |
-          set -euo pipefail
-          export DEVKIT_AUTHOR_ENGINE="$PWD/.artifacts/amd64/devkit-x86_64-unknown-linux-musl"
-          make pack-preview output="$PWD/.artifacts/preview" npm_inputs="$PWD/.artifacts/npm-inputs" \
-            target_inputs="x86_64-unknown-linux-musl:.artifacts/amd64:$AMD64 aarch64-unknown-linux-musl:.artifacts/arm64:$ARM64 aarch64-apple-darwin:.artifacts/darwin:$DARWIN" build_run="$BUILD_RUN"
-          jq -e '.publicationEligible == false and (.engines | length) == 3' .artifacts/preview/release-index.json
-          preview_artifact="devkit-darwin-preview-$GITHUB_RUN_ATTEMPT"
-          preview_sha256=$(sha256sum .artifacts/preview/release-index.json | cut -d ' ' -f 1)
-          echo "preview_artifact=$preview_artifact" >> "$GITHUB_OUTPUT"
-          echo "preview_index_sha256=$preview_sha256" >> "$GITHUB_OUTPUT"
-          printf 'Darwin preview artifact %s has index SHA-256 %s.\n' "$preview_artifact" "$preview_sha256" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: inputs.state == 'fresh'
-        with:
-          include-hidden-files: true
-          name: devkit-darwin-preview-${{ github.run_attempt }}
-          path: |
-            .artifacts/preview/*.json
-            .artifacts/preview/*.tgz
-            .artifacts/preview/*.tar.gz
-            .artifacts/preview/*.sh
-            .artifacts/preview/*.txt
-            .artifacts/preview/devkit-*
           if-no-files-found: error
           retention-days: 90

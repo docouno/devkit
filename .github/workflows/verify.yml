@@ -55,15 +55,12 @@ jobs:
           set -euo pipefail
           test "$ASSEMBLY_RESULT" = success || { echo "Assembly result was $ASSEMBLY_RESULT" >&2; exit 1; }
           jq -e --arg state "$STATE" '
-            (.frozen_set_artifact | capture("^devkit-frozen-set-(?<attempt>[1-9][0-9]*)\\z").attempt) as $attempt |
+            ($state == "fresh" or $state == "restored" or $state == "incomplete") and
+            (.frozen_set_artifact | test("^devkit-frozen-set-[1-9][0-9]*\\z")) and
             (.version | type == "string" and length > 0) and
             (.source_commit | test("^[0-9a-f]{40}\\z")) and (.source_tree | test("^[0-9a-f]{40}\\z")) and
-            (.index_sha256 | test("^[0-9a-f]{64}\\z")) and
-            (if $state == "fresh" then
-               .preview_artifact == ("devkit-darwin-preview-" + $attempt) and
-               (.preview_index_sha256 | test("^[0-9a-f]{64}\\z"))
-             else $state == "restored" or $state == "incomplete" end)
-          ' <<< "$FROZEN" || { echo "Invalid frozen or preview identity for state $STATE" >&2; exit 1; }
+            (.index_sha256 | test("^[0-9a-f]{64}\\z"))
+          ' <<< "$FROZEN" || { echo "Invalid frozen identity for state $STATE" >&2; exit 1; }
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           ref: ${{ fromJSON(inputs.frozen).source_commit }}
@@ -155,7 +152,7 @@ jobs:
   source:
     name: source
     if: '!cancelled()'
-    needs: [handoff, darwin-host]
+    needs: [handoff]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
@@ -288,56 +285,6 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
-
-  darwin-host:
-    needs: handoff
-    runs-on: macos-15
-    timeout-minutes: 30
-    env:
-      PREVIEW_ARTIFACT: ${{ fromJSON(inputs.frozen).preview_artifact }}
-      PREVIEW_SHA256: ${{ fromJSON(inputs.frozen).preview_index_sha256 }}
-      LEGACY_SHA256: ${{ needs.handoff.outputs.legacy_checkout_sha256 }}
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          ref: ${{ fromJSON(inputs.frozen).source_commit }}
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: inputs.state == 'fresh'
-        with:
-          name: ${{ env.PREVIEW_ARTIFACT }}
-          path: .artifacts/preview
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        if: inputs.state == 'fresh'
-        with:
-          name: ${{ needs.handoff.outputs.legacy_checkout_artifact }}
-          path: .artifacts/legacy-handoff
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
-        if: inputs.state == 'fresh'
-        with:
-          node-version: 24.22.1
-          package-manager-cache: false
-      - name: Verify the unpublished native package, bootstrap and checkout
-        if: inputs.state == 'fresh'
-        run: |
-          set -euo pipefail
-          dir="$PWD/.artifacts/preview"
-          test "$(shasum -a 256 "$dir/release-index.json" | cut -d ' ' -f 1)" = "$PREVIEW_SHA256"
-          test "$(shasum -a 256 .artifacts/legacy-handoff/legacy.bundle | cut -d ' ' -f 1)" = "$LEGACY_SHA256"
-          archive=$(jq -er '.archive' "$dir/release-index.json")
-          test "$(shasum -a 256 "$dir/$archive" | cut -d ' ' -f 1)" = "$(jq -er --arg name "$archive" '.files[$name].sha256' "$dir/release-index.json")"
-          jq -er '.engines[]' "$dir/release-index.json" | while IFS= read -r engine; do
-            chmod 755 "$dir/$engine"
-          done
-          chmod 755 "$dir"/{install,bootstrap}.sh
-          mkdir "$dir/payload"
-          tar -xzf "$dir/$archive" --strip-components=1 -C "$dir/payload"
-          python3 test/darwin/verify.py --build-set "$dir"
-          python3 test/bootstrap/legacy_checkout.py verify --release "$dir/payload" --bundle .artifacts/legacy-handoff/legacy.bundle
-      - name: Verify stock host entry points for a restored Linux release
-        if: inputs.state == 'restored' || inputs.state == 'incomplete'
-        run: python3 test/bootstrap/portable.py
 
   performance:
     needs: handoff

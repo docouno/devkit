@@ -6,9 +6,6 @@ on:
       source_commit:
         required: true
         type: string
-      fresh:
-        required: true
-        type: boolean
     outputs:
       contribution_artifact:
         description: Contribution artifact
@@ -48,18 +45,11 @@ jobs:
           key: darwin-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
       - name: Build the native host and exercise stock macOS primitives
         env:
-          FRESH: ${{ inputs.fresh }}
           DEVKIT_DARWIN_CARGO_HOME: ${{ github.workspace }}/.artifacts/darwin-cargo-cache
           BUILD_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-        run: |
-          if test "$FRESH" = true; then
-            tooling/darwin-producer.sh "$PWD/.artifacts/contribution"
-          else
-            tooling/darwin-producer.sh --test-only
-          fi
+        run: tooling/darwin-producer.sh "$PWD/.artifacts/contribution"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         id: contribution
-        if: inputs.fresh
         with:
           include-hidden-files: true
           name: devkit-contribution-darwin-${{ github.run_attempt }}
@@ -67,8 +57,8 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Identify the host-only contribution
-        if: inputs.fresh
         id: handoff
         run: |
+          set -euo pipefail
           echo "contribution_sha256=$(shasum -a 256 .artifacts/contribution/producer.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           echo "contribution_artifact=devkit-contribution-darwin-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"

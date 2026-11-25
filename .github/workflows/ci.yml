@@ -40,21 +40,14 @@ jobs:
       source_commit: ${{ github.sha }}
       fresh: true
 
-  build-darwin-arm64:
-    uses: ./.github/workflows/build-darwin.yml
-    with:
-      source_commit: ${{ github.sha }}
-      fresh: true
-
   assemble:
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    needs: [build-linux-amd64, build-linux-arm64]
     uses: ./.github/workflows/assemble.yml
     with:
       source_commit: ${{ github.sha }}
       state: fresh
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
-      darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}
 
   verify:
     needs: [assemble, build-linux-amd64, build-linux-arm64, source-linux-amd64, source-linux-arm64]
@@ -68,3 +61,17 @@ jobs:
       frozen: ${{ toJSON(needs.assemble.outputs) }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
+
+  build-darwin-arm64:
+    uses: ./.github/workflows/build-darwin.yml
+    with:
+      source_commit: ${{ github.sha }}
+
+  darwin-preview:
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    uses: ./.github/workflows/darwin-preview.yml
+    with:
+      source_commit: ${{ github.sha }}
+      amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
+      arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
+      darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}

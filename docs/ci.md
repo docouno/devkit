@@ -147,9 +147,9 @@ Devkit automatically detects cgroup v2 CPU and memory quotas on containerized CI
 
 ## Devkit release verification on Apple Silicon
 
-The host-only job on `macos-15` exercises the native CLI and the stock shell and Make entry points. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
+While Apple Silicon remains behind the publication gate, the host-only `build-darwin-arm64` and `darwin-preview` CI jobs run on `macos-15` in parallel with the required Linux assembly and verification checks without blocking Linux PR checks or Linux-only releases. They exercise the native CLI and the stock shell and Make entry points, and upload the three-target `devkit-darwin-preview` artifact. The Docker gate runs the same consumer commit on Linux x86-64, Linux ARM64, and Apple Silicon with a local Linux Docker VM. All three hosts need the Devkit repository at the candidate source commit, Git, Make, Python 3.12 or newer, and local Docker with Compose 5 or newer. The Mac also needs Worktrunk 0.74.0.
 
-On Linux x86-64, take the run ID, three-target preview artifact name, and preview index SHA-256 from the candidate Actions run and its assembly summary. Set `run_id`, `preview_artifact`, and `preview_sha256` accordingly. From the candidate checkout, generate a fullstack web project, run its gates, and send the preview, Git bundle, and x86-64 receipt to the ARM64 runner at `linux_arm_host`.
+On Linux x86-64, take the run ID, three-target preview artifact name, and preview index SHA-256 from the candidate CI Actions run and its `darwin-preview` assembly summary. Set `run_id`, `preview_artifact`, and `preview_sha256` accordingly. From the candidate checkout, generate a fullstack web project, run its gates, and send the preview, Git bundle, and x86-64 receipt to the ARM64 runner at `linux_arm_host`.
 
 ```sh
 handoff="$PWD/.artifacts/devkit-preview-handoff"

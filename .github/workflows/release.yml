@@ -159,15 +159,8 @@ jobs:
       source_commit: ${{ inputs.source_commit }}
       fresh: ${{ needs.admit-and-inspect.outputs.state == 'fresh' }}
 
-  build-darwin-arm64:
-    needs: admit-and-inspect
-    uses: ./.github/workflows/build-darwin.yml
-    with:
-      source_commit: ${{ inputs.source_commit }}
-      fresh: ${{ needs.admit-and-inspect.outputs.state == 'fresh' }}
-
   assemble:
-    needs: [admit-and-inspect, build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    needs: [admit-and-inspect, build-linux-amd64, build-linux-arm64]
     uses: ./.github/workflows/assemble.yml
     with:
       source_commit: ${{ inputs.source_commit }}
@@ -179,7 +172,6 @@ jobs:
       restored_frozen_artifact: ${{ needs.admit-and-inspect.outputs.restored_frozen_artifact }}
       amd64: ${{ toJSON(needs.build-linux-amd64.outputs) }}
       arm64: ${{ toJSON(needs.build-linux-arm64.outputs) }}
-      darwin: ${{ toJSON(needs.build-darwin-arm64.outputs) }}
 
   verify:
     needs:
