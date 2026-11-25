@@ -57,7 +57,7 @@ make update to=0.6.0
 
 Rust projects gain a virtual root Cargo workspace. Existing crate names, dependencies and selected versions carry forward. The migration combines compatible component locks into one root `Cargo.lock`, moves workspace-wide Cargo settings and formatting to the root, and installs the target release's root `rust-toolchain.toml`. Preview and apply both run pinned Cargo in Docker when the combined graph needs verification beyond the known templates or simple local dependencies. If the old components disagree, preview identifies the paths to reconcile on `0.5.x`. The old build directories remain local to the checkout and can be removed once the new build has succeeded. See the [Cargo migration guide](migrations/0.6.0.md#adopt-the-root-cargo-workspace).
 
-On upgrade to `0.6.0`, projects without a registered Electron component also drop the managed desktop Dockerfile, seccomp profile, associated notices, desktop recipe pin, and desktop tool Compose service. Adding or registering the first Electron app restores them in the same transaction as registration.
+The upgrade to `0.6.0` removes the unused `.devkit/runtime/compose.tools.yaml` and `.devkit/compose.workspace.json` from every checkout in the update transaction. For projects without a registered Electron component, the transaction also removes the managed desktop Dockerfile, seccomp profile, associated notices and desktop recipe pin. Adding or registering the first Electron app installs those desktop assets in the registration transaction.
 
 Updates also refresh managed runtime files, Make/Compose projections, and the accepted Node tool dependencies and pnpm workspace lock where applicable. Product source, root `Makefile`, `compose.yaml`, registry settings and project-owned environment files stay under your control. Devkit checks managed file identities before applying changes.
 
@@ -94,7 +94,9 @@ Because Devkit never overwrites product-owned `scripts` or configuration files s
 
 ### Choosing a CLI for headless projects
 
-Use the checkout's Make targets, `sh .devkit/runtime/devkit.sh cli <command> ...`, or an external CLI at `0.6.0` or newer. Headless checkouts from `0.6.0` omit `DEVKIT_DESKTOP_RECIPE_HASH`. External engines through `0.5.1` expect that pin. In `0.5.1`, `add-app`, `add-package`, `register`, `sync`, `exec`, `task`, `describe`, `status`, `stand reserve` and `stand remove` fail before dispatch. The old `doctor` reports `Missing toolchain pin`, and `info` reports readiness as `unknown`.
+External `doctor` through `0.5.1` rejects every `0.6.0+` checkout because the old format expects both retired Compose files. Use `make doctor`, `sh .devkit/runtime/devkit.sh cli doctor .`, or an external CLI at `0.6.0` or newer.
+
+On a headless `0.6.0+` checkout, external CLI `0.5.1` reports `Missing toolchain pin` before dispatch for `add-app`, `add-package`, `register`, `sync`, `exec`, `task`, `describe`, `status`, `stand reserve` and `stand remove`. Its local `info` fallback reports readiness as `unknown`. On Linux x86-64, an Electron checkout supplies the desktop recipe pin that CLI `0.5.1` needs to dispatch those commands to the accepted engine.
 
 ## Recovering Interrupted Updates (`devkit recover`)
 

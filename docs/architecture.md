@@ -25,7 +25,7 @@ A Devkit repository contains at least one registered component across two direct
 
 `.devkit/manifest.json` records environment identity (`version`, `releaseIdentity`), managed file digests, component roles/profiles, inter-component DAG edges (`dependencies`), and the exact `toolDependencies` subset managed inside each Node component's `devDependencies`. A root Cargo workspace can also record `cargoResolution`, which binds the accepted lock to the toolchain, manifests and checkout Cargo configuration. When the lock allows several local directories for one package ID, Devkit records which path Cargo selected. Committing this state with `Cargo.lock` lets an unchanged checkout run `make sync` before setup.
 
-Starting with `0.6.0`, the accepted component profiles determine which desktop assets belong in the checkout. A registered `electron` component adds the desktop Dockerfile, seccomp profile, its Apache license and notice, the desktop recipe pin and the desktop tool service. The release always carries the complete set so registration can use the accepted payload. The checkout records the digests of its rendered pins and Compose files.
+Starting with `0.6.0`, the accepted component profiles determine which desktop assets belong in the checkout. A registered `electron` component adds the desktop Dockerfile, seccomp profile, its Apache license and notice, and the desktop recipe pin. The release always carries the complete set so registration can use the accepted payload. The checkout records the digests of its rendered pins and `.devkit/compose.apps.yaml`, which development stands use. Daily tool commands run directly in Docker containers.
 
 Devkit deliberately avoids duplicating native package metadata in `.devkit/manifest.json`:
 

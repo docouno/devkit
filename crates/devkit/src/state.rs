@@ -14,13 +14,19 @@ pub const CHECKSUM_PATH: &str = ".devkit/runtime.sha256";
 pub const MIN_SUPPORTED_PROJECT_VERSION: &str = "0.5.0";
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const RUNTIME_LICENSES: &str = ".devkit/runtime/licenses";
+pub(crate) const LEGACY_TOOL_COMPOSE_RUNTIME_FILE: &str = "runtime/compose.tools.yaml";
+pub(crate) const LEGACY_TOOL_COMPOSE_RUNTIME_PATH: &str = ".devkit/runtime/compose.tools.yaml";
+pub(crate) const LEGACY_TOOL_COMPOSE_WORKSPACE_FILE: &str = ".devkit/compose.workspace.json";
+const LEGACY_TOOL_COMPOSE_FILES: [&str; 2] = [
+    LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+    LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
+];
 
 // Paths within a release payload. The seccomp notices travel with the profile.
-pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 4] = [
+pub(crate) const REQUIRED_RUNTIME_FILES: [&str; 3] = [
     "runtime/devkit.mk",
     "runtime/devkit.sh",
     "runtime/toolchains.env",
-    "runtime/compose.tools.yaml",
 ];
 pub(crate) const RUNTIME_LICENSE_FILE: &str = "runtime/LICENSE";
 pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
@@ -33,6 +39,10 @@ pub(crate) const DESKTOP_RUNTIME_FILES: [&str; 4] = [
 pub fn uses_profile_scoped_runtime(version: &str) -> Result<bool> {
     let v = SemVer::parse(version)?;
     Ok((v.major, v.minor, v.patch) >= (0, 6, 0))
+}
+
+pub fn uses_tool_compose_projections(version: &str) -> Result<bool> {
+    Ok(!uses_profile_scoped_runtime(version)?)
 }
 
 pub fn has_electron(state: &ProjectState) -> bool {
@@ -190,7 +200,7 @@ pub fn managed_path(name: &str) -> Result<&str> {
                 "rust-toolchain.toml",
                 ".devkit/project.mk",
                 ".devkit/compose.apps.yaml",
-                ".devkit/compose.workspace.json",
+                LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
                 ".devkit/tooling-profiles.json",
                 CHECKSUM_PATH
             ]
@@ -502,12 +512,30 @@ pub(crate) fn verify_runtime_inventory(root: &Path, state: &ProjectState) -> Res
     verify_runtime_inventory_with_incoming(root, state, &BTreeSet::new())
 }
 
+fn unexpected_legacy_tool_compose(path: &str, is_dir: bool) -> anyhow::Error {
+    let command = if is_dir { "rmdir" } else { "rm" };
+    anyhow::anyhow!("Unexpected legacy {path}; review its contents and run '{command} {path}'")
+}
+
+pub(crate) fn verify_retired_workspace_compose_absent(root: &Path) -> Result<()> {
+    let path = safe_path(root, ".devkit")?.join("compose.workspace.json");
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Err(unexpected_legacy_tool_compose(
+            LEGACY_TOOL_COMPOSE_WORKSPACE_FILE,
+            meta.is_dir(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub(crate) fn verify_runtime_inventory_with_incoming(
     root: &Path,
     state: &ProjectState,
     incoming: &BTreeSet<String>,
 ) -> Result<()> {
     let root = project_root(root)?;
+    let scoped = uses_profile_scoped_runtime(&state.version)?;
     let mut files: BTreeSet<&Path> = state
         .managed
         .keys()
@@ -535,6 +563,11 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
                             has_electron(state),
                             "Unexpected .devkit/runtime/licenses; review its contents and run 'rmdir .devkit/runtime/licenses'"
                         );
+                    } else if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
+                        return Err(unexpected_legacy_tool_compose(
+                            LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+                            true,
+                        ));
                     } else {
                         anyhow::bail!("Unlisted runtime directory: {}", name.display());
                     }
@@ -545,6 +578,12 @@ pub(crate) fn verify_runtime_inventory_with_incoming(
                     let display = name.to_string_lossy();
                     if incoming.contains(display.as_ref()) {
                         anyhow::bail!("New managed file conflicts with project content: {display}");
+                    }
+                    if scoped && name == Path::new(LEGACY_TOOL_COMPOSE_RUNTIME_PATH) {
+                        return Err(unexpected_legacy_tool_compose(
+                            LEGACY_TOOL_COMPOSE_RUNTIME_PATH,
+                            false,
+                        ));
                     }
                     anyhow::bail!("Unlisted runtime file: {display}");
                 }
@@ -571,7 +610,6 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         ".devkit/tooling-profiles.json",
         ".devkit/project.mk",
         ".devkit/compose.apps.yaml",
-        ".devkit/compose.workspace.json",
     ] {
         ensure!(
             state.managed.contains_key(required),
@@ -586,7 +624,21 @@ pub fn verify_managed_set(root: &Path, state: &ProjectState) -> Result<()> {
         );
     }
     let scoped = uses_profile_scoped_runtime(&state.version)?;
+    for path in LEGACY_TOOL_COMPOSE_FILES {
+        if scoped {
+            ensure!(
+                !state.managed.contains_key(path),
+                "Unexpected legacy tool Compose file: {path}"
+            );
+        } else {
+            ensure!(
+                state.managed.contains_key(path),
+                "Missing managed runtime identity: {path}"
+            );
+        }
+    }
     if scoped {
+        verify_retired_workspace_compose_absent(root)?;
         let license = format!(".devkit/{RUNTIME_LICENSE_FILE}");
         ensure!(
             state.managed.contains_key(&license),

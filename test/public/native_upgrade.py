@@ -166,7 +166,7 @@ def verify(helper, module, index, from_version, environment, products):
     require(module.source_snapshot(root) == before, "Native upgrade preview changed project inputs")
     cli("native-upgrade-apply", "update", ".", "--to", to_version)
     after, new_pins = accepted(root, to_version, index["releaseIdentity"])
-    helper.verify_tool_compose(root, after, "native-upgrade-applied")
+    module.assert_desktop_runtime(root, after)
     module.assert_node_workspace(root, [path for path, c in after["components"].items() if c["toolchain"] == "node"])
     require(module.cargo_packages(root / "Cargo.lock") == selected_crates
             and not (root / "apps/api/Cargo.lock").exists(), "Upgrade changed the Rust dependency selection")

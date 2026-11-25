@@ -119,12 +119,20 @@ def assert_desktop_runtime(root, state):
                 if line and not line.startswith("#"))
     checksums = {name: digest for digest, name in
                  (line.split("  ", 1) for line in (root / ".devkit/runtime.sha256").read_text().splitlines())}
-    for name in ("desktop.Dockerfile", "desktop-seccomp.json", "licenses/Apache-2.0.txt",
-                 "licenses/moby-profiles.NOTICE", "LICENSE", "toolchains.env", "compose.tools.yaml"):
-        path = runtime / name
-        key = str(path.relative_to(root))
-        expected = present or name in ("LICENSE", "toolchains.env", "compose.tools.yaml")
-        require(path.is_file() == expected and (key in state["managed"]) == expected
+    expected_paths = {
+        ".devkit/runtime/desktop.Dockerfile": present,
+        ".devkit/runtime/desktop-seccomp.json": present,
+        ".devkit/runtime/licenses/Apache-2.0.txt": present,
+        ".devkit/runtime/licenses/moby-profiles.NOTICE": present,
+        ".devkit/runtime/LICENSE": True,
+        ".devkit/runtime/toolchains.env": True,
+        ".devkit/runtime/compose.tools.yaml": not scoped,
+        ".devkit/compose.workspace.json": not scoped,
+    }
+    for key, expected in expected_paths.items():
+        path = root / key
+        on_disk = path.is_file() if expected else not path.exists()
+        require(on_disk and not path.is_symlink() and (key in state["managed"]) == expected
                 and (key in checksums) == expected, f"Wrong managed runtime inventory for {key}")
         if expected:
             digest = sha256(path.read_bytes())
@@ -133,12 +141,6 @@ def assert_desktop_runtime(root, state):
     require((runtime / "licenses").exists() == present, "Wrong desktop license directory presence")
     expected_pin = sha256((runtime / "desktop.Dockerfile").read_bytes()) if present else None
     require(pins.get("DEVKIT_DESKTOP_RECIPE_HASH") == expected_pin, "Wrong checkout desktop recipe pin")
-    workspace = json.loads((root / ".devkit/compose.workspace.json").read_text())
-    require(("desktop" in workspace["services"]) == present, "Wrong workspace desktop projection")
-    if not present:
-        tools = (runtime / "compose.tools.yaml").read_text()
-        require("desktop-seccomp.json" not in tools and "ELECTRON_CACHE" not in tools,
-                "Headless tool Compose retains Electron configuration")
 
 
 def source_snapshot(root):
@@ -350,6 +352,10 @@ class Verification:
         actual = source_snapshot(destination)
         expected = manifest["files"]
         require(set(actual) == set(expected) | {"release.json"}, "Unexpected release payload file set")
+        if semver_tuple(manifest["version"]) >= (0, 6, 0):
+            path = "runtime/compose.tools.yaml"
+            require(path not in expected and not (destination / path).exists()
+                    and not (destination / path).is_symlink(), "Release carries the retired tool Compose projection")
         for path, identity in expected.items():
             require(actual[path] == [identity["mode"], identity["sha256"]], f"Release mismatch: {path}")
         require((destination / "runtime/LICENSE").read_bytes() == (destination / "LICENSE").read_bytes(),
@@ -478,7 +484,7 @@ class Verification:
         state = json.loads((root / ".devkit/manifest.json").read_text())
         require(state["schemaVersion"] == 2 and state["version"] == selected_version and state["packageMode"] == self.package_source, "Wrong accepted v2 release")
         self.created_versions.setdefault(kind, state["version"])
-        self.verify_tool_compose(root, state, f"{parent}-init")
+        assert_desktop_runtime(root, state)
         if self.package_source == "registry":
             require(not (root / ".devkit/npm").exists(), "Registry consumer copied a local environment archive")
         components = state["components"]
@@ -506,37 +512,6 @@ class Verification:
                 require(components[path]["dependencies"] == ["packages/client"], "Shared dependency not derived")
         (root / ".env").write_text("PRODUCT_SECRET=consumer-owned-fixture-value\n")
         return root
-
-    def verify_tool_compose(self, root, state, label):
-        assert_desktop_runtime(root, state)
-        if semver_tuple(state["version"]) < (0, 6, 0):
-            return
-        runtime = root / ".devkit/runtime"
-        pins = dict(line.split("=", 1) for line in (runtime / "toolchains.env").read_text().splitlines()
-                    if line and not line.startswith("#"))
-        component = next(iter(state["components"]))
-        environment = dict(self.environment, **pins, DEVKIT_UID=str(os.getuid()), DEVKIT_GID=str(os.getgid()),
-                           DEVKIT_PROJECT_NAME="consumer", DEVKIT_PROJECT_ROOT=str(root),
-                           DEVKIT_COMPONENT_ROOT=str(root / component), DEVKIT_CURRENT_COMPONENT=component,
-                           DEVKIT_WORKDIR="/workspace/" + component)
-        output = self.run(label + "-tool-compose",
-                          ["docker", "compose", "-p", "consumer", "-f", runtime / "compose.tools.yaml",
-                           "-f", root / ".devkit/compose.workspace.json", "config", "--format", "json"],
-                          environment=environment)
-        services = json.loads(output)["services"]
-        electron = any(c["toolingProfile"] == "electron" for c in state["components"].values())
-        require(("desktop" in services) == electron, "Wrong normalized desktop service presence")
-        node = services["node"]
-        require("ELECTRON_CACHE" not in node["environment"]
-                and all(v["target"] != "/cache/electron" for v in node["volumes"]), "Electron cache leaked to Node")
-        if electron:
-            desktop = services["desktop"]
-            require(desktop["environment"]["HOME"] == node["environment"]["HOME"]
-                    and desktop["environment"]["ELECTRON_CACHE"] == "/cache/electron"
-                    and {"/workspace", "/devkit/bin/pnpm", "/cache/electron"} <= {v["target"] for v in desktop["volumes"]}
-                    and {"no-new-privileges:true", f"seccomp={runtime}/desktop-seccomp.json"} <= set(desktop["security_opt"])
-                    and desktop["cap_drop"] == ["ALL"] and int(desktop["shm_size"]) == 256 * 1024 ** 2,
-                    "Electron tool Compose lost its runtime mounts, environment or sandbox settings")
 
     def healthy(self, root, kind):
         before = source_snapshot(root)
@@ -1166,7 +1141,7 @@ class Verification:
         apps = json.loads((root / ".devkit/compose.apps.yaml").read_text())
         require(("shell" in apps["services"]) != adopt and compose.read_bytes() == compose_before,
                 "Electron registration changed ownership of the application service")
-        self.verify_tool_compose(root, state, label)
+        assert_desktop_runtime(root, state)
         before = source_snapshot(root)
         self.make(root, *targets, label=label + "-repeat")
         require(before == source_snapshot(root), "Repeated Electron registration changed checkout inputs")
@@ -1202,7 +1177,7 @@ class Verification:
                 expected = [identity["mode"], identity["sha256"]] if identity else None
                 require(snapshot.get(item["path"]) == expected, f"Wrong {phase} identity for {item['path']}")
         state = json.loads((root / ".devkit/manifest.json").read_text())
-        self.verify_tool_compose(root, state, label)
+        assert_desktop_runtime(root, state)
 
     def legacy_cargo_links(self):
         """Separate valid legacy locks can still compete for a native library."""

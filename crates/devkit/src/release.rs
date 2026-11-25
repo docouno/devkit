@@ -283,6 +283,13 @@ pub fn read_release(root: &Path) -> Result<Release> {
 }
 impl AdmittedRelease {
     fn check_scoped_runtime(&self) -> Result<()> {
+        ensure!(
+            !self
+                .manifest
+                .files
+                .contains_key(crate::state::LEGACY_TOOL_COMPOSE_RUNTIME_FILE),
+            "Unexpected legacy runtime/compose.tools.yaml in release payload"
+        );
         // Every attribution in this directory needs a declared profile. A
         // headless checkout omits the directory together with the seccomp file.
         for name in self
@@ -323,7 +330,7 @@ impl AdmittedRelease {
                 ),
             "Release desktop.Dockerfile differs from DEVKIT_DESKTOP_RECIPE_HASH"
         );
-        crate::projections::verify_release_tool_compose(&self.bytes("runtime/compose.tools.yaml")?)
+        Ok(())
     }
 
     pub(crate) fn ensure_scoped_runtime(&self) -> Result<()> {

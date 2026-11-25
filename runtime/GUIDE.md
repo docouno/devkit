@@ -12,13 +12,13 @@ The same project commit works on Linux x86-64 and ARM64. Run `make setup` on the
 
 - `apps/<name>` (`0..N`): Runnable product entry points (`node-api`, `react-web`, `electron-react`, `rust-api`). Libraries-only repositories may have zero applications.
 - `packages/<name>` (`1..M`): Reusable workspace libraries (`ts-library`, `react-ui`, `react-client`, `rust-library`).
-- `.devkit/`: Pinned runtime scripts, Docker/Compose definitions, `.devkit/manifest.json`, and generated Make/Compose projections.
+- `.devkit/`: Pinned runtime scripts, Dockerfiles, `.devkit/manifest.json`, and generated Make registration and development Compose files.
 
-From Devkit `0.6.0`, adding or registering the first Electron app installs `.devkit/runtime/desktop.Dockerfile`, `desktop-seccomp.json`, their `licenses/` attributions and the desktop tool service. Headless projects omit these files and the desktop recipe pin. Use Make, the checkout loader or CLI `0.6.0+` for these projects. Older external CLI versions require the desktop pin.
+From Devkit `0.6.0`, adding or registering the first Electron app installs `.devkit/runtime/desktop.Dockerfile`, `desktop-seccomp.json` and their `licenses/` attributions. Headless projects omit these files and the desktop recipe pin. For all `0.6.0+` checkouts, run `make doctor`, run `sh .devkit/runtime/devkit.sh cli doctor .`, or use CLI `0.6.0+`. External `doctor` through `0.5.1` rejects the new checkout format.
 
 ## File Ownership Boundaries
 
-- **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/compose.workspace.json`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and the root `rust-toolchain.toml` for Rust workspaces.
+- **Managed by Devkit (do not edit manually)**: `.devkit/runtime/**`, `.devkit/project.mk`, `.devkit/compose.apps.yaml`, `.devkit/tooling-profiles.json`, `.devkit/runtime.sha256`, `.devkit/npm/**`, and the root `rust-toolchain.toml` for Rust workspaces.
 - **Shared native manifests**:
   - In `apps/*/package.json` and `packages/*/package.json`, Devkit manages only the `toolDependencies` entries inside `devDependencies` (recorded in `.devkit/manifest.json`). Product `name`, `version`, `private`, `exports`, `files`, `publishConfig`, `scripts`, `dependencies`, `peerDependencies`, and extra `devDependencies` belong to the project.
   - Root `pnpm-workspace.yaml` and `pnpm-lock.yaml` represent the unified Node workspace graph; `package.json` has no `workspaces` field.

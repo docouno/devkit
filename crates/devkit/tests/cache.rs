@@ -171,11 +171,6 @@ fn fixture(root: &Path, marker: &[u8]) -> String {
             b"fixture Devkit license\n".as_slice(),
             0o644,
         ),
-        (
-            "runtime/compose.tools.yaml",
-            include_bytes!("../../../runtime/compose.tools.yaml").as_slice(),
-            0o644,
-        ),
         ("runtime/devkit.mk", b"# fixture\n".as_slice(), 0o644),
         ("runtime/devkit.sh", b"#!/bin/sh\n".as_slice(), 0o755),
     ] {

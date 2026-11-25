@@ -4,8 +4,7 @@ use devkit::{
 };
 use std::path::Path;
 
-// Seal replicas of the runtime inputs used by the lifecycle APIs. The Compose
-// template is shared with the assembler so profile selection exercises its anchors.
+// Seal replicas of the runtime inputs used by the lifecycle APIs.
 pub fn write_runtime(release: &Path, version: &str, engine_sha: &str) {
     let runtime = release.join("runtime");
     let recipe = b"FROM scratch\n";
@@ -16,12 +15,16 @@ pub fn write_runtime(release: &Path, version: &str, engine_sha: &str) {
         ("licenses/Apache-2.0.txt", b"fixture license\n"),
         ("licenses/moby-profiles.NOTICE", b"fixture attribution\n"),
         ("LICENSE", b"fixture Devkit license\n"),
-        (
-            "compose.tools.yaml",
-            include_bytes!("../../../../runtime/compose.tools.yaml"),
-        ),
     ] {
         write_atomic(&runtime.join(name), bytes, 0o644).unwrap();
+    }
+    if devkit::state::uses_tool_compose_projections(version).unwrap() {
+        write_atomic(
+            &runtime.join("compose.tools.yaml"),
+            b"services: {}\n",
+            0o644,
+        )
+        .unwrap();
     }
     for (name, mode) in [("devkit.mk", 0o644), ("devkit.sh", 0o755)] {
         write_atomic(
