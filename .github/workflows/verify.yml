@@ -6,10 +6,7 @@ on:
       assembly_result:
         required: true
         type: string
-      source_amd64_result:
-        required: true
-        type: string
-      source_arm64_result:
+      source_commit:
         required: true
         type: string
       state:
@@ -39,6 +36,18 @@ permissions:
   contents: read
 
 jobs:
+  source-linux-amd64:
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: amd64
+      source_commit: ${{ inputs.source_commit }}
+
+  source-linux-arm64:
+    uses: ./.github/workflows/source-linux.yml
+    with:
+      platform: arm64
+      source_commit: ${{ inputs.source_commit }}
+
   handoff:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -49,13 +58,15 @@ jobs:
       - name: Validate the completed assembly handoff
         env:
           ASSEMBLY_RESULT: ${{ inputs.assembly_result }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
           STATE: ${{ inputs.state }}
           FROZEN: ${{ inputs.frozen }}
         run: |
           set -euo pipefail
           test "$ASSEMBLY_RESULT" = success || { echo "Assembly result was $ASSEMBLY_RESULT" >&2; exit 1; }
-          jq -e --arg state "$STATE" '
+          jq -e --arg state "$STATE" --arg source_commit "$SOURCE_COMMIT" '
             ($state == "fresh" or $state == "restored" or $state == "incomplete") and
+            (.source_commit == $source_commit) and
             (.frozen_set_artifact | test("^devkit-frozen-set-[1-9][0-9]*\\z")) and
             (.version | type == "string" and length > 0) and
             (.source_commit | test("^[0-9a-f]{40}\\z")) and (.source_tree | test("^[0-9a-f]{40}\\z")) and
@@ -152,19 +163,13 @@ jobs:
   source:
     name: source
     if: '!cancelled()'
-    needs: [handoff]
+    needs: [handoff, source-linux-amd64, source-linux-arm64]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every native verification worker to pass
         env:
           RESULTS: ${{ toJSON(needs) }}
-          SOURCE_AMD64: ${{ inputs.source_amd64_result }}
-          SOURCE_ARM64: ${{ inputs.source_arm64_result }}
-        run: |
-          set -euo pipefail
-          test "$SOURCE_AMD64" = success
-          test "$SOURCE_ARM64" = success
-          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
 
   runtime-linux-amd64:
     needs: handoff

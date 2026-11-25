@@ -21,6 +21,10 @@
 - Retire the unused `.devkit/runtime/compose.tools.yaml` and `.devkit/compose.workspace.json`. Updating to `0.6.0` removes them transactionally. Use `make doctor`, the checked-in loader or CLI `0.6.0+` to inspect the upgraded checkout.
 - Register existing Electron apps as project-owned desktop services so stand reservation and checkout inspection recognize them.
 
+### Fixed
+
+- Allow a queued checkout operation to acquire the lock when the previous owner removes its diagnostic record just before releasing the lock.
+
 ## [0.5.1]
 
 ### Fixed

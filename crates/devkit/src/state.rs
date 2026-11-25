@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MANIFEST_PATH: &str = ".devkit/manifest.json";
@@ -1016,6 +1017,18 @@ fn shared_readers_hold_lock(lock_path: &Path) -> bool {
     probe.try_lock_shared().is_ok()
 }
 
+fn ownerless_wait_duration(
+    since: &mut Option<Instant>,
+    now: Instant,
+    owner_present: bool,
+) -> Duration {
+    if owner_present {
+        *since = None;
+        return Duration::ZERO;
+    }
+    now.duration_since(*since.get_or_insert(now))
+}
+
 /// Shared by lifecycle operations and native runtime commands. No inherited
 /// process-wide lock protocol is needed; the open file owns the advisory lock.
 pub struct CheckoutLock {
@@ -1142,6 +1155,7 @@ impl CheckoutLock {
         };
         let timeout_ms = lock_timeout_ms()?;
         let started = std::time::Instant::now();
+        let mut ownerless_since = Some(started);
         let mut printed_wait = false;
         loop {
             ensure!(
@@ -1173,8 +1187,13 @@ impl CheckoutLock {
                     if let Some(r) = runner {
                         r.check_cancelled()?;
                     }
-                    let elapsed = started.elapsed();
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(started);
                     let identity = checkout_owner(&root);
+                    // The owner removes the sidecar while still holding the lock.
+                    // Give any new period without an owner its own short grace window.
+                    let ownerless_elapsed =
+                        ownerless_wait_duration(&mut ownerless_since, now, identity.is_some());
                     if let Some(OwnerIdentity::Verified(owner)) = identity {
                         ensure!(
                             !is_ancestor_or_self(owner.pid),
@@ -1208,7 +1227,9 @@ impl CheckoutLock {
                             } else {
                                 250.min(timeout_ms)
                             };
-                        if elapsed >= std::time::Duration::from_millis(unowned_limit_ms) {
+                        if elapsed >= Duration::from_millis(timeout_ms)
+                            || ownerless_elapsed >= Duration::from_millis(unowned_limit_ms)
+                        {
                             anyhow::bail!("Another devkit operation owns this checkout");
                         }
                     }
@@ -1223,6 +1244,27 @@ impl CheckoutLock {
 mod owner_tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn ownerless_wait_restarts_when_the_verified_owner_disappears() {
+        let started = Instant::now();
+        let mut since = Some(started);
+        let grace = Duration::from_millis(250);
+        assert_eq!(
+            ownerless_wait_duration(&mut since, started + grace, false),
+            grace
+        );
+        let handoff = started + Duration::from_secs(1);
+        ownerless_wait_duration(&mut since, handoff - grace, true);
+        assert_eq!(
+            ownerless_wait_duration(&mut since, handoff, false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ownerless_wait_duration(&mut since, handoff + grace, false),
+            grace
+        );
+    }
 
     #[test]
     fn lock_identity_rejects_other_clocks_and_stale_start_times() {
