@@ -306,6 +306,22 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
         );
     }
 
+    let bad = tempfile::tempdir_in(temp.path()).unwrap();
+    copy_tree(&source, bad.path(), &|_| false, false).unwrap();
+    let retired = "runtime/compose.tools.yaml";
+    fs::create_dir(bad.path().join(retired)).unwrap();
+    assert_eq!(
+        devkit::release::release_identity(bad.path()).unwrap(),
+        good.identity
+    );
+    let error = cache
+        .acquire(version, None, Some(bad.path()), true)
+        .err()
+        .expect("an empty retired directory must be rejected before normalization");
+    assert!(error.to_string().contains(retired), "{error:#}");
+    assert_eq!(fs::read(&reference).unwrap(), saved);
+    assert!(bad.path().join(retired).is_dir());
+
     // Removing the version reference must heal when the cached release is re-admitted.
     fs::remove_file(&reference).unwrap();
     assert!(cache.acquire(version, None, None, true).is_err());

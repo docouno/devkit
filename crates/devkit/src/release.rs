@@ -187,6 +187,25 @@ pub struct AdmittedRelease {
 pub fn release_identity(root: &Path) -> Result<String> {
     Ok(digest(fs::read(safe_path(root, "release.json")?)?))
 }
+
+fn uses_known_scoped_runtime(version: &str) -> Result<bool> {
+    // A newer engine owns its runtime format. Older dispatchers only need the
+    // verified payload and its engine pin to hand control to that engine.
+    Ok(crate::state::uses_profile_scoped_runtime(version)?
+        && SemVer::parse(version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?)
+}
+
+fn verify_retired_tool_compose_absent(root: &Path) -> Result<()> {
+    ensure!(
+        !exists(&safe_path(
+            root,
+            crate::state::LEGACY_TOOL_COMPOSE_RUNTIME_FILE
+        )?)?,
+        "Unexpected legacy runtime/compose.tools.yaml in release payload"
+    );
+    Ok(())
+}
+
 fn parse_release(root: &Path) -> Result<Release> {
     let release: Release = read_json(&safe_path(root, "release.json")?)?;
     ensure!(
@@ -268,11 +287,7 @@ pub fn admit_release(root: &Path) -> Result<AdmittedRelease> {
         manifest,
         scoped_runtime_checked: false,
     };
-    // A newer engine owns its runtime format. Older dispatchers only need the
-    // verified payload and its engine pin to hand control to that engine.
-    if crate::state::uses_profile_scoped_runtime(&release.manifest.version)?
-        && SemVer::parse(&release.manifest.version)? <= SemVer::parse(env!("CARGO_PKG_VERSION"))?
-    {
+    if uses_known_scoped_runtime(&release.manifest.version)? {
         release.check_scoped_runtime()?;
         release.scoped_runtime_checked = true;
     }
@@ -283,13 +298,7 @@ pub fn read_release(root: &Path) -> Result<Release> {
 }
 impl AdmittedRelease {
     fn check_scoped_runtime(&self) -> Result<()> {
-        ensure!(
-            !exists(&safe_path(
-                &self.root,
-                crate::state::LEGACY_TOOL_COMPOSE_RUNTIME_FILE
-            )?)?,
-            "Unexpected legacy runtime/compose.tools.yaml in release payload"
-        );
+        verify_retired_tool_compose_absent(&self.root)?;
         // Every attribution in this directory needs a declared profile. A
         // headless checkout omits the directory together with the seccomp file.
         for name in self
@@ -366,6 +375,9 @@ impl AdmittedRelease {
             actual == self.manifest.files,
             "Release payload file set or integrity differs from its manifest"
         );
+        if self.scoped_runtime_checked {
+            verify_retired_tool_compose_absent(&self.root)?;
+        }
         ensure!(
             identity(&manifest_path)?.as_ref() == Some(&before),
             "Release manifest changed during admission"
@@ -378,6 +390,12 @@ impl AdmittedRelease {
 pub fn import_npm_payload(source: &Path, target: &Path) -> Result<AdmittedRelease> {
     let source = project_root(source)?;
     let manifest = parse_release(&source)?;
+    let scoped = uses_known_scoped_runtime(&manifest.version)?;
+    if scoped {
+        // Normalization copies declared files, so only the source can reveal
+        // an empty directory at the retired path.
+        verify_retired_tool_compose_absent(&source)?;
+    }
     let mut actual = file_map(&source)?;
     actual.remove("release.json");
     ensure!(
@@ -434,6 +452,9 @@ pub fn import_npm_payload(source: &Path, target: &Path) -> Result<AdmittedReleas
             "Npm manifest changed during import"
         );
         write_atomic(&safe_path(target, "release.json")?, &bytes, 0o644)?;
+    }
+    if scoped {
+        verify_retired_tool_compose_absent(&source)?;
     }
     admit_release(target)
 }
