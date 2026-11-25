@@ -316,8 +316,7 @@ fn rejected_scoped_runtime_preserves_the_working_offline_release() {
     );
     let error = cache
         .acquire(version, None, Some(bad.path()), true)
-        .err()
-        .expect("an empty retired directory must be rejected before normalization");
+        .expect_err("an empty retired directory must be rejected before normalization");
     assert!(error.to_string().contains(retired), "{error:#}");
     assert_eq!(fs::read(&reference).unwrap(), saved);
     assert!(bad.path().join(retired).is_dir());
