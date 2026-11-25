@@ -1039,6 +1039,16 @@ fn inspect_checkout_lockfree(
     daemon_platform: Option<&str>,
     cache_dir: Option<&Path>,
 ) -> DoctorCheck {
+    inspect_checkout_lockfree_for_host(target, Target::host(), daemon_platform, cache_dir)
+}
+
+fn inspect_checkout_lockfree_for_host(
+    target: &Path,
+    host: Result<Target>,
+    daemon_platform: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> DoctorCheck {
+    let host_target = host.as_ref().ok().copied();
     let root = match project_root(target) {
         Ok(r) => r,
         Err(err) => {
@@ -1073,7 +1083,9 @@ fn inspect_checkout_lockfree(
         state::check_manifest_regular_bounded(&manifest_path)?;
         let manifest_id = identity(&manifest_path)?.context("Missing project manifest")?;
         let s = state::read_project_state(&root)?;
-        let full = state::admit_runtime_snapshot(&root, s, manifest_id)?;
+        let pins = ToolPins::admit(&root, &s)?;
+        pins.engines.for_target(host?)?;
+        let full = state::admit_runtime_snapshot_with_pins(&root, s, manifest_id, Some(pins))?;
         if full
             .state
             .components
@@ -1085,7 +1097,7 @@ fn inspect_checkout_lockfree(
                 .unwrap_or(Target::LinuxX64);
             if let Err(err) = crate::runtime::PnpmPin::from_checkout_for_target(&root, target) {
                 if err.to_string().contains("Missing pnpm pin for ") {
-                    let hint = Target::host().unwrap_or(target).checkout_upgrade_hint();
+                    let hint = host_target.unwrap_or(target).checkout_upgrade_hint();
                     return Err(crate::cli::error(
                         "UNSUPPORTED_HOST_TARGET",
                         format!(
@@ -1124,8 +1136,7 @@ fn inspect_checkout_lockfree(
                         .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
                     let has_root_lock = fs::symlink_metadata(root.join("Cargo.lock")).is_ok();
                     if crate::cli::error_code(&err) == "UNSUPPORTED_HOST_TARGET"
-                        && let Some(target) = Target::host()
-                            .ok()
+                        && let Some(target) = host_target
                             .or_else(|| daemon_platform.and_then(Target::from_docker_platform))
                     {
                         target.checkout_upgrade_hint()
@@ -1256,5 +1267,106 @@ mod tests {
         wrong_schema.schema_version = 2;
         write_json(&receipt_path, &wrong_schema).unwrap();
         assert!(read_image_receipt(root, "rust", &pin).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_checkout_without_host_engine_fails_doctor_with_upgrade_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project_root(temp.path()).unwrap();
+        let sha = "a".repeat(64);
+        let toolchains = format!(
+            "DEVKIT_VERSION=0.5.1\n\
+             DEVKIT_ENGINE_TARGET=x86_64-unknown-linux-musl\n\
+             DEVKIT_ENGINE_SHA256={sha}\n\
+             DEVKIT_NODE_IMAGE=node@sha256:{sha}\n\
+             DEVKIT_NODE_VERSION=24.22.1\n\
+             DEVKIT_RUST_VERSION=1.99.1\n\
+             DEVKIT_RUST_RECIPE_HASH={sha}\n\
+             DEVKIT_DESKTOP_RECIPE_HASH={sha}\n"
+        );
+        let mut managed = BTreeMap::new();
+        for (rel, bytes) in [
+            (state::CHECKSUM_PATH, b"".as_slice()),
+            (".devkit/runtime/toolchains.env", toolchains.as_bytes()),
+            (".devkit/project.mk", b"".as_slice()),
+            (".devkit/compose.apps.yaml", b"services: {}\n".as_slice()),
+            (".devkit/tooling-profiles.json", b"{}\n".as_slice()),
+        ] {
+            let path = root.join(rel);
+            create_dir_all_durable(path.parent().unwrap()).unwrap();
+            write_atomic(&path, bytes, 0o644).unwrap();
+            managed.insert(rel.to_owned(), identity(&path).unwrap().unwrap());
+        }
+        let state = ProjectState {
+            schema_version: 2,
+            version: "0.5.1".into(),
+            release_identity: sha,
+            generation: "00000000-0000-0000-0000-000000000001".into(),
+            package_mode: PackageMode::Local,
+            managed,
+            components: BTreeMap::from([(
+                "apps/api".into(),
+                ComponentState {
+                    role: Role::App,
+                    toolchain: Toolchain::Rust,
+                    tooling_profile: ToolingProfile::Rust,
+                    origin: Origin {
+                        template: "rust-api".into(),
+                        version: "0.5.1".into(),
+                        extra: BTreeMap::new(),
+                    },
+                    dependencies: Vec::new(),
+                    tool_dependencies: BTreeMap::new(),
+                    development: None,
+                    extra: BTreeMap::new(),
+                },
+            )]),
+            cargo_resolution: None,
+            extra: BTreeMap::new(),
+        };
+        write_json(&root.join(state::MANIFEST_PATH), &state).unwrap();
+
+        let version = env!("CARGO_PKG_VERSION");
+        let arm64 = inspect_checkout_lockfree_for_host(&root, Ok(Target::LinuxArm64), None, None);
+        assert_eq!(arm64.status, "fail", "{arm64:?}");
+        assert!(
+            arm64
+                .summary
+                .contains("Devkit 0.5.1 has no engine for aarch64-unknown-linux-musl"),
+            "{arm64:?}"
+        );
+        let arm64_rem = arm64.remediation.as_deref().unwrap_or("");
+        assert!(
+            arm64_rem.contains(&format!(
+                "npx @docouno/devkit@{version} update . --to {version}"
+            )),
+            "{arm64:?}"
+        );
+        assert!(
+            arm64_rem.contains(&format!(
+                "/path/to/release/devkit-aarch64-unknown-linux-musl update . --to {version} --release-root /path/to/release"
+            )),
+            "{arm64:?}"
+        );
+
+        let darwin = inspect_checkout_lockfree_for_host(&root, Ok(Target::DarwinArm64), None, None);
+        assert_eq!(darwin.status, "fail", "{darwin:?}");
+        assert!(
+            darwin
+                .summary
+                .contains("Devkit 0.5.1 has no engine for aarch64-apple-darwin"),
+            "{darwin:?}"
+        );
+        let darwin_rem = darwin.remediation.as_deref().unwrap_or("");
+        assert!(!darwin_rem.contains("npx @docouno/devkit"), "{darwin:?}");
+        assert!(
+            darwin_rem.contains(&format!(
+                "/path/to/preview/devkit-aarch64-apple-darwin update . --to {version} --release-root /path/to/preview"
+            )),
+            "{darwin:?}"
+        );
+
+        let x64 = inspect_checkout_lockfree_for_host(&root, Ok(Target::LinuxX64), None, None);
+        assert!(!x64.summary.contains("has no engine"), "{x64:?}");
     }
 }

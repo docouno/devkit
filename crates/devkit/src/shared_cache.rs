@@ -680,16 +680,21 @@ mod tests {
         let checkout = project_root(&tmp.path().join("checkout")).unwrap();
         let cache = project_root(&tmp.path().join("cache")).unwrap();
         directory(&checkout.join(".git")).unwrap();
+        let case_sensitive = volume_is_case_sensitive(&checkout).unwrap();
         let mut attempts = Vec::new();
         let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |p| {
             if attempts.is_empty() {
-                for name in MASKED_CACHE_DIRS
-                    .iter()
-                    .chain(std::iter::once(&"empty-file-mask"))
-                {
-                    assert!(p.masks.iter().any(
-                        |(target, _)| target == &Path::new("/devkit/unified/cache").join(name)
-                    ));
+                if case_sensitive {
+                    for name in MASKED_CACHE_DIRS
+                        .iter()
+                        .chain(std::iter::once(&"empty-file-mask"))
+                    {
+                        assert!(p.masks.iter().any(|(target, _)| {
+                            target == &Path::new("/devkit/unified/cache").join(name)
+                        }));
+                    }
+                } else {
+                    assert_eq!(p.ancestor, checkout);
                 }
             }
             attempts.push(p.store.clone());
@@ -701,14 +706,36 @@ mod tests {
             fs::metadata(cache.join(".tmp")).unwrap().mode() & 0o777,
             0o700
         );
-        assert_eq!(
-            attempts,
-            [
+        let shared = UnifiedStorePlan::candidate_with_case_sensitivity(
+            &checkout,
+            &cache.join("pnpm-store"),
+            &cache,
+            true,
+        )
+        .unwrap()
+        .expect("case-sensitive shared cache candidate should include cache masks");
+        for name in MASKED_CACHE_DIRS
+            .iter()
+            .chain(std::iter::once(&"empty-file-mask"))
+        {
+            assert!(
+                shared
+                    .masks
+                    .iter()
+                    .any(|(target, _)| target == &Path::new("/devkit/unified/cache").join(name)),
+                "missing shared cache mask for {name}"
+            );
+        }
+        let expected_attempts = if case_sensitive {
+            vec![
                 cache.join("pnpm-store"),
                 checkout.join(".git/devkit-store"),
-                plan.store
+                plan.store,
             ]
-        );
+        } else {
+            vec![checkout.join(".git/devkit-store"), plan.store]
+        };
+        assert_eq!(attempts, expected_attempts);
         let mut count = 0;
         assert!(
             UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |_| {
@@ -787,6 +814,10 @@ mod tests {
             root.display()
         );
         for message in [missing(&root), denied, lima_denied] {
+            assert!(
+                !guest_hardlinks_supported(diagnostic(125, message.clone()), &root).unwrap(),
+                "expected fallback for unshared ancestor error: {message}"
+            );
             let plan = UnifiedStorePlan::resolve_with_probe(&checkout, &cache, |plan| {
                 if plan.store == cache.join("pnpm-store") {
                     guest_hardlinks_supported(diagnostic(125, message.clone()), &plan.ancestor)

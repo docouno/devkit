@@ -492,10 +492,7 @@ class DeliveryTests(ReleaseFixture, unittest.TestCase):
                 mounts = json.loads(run("docker", "container", "inspect", cid).stdout)[0]["Mounts"]
                 self.assertEqual(next(m["Name"] for m in mounts if m["Destination"] == "/state"), volume)
                 run("sh", ".devkit/runtime/devkit.sh", "cli", "stand", "remove", ".")
-                # The 0.5.1 stand owns this volume. Explicit retirement removes it
-                # after both update routes have preserved the original name and data.
-                remaining = run("docker", "volume", "ls", "--quiet", "--filter", f"label={label}={token}")
-                self.assertNotIn(volume, remaining.stdout.splitlines())
+                self.assertEqual(run("docker", "volume", "inspect", volume).returncode, 0)
                 self.assertEqual(find_actor(), "")
             finally:
                 run("make", "down", check=False)
