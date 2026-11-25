@@ -487,6 +487,10 @@ pub fn create_dir_all_durable(path: &Path) -> Result<()> {
     } else {
         path.to_path_buf()
     };
+    #[cfg(target_os = "macos")]
+    {
+        current = darwin::system_alias(current)?;
+    }
     loop {
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {

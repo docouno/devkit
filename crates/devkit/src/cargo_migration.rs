@@ -50,7 +50,8 @@ fn rebased(root: &Path, component: &str, path: &str) -> Result<String> {
         !path.is_empty() && !Path::new(path).is_absolute(),
         "Expected a relative path in {component}/Cargo.toml: {path}"
     );
-    relative_name(root, &input_path(root, Path::new(component).join(path))?)
+    let root = crate::files::project_root(root)?;
+    relative_name(&root, &input_path(&root, Path::new(component).join(path))?)
 }
 
 fn replace_string(item: &mut Item, new: String) -> Result<()> {

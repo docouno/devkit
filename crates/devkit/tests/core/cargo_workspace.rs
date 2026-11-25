@@ -1573,6 +1573,7 @@ if [ "$1" = "context" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  printf '{platform}\n'
   exit 0
 fi
 if [ "$1" = "run" ]; then
@@ -1594,6 +1595,11 @@ exit 0
         log = docker_log.display(),
         fail_once = fail_once.display(),
         arch = std::env::consts::ARCH,
+        platform = if cfg!(target_arch = "aarch64") {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        },
     );
     fs::write(&docker_script, script).unwrap();
     fs::set_permissions(&docker_script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1610,6 +1616,7 @@ exit 0
         ])
         .env("PATH", &path_env)
         .env("DEVKIT_CACHE_DIR", &cache)
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/riscv64")
         .env("DEVKIT_CA_CERT", &ca)
         .env("DEVKIT_TEST_RELEASE", &release)
         .env("DEVKIT_TEST_TARGET", &root)
@@ -1627,18 +1634,46 @@ exit 0
     // 2. Validate offline mounted /cache/cargo RO without CA cert.
     // 3. Paths offline mounted /cache/cargo RO without CA cert.
     // 4. Paths online mounted /cache/cargo RW with CA cert.
+    let expected_platform = if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    };
+    let mask_source = cache.join("empty-file-mask");
+    let tmp_prefix = format!("type=bind,\"source={}/", cache.join(".tmp").display());
     assert_eq!(runs.len(), 5, "expected 5 docker run lines:\n{log}");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(cache.join(".tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     assert!(runs[0].contains("--cpus") || runs[0].contains("--memory"));
     assert!(!runs[1].contains("--cpus") && !runs[1].contains("--memory"));
+    assert!(runs[1].contains(&format!("--platform {expected_platform} --pull never")));
+    assert!(!runs[1].contains("linux/riscv64"));
     assert!(runs[1].contains("--tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size="));
     assert!(!runs[1].contains("exec,mode=1777"));
-    assert!(runs[1].contains("type=bind,\"source=/dev/null\",\"target=/workspace/.env\",readonly"));
-    assert!(runs[1].contains(
-        "type=bind,\"source=/dev/null\",\"target=/workspace/packages/core/.env\",readonly"
-    ));
-    assert!(
-        runs[1].contains("type=bind,\"source=/dev/null\",\"target=/workspace/.npmrc\",readonly")
-    );
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/.env\",readonly",
+        mask_source.display()
+    )));
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/packages/core/.env\",readonly",
+        mask_source.display()
+    )));
+    assert!(runs[1].contains(&format!(
+        "type=bind,\"source={}\",\"target=/workspace/.npmrc\",readonly",
+        mask_source.display()
+    )));
+    assert!(!runs[1].contains("source=/dev/null"));
+    assert!(runs[1].contains(&tmp_prefix));
     assert!(runs[1].contains("RUSTC=/usr/local/cargo/bin/rustc"));
     assert!(runs[1].contains("CARGO_NET_GIT_FETCH_WITH_CLI=false"));
     assert!(runs[1].contains("RUSTFLAGS="));
@@ -1649,6 +1684,8 @@ exit 0
     assert!(!runs[2].contains("CARGO_HTTP_CAINFO"));
     assert!(runs[3].contains("\"target=/cache/cargo\",readonly"));
     assert!(!runs[3].contains("CARGO_HTTP_CAINFO"));
+    assert!(runs[4].contains(&format!("--platform {expected_platform} --pull never")));
+    assert!(runs[4].contains(&tmp_prefix));
     assert!(runs[4].contains("\"target=/cache/cargo\" "));
     assert!(!runs[4].contains("\"target=/cache/cargo\",readonly"));
     assert!(runs[4].contains("CARGO_HTTP_CAINFO=/devkit/ca.pem"));

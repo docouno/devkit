@@ -3462,7 +3462,6 @@ fn project_mutations_enforce_supported_floor_and_release_min_from_before_lock() 
     for (label, manifest_val) in [
         ("schema1", json!({"schemaVersion": 1, "version": "0.1.0"})),
         ("v021", json!({"schemaVersion": 2, "version": "0.2.1"})),
-        ("v041", json!({"schemaVersion": 2, "version": "0.4.1"})),
         ("v032", json!({"schemaVersion": 2, "version": "0.3.2"})),
         ("v041", json!({"schemaVersion": 2, "version": "0.4.1"})),
     ] {

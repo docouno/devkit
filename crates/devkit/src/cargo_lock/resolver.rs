@@ -10,6 +10,7 @@ use crate::{
         assert_clean_cargo_home, bind_mount, cargo_safety_env, mount_sensitive_workspace_masks,
     },
 };
+use anyhow::Context;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -123,6 +124,7 @@ impl DockerCargoLockResolver {
         )?;
         let root = project_root(root)?;
         let cache_root = crate::cache::cache_root(self.cache_dir.as_deref())?;
+        crate::shared_cache::prepare_mount_masks(&cache_root)?;
         let cache = safe_path(&cache_root, "cargo")?;
         crate::shared_cache::directory(&cache)?;
         assert_clean_cargo_home(&cache)?;
@@ -135,7 +137,6 @@ impl DockerCargoLockResolver {
             crate::native::resolve_ca_cert_path()?
                 .map(|p| {
                     let tmp_dir = safe_path(&cache_root, ".tmp")?;
-                    crate::shared_cache::directory(&tmp_dir)?;
                     crate::download::additional_ca_file_in(&p, &tmp_dir)
                 })
                 .transpose()?
@@ -144,6 +145,12 @@ impl DockerCargoLockResolver {
         };
         let mut budget =
             HostResourceBudget::probe_with_docker(&runner, &mut crate::runtime::docker_command())?;
+        let platform = budget
+            .daemon_info
+            .as_ref()
+            .context("Missing Linux Docker daemon information")?
+            .platform;
+        crate::runtime::ensure_image(&runner, &image, platform, !offline)?;
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
         let cache_readonly =
@@ -158,11 +165,12 @@ impl DockerCargoLockResolver {
                 let spec = budget.for_cargo_resolver();
                 let env_plan = budget.toolchain_env_for_task(ToolingProfile::Rust, &spec)?;
                 let mut command = crate::runtime::docker_command();
-                command.arg("run");
-                if let Some(info) = budget.daemon_info.as_ref() {
-                    command.args(["--platform", info.platform]);
-                }
                 command.args([
+                    "run",
+                    "--platform",
+                    platform,
+                    "--pull",
+                    "never",
                     "--rm",
                     "--init",
                     "--read-only",
@@ -176,12 +184,9 @@ impl DockerCargoLockResolver {
                     "no-new-privileges:true",
                     "--user",
                     &format!("{uid}:{gid}"),
+                    "--network",
+                    if offline { "none" } else { "bridge" },
                 ]);
-                if offline {
-                    command.args(["--pull", "never", "--network", "none"]);
-                } else {
-                    command.args(["--network", "bridge"]);
-                }
                 spec.write_docker_args(&mut command);
                 command
                     .arg("--mount")
@@ -196,7 +201,7 @@ impl DockerCargoLockResolver {
                         Path::new("/cache/cargo"),
                         cache_readonly,
                     )?);
-                mount_sensitive_workspace_masks(&mut command, &root)?;
+                mount_sensitive_workspace_masks(&mut command, &root, &cache_root)?;
                 if let Some(ca_cert) = &ca_cert {
                     command
                         .arg("--mount")

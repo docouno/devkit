@@ -277,10 +277,14 @@ pub(crate) fn local_receipts_with_pins(
             .is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
     });
     let rust = read_image_receipt(root, "rust", &pins.rust_recipe)?;
-    let rust_workspace_ready = native.is_some_and(|n| {
-        crate::runtime::workspace_ready(root, project_state, n, Toolchain::Rust, cache_dir)
-            .unwrap_or(false)
-    });
+    let rust_workspace_ready = match native {
+        Some(n) => {
+            crate::runtime::rust_checkout_receipt_matches(root, project_state, n)?
+                && crate::runtime::rust_cache_receipt_matches(root, project_state, n, cache_dir)
+                    .unwrap_or(false)
+        }
+        None => false,
+    };
     let has_electron = state::has_electron(project_state);
     let desktop = if has_electron {
         pins.desktop_recipe

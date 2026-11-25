@@ -178,14 +178,15 @@ pub(super) fn listed_members(root: &Path, component: &str) -> Result<Vec<String>
     else {
         return Ok(Vec::new());
     };
+    let root = crate::files::project_root(root)?;
     let mut matched = Vec::new();
     for entry in members.iter() {
         let raw = entry
             .as_str()
             .context("workspace.members entries must be strings")?;
-        let normalized = relative_name(root, &input_path(root, raw)?)?;
+        let normalized = relative_name(&root, &input_path(&root, raw)?)?;
         if Path::new(&normalized).starts_with(component) {
-            let member_manifest = input_path(root, format!("{normalized}/Cargo.toml"))?;
+            let member_manifest = input_path(&root, format!("{normalized}/Cargo.toml"))?;
             ensure!(
                 exists(&member_manifest)?,
                 "Listed Cargo workspace member is missing {normalized}/Cargo.toml"
@@ -212,11 +213,12 @@ pub(super) fn listed_members(root: &Path, component: &str) -> Result<Vec<String>
 
 /// Never follow directory links or look for package manifests in generated outputs.
 pub(super) fn discover_members(root: &Path, component: &str) -> Result<Vec<String>> {
-    let mut pending = vec![input_path(root, component)?];
+    let root = crate::files::project_root(root)?;
+    let mut pending = vec![input_path(&root, component)?];
     let mut found = Vec::new();
     while let Some(dir) = pending.pop() {
-        let rel = relative_name(root, &dir)?;
-        let path = input_path(root, format!("{rel}/Cargo.toml"))?;
+        let rel = relative_name(&root, &dir)?;
+        let path = input_path(&root, format!("{rel}/Cargo.toml"))?;
         if exists(&path)? {
             let doc = document(&read_input_bytes(&path)?, &format!("{rel}/Cargo.toml"))?;
             ensure!(
@@ -259,7 +261,8 @@ pub(super) fn discover_members(root: &Path, component: &str) -> Result<Vec<Strin
 }
 
 pub(super) fn reconcile_members(root: &Path, state: &ProjectState) -> Result<()> {
-    let listed = add_members(root, &[], false)?;
+    let root = crate::files::project_root(root)?;
+    let listed = add_members(&root, &[], false)?;
     let proof = state.cargo_resolution.as_ref().filter(|p| p.version == 1);
     let mut restored = Vec::new();
     for (component, spec) in &state.components {
@@ -287,12 +290,12 @@ pub(super) fn reconcile_members(root: &Path, state: &ProjectState) -> Result<()>
         );
         for member in previous {
             let name = format!("{member}/Cargo.toml");
-            let manifest = input_path(root, &name).with_context(|| {
+            let manifest = input_path(&root, &name).with_context(|| {
                 format!("Cannot restore accepted Cargo member {member}; {guidance}")
             })?;
             ensure!(
                 manifest.starts_with(&component_dir)
-                    && relative_name(root, &manifest)? == name
+                    && relative_name(&root, &manifest)? == name
                     && manifest.is_file(),
                 "Cannot restore previously accepted Cargo member at {name}; {guidance}"
             );
@@ -300,7 +303,7 @@ pub(super) fn reconcile_members(root: &Path, state: &ProjectState) -> Result<()>
         }
     }
     if !restored.is_empty() {
-        add_members(root, &restored, false)?;
+        add_members(&root, &restored, false)?;
     }
     Ok(())
 }

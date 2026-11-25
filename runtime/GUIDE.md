@@ -147,7 +147,7 @@ make setup && make check
 
 For the `0.5.x` Rust migration, both preview and apply verify the merged lock in staging. Devkit can verify known template and simple local dependency graphs before setup. Other graphs require Docker to run the target release's pinned Cargo. For offline validation, cache the target release, the base image in its `runtime/rust.Dockerfile` and the required Cargo dependency data.
 
-Pass `reconcile=1` for pnpm transitive re-resolution. After an interrupted update, `make recover` restores the previous checkout offline from the local journal without Docker. If the loader still comes from `0.5.x`, run the cached target engine at `${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/docouno/devkit}/engines/x86_64-unknown-linux-musl/0.6.0/<sha256>/devkit recover .`.
+Pass `reconcile=1` for pnpm transitive re-resolution. After an interrupted update, `make recover` restores the previous checkout offline from the local journal without Docker. If the loader still comes from `0.5.x`, run the cached target engine at `${DEVKIT_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/docouno/devkit}/engines/<target>/0.6.0/<sha256>/devkit recover .` (where `<target>` is `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`).
 
 ### Shared caches
 

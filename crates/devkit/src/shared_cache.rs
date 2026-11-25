@@ -26,7 +26,7 @@ pub fn directory(path: &Path) -> Result<()> {
     create_dir_all_durable(&path)
 }
 
-const MASKED_CACHE_DIRS: [&str; 7] = [
+const MASKED_CACHE_DIRS: [&str; 8] = [
     ".tmp",
     "empty-mask",
     ".locks",
@@ -34,6 +34,7 @@ const MASKED_CACHE_DIRS: [&str; 7] = [
     "tools",
     "releases",
     "refs",
+    "cargo-receipts",
 ];
 const MASKED_CACHE_FILES: [&str; 3] = ["empty-file-mask", "port-leases.json", "port-leases.lock"];
 

@@ -987,7 +987,7 @@ impl<'a> PreparedContext<'a> {
         let unified = if node && (setup || write_root) {
             Some(self.store_plan()?)
         } else {
-            if node {
+            if node || matches!(access, TaskAccess::SetupRust) || network != "none" {
                 crate::shared_cache::prepare_mount_masks(&root_cache)?;
             }
             None
@@ -1130,7 +1130,7 @@ impl<'a> PreparedContext<'a> {
                 }
             }
             if !node && matches!(access, TaskAccess::SetupRust) {
-                mount_sensitive_workspace_masks(&mut c, root)?;
+                mount_sensitive_workspace_masks(&mut c, root, &root_cache)?;
             }
             if let Some(pnpm) = &pnpm {
                 crate::shared_cache::mount(&mut c, pnpm, Path::new("/devkit/bin/pnpm"), true)?;
@@ -1676,9 +1676,15 @@ pub(crate) fn cargo_safety_env() -> [&'static str; 9] {
 }
 
 /// Mask checkout-root and component-level secret files (.env, .env.*, .npmrc)
-/// with /dev/null inside automatic networked Rust containers (setup-rust and
-/// Cargo lock resolution), refusing symlinked secret files fail-closed.
-pub(crate) fn mount_sensitive_workspace_masks(command: &mut Command, root: &Path) -> Result<()> {
+/// with the shared empty-file-mask inside automatic networked Rust containers
+/// (setup-rust and Cargo lock resolution), refusing symlinked secret files fail-closed.
+pub(crate) fn mount_sensitive_workspace_masks(
+    command: &mut Command,
+    root: &Path,
+    cache_root: &Path,
+) -> Result<()> {
+    let file_mask = cache_root.join("empty-file-mask");
+    let fold_case = cfg!(target_os = "macos");
     let mut rel_paths = BTreeSet::new();
     let mut scan_dirs: Vec<(String, PathBuf)> = vec![(String::new(), root.to_path_buf())];
     for group in ["apps", "packages"] {
@@ -1702,21 +1708,29 @@ pub(crate) fn mount_sensitive_workspace_masks(command: &mut Command, root: &Path
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let sensitive = name == ".npmrc"
-                || name == ".env"
-                || (name.starts_with(".env.")
+            let canonical: std::borrow::Cow<'_, str> = if fold_case {
+                name.to_ascii_lowercase().into()
+            } else {
+                name.as_str().into()
+            };
+            let sensitive = canonical == ".npmrc"
+                || canonical == ".env"
+                || (canonical.starts_with(".env.")
                     && !matches!(
-                        name.as_str(),
+                        canonical.as_ref(),
                         ".env.example" | ".env.sample" | ".env.template"
                     ));
             if !sensitive {
                 continue;
             }
-            let rel = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
+            let rel_for = |leaf: &str| {
+                if prefix.is_empty() {
+                    leaf.to_owned()
+                } else {
+                    format!("{prefix}/{leaf}")
+                }
             };
+            let rel = rel_for(&name);
             let meta = fs::symlink_metadata(entry.path())?;
             ensure!(
                 !meta.file_type().is_symlink(),
@@ -1724,13 +1738,24 @@ pub(crate) fn mount_sensitive_workspace_masks(command: &mut Command, root: &Path
             );
             if meta.is_file() {
                 rel_paths.insert(rel);
+                if canonical.as_ref() != name.as_str() {
+                    match fs::symlink_metadata(dir.join(canonical.as_ref())) {
+                        Ok(alias_meta) if alias_meta.is_file() => {
+                            rel_paths.insert(rel_for(canonical.as_ref()));
+                        }
+                        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(err.into());
+                        }
+                        _ => (),
+                    }
+                }
             }
         }
     }
     for rel in rel_paths {
         crate::shared_cache::mount(
             command,
-            Path::new("/dev/null"),
+            &file_mask,
             &Path::new("/workspace").join(rel),
             true,
         )?;
@@ -1746,53 +1771,51 @@ fn cargo_cache_receipt(root: &Path, cache_dir: Option<&Path>) -> Result<PathBuf>
     safe_path(&cache, &format!("cargo-receipts/{checkout}"))
 }
 
-pub(crate) fn workspace_ready(
+pub(crate) fn rust_checkout_receipt_matches(
     root: &Path,
     state: &ProjectState,
     native: &crate::native::NativeAdmission,
-    toolchain: Toolchain,
-    cache_dir: Option<&Path>,
 ) -> Result<bool> {
-    let inputs = match toolchain {
-        Toolchain::Node if safe_path(root, "node_modules")?.is_dir() => {
-            return Ok(crate::doctor::read_node_receipt(root)?.is_some_and(|r| {
-                r == crate::doctor::NodeWorkspaceReceipt::new(
-                    &r.platform,
-                    &state.release_identity,
-                    &native.node_inputs.digest,
-                )
-            }));
-        }
-        Toolchain::Rust if native.cargo_workspace.is_some() => &native.rust_inputs,
-        _ => return Ok(false),
-    };
-    let path = safe_path(root, &format!(".devkit/state/{toolchain}-workspace.lock"))?;
-    let expected = workspace_fingerprint(state, inputs);
-    let matches = |path: &Path| -> Result<bool> {
-        Ok(
-            read_regular_file(path, 4096, "workspace receipt")?.is_some_and(|(bytes, _)| {
-                std::str::from_utf8(&bytes).is_ok_and(|value| value.trim() == expected)
-            }),
-        )
-    };
-    Ok(matches(&path)?
-        && (toolchain == Toolchain::Node || matches(&cargo_cache_receipt(root, cache_dir)?)?))
+    if native.cargo_workspace.is_none() {
+        return Ok(false);
+    }
+    let path = safe_path(root, ".devkit/state/rust-workspace.lock")?;
+    let expected = workspace_fingerprint(state, &native.rust_inputs);
+    Ok(
+        read_regular_file(&path, 4096, "workspace receipt")?.is_some_and(|(bytes, _)| {
+            std::str::from_utf8(&bytes).is_ok_and(|value| value.trim() == expected)
+        }),
+    )
 }
 
-fn require_workspace(
-    admission: &RuntimeAdmission,
-    toolchain: Toolchain,
+pub(crate) fn rust_cache_receipt_matches(
+    root: &Path,
+    state: &ProjectState,
+    native: &crate::native::NativeAdmission,
     cache_dir: Option<&Path>,
-) -> Result<()> {
+) -> Result<bool> {
+    if native.cargo_workspace.is_none() {
+        return Ok(false);
+    }
+    let path = cargo_cache_receipt(root, cache_dir)?;
+    let expected = workspace_fingerprint(state, &native.rust_inputs);
+    Ok(
+        read_regular_file(&path, 4096, "workspace receipt")?.is_some_and(|(bytes, _)| {
+            std::str::from_utf8(&bytes).is_ok_and(|value| value.trim() == expected)
+        }),
+    )
+}
+
+fn require_rust_workspace(admission: &RuntimeAdmission, cache_dir: Option<&Path>) -> Result<()> {
     ensure!(
-        workspace_ready(
-            &admission.root,
-            &admission.state,
-            &admission.native,
-            toolchain,
-            cache_dir
-        )?,
-        "{toolchain} workspace dependencies are absent/stale; run make setup"
+        rust_checkout_receipt_matches(&admission.root, &admission.state, &admission.native)?
+            && rust_cache_receipt_matches(
+                &admission.root,
+                &admission.state,
+                &admission.native,
+                cache_dir,
+            )?,
+        "rust workspace dependencies are absent/stale; run make setup"
     );
     Ok(())
 }
@@ -2195,7 +2218,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             if c.toolchain == Toolchain::Rust {
                 if !checked_rust {
                     ctx.derived_image("rust", false)?;
-                    require_workspace(&full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+                    require_rust_workspace(&full, ctx.cache_dir.as_deref())?;
                     checked_rust = true;
                 }
             } else if !checked_node {
@@ -2233,7 +2256,7 @@ pub fn run(request: RuntimeRequest, runner: &ProcessRunner) -> Result<()> {
             "package is defined for desktop applications and publishable libraries"
         );
         let image = ctx.derived_image("rust", false)?;
-        require_workspace(&full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+        require_rust_workspace(&full, ctx.cache_dir.as_deref())?;
         if !setup {
             let workspace = full
                 .native
@@ -3454,7 +3477,7 @@ fn run_development(
         let c = &full.state.components[&path];
         if c.toolchain == Toolchain::Rust {
             let image = ctx.derived_image("rust", false)?;
-            require_workspace(full, Toolchain::Rust, ctx.cache_dir.as_deref())?;
+            require_rust_workspace(full, ctx.cache_dir.as_deref())?;
             let cargo_cache = ctx.cache_directory("cargo")?;
             assert_clean_cargo_home(&cargo_cache)?;
             ctx.dirs(["target".into()])?;
